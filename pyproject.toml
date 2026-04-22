@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lapis-pm"
+version = "0.1.0"
+description = "Lapis PM — per-thread project manager daemon + shaped-agent dispatch. Perceive → score → encode → decide → act, bound via `lapis-pm bind`."
+requires-python = ">=3.12"
+dependencies = [
+    "agents-core",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lapis_pm*"]
+
+[tool.setuptools.package-data]
+lapis_pm = ["registry.yaml", "smoke.sh"]

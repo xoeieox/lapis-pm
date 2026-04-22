@@ -1,0 +1,183 @@
+"""Shaped-agent registry + dispatch.
+
+Loads the sibling `registry.yaml` at import time, composes chub bundles +
+system templates, writes a JSON spec to /srv/lapis/gpu-queue/shaped/, and submits
+a `subprocess` task whose command runs `lapis_pm._runner` against that spec.
+
+The GPU queue runner captures stdout (the Claude response) to
+/srv/lapis/gpu-queue/completed/<task_id>-output.md.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sys
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+from agents_core.gpu import GPUQueue, Priority
+
+# chub_broker still lives in /data/agents/scripts/ (deferred from the agents-core
+# day-one scope). Keep this last sys.path shim until chub_broker moves into
+# agents-core, at which point this block + the import can be deleted.
+if "/data/agents/scripts" not in sys.path:
+    sys.path.insert(0, "/data/agents/scripts")
+
+try:
+    from chub_broker import select_bundles_by_ids, compose_with_system  # noqa: E402
+except Exception:
+    select_bundles_by_ids = None  # type: ignore
+    compose_with_system = None  # type: ignore
+
+
+REGISTRY_PATH = Path(__file__).parent / "registry.yaml"
+SPEC_DIR = Path("/srv/lapis/gpu-queue/shaped")
+RUNNER = str(Path(__file__).parent / "_runner.py")
+
+
+@dataclass
+class ShapedAgent:
+    name: str
+    chub_bundles: list[str]
+    system_template: str
+    model: str
+    timeout_s: int
+
+
+def _load_registry() -> dict[str, ShapedAgent]:
+    if not REGISTRY_PATH.exists():
+        raise RuntimeError(f"Lapis PM registry missing: {REGISTRY_PATH}")
+    raw = yaml.safe_load(REGISTRY_PATH.read_text()) or {}
+    out: dict[str, ShapedAgent] = {}
+    for name, body in (raw.get("agents") or {}).items():
+        out[name] = ShapedAgent(
+            name=name,
+            chub_bundles=list(body.get("chub_bundles") or []),
+            system_template=body.get("system_template", ""),
+            model=body.get("model", "haiku"),
+            timeout_s=int(body.get("timeout_s", 300)),
+        )
+    return out
+
+
+# Loaded at import time so agent names are available as soon as the module is
+# imported. Missing registry.yaml raises RuntimeError immediately — intentional
+# fail-fast: the lapis-pm CLI won't start if the registry is absent.
+_REGISTRY = _load_registry()
+
+
+def list_agents() -> list[str]:
+    return sorted(_REGISTRY.keys())
+
+
+def get_agent(name: str) -> ShapedAgent:
+    if name not in _REGISTRY:
+        raise KeyError(f"Unknown shaped agent: {name}. Known: {list_agents()}")
+    return _REGISTRY[name]
+
+
+def reload_registry():
+    global _REGISTRY
+    _REGISTRY = _load_registry()
+
+
+# ---------------------------------------------------------------------------
+
+def _slugify(text: str, max_len: int = 32) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return (s or "task")[:max_len]
+
+
+def _compose_system(agent: ShapedAgent, vars_: dict) -> str:
+    base = agent.system_template.format(**vars_)
+    if agent.chub_bundles and select_bundles_by_ids and compose_with_system:
+        try:
+            sel = select_bundles_by_ids(agent.chub_bundles)
+            return compose_with_system(sel, base)
+        except Exception:
+            return base
+    return base
+
+
+@dataclass
+class DispatchResult:
+    task_id: str
+    agent_type: str
+    spec_path: str
+    spec_id: str        # short uuid embedded in spec filename (used to find meta sidecar)
+    output_path: str    # where the GPU runner will write the result
+
+
+def dispatch(
+    agent_type: str,
+    target_id: str,
+    user_prompt: str,
+    vars_: dict | None = None,
+    priority: int = Priority.HIGH,
+    submitted_by: str = "lapis-pm",
+) -> DispatchResult:
+    """Submit a shaped-agent invocation to the GPU queue.
+
+    vars_ are interpolated into the agent's system_template via str.format.
+    user_prompt is passed straight through to Claude as the user message.
+    """
+    agent = get_agent(agent_type)
+    vars_ = dict(vars_ or {})
+
+    SPEC_DIR.mkdir(parents=True, exist_ok=True)
+
+    system = _compose_system(agent, vars_)
+
+    spec = {
+        "agent_type": agent.name,
+        "target_id": target_id,
+        "model": agent.model,
+        "timeout_s": agent.timeout_s,
+        "system": system,
+        "prompt": user_prompt,
+        # Fixer agents get a meta sidecar so pm_core can detect confabulation
+        # (substantial prose with no tool use). Other agents skip the overhead.
+        "capture_meta": agent.name == "fixer",
+    }
+
+    spec_id = uuid.uuid4().hex[:12]
+    spec_path = SPEC_DIR / f"{target_id}-{agent.name}-{spec_id}.json"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False))
+
+    cmd = f"python3 {shlex.quote(RUNNER)} {shlex.quote(str(spec_path))}"
+
+    queue = GPUQueue()
+    task_id = queue.submit({
+        "task_type": "subprocess",
+        "priority": priority,
+        "timeout_seconds": agent.timeout_s + 60,  # cushion over the inner timeout
+        "submitted_by": submitted_by,
+        "model": agent.model,
+        "payload": {"command": cmd},
+    })
+
+    output_path = f"/srv/lapis/gpu-queue/completed/{task_id}-output.md"
+    return DispatchResult(
+        task_id=task_id,
+        agent_type=agent.name,
+        spec_path=str(spec_path),
+        spec_id=spec_id,
+        output_path=output_path,
+    )
+
+
+def select(event_kind: str) -> str:
+    """Rule-based shape selection. v2 will learn from pm/shape-stats."""
+    if event_kind == "pr_opened":
+        return "reviewer"
+    if event_kind == "ci_failing" or event_kind == "fixable":
+        return "fixer"
+    if event_kind == "spec_question" or event_kind == "explore":
+        return "scout"
+    return "scout"

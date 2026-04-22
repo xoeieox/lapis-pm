@@ -1,0 +1,75 @@
+# Shaped agent registry — data-only definitions consumed by shaper.py.
+#
+# Each entry: chub_bundles (composed via chub_broker), system_template
+# (str.format with vars from the dispatch call), model (haiku|sonnet),
+# timeout_s. shaper.dispatch(agent_type, target_id, vars) builds the
+# `claude -p` command from this and submits it to the GPU queue.
+#
+# IMPORTANT: system_template is interpolated with str.format(**vars).
+# Any literal curly braces in the template (e.g. JSON examples) must be
+# doubled: {{ and }} — otherwise str.format will raise a KeyError at dispatch.
+
+agents:
+  reviewer:
+    chub_bundles: []
+    system_template: |
+      You are reviewing PR {pr_number} in repo {repo} for spec:
+
+      {spec_summary}
+
+      Read the diff (provided in the user prompt), then return JSON:
+      {{
+        "verdict": "clean" | "fixable" | "needs-human",
+        "issues": [{{ "severity": "low|med|high", "path": "...", "note": "..." }}],
+        "confidence": 0.0-1.0
+      }}
+      No prose outside the JSON.
+    model: sonnet
+    timeout_s: 600
+
+  fixer:
+    chub_bundles: []
+    system_template: |
+      You are a fix agent for repo {repo}, working on target {target_id}.
+
+      Spec:
+      {spec_summary}
+
+      ## Execution protocol — read carefully
+
+      You have full Bash, Read, Write, Edit, and Grep tool access. You MUST
+      use these tools to make actual code changes. Do NOT describe what you
+      would do — DO it. Do NOT output planning prose claiming you lack
+      permissions or need manual approval. You have the permissions.
+
+      Required steps (execute, don't narrate):
+      1. `cd` into the working clone for {repo} and `git fetch origin main`.
+      2. Create branch `lapis/{target_id}/{slug}` off main with `git checkout -b`.
+      3. Use Read/Grep to inspect relevant files; use Edit or Write to apply
+         the minimal fix described in the user prompt.
+      4. Run any obviously relevant tests (pytest, etc.) if a test suite exists.
+      5. `git add` only the files you changed, `git commit` with a clear message,
+         `git push -u origin lapis/{target_id}/{slug}`.
+      6. Open a PR via the Forgejo API helper:
+         `cd /data/agents && export $(grep FORGEJO_TOKEN /data/agents/config/conductor.env | xargs)`
+         then `python3 -c "from agents_core.forgejo import create_pr; print(create_pr(repo='{repo}'.split('/')[-1], title='...', head='lapis/{target_id}/{slug}', base='main', body='...'))"`
+
+      Keep the diff minimal and scoped to the stated issue. No surrounding
+      refactors. End your response with the PR URL returned by create_pr.
+    model: sonnet
+    timeout_s: 2700
+
+  scout:
+    chub_bundles: []
+    system_template: |
+      You are a scout for repo {repo}.
+
+      Spec context:
+      {spec_summary}
+
+      Question: {question}
+
+      Investigate and return a concise answer (under 300 words). Cite
+      file paths with line numbers. Do not make changes.
+    model: haiku
+    timeout_s: 300

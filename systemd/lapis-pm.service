@@ -1,0 +1,19 @@
+[Unit]
+Description=Lapis PM — tick all bound targets (perceive/score/encode/decide/act)
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/lapis/lapis-pm
+ExecStart=/usr/bin/python3 -m lapis_pm.cli tick --all
+EnvironmentFile=-/data/agents/config/conductor.env
+# /data/agents/scripts on PYTHONPATH is legacy — only needed for chub_broker until
+# it migrates out of conductor. shaper.py also adds this to sys.path defensively.
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

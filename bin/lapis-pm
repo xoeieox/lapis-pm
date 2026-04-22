@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Wrapper for the lapis-pm CLI. Symlink to /usr/local/bin/lapis-pm.
+# Sources conductor.env so FORGEJO_TOKEN and PUSHOVER_* are exported.
+set -e
+
+if [ -f /data/agents/config/conductor.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /data/agents/config/conductor.env
+    set +a
+fi
+
+exec /usr/bin/python3 -m lapis_pm.cli "$@"

@@ -40,6 +40,15 @@ REGISTRY_PATH = Path(__file__).parent / "registry.yaml"
 SPEC_DIR = Path("/srv/lapis/gpu-queue/shaped")
 RUNNER = str(Path(__file__).parent / "_runner.py")
 
+# Per-repo working-clone convention. A repo name like "lapis-engine" maps to
+# /srv/git/lapis-engine-working/. Shaped agents dispatch with this as cwd so
+# chub-inject.py (SessionStart hook) finds the repo CLAUDE.md and injects its
+# @chub: bundles + per-project auto-memory into the subprocess context.
+REPO_CWD_TEMPLATE = "/srv/git/{repo}-working"
+# Fallback when the working clone doesn't exist (test runs, unknown repo). The
+# subprocess still works — just without repo-specific hook injection.
+DEFAULT_CWD = "/data/agents"
+
 
 @dataclass
 class ShapedAgent:
@@ -50,10 +59,14 @@ class ShapedAgent:
     timeout_s: int
 
 
-def _load_registry() -> dict[str, ShapedAgent]:
+def _load_registry() -> tuple[str, dict[str, ShapedAgent]]:
+    """Return (shared_preamble, agents). Both are required fields; a missing
+    shared_preamble is treated as empty string for backward compatibility with
+    older registry.yaml files that predate the preamble."""
     if not REGISTRY_PATH.exists():
         raise RuntimeError(f"Lapis PM registry missing: {REGISTRY_PATH}")
     raw = yaml.safe_load(REGISTRY_PATH.read_text()) or {}
+    preamble = raw.get("shared_preamble") or ""
     out: dict[str, ShapedAgent] = {}
     for name, body in (raw.get("agents") or {}).items():
         out[name] = ShapedAgent(
@@ -63,13 +76,13 @@ def _load_registry() -> dict[str, ShapedAgent]:
             model=body.get("model", "haiku"),
             timeout_s=int(body.get("timeout_s", 300)),
         )
-    return out
+    return preamble, out
 
 
 # Loaded at import time so agent names are available as soon as the module is
 # imported. Missing registry.yaml raises RuntimeError immediately — intentional
 # fail-fast: the lapis-pm CLI won't start if the registry is absent.
-_REGISTRY = _load_registry()
+_SHARED_PREAMBLE, _REGISTRY = _load_registry()
 
 
 def list_agents() -> list[str]:
@@ -83,8 +96,8 @@ def get_agent(name: str) -> ShapedAgent:
 
 
 def reload_registry():
-    global _REGISTRY
-    _REGISTRY = _load_registry()
+    global _REGISTRY, _SHARED_PREAMBLE
+    _SHARED_PREAMBLE, _REGISTRY = _load_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +107,33 @@ def _slugify(text: str, max_len: int = 32) -> str:
     return (s or "task")[:max_len]
 
 
+def _resolve_repo_cwd(repo: str) -> str:
+    """Map a repo name to its working-clone path, falling back to DEFAULT_CWD
+    when the clone doesn't exist. Returned path is what the shaped-agent
+    subprocess uses as cwd — determining which CLAUDE.md + hooks fire."""
+    if not repo:
+        return DEFAULT_CWD
+    # Accept bare name ("lapis-engine") or owner-prefixed ("Erah/lapis-engine").
+    bare = repo.rsplit("/", 1)[-1]
+    candidate = REPO_CWD_TEMPLATE.format(repo=bare)
+    return candidate if Path(candidate).is_dir() else DEFAULT_CWD
+
+
 def _compose_system(agent: ShapedAgent, vars_: dict) -> str:
+    # Preamble is prepended to every agent's composed prompt. Its format
+    # vars (repo, repo_cwd, target_id) are supplied by dispatch(). Missing
+    # vars in the preamble are a programmer error — fail loud at format time
+    # rather than silently producing a half-rendered preamble.
+    preamble = _SHARED_PREAMBLE.format(**vars_) if _SHARED_PREAMBLE else ""
     base = agent.system_template.format(**vars_)
+    composed = f"{preamble}\n\n---\n\n{base}" if preamble else base
     if agent.chub_bundles and select_bundles_by_ids and compose_with_system:
         try:
             sel = select_bundles_by_ids(agent.chub_bundles)
-            return compose_with_system(sel, base)
+            return compose_with_system(sel, composed)
         except Exception:
-            return base
-    return base
+            return composed
+    return composed
 
 
 @dataclass
@@ -130,6 +161,13 @@ def dispatch(
     agent = get_agent(agent_type)
     vars_ = dict(vars_ or {})
 
+    # Derive the subprocess cwd from the repo. The shaped agent's
+    # SessionStart hooks (chub-inject.py, per-project auto-memory) key off
+    # this — see REPO_CWD_TEMPLATE docstring. Always populate repo_cwd in
+    # vars so the shared_preamble can reference it.
+    repo_cwd = _resolve_repo_cwd(vars_.get("repo") or "")
+    vars_.setdefault("repo_cwd", repo_cwd)
+
     SPEC_DIR.mkdir(parents=True, exist_ok=True)
 
     system = _compose_system(agent, vars_)
@@ -141,6 +179,10 @@ def dispatch(
         "timeout_s": agent.timeout_s,
         "system": system,
         "prompt": user_prompt,
+        # cwd that _runner.py passes to call_claude_cli. Hooks fire against
+        # the CLAUDE.md at this path — that's what pulls chubs + auto-memory
+        # into the shaped agent's context.
+        "cwd": repo_cwd,
         # Fixer agents get a meta sidecar so pm_core can detect confabulation
         # (substantial prose with no tool use). Other agents skip the overhead.
         "capture_meta": agent.name == "fixer",

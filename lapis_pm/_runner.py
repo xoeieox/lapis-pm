@@ -32,7 +32,12 @@ _GIT_EVIDENCE_RE = re.compile(
 # Phrases that recurrently appear in confabulated fixer responses (planning
 # prose claiming the agent lacks permissions, or describing what it "would"
 # do instead of doing it). Calibrated on the flight-2 confabulation that
-# claimed "claude -p runs read-only, manual approval required."
+# claimed "claude -p runs read-only, manual approval required." Extended
+# 2026-04-23 to also catch the permission-wall phrasing seen when
+# `claude -p` couldn't write to an un-trusted workspace cwd — even though
+# that case is structural (not strictly confabulation), the downstream
+# handling is the same: the shaped agent produced no executed artifacts
+# and the dispatch should be retried.
 _CONFAB_PHRASES_RE = re.compile(
     r"\b("
     r"read[- ]only"
@@ -44,6 +49,9 @@ _CONFAB_PHRASES_RE = re.compile(
     r"|would (?:need|have) to"
     r"|don'?t have (?:access|permission|the ability)"
     r"|require[s]? (?:manual|human) (?:approval|intervention|review)"
+    r"|(?:write )?permissions? need(?:s)? to be granted"
+    r"|please allow writes? to"
+    r"|once you grant (?:write )?access"
     r")",
     re.IGNORECASE,
 )
@@ -59,14 +67,18 @@ def _build_meta(result: str | None, envelope: dict | None) -> dict:
 
     Multi-signal decision tree, ordered highest-confidence first:
 
-      1. is_error                       → not confab (model reported error)
-      2. multi_turn_confirmed (>=2)     → not confab (tools provably ran)
-      3. PR URL or git evidence present → not confab (execution artifacts)
-      4. single_turn_confirmed (==1)    → confab if >200 chars OR confab phrases
-      5. confab phrases (turns unknown) → confab if >200 chars
-      6. uncertain (no turns, no phrases) → confab only if >800 chars
+      1. is_error                             → not confab (model reported error)
+      2. PR URL or git evidence present       → not confab (execution artifacts)
+      3. confab phrases + no artifacts        → confab if >200 chars
+         (catches the permission-wall case where the fixer read many files —
+          multi_turn_confirmed — but wrote nothing; multi-turn alone is NOT
+          a strong enough positive signal to override phrase evidence)
+      4. multi_turn_confirmed (>=2)           → not confab (tools ran, no confab phrasing)
+      5. single_turn_confirmed (==1)          → confab if >200 chars OR confab phrases
+      6. confab phrases (turns unknown)       → confab if >200 chars
+      7. uncertain (no turns, no phrases)     → confab only if >800 chars
 
-    Cases 4-6 trade off: when num_turns is absent (e.g., older claude CLI
+    Cases 5-7 trade off: when num_turns is absent (e.g., older claude CLI
     versions don't emit it), positive language signals are required to
     flag — biases toward false negatives over false positives. The 800-char
     floor in the fully-uncertain case catches egregious cases where length
@@ -93,10 +105,17 @@ def _build_meta(result: str | None, envelope: dict | None) -> dict:
 
     if is_error:
         confabulated, basis = False, "model reported is_error"
-    elif multi_turn_confirmed:
-        confabulated, basis = False, f"multi_turn confirmed (num_turns={num_turns})"
     elif has_artifacts:
         confabulated, basis = False, "execution artifacts present"
+    elif has_confab_phrases and char_count > 200:
+        confabulated = True
+        basis = (
+            f"confab phrases + no artifacts"
+            f"{f' (num_turns={num_turns})' if num_turns is not None else ''}, "
+            f"{char_count} chars"
+        )
+    elif multi_turn_confirmed:
+        confabulated, basis = False, f"multi_turn confirmed (num_turns={num_turns})"
     elif single_turn_confirmed:
         confabulated = char_count > 200 or has_confab_phrases
         basis = "single_turn confirmed + " + (
@@ -148,6 +167,10 @@ def main():
     # per-project auto-memory) the subprocess picks up. Older specs without
     # the field fall back to call_claude_cli's default.
     cwd = spec.get("cwd") or None
+    # permission_mode is "bypassPermissions" for shaped-agent dispatches (set
+    # by shaper). Without it, `claude -p` cannot grant Write/Edit in a
+    # non-cached-trust workspace and returns a "please allow writes" message.
+    permission_mode = spec.get("permission_mode") or None
 
     if capture_meta:
         result, envelope = call_claude_cli(
@@ -158,6 +181,7 @@ def main():
             json_mode=bool(spec.get("json_mode", False)),
             return_envelope=True,
             cwd=cwd,
+            permission_mode=permission_mode,
         )
         try:
             spec_id = _spec_id_from_path(spec_path)
@@ -176,6 +200,7 @@ def main():
             timeout=int(spec.get("timeout_s", 300)),
             json_mode=bool(spec.get("json_mode", False)),
             cwd=cwd,
+            permission_mode=permission_mode,
         )
 
     # Cleanup spec file regardless of outcome.

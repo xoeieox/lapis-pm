@@ -144,6 +144,10 @@ def main():
         sys.exit(2)
 
     capture_meta = bool(spec.get("capture_meta"))
+    # cwd determines which CLAUDE.md and SessionStart hooks (chub-inject.py,
+    # per-project auto-memory) the subprocess picks up. Older specs without
+    # the field fall back to call_claude_cli's default.
+    cwd = spec.get("cwd") or None
 
     if capture_meta:
         result, envelope = call_claude_cli(
@@ -153,6 +157,7 @@ def main():
             timeout=int(spec.get("timeout_s", 300)),
             json_mode=bool(spec.get("json_mode", False)),
             return_envelope=True,
+            cwd=cwd,
         )
         try:
             spec_id = _spec_id_from_path(spec_path)
@@ -170,6 +175,7 @@ def main():
             model=spec.get("model", "haiku"),
             timeout=int(spec.get("timeout_s", 300)),
             json_mode=bool(spec.get("json_mode", False)),
+            cwd=cwd,
         )
 
     # Cleanup spec file regardless of outcome.

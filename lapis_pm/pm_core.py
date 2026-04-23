@@ -173,6 +173,54 @@ def clear_classified_prs(target_id: str):
     _mem().delete(_classified_prs_key(target_id))
 
 
+def clear_landed_state(target_id: str) -> dict[str, int]:
+    """Clear all PM mem state for a landed target.
+
+    Called from `lapis-pm land` so archived targets stop polluting
+    tick loops and `lapis-pm status`. Pending dispatched records are
+    marked `status: "landed"` (not deleted) so the history stays
+    queryable from mem for future arc-doc regeneration or audit.
+
+    Returns a dict describing what was non-empty at clear time —
+    for a caller (the `land` command) to print a useful summary.
+    Idempotent: safe to call on a target that has no state.
+    """
+    mem = _mem()
+    summary = {
+        "outstanding_brief": 0,
+        "classified_prs": 0,
+        "cursor": 0,
+        "pause_state": 0,
+        "dispatched_pending": 0,
+    }
+
+    if get_outstanding_brief(target_id) is not None:
+        summary["outstanding_brief"] = 1
+    clear_outstanding_brief(target_id)
+
+    summary["classified_prs"] = len(_classified_pr_ids(target_id))
+    clear_classified_prs(target_id)
+
+    if get_cursor(target_id) is not None:
+        summary["cursor"] = 1
+    mem.delete(_cursor_key(target_id))
+
+    if get_pause_state(target_id) is not None:
+        summary["pause_state"] = 1
+    mem.delete(_pause_key(target_id))
+
+    records = load_dispatched(target_id)
+    pending = [r for r in records if r.get("status") == "pending"]
+    if pending:
+        for r in records:
+            if r.get("status") == "pending":
+                r["status"] = "landed"
+        save_dispatched(target_id, records)
+    summary["dispatched_pending"] = len(pending)
+
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Perceive helpers
 # ---------------------------------------------------------------------------

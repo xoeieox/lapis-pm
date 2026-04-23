@@ -183,6 +183,13 @@ def dispatch(
         # the CLAUDE.md at this path — that's what pulls chubs + auto-memory
         # into the shaped agent's context.
         "cwd": repo_cwd,
+        # Shaped agents run headless with no human to answer Claude Code's
+        # workspace-trust prompt. `claude -p` skips that prompt's dialog and
+        # returns "please allow writes to <path>" when the workspace isn't
+        # cached-trusted. bypassPermissions sidesteps that — safe because
+        # the authority gate upstream (spec + --authority flag) already
+        # bounds what the shaped agent is allowed to do.
+        "permission_mode": "bypassPermissions",
         # Fixer agents get a meta sidecar so pm_core can detect confabulation
         # (substantial prose with no tool use). Other agents skip the overhead.
         "capture_meta": agent.name == "fixer",

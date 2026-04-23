@@ -21,6 +21,7 @@ from pathlib import Path
 
 import yaml
 
+from agents_core.claude_queue import ClaudeQueue
 from agents_core.gpu import GPUQueue, Priority
 
 # chub_broker still lives in /data/agents/scripts/ (deferred from the agents-core
@@ -197,21 +198,52 @@ def dispatch(
 
     spec_id = uuid.uuid4().hex[:12]
     spec_path = SPEC_DIR / f"{target_id}-{agent.name}-{spec_id}.json"
-    spec_path.write_text(json.dumps(spec, ensure_ascii=False))
 
     cmd = f"python3 {shlex.quote(RUNNER)} {shlex.quote(str(spec_path))}"
 
-    queue = GPUQueue()
-    task_id = queue.submit({
-        "task_type": "subprocess",
-        "priority": priority,
-        "timeout_seconds": agent.timeout_s + 60,  # cushion over the inner timeout
-        "submitted_by": submitted_by,
-        "model": agent.model,
-        "payload": {"command": cmd},
-    })
+    # Route by agent.model. Sonnet/Haiku → ClaudeQueue (API-backed, parallel,
+    # per-task worktree). Qwen → GPUQueue (GPU-serialized, no worktree).
+    # LAPIS_PM_FORCE_GPU_QUEUE=1 is the emergency rollback knob that sends
+    # everything back to GPUQueue.
+    route_to_claude = (
+        agent.model in {"sonnet", "haiku"}
+        and os.getenv("LAPIS_PM_FORCE_GPU_QUEUE") != "1"
+    )
 
-    output_path = f"/srv/lapis/gpu-queue/completed/{task_id}-output.md"
+    if route_to_claude:
+        # Generate task_id BEFORE the single spec write so the runner cannot
+        # claim a spec that's missing task_id or worktree_required. See spec
+        # §Shaper routing ("Why generate before write, not after submit").
+        queue = ClaudeQueue()
+        task_id = queue._generate_id(slug=f"{agent.name}-{target_id}")
+        spec["task_id"] = task_id
+        spec["base_branch"] = "main"
+        spec["worktree_required"] = True
+        spec_path.write_text(json.dumps(spec, ensure_ascii=False))
+        queue.submit({
+            "task_type": "subprocess",
+            "priority": priority,
+            "timeout_seconds": agent.timeout_s + 60,
+            "submitted_by": submitted_by,
+            "model": agent.model,
+            "description": f"{agent.name}:{target_id}",
+            "notify": agent.name in {"fixer", "reviewer"},
+            "payload": {"command": cmd, "spec_path": str(spec_path)},
+        }, task_id=task_id)
+        output_path = f"/srv/lapis/claude-queue/completed/{task_id}-output.md"
+    else:
+        spec_path.write_text(json.dumps(spec, ensure_ascii=False))
+        queue = GPUQueue()
+        task_id = queue.submit({
+            "task_type": "subprocess",
+            "priority": priority,
+            "timeout_seconds": agent.timeout_s + 60,
+            "submitted_by": submitted_by,
+            "model": agent.model,
+            "payload": {"command": cmd},
+        })
+        output_path = f"/srv/lapis/gpu-queue/completed/{task_id}-output.md"
+
     return DispatchResult(
         task_id=task_id,
         agent_type=agent.name,

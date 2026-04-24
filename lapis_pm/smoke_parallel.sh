@@ -46,7 +46,7 @@ trap cleanup EXIT
 # --- 1. Set up throwaway repo -------------------------------------------
 step "1. Set up throwaway repo at $TEST_REPO"
 rm -rf "$TEST_REPO" "$TEST_BARE"
-git init --bare "$TEST_BARE" >/dev/null
+git init --bare -b main "$TEST_BARE" >/dev/null
 git clone "$TEST_BARE" "$TEST_REPO" >/dev/null 2>&1
 
 cd "$TEST_REPO"

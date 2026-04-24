@@ -271,9 +271,31 @@ def _print_target_status(t, explain: bool = False):
                 print(f"  [{c.ts}] {','.join(c.tags):40s} {preview}")
 
 
+def _target_to_json_dict(t) -> dict:
+    dispatched = pm_core.load_dispatched(t.id)
+    pending = [d for d in dispatched if d.get("status") == "pending"]
+    return {
+        "target_id": t.id,
+        "title": t.title,
+        "pm_repo": t.pm_repo,
+        "pm_authority": t.pm_authority,
+        "paused": t.paused,
+        "cursor": pm_core.get_cursor(t.id),
+        "dispatched_total": len(dispatched),
+        "dispatched_pending": len(pending),
+        "outstanding_brief_id": pm_core.get_outstanding_brief(t.id),
+        "tags": t.data.get("tags", []),
+        "urgency": t.urgency,
+        "category": t.category,
+    }
+
+
 def cmd_list(args) -> int:
     store = TargetStore()
     bound = [t for t in store.load_all() if t.pm_bound]
+    if getattr(args, "json", False):
+        print(json.dumps([_target_to_json_dict(t) for t in bound]))
+        return 0
     if not bound:
         print("(no pm-bound targets)")
         return 0
@@ -389,6 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
     re_.set_defaults(func=cmd_resume)
 
     ls = sub.add_parser("list", help="List all pm_bound targets.")
+    ls.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     ls.set_defaults(func=cmd_list)
 
     ld = sub.add_parser("land", help="Produce an arc doc for a landed thread.")

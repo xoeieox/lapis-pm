@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 WORKTREE_ROOT = Path("/tmp/lapis-pm-worktrees")
@@ -25,9 +26,19 @@ def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> Pa
     Symlinks the parent clone's `.claude/` into the worktree root because
     `git worktree add` only materializes the tracked working tree, and
     `.claude/` (containing settings.json, hooks, and per-project
-    auto-memory) is gitignored. Without the symlink, `chub-inject.py`
-    SessionStart hooks do not fire and the living-context invariant
-    (agents-core #7 / lapis-pm #2) silently regresses.
+    auto-memory) is gitignored. The load-bearing `chub-inject.py`
+    SessionStart hook is registered at user level in
+    `~/.claude/settings.json` and fires for every `claude -p` invocation
+    regardless of this symlink — so the living-context invariant
+    (agents-core #7 / lapis-pm #2) is enforced there. The symlink
+    carries per-project auto-memory + any local per-repo permissions
+    into the worktree cwd.
+
+    A missing `CLAUDE.md` or `.claude/settings.json` in the parent clone
+    is a soft warning (emitted to stderr, captured by the claude-queue
+    runner into the task output markdown), not a fatal. Dispatch
+    proceeds; the shaped agent simply runs without repo-specific
+    `@chub:` expansion and/or without per-repo hooks/permissions.
 
     Known constraint: the symlink means concurrent workers share one
     `.claude/settings.json` + `.claude/projects/*/memory/`. Safe at
@@ -54,13 +65,20 @@ def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> Pa
     if src_claude.exists() and not dst_claude.exists():
         dst_claude.symlink_to(src_claude, target_is_directory=True)
 
-    assert (path / "CLAUDE.md").exists(), (
-        f"worktree missing CLAUDE.md — SessionStart hooks will not fire; "
-        f"worktree={path}")
+    if not (path / "CLAUDE.md").exists():
+        print(
+            f"WARN: worktree_setup: CLAUDE.md missing at {path} — "
+            f"shaped agent will run without repo-specific @chub: expansion "
+            f"(user-level chub-inject hook still fires but finds no directives)",
+            file=sys.stderr,
+        )
     settings = path / ".claude" / "settings.json"
-    assert settings.exists(), (
-        f"worktree .claude/settings.json not resolvable — hooks will not "
-        f"fire; tried {settings}")
+    if not settings.exists():
+        print(
+            f"WARN: worktree_setup: .claude/settings.json missing at {settings} — "
+            f"per-repo hooks/permissions absent; user-level settings still apply",
+            file=sys.stderr,
+        )
 
     return path
 

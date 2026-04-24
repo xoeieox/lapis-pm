@@ -40,6 +40,18 @@ FAILED_DIR = Path("/srv/lapis/gpu-queue/failed")
 SHAPED_DIR = Path("/srv/lapis/gpu-queue/shaped")  # _runner.py meta sidecars
 MAX_DISPATCH_RETRIES = 2
 
+# Review-gate loop constants
+REVIEW_GATE_THRESHOLD = 40          # Opus reviewer calls before soft-pause
+REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
+REVIEW_GATE_PAUSED_KEY = "pm/review-gate/paused"
+REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
+
+# Cycle budgets per authority level (number of reviewer dispatches before exhausted)
+_REVIEW_CYCLE_BUDGETS: dict[str, int] = {
+    "advisory": 2,
+    "hold": 4,
+}
+
 
 def _read_fixer_meta(spec_id: str) -> dict | None:
     """Read the {spec_id}-meta.json sidecar written by _runner.py for fixers."""
@@ -222,6 +234,175 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Review-gate kill-switch helpers
+# ---------------------------------------------------------------------------
+
+def _review_gate_counter() -> int:
+    rec = _mem().get(REVIEW_GATE_COUNTER_KEY)
+    if not rec:
+        return 0
+    try:
+        return int(rec["content"])
+    except (ValueError, TypeError):
+        return 0
+
+
+def _increment_review_gate_counter() -> int:
+    count = _review_gate_counter() + 1
+    _mem().set(REVIEW_GATE_COUNTER_KEY, str(count), tags=["lapis-pm", "review-gate"])
+    return count
+
+
+def _review_gate_paused() -> bool:
+    rec = _mem().get(REVIEW_GATE_PAUSED_KEY)
+    return bool(rec and rec["content"] == "1")
+
+
+def _set_review_gate_paused(paused: bool) -> None:
+    _mem().set(REVIEW_GATE_PAUSED_KEY, "1" if paused else "0",
+               tags=["lapis-pm", "review-gate"])
+
+
+def review_gate_resume() -> int:
+    """Reset kill-switch counter. Returns previous count.
+
+    Called by `lapis-pm review-gate resume`.
+    """
+    count = _review_gate_counter()
+    _mem().set(REVIEW_GATE_COUNTER_KEY, "0", tags=["lapis-pm", "review-gate"])
+    _set_review_gate_paused(False)
+    _mem().delete(REVIEW_GATE_PAUSE_BRIEF_KEY)
+    return count
+
+
+def review_gate_status() -> dict:
+    """Return kill-switch state for `lapis-pm review-gate status`."""
+    return {
+        "counter": _review_gate_counter(),
+        "threshold": REVIEW_GATE_THRESHOLD,
+        "paused": _review_gate_paused(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Review-gate loop helpers
+# ---------------------------------------------------------------------------
+
+def _reviewer_cycle_count(target_id: str, pr_number: int) -> int:
+    """Count completed reviewer cycles for this PR via episodic tags."""
+    prefix = f"pm:reviewer:pr={pr_number}:cycle="
+    count = 0
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                verdict_val = t.split(":verdict=")[-1]
+                if verdict_val != "pending":
+                    count += 1
+    return count
+
+
+def _last_review_verdict(target_id: str, pr_number: int) -> dict | None:
+    """Return the most recent completed reviewer verdict dict for this PR, or None."""
+    prefix = f"pm:reviewer:pr={pr_number}:cycle="
+    last_comment = None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                verdict_val = t.split(":verdict=")[-1]
+                if verdict_val != "pending":
+                    last_comment = c
+    if last_comment is None:
+        return None
+    # Content format: "Reviewer verdict for PR #N:\n<json>"
+    content = last_comment.content
+    try:
+        json_part = content.split("\n", 1)[-1].strip()
+        return json.loads(json_part)
+    except (json.JSONDecodeError, IndexError):
+        # Fall back to extracting verdict from tag
+        for t in last_comment.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                verdict_val = t.split(":verdict=")[-1]
+                return {"verdict": verdict_val, "issues": [], "confidence": 0.0}
+        return None
+
+
+def _fixer_retry_count(target_id: str, pr_number: int) -> int:
+    """Count completed fixer_retry dispatches for this PR via dispatch records."""
+    return sum(
+        1 for r in load_dispatched(target_id)
+        if r.get("agent_type") == "fixer_retry"
+        and r.get("pr_number") == pr_number
+        and r.get("status") in ("processed", "failed")
+    )
+
+
+def _has_pending_reviewer_for_pr(target_id: str, pr_number: int) -> bool:
+    return any(
+        r.get("status") == "pending"
+        and r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        and r.get("pr_number") == pr_number
+        for r in load_dispatched(target_id)
+    )
+
+
+def _has_pending_fixer_for_pr(target_id: str, pr_number: int) -> bool:
+    return any(
+        r.get("status") == "pending"
+        and r.get("agent_type") == "fixer_retry"
+        and r.get("pr_number") == pr_number
+        for r in load_dispatched(target_id)
+    )
+
+
+def _collect_review_history(target_id: str, pr_number: int) -> list[dict]:
+    """Collect all reviewer verdicts for a PR from episodic, in order."""
+    prefix = f"pm:reviewer:pr={pr_number}:cycle="
+    history: list[dict] = []
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                verdict_val = t.split(":verdict=")[-1]
+                if verdict_val == "pending":
+                    continue
+                cycle_part = t.split(":cycle=")[1].split(":")[0]
+                try:
+                    cycle_num = int(cycle_part)
+                except ValueError:
+                    cycle_num = 0
+                entry: dict = {"cycle": cycle_num, "verdict": verdict_val, "issues": []}
+                try:
+                    json_part = c.content.split("\n", 1)[-1].strip()
+                    data = json.loads(json_part)
+                    entry["issues"] = data.get("issues", [])
+                except (json.JSONDecodeError, IndexError):
+                    pass
+                history.append(entry)
+    history.sort(key=lambda h: h["cycle"])
+    return history
+
+
+def _active_review_state(target_id: str, open_prs: list[dict]) -> dict | None:
+    """Return active review-loop state for status display, or None."""
+    classified_ids = _classified_pr_ids(target_id)
+    for pr in open_prs:
+        pr_number = pr.get("number")
+        if pr_number in classified_ids:
+            continue
+        cycle = _reviewer_cycle_count(target_id, pr_number)
+        if cycle == 0 and not _has_pending_reviewer_for_pr(target_id, pr_number):
+            continue  # not started yet
+        verdict_info = _last_review_verdict(target_id, pr_number)
+        return {
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "verdict": verdict_info.get("verdict") if verdict_info else "pending",
+            "issues": len(verdict_info.get("issues", [])) if verdict_info else 0,
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Perceive helpers
 # ---------------------------------------------------------------------------
 
@@ -272,10 +453,102 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
     spec_summary = episodic.spec_summary(target_id)
     cls = authority.classify(repo, pr["number"], spec_summary, pm_authority=pm_authority)
     payload = {"classification": cls, "pr": pr}
-    if cls.verdict == "auto":
-        return Decision("merge", payload)
-    if cls.verdict == "hold":
+
+    # Static hold: held paths always surface immediately (no reviewer needed)
+    if cls.static_outcome == authority.StaticOutcome.auto_hold_path:
         return Decision("hold_brief", payload)
+
+    # Auto-merge path: inline Sonnet screen result drives action (unchanged)
+    if pm_authority == "auto":
+        if cls.verdict == "auto":
+            return Decision("merge", payload)
+        if cls.verdict == "hold":
+            return Decision("hold_brief", payload)
+        return Decision("advisory_brief", payload)
+
+    # Advisory / hold path — review-gate loop
+    pr_number = pr["number"]
+
+    # Kill-switch: if paused, fall back to inline Sonnet
+    if _review_gate_paused():
+        return _decide_review_gate_fallback(target_id, cls, pr, pm_authority)
+
+    # Don't double-dispatch while reviewer or fixer is pending for this PR
+    if _has_pending_reviewer_for_pr(target_id, pr_number):
+        return Decision("noop", {"reason": f"reviewer pending for PR #{pr_number}"})
+    if _has_pending_fixer_for_pr(target_id, pr_number):
+        return Decision("noop", {"reason": f"fixer_retry pending for PR #{pr_number}"})
+
+    reviewer_count = _reviewer_cycle_count(target_id, pr_number)
+    fixer_count = _fixer_retry_count(target_id, pr_number)
+    budget = _REVIEW_CYCLE_BUDGETS.get(pm_authority, 2)
+    mode = "fresh" if pm_authority == "hold" else "same"
+
+    if reviewer_count == fixer_count:
+        # Either initial dispatch (both==0) or post-fixer dispatch (both==N)
+        if reviewer_count >= budget:
+            # Both sides exhausted budget
+            history = _collect_review_history(target_id, pr_number)
+            return Decision("review_exhausted_brief", {
+                "pr": pr, "cls": cls, "history": history,
+            })
+        # Check kill-switch threshold before dispatching Opus reviewer
+        if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
+            _set_review_gate_paused(True)
+            return Decision("review_gate_pause", {"pr": pr, "cls": cls})
+        next_cycle = reviewer_count + 1
+        return Decision("dispatch_reviewer", {
+            "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
+        })
+
+    # reviewer_count > fixer_count: reviewer has returned a verdict
+    verdict_info = _last_review_verdict(target_id, pr_number)
+    if verdict_info is None:
+        # Shouldn't happen; defensively noop
+        return Decision("noop", {"reason": "reviewer_count > fixer_count but no verdict found"})
+
+    verdict = verdict_info.get("verdict", "needs-human")
+    issues = verdict_info.get("issues", [])
+
+    if verdict == "clean":
+        # Reviewer approved — surface per authority level
+        cls.screen_verdict = "clean"
+        cls.issues = issues
+        if pm_authority == "hold":
+            return Decision("hold_brief", payload)
+        return Decision("advisory_brief", payload)
+
+    if verdict == "fixable":
+        if reviewer_count < budget:
+            return Decision("dispatch_fixer_retry", {
+                "pr": pr, "cls": cls, "issues": issues,
+                "cycle": reviewer_count, "budget": budget,
+            })
+        history = _collect_review_history(target_id, pr_number)
+        return Decision("review_exhausted_brief", {
+            "pr": pr, "cls": cls, "history": history,
+        })
+
+    # needs-human (or unknown verdict)
+    cls.screen_verdict = verdict
+    cls.issues = issues
+    return Decision("hold_brief", payload)
+
+
+def _decide_review_gate_fallback(target_id: str, cls: authority.PRClassification,
+                                  pr: dict, pm_authority: str) -> Decision:
+    """Inline Sonnet fallback when review-gate kill-switch is active."""
+    spec_summary = episodic.spec_summary(target_id)
+    screen_result = authority.screen(cls.repo, cls.pr_number, spec_summary, cls.diff)
+    sv = screen_result.get("verdict", "needs-human")
+    cls.screen_verdict = sv
+    cls.issues = list(screen_result.get("issues") or [])
+    payload = {"classification": cls, "pr": pr}
+    if sv == "needs-human":
+        cls.verdict = "hold"
+        return Decision("hold_brief", payload)
+    if sv == "clean" and pm_authority == "advisory":
+        return Decision("advisory_brief", payload)
     return Decision("advisory_brief", payload)
 
 
@@ -371,6 +644,212 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
     return f"retry:{res.task_id}"
 
 
+def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassification,
+                            mode: str = "same", cycle: int = 1) -> str:
+    """Dispatch a reviewer agent for the given PR."""
+    pr_number = pr["number"]
+    repo = cls.repo
+    spec_summary = episodic.spec_summary(target_id)
+
+    agent_type = "reviewer_fresh" if mode == "fresh" else "reviewer"
+
+    # Build prior_review context for same-reviewer mode
+    prior_review_text = ""
+    if mode == "same" and cycle > 1:
+        prior = _last_review_verdict(target_id, pr_number)
+        if prior:
+            issues_text = json.dumps(prior.get("issues", []), indent=2)
+            prior_review_text = (
+                f"\n## Prior review context (cycle {cycle - 1})\n\n"
+                f"Verdict: {prior.get('verdict')}\n"
+                f"Issues:\n{issues_text}\n\n"
+                f"Review the updated diff in light of these prior concerns.\n"
+            )
+
+    vars_: dict = {
+        "target_id": target_id,
+        "spec_summary": spec_summary,
+        "repo": repo,
+        "repo_cwd": shaper._resolve_repo_cwd(repo),
+        "pr_number": pr_number,
+        "slug": f"pr{pr_number}-review-c{cycle}",
+        "question": f"review PR #{pr_number}",
+        "prior_review": prior_review_text,
+    }
+
+    # Get the diff for the reviewer prompt
+    try:
+        from agents_core.forgejo import get_pr_diff as _get_diff
+        diff_text = _get_diff(repo, pr_number)
+        if len(diff_text) > 60000:
+            diff_text = diff_text[:60000] + "\n\n... (diff truncated)"
+    except Exception:
+        diff_text = "(diff unavailable)"
+
+    user_prompt = (
+        f"Review PR #{pr_number} in {repo}. This is reviewer cycle {cycle}.\n\n"
+        f"```diff\n{diff_text}\n```\n\n"
+        f"Return JSON: {{\"verdict\": \"clean\" | \"fixable\" | \"needs-human\", "
+        f"\"issues\": [...], \"confidence\": 0.0-1.0}}"
+    )
+
+    # Increment kill-switch counter before dispatch
+    _increment_review_gate_counter()
+
+    res = shaper.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
+
+    record = {
+        "gpu_id": res.task_id,
+        "spec_id": res.spec_id,
+        "agent_type": agent_type,
+        "intent": f"review PR #{pr_number} cycle {cycle}",
+        "repo": repo,
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "mode": mode,
+        "ts": _now_iso(),
+        "status": "pending",
+        "retry_count": 0,
+    }
+    append_dispatched(target_id, record)
+
+    episodic.write_dispatch(
+        target_id,
+        f"Reviewer dispatched (cycle {cycle}, mode={mode}): {agent_type} → {res.task_id}\n"
+        f"PR #{pr_number}: {pr.get('title', '')}",
+        extra_tags=[
+            f"pm:repo={repo}",
+            f"pm:pr={pr_number}",
+            f"pm:reviewer:pr={pr_number}:cycle={cycle}:verdict=pending",
+        ],
+    )
+    return f"reviewer_dispatched:pr={pr_number}:cycle={cycle}"
+
+
+def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
+    """Dispatch a fixer_retry agent to fix reviewer-flagged issues on an existing PR."""
+    pr = payload["pr"]
+    cls = payload["cls"]
+    issues = payload["issues"]
+    cycle = payload.get("cycle", 1)  # reviewer cycle that returned fixable
+
+    pr_number = pr["number"]
+    pr_branch = (pr.get("head") or {}).get("ref") or f"lapis/{target_id}/pr{pr_number}"
+
+    issues_text = "\n".join(
+        f"- [{i.get('severity', '?')}] {i.get('path', '?')}: {i.get('note', '')}"
+        for i in issues
+    ) or "(no issues listed)"
+
+    spec_summary = episodic.spec_summary(target_id)
+
+    vars_: dict = {
+        "target_id": target_id,
+        "spec_summary": spec_summary,
+        "repo": cls.repo,
+        "repo_cwd": shaper._resolve_repo_cwd(cls.repo),
+        "pr_number": pr_number,
+        "slug": f"pr{pr_number}-fix-c{cycle}",
+        "existing_branch": pr_branch,
+        "question": f"fix reviewer issues on PR #{pr_number}",
+    }
+
+    user_prompt = (
+        f"PR #{pr_number} reviewer returned `fixable` on cycle {cycle}. "
+        f"Fix the listed issues on existing branch `{pr_branch}`.\n\n"
+        f"Issues:\n{issues_text}\n\n"
+        f"Push to the existing branch — do NOT create a new branch or new PR."
+    )
+
+    res = shaper.dispatch("fixer_retry", target_id, user_prompt, vars_=vars_)
+
+    record = {
+        "gpu_id": res.task_id,
+        "spec_id": res.spec_id,
+        "agent_type": "fixer_retry",
+        "intent": f"fix PR #{pr_number} after reviewer cycle {cycle}",
+        "repo": cls.repo,
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "ts": _now_iso(),
+        "status": "pending",
+        "retry_count": 0,
+    }
+    append_dispatched(target_id, record)
+
+    episodic.write_dispatch(
+        target_id,
+        f"Fixer retry dispatched (reviewer cycle {cycle}): fixer_retry → {res.task_id}\n"
+        f"PR #{pr_number} issues:\n{issues_text}",
+        extra_tags=[
+            f"pm:repo={cls.repo}",
+            f"pm:pr={pr_number}",
+            "pm:fixer-retry",
+        ],
+    )
+    return f"fixer_retry_dispatched:pr={pr_number}:cycle={cycle}"
+
+
+def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
+    """Human brief when review cycle budget is exhausted."""
+    pr = payload["pr"]
+    cls = payload["cls"]
+    history = payload.get("history", [])
+
+    history_text = "\n\n".join(
+        f"Cycle {h.get('cycle')}: verdict={h.get('verdict')}\n"
+        f"Issues: {json.dumps(h.get('issues', []))}"
+        for h in history
+    ) or "(no history)"
+
+    episodic.write_hold(
+        target_id,
+        f"PR #{cls.pr_number} review budget exhausted after {len(history)} cycle(s).\n"
+        f"Title: {cls.title}\n{cls.html_url}\n\nHistory:\n{history_text}",
+        extra_tags=[
+            f"pm:repo={cls.repo}",
+            f"pm:pr={cls.pr_number}",
+            "pm:review-exhausted",
+        ],
+    )
+    b = brief.synthesize(
+        target_id,
+        trigger=f"Review budget exhausted for PR #{cls.pr_number} — human judgment needed",
+        query=f"PR #{cls.pr_number} review exhausted: {cls.title}",
+        diff_snippet=cls.diff or None,
+        screen_issues=None,
+    )
+    set_outstanding_brief(target_id, b.comment_id)
+    _mark_pr_classified(target_id, cls.pr_number)
+    return f"review_exhausted_brief:{b.comment_id}"
+
+
+def _act_review_gate_pause(target_id: str, payload: dict) -> str:
+    """Emit a single pause brief when the kill-switch threshold is exceeded."""
+    # Only post the pause brief once (idempotent)
+    rec = _mem().get(REVIEW_GATE_PAUSE_BRIEF_KEY)
+    if rec:
+        return "review_gate_pause:already_briefed"
+
+    count = _review_gate_counter()
+    episodic.write_observation(
+        target_id,
+        f"Review-gate loop soft-paused after {count} Opus reviewer calls in the past 7d. "
+        f"Falling back to inline-Sonnet behavior for new PRs. "
+        f"Resume with `lapis-pm review-gate resume`.",
+        extra_tags=["pm:review-gate-paused"],
+    )
+    b = brief.synthesize(
+        target_id,
+        trigger=f"Review-gate loop soft-paused after {count} Opus reviewer calls",
+        query="review-gate pause — token budget exceeded",
+    )
+    set_outstanding_brief(target_id, b.comment_id)
+    _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
+               tags=["lapis-pm", "review-gate"])
+    return f"review_gate_paused:{b.comment_id}"
+
+
 # ---------------------------------------------------------------------------
 # Encode percepts
 # ---------------------------------------------------------------------------
@@ -461,12 +940,38 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
             )
             failed_for_retry.append(rec)
         else:
-            episodic.write_result(
-                target_id,
-                f"Completed — {rec.get('agent_type')} task {rec['gpu_id']}\n"
-                f"Intent: {rec.get('intent')}\n\n{snippet}",
-                extra_tags=tags,
-            )
+            # Reviewer agents: parse JSON output and write reviewer-tagged episodic entry
+            if rec.get("agent_type") in ("reviewer", "reviewer_fresh"):
+                pr_num = rec.get("pr_number", "?")
+                cycle_num = rec.get("cycle", 1)
+                raw_output = text.strip()
+                if raw_output.startswith("```"):
+                    raw_output = re.sub(r"^```(?:json)?\s*", "", raw_output)
+                    raw_output = re.sub(r"\s*```$", "", raw_output.strip())
+                try:
+                    verdict_data = json.loads(raw_output)
+                    verdict_val = verdict_data.get("verdict", "needs-human")
+                    stored_json = json.dumps(verdict_data)
+                except json.JSONDecodeError:
+                    verdict_val = "needs-human"
+                    stored_json = json.dumps({"verdict": "needs-human", "issues": [],
+                                              "confidence": 0.0,
+                                              "_parse_error": raw_output[:200]})
+                episodic.write_result(
+                    target_id,
+                    f"Reviewer verdict for PR #{pr_num}:\n{stored_json}",
+                    extra_tags=tags + [
+                        f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
+                        f"pm:pr={pr_num}",
+                    ],
+                )
+            else:
+                episodic.write_result(
+                    target_id,
+                    f"Completed — {rec.get('agent_type')} task {rec['gpu_id']}\n"
+                    f"Intent: {rec.get('intent')}\n\n{snippet}",
+                    extra_tags=tags,
+                )
         total_encoded += 1
     if changed:
         save_dispatched(target_id, records)
@@ -593,9 +1098,23 @@ def tick(target_id: str) -> TickResult:
             elif decision.kind == "hold_brief":
                 decision_str = _act_brief(target_id, trigger="held PR", hold=True,
                                           payload=decision.payload)
-            else:
+            elif decision.kind == "advisory_brief":
                 decision_str = _act_brief(target_id, trigger="advisory PR", hold=False,
                                           payload=decision.payload)
+            elif decision.kind == "dispatch_reviewer":
+                p = decision.payload
+                decision_str = _act_dispatch_reviewer(
+                    target_id, p["pr"], p["cls"], p["mode"], p["cycle"],
+                )
+            elif decision.kind == "dispatch_fixer_retry":
+                decision_str = _act_dispatch_fixer_retry(target_id, decision.payload)
+            elif decision.kind == "review_exhausted_brief":
+                decision_str = _act_brief_review_exhausted(target_id, decision.payload)
+            elif decision.kind == "review_gate_pause":
+                decision_str = _act_review_gate_pause(target_id, decision.payload)
+            else:
+                # noop or unknown — single-action discipline: do nothing
+                decision_str = "noop"
 
     elif failed_dispatches:
         rec = failed_dispatches[-1]

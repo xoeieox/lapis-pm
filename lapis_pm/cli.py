@@ -12,6 +12,7 @@ Commands:
     resume <target_id>
     list
     land <target_id> [--dry-run]
+    review-gate {status,resume}
 """
 
 from __future__ import annotations
@@ -241,6 +242,25 @@ def _print_target_status(t, explain: bool = False):
     outstanding = pm_core.get_outstanding_brief(t.id)
     print(f"  outstanding:   {outstanding or '(none)'}")
 
+    # Review-gate loop context (shown when a review loop is active)
+    try:
+        from agents_core.forgejo import get_open_prs
+        open_prs = get_open_prs(t.pm_repo) if t.pm_repo else []
+        from . import pm_core as _pm
+        review_state = _pm._active_review_state(t.id, open_prs)
+        if review_state:
+            budget = _pm._REVIEW_CYCLE_BUDGETS.get(t.pm_authority, 2)
+            mode = "fresh-reviewer" if t.pm_authority == "hold" else "same-reviewer"
+            print(f"  reviewing:     PR #{review_state['pr_number']}, "
+                  f"cycle {review_state['cycle']}/{budget} (opus, {mode})")
+            verdict = review_state.get("verdict", "pending")
+            issues = review_state.get("issues", 0)
+            if verdict != "pending":
+                print(f"  last-verdict:  {verdict}"
+                      + (f", {issues} issue(s)" if verdict == "fixable" else ""))
+    except Exception:
+        pass  # status display is best-effort
+
     if explain:
         print("  --- recent PM episodes ---")
         for c in episodic.all_comments(t.id)[-10:]:
@@ -302,6 +322,23 @@ def cmd_land(args) -> int:
     return 0
 
 
+def cmd_review_gate(args) -> int:
+    sub = args.review_gate_sub
+    if sub == "status":
+        state = pm_core.review_gate_status()
+        print(f"review-gate counter:   {state['counter']} / {state['threshold']}")
+        print(f"review-gate paused:    {state['paused']}")
+        if state["paused"]:
+            print("  → Resume with: lapis-pm review-gate resume")
+        return 0
+    if sub == "resume":
+        prev = pm_core.review_gate_resume()
+        print(f"Review-gate counter reset (was {prev}). Opus reviewer active again.")
+        return 0
+    print(f"ERROR: unknown review-gate subcommand: {sub}", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lapis-pm", description="Lapis PM agent CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -359,6 +396,13 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--dry-run", action="store_true",
                     help="Print arc doc to stdout instead of writing to /srv/lapis/lapis-state/")
     ld.set_defaults(func=cmd_land)
+
+    rg = sub.add_parser("review-gate",
+                        help="Manage the Opus reviewer kill-switch.")
+    rg_sub = rg.add_subparsers(dest="review_gate_sub", required=True)
+    rg_sub.add_parser("status", help="Print current counter + threshold.")
+    rg_sub.add_parser("resume", help="Reset counter; re-enable Opus reviewer.")
+    rg.set_defaults(func=cmd_review_gate)
 
     return p
 

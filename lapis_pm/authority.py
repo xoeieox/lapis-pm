@@ -1,15 +1,17 @@
 """Authority gate for PR auto-merge / advisory / hold classification.
 
-We do not call `digest.py screen` as a subprocess (it posts a PR comment
-rather than emitting structured JSON). Instead, we run an inline Sonnet
-verdict via call_claude_cli with json_mode, then apply path/size/CI rules.
+Static checks (held paths, size cap) determine whether the reviewer agent
+should be dispatched. For auto-merge targets, an inline Sonnet screen still
+runs as before. For advisory/hold targets the LLM verdict is a dispatched
+Opus reviewer (see pm_core.py review-gate loop).
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from agents_core.llm import call_claude_cli
@@ -33,10 +35,17 @@ DIFF_PATH_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 DIFF_HUNK_LINE_RE = re.compile(r"^[+-](?![+-])", re.MULTILINE)
 
 
+class StaticOutcome(str, Enum):
+    auto_hold_path = "auto_hold_path"   # touched a held path — skip reviewer
+    size_exceeded = "size_exceeded"     # LOC exceeds auto-merge cap (auto only)
+    static_pass = "static_pass"         # no static blockers
+
+
 @dataclass
 class PRClassification:
     verdict: str               # "auto" | "advisory" | "hold"
     screen_verdict: str        # "clean" | "fixable" | "needs-human" | "unknown"
+    static_outcome: str        # StaticOutcome value
     reasons: list[str]
     issues: list[dict]
     pr_number: int
@@ -74,7 +83,11 @@ Be terse. Only return the JSON object.
 
 
 def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict:
-    """Inline structured screen via Sonnet. Returns parsed JSON or fallback dict."""
+    """Inline structured screen via Sonnet.
+
+    Used only for auto-merge authority targets and as the kill-switch fallback.
+    Returns parsed JSON or fallback dict.
+    """
     if len(diff_text) > 60000:
         diff_text = diff_text[:60000] + "\n\n... (diff truncated)"
     user = (
@@ -89,7 +102,6 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
     if not raw:
         return {"verdict": "needs-human", "issues": [], "confidence": 0.0,
                 "reason": "screen call returned empty"}
-    # Strip code fences just in case
     raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -103,9 +115,11 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
 
 def classify(repo: str, pr_number: int, spec_summary: str,
              pm_authority: str = "advisory") -> PRClassification:
-    """Decide auto/advisory/hold for a PR.
+    """Classify a PR based on static checks.
 
-    pm_authority is the target's setting. "advisory" never auto-merges.
+    For auto-merge targets: also runs inline Sonnet screen (unchanged behavior).
+    For advisory/hold targets: static checks only; Opus reviewer is dispatched
+    by pm_core's review-gate loop (not here).
     """
     pr = get_pr(repo, pr_number)
     diff_text = get_pr_diff(repo, pr_number)
@@ -114,37 +128,67 @@ def classify(repo: str, pr_number: int, spec_summary: str,
     loc = diff_loc(diff_text)
 
     held_hits = [p for p in paths if is_held_path(p)]
-    reasons: list[str] = []
 
-    screen_result = screen(repo, pr_number, spec_summary, diff_text)
-    sv = screen_result.get("verdict", "needs-human")
-
-    # Derive verdict
+    # --- Static: held paths (applies to all authority levels) ---
     if held_hits:
-        reasons.append(f"held path(s) touched: {', '.join(held_hits[:5])}")
-        verdict = "hold"
-    elif sv == "needs-human":
-        reasons.append("screen verdict: needs-human")
-        verdict = "hold"
-    elif sv == "clean" and pm_authority == "auto" and loc < MAX_AUTO_LOC \
-            and pr.get("mergeable") is not False:
-        verdict = "auto"
-        reasons.append(f"clean screen, {loc} LOC, mergeable")
-    elif sv == "clean" and pm_authority == "advisory":
-        verdict = "advisory"
-        reasons.append("clean screen but target authority is advisory")
-    elif sv == "fixable":
-        verdict = "advisory"
-        reasons.append("fixable issues found")
-    else:
-        verdict = "advisory"
-        reasons.append(f"defaulting to advisory (screen={sv}, loc={loc})")
+        reasons = [f"held path(s) touched: {', '.join(held_hits[:5])}"]
+        return PRClassification(
+            verdict="hold",
+            screen_verdict="unknown",
+            static_outcome=StaticOutcome.auto_hold_path,
+            reasons=reasons,
+            issues=[],
+            pr_number=pr_number,
+            repo=repo,
+            title=pr.get("title", ""),
+            html_url=pr.get("html_url", ""),
+            changed_paths=paths,
+            diff_loc=loc,
+            diff=diff_text,
+        )
 
+    # --- Auto-merge path: inline Sonnet screen (unchanged behavior) ---
+    if pm_authority == "auto":
+        screen_result = screen(repo, pr_number, spec_summary, diff_text)
+        sv = screen_result.get("verdict", "needs-human")
+        reasons: list[str] = []
+        if sv == "needs-human":
+            reasons.append("screen verdict: needs-human")
+            verdict = "hold"
+        elif sv == "clean" and loc < MAX_AUTO_LOC \
+                and pr.get("mergeable") is not False:
+            verdict = "auto"
+            reasons.append(f"clean screen, {loc} LOC, mergeable")
+        elif sv == "fixable":
+            verdict = "advisory"
+            reasons.append("fixable issues found")
+        else:
+            verdict = "advisory"
+            reasons.append(f"defaulting to advisory (screen={sv}, loc={loc})")
+        return PRClassification(
+            verdict=verdict,
+            screen_verdict=sv,
+            static_outcome=StaticOutcome.static_pass,
+            reasons=reasons,
+            issues=list(screen_result.get("issues") or []),
+            pr_number=pr_number,
+            repo=repo,
+            title=pr.get("title", ""),
+            html_url=pr.get("html_url", ""),
+            changed_paths=paths,
+            diff_loc=loc,
+            diff=diff_text,
+        )
+
+    # --- Advisory / hold path: static pass only ---
+    # Opus reviewer will be dispatched by pm_core review-gate loop.
+    reasons = [f"static checks passed, {loc} LOC — Opus reviewer will be dispatched"]
     return PRClassification(
-        verdict=verdict,
-        screen_verdict=sv,
+        verdict="advisory",        # tentative; reviewer verdict drives final action
+        screen_verdict="unknown",
+        static_outcome=StaticOutcome.static_pass,
         reasons=reasons,
-        issues=list(screen_result.get("issues") or []),
+        issues=[],
         pr_number=pr_number,
         repo=repo,
         title=pr.get("title", ""),

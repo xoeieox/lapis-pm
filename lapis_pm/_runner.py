@@ -166,48 +166,74 @@ def main():
     # cwd determines which CLAUDE.md and SessionStart hooks (chub-inject.py,
     # per-project auto-memory) the subprocess picks up. Older specs without
     # the field fall back to call_claude_cli's default.
-    cwd = spec.get("cwd") or None
+    base_cwd = spec.get("cwd") or None
     # permission_mode is "bypassPermissions" for shaped-agent dispatches (set
     # by shaper). Without it, `claude -p` cannot grant Write/Edit in a
     # non-cached-trust workspace and returns a "please allow writes" message.
     permission_mode = spec.get("permission_mode") or None
 
-    if capture_meta:
-        result, envelope = call_claude_cli(
-            prompt=spec["prompt"],
-            system=spec.get("system", ""),
-            model=spec.get("model", "haiku"),
-            timeout=int(spec.get("timeout_s", 300)),
-            json_mode=bool(spec.get("json_mode", False)),
-            return_envelope=True,
-            cwd=cwd,
-            permission_mode=permission_mode,
-        )
-        try:
-            spec_id = _spec_id_from_path(spec_path)
-            meta_path = spec_path.parent / f"{spec_id}-meta.json"
-            meta_path.write_text(
-                json.dumps(_build_meta(result, envelope), ensure_ascii=False, default=str)
-            )
-        except OSError as e:
-            # Sidecar is best-effort; never block the result on it.
-            print(f"WARN: meta sidecar write failed: {e}", file=sys.stderr)
-    else:
-        result = call_claude_cli(
-            prompt=spec["prompt"],
-            system=spec.get("system", ""),
-            model=spec.get("model", "haiku"),
-            timeout=int(spec.get("timeout_s", 300)),
-            json_mode=bool(spec.get("json_mode", False)),
-            cwd=cwd,
-            permission_mode=permission_mode,
-        )
-
-    # Cleanup spec file regardless of outcome.
+    # Per-task git worktree isolation for shaped agents (2026-04-23). When
+    # the shaper routes to ClaudeQueue it sets worktree_required=True;
+    # concurrent runners would otherwise interleave git checkout/commit/push
+    # on the shared /srv/git/<repo>-working/ tree (see
+    # /srv/lapis/planning/specs/agents-core-claude-queue.md).
+    worktree_path = None
     try:
-        spec_path.unlink()
-    except OSError:
-        pass
+        if spec.get("worktree_required"):
+            try:
+                from lapis_pm.worktree import setup_worktree
+                worktree_path = setup_worktree(
+                    spec["task_id"], base_cwd,
+                    spec.get("base_branch", "main"),
+                )
+                cwd = str(worktree_path)
+            except Exception as e:
+                print(f"ERROR: worktree_setup: {e}", file=sys.stderr)
+                sys.exit(2)
+        else:
+            cwd = base_cwd
+
+        if capture_meta:
+            result, envelope = call_claude_cli(
+                prompt=spec["prompt"],
+                system=spec.get("system", ""),
+                model=spec.get("model", "haiku"),
+                timeout=int(spec.get("timeout_s", 300)),
+                json_mode=bool(spec.get("json_mode", False)),
+                return_envelope=True,
+                cwd=cwd,
+                permission_mode=permission_mode,
+            )
+            try:
+                spec_id = _spec_id_from_path(spec_path)
+                meta_path = spec_path.parent / f"{spec_id}-meta.json"
+                meta_path.write_text(
+                    json.dumps(_build_meta(result, envelope), ensure_ascii=False, default=str)
+                )
+            except OSError as e:
+                # Sidecar is best-effort; never block the result on it.
+                print(f"WARN: meta sidecar write failed: {e}", file=sys.stderr)
+        else:
+            result = call_claude_cli(
+                prompt=spec["prompt"],
+                system=spec.get("system", ""),
+                model=spec.get("model", "haiku"),
+                timeout=int(spec.get("timeout_s", 300)),
+                json_mode=bool(spec.get("json_mode", False)),
+                cwd=cwd,
+                permission_mode=permission_mode,
+            )
+    finally:
+        if worktree_path is not None:
+            try:
+                from lapis_pm.worktree import teardown_worktree
+                teardown_worktree(spec["task_id"], base_cwd)
+            except Exception as e:
+                print(f"WARN: worktree teardown failed: {e}", file=sys.stderr)
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
 
     if result is None:
         print("ERROR: shaped agent call returned None (timeout or invocation failure)")

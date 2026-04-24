@@ -233,6 +233,21 @@ def cmd_land(args) -> int:
     path = land.write_arc_doc(arc)
     print(f"Arc doc written: {path}")
     print(f"Length: {len(arc.body)} chars")
+
+    # Hygiene: archive the target, unbind from PM, and clear mem state so
+    # the landed target stops appearing in tick loops and `lapis-pm status`.
+    # Previously land stopped after writing the arc doc, leaving
+    # pm_bound=True + stale cursor/dispatched/brief entries indefinitely.
+    store.archive(args.target_id)          # sets status=archived + saves
+    target = store.get(args.target_id)     # re-read after archive saved
+    target.unbind_pm()
+    target.save()
+    cleared = pm_core.clear_landed_state(args.target_id)
+    cleared_summary = ", ".join(f"{k}={v}" for k, v in cleared.items() if v)
+    print(
+        f"Archived + unbound {args.target_id}"
+        + (f"; cleared: {cleared_summary}" if cleared_summary else "; mem state already clean")
+    )
     return 0
 
 

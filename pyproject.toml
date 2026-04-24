@@ -20,4 +20,4 @@ where = ["."]
 include = ["lapis_pm*"]
 
 [tool.setuptools.package-data]
-lapis_pm = ["registry.yaml", "smoke.sh"]
+lapis_pm = ["registry.yaml", "smoke.sh", "bench/batteries/*.yaml"]

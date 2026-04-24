@@ -37,8 +37,9 @@ synthesizes an arc doc at `/srv/lapis/lapis-state/<tid>.md` (RoomRAG-indexed).
 - **Arc-doc synthesis** — `land.py`: Haiku over the full episodic chronology
   of a landed thread, written to `/srv/lapis/lapis-state/<tid>.md`.
 - **CLI + systemd** — `cli.py` exposes `bind/unbind/tick/status/pause/resume/
-  list/land`. `systemd/lapis-pm.service` + `.timer` runs `tick --all` every
-  10 minutes.
+  list/land`. `bind` accepts `--create` to create the target YAML and bind in one
+  step (eliminates the historic two-step `TargetStore.create()` + `bind` flow).
+  `systemd/lapis-pm.service` + `.timer` runs `tick --all` every 10 minutes.
 
 ## What lapis-pm does NOT own
 

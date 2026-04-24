@@ -1,0 +1,127 @@
+# lapis_pm/bench/batteries/loud_quiet.yaml
+#
+# Canonical loud/quiet pairs for measuring Synapse contribution.
+#
+# Loud pair:  Topic the baseline instance is expected to handle reasonably
+#             without living-memory augmentation.  A correct response here
+#             means the pair is a fair general-knowledge question.
+#
+# Quiet pair: Topic where the baseline instance is expected to be confidently
+#             wrong or silently incomplete because the fact post-dates its
+#             training, was never public, or is purely internal state.
+#             These are the "signal" slots — a Synapse-enabled run should
+#             answer these correctly; the baseline should not.
+#
+# expected_awareness is for human reviewer reference only; the harness does
+# not evaluate it automatically (v1 is diff-for-human-reading).
+
+name: loud_quiet
+description: Canonical loud/quiet pairs for measuring Synapse contribution
+
+pairs:
+  - id: ollama-llamacpp
+    loud:
+      topic: >-
+        What is llama.cpp and what is it typically used for in local LLM
+        inference setups?
+      expected_awareness: >-
+        A C/C++ library for running quantised LLMs locally; supports GGUF
+        models; exposes an OpenAI-compatible HTTP server via llama-server.
+    quiet:
+      topic: >-
+        What model currently serves LLM inference in the Lapis stack and
+        on what port, and is Ollama still involved?
+      expected_awareness: >-
+        qwen3.5-35b-a3b via llama-server on port 8081 at 203.0.113.12;
+        Ollama was removed — llama.cpp's own server replaced it.
+
+  - id: synapse-is-what
+    loud:
+      topic: >-
+        What does a real-time context retrieval layer do for an AI agent,
+        and why would you want one?
+      expected_awareness: >-
+        It retrieves relevant facts, decisions, and recent state from a
+        persistent store and injects them into the agent's prompt at call
+        time, extending effective context beyond the training cutoff.
+    quiet:
+      topic: >-
+        What is Synapse in the Lapis ecosystem, what problem does it solve,
+        and when was its v0 design finalised?
+      expected_awareness: >-
+        Synapse is the Lapis real-time context retrieval layer (mem.db →
+        prompt injection); designed 2026-04-24; not yet shipped at v0.
+        It solves the living-memory gap — baseline instances don't know
+        recent internal decisions.
+
+  - id: agents-core-split
+    loud:
+      topic: >-
+        What are shared primitives in a multi-repo Python project and how
+        are they typically organised?
+      expected_awareness: >-
+        Reusable utilities extracted into a common library (e.g.
+        agents_core) so individual repos import rather than duplicate them.
+    quiet:
+      topic: >-
+        Where do shared primitives live in the Lapis agent codebase as of
+        late April 2026, and when was the split from lapis-pm completed?
+      expected_awareness: >-
+        In agents_core.* — the split from lapis-pm was completed
+        2026-04-22; nothing is duplicated; lapis-pm imports from
+        agents_core for all shared functionality.
+
+  - id: lapis-pm-bind-flow
+    loud:
+      topic: >-
+        In a project management system that uses a daemon to monitor work,
+        what steps would you expect to be required to start tracked work on
+        a new task?
+      expected_awareness: >-
+        Typically: create a spec, register/bind the task, then trigger the
+        first dispatch — the daemon monitors but does not auto-initiate.
+    quiet:
+      topic: >-
+        What are the three required steps to dispatch work in lapis-pm,
+        and what happens if step 3 is skipped?
+      expected_awareness: >-
+        1) Write spec to /srv/lapis/planning/specs/<id>.md.
+        2) lapis-pm bind --create (creates YAML, binds spec).
+        3) lapis-pm tick --target <id> --force-dispatch fixer:"...".
+        Skipping step 3 leaves the target permanently silent — the daemon
+        is a monitor, not an initiator; it never auto-starts work.
+
+  - id: pushover-replaced-matrix
+    loud:
+      topic: >-
+        What is Pushover and what is it commonly used for in developer
+        tooling?
+      expected_awareness: >-
+        Pushover is a push-notification service for mobile/desktop; often
+        used for alerting from scripts, daemons, and CI pipelines.
+    quiet:
+      topic: >-
+        Which notification channel does the Lapis PM daemon currently use
+        for human-judgment briefs, and when did it switch from the old one?
+      expected_awareness: >-
+        Pushover — replaced Matrix on 2026-03-16.  The daemon posts briefs
+        via Pushover; Matrix is no longer in the loop.
+
+  - id: claude-queue-cutover
+    loud:
+      topic: >-
+        What is a job queue for LLM API calls and why would a project
+        manager daemon use one?
+      expected_awareness: >-
+        A durable queue serialises requests, handles back-pressure, retries
+        failures, and decouples the caller from the LLM API latency — lets
+        the daemon submit work and move on without blocking.
+    quiet:
+      topic: >-
+        What is the current state of ClaudeQueue in the Lapis stack as of
+        2026-04-24 and why?
+      expected_awareness: >-
+        ClaudeQueue is paused as of 2026-04-24; the ops-layer cutover
+        decision (decision/claude-queue-cutover) is pending.  Shaped-agent
+        dispatches are currently routed differently while the cutover is
+        evaluated.

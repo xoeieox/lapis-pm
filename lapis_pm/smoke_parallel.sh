@@ -23,6 +23,7 @@ set -euo pipefail
 
 TEST_REPO=/tmp/lapis-pm-parallel-test-repo
 TEST_BARE=/tmp/lapis-pm-parallel-test-repo.bare
+CLONE_SYMLINK=/srv/git/lapis-pm-parallel-test-working
 TID_A="parallel-smoke-A-$$"
 TID_B="parallel-smoke-B-$$"
 WORKTREE_ROOT=/tmp/lapis-pm-worktrees
@@ -40,8 +41,9 @@ q = ClaudeQueue()
 q.cancel("$TID_A"); q.cancel("$TID_B")
 PY
     rm -rf "$TEST_REPO" "$TEST_BARE"
+    rm -f "$CLONE_SYMLINK"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 # --- 1. Set up throwaway repo -------------------------------------------
 step "1. Set up throwaway repo at $TEST_REPO"
@@ -64,6 +66,13 @@ git add -A
 git -c user.email=smoke@test -c user.name=smoke commit -m "initial" >/dev/null
 git push origin main >/dev/null 2>&1
 cd - >/dev/null
+
+# Symlink so shaper._resolve_repo_cwd("lapis-pm-parallel-test") finds the clone.
+# Pre-flight guard: refuse to clobber a real working-clone by that name.
+if [ -e "$CLONE_SYMLINK" ] && [ ! -L "$CLONE_SYMLINK" ]; then
+    red "$CLONE_SYMLINK exists and is not a symlink — refusing to clobber"
+fi
+ln -sfn "$TEST_REPO" "$CLONE_SYMLINK"
 
 # --- 2. Verify daemon is up ---------------------------------------------
 step "2. Verify claude-queue-runner is active"
@@ -91,17 +100,28 @@ tags: [test]
 EOF
 done
 
-# Route cwd to our test repo via env override
-export LAPIS_REPO_ROOT_OVERRIDE="$TEST_REPO"
-
 python3 - <<PY || red "dispatch script failed"
-import os
-os.environ["LAPIS_REPO_ROOT_OVERRIDE"] = "$TEST_REPO"
 from lapis_pm.shaper import dispatch
-dispatch("fixer", "$TID_A", "edit a.md so its sole content is the word 'hello'",
-         vars_={"repo": "lapis-pm-parallel-test", "repo_cwd": "$TEST_REPO"})
-dispatch("fixer", "$TID_B", "edit b.md so its sole content is the word 'world'",
-         vars_={"repo": "lapis-pm-parallel-test", "repo_cwd": "$TEST_REPO"})
+dispatch("fixer", "$TID_A",
+         "edit a.md so its sole content is the word 'hello'. "
+         "Do NOT open a Forgejo PR — the test repo is not on the Forgejo server. "
+         "Stop after \`git push\`.",
+         vars_={
+             "repo": "lapis-pm-parallel-test",
+             "target_id": "$TID_A",
+             "spec_summary": "Parallel-dispatch smoke test. Edit a.md to contain the single word 'hello'.",
+             "slug": "smoke-a",
+         })
+dispatch("fixer", "$TID_B",
+         "edit b.md so its sole content is the word 'world'. "
+         "Do NOT open a Forgejo PR — the test repo is not on the Forgejo server. "
+         "Stop after \`git push\`.",
+         vars_={
+             "repo": "lapis-pm-parallel-test",
+             "target_id": "$TID_B",
+             "spec_summary": "Parallel-dispatch smoke test. Edit b.md to contain the single word 'world'.",
+             "slug": "smoke-b",
+         })
 print("dispatched")
 PY
 
@@ -140,7 +160,7 @@ green "git worktree list shows only the main clone"
 # 5b. /tmp/lapis-pm-worktrees is empty (aside from other concurrent tests)
 if [ -d "$WORKTREE_ROOT" ]; then
     leftover=$(find "$WORKTREE_ROOT" -maxdepth 1 -mindepth 1 -type d \
-        \( -name "claude_*${TID_A}*" -o -name "claude_*${TID_B}*" \) | wc -l)
+        \( -name "*-fixer-${TID_A}" -o -name "*-fixer-${TID_B}" \) | wc -l)
     [ "$leftover" = "0" ] \
         || red "leftover worktree dirs in $WORKTREE_ROOT for this smoke"
 fi

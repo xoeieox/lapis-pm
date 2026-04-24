@@ -98,6 +98,10 @@ CLI wrapper at `bin/lapis-pm` adds env-loading; symlink it to
 - The `registry.yaml` agent definitions are the PM's contract with the
   shaped sub-agents. Changes there may shift fixer/reviewer/scout
   behavior at runtime — prefer additive changes.
+- **Reviewer is read-only; fixer is write-only; never merge the roles.**
+  The reviewer agent returns a verdict JSON and nothing else. Any reviewer
+  template change that adds tool instructions beyond read/report is a
+  violation of the role-separation invariant.
 
 ## Versioning
 

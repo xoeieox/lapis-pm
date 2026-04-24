@@ -3,6 +3,8 @@
 
 Commands:
     bind <target_id> --spec-from PATH|- --repo REPO [--authority advisory|auto]
+               [--create --title TITLE [--description TEXT] [--urgency medium]
+                [--tag TAG ...] [--product NAME]] [--force]
     unbind <target_id>
     tick [--target ID | --all] [--force-brief] [--force-dispatch AGENT:INTENT]
     status [target_id] [--explain]
@@ -24,6 +26,14 @@ from agents_core.targets import TargetStore
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, shaper, brief, pm_core, land
 
+# Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
+PM_LIFECYCLE_STAGES = [
+    {"name": "Bind to lapis-pm daemon with spec + advisory authority", "status": "active"},
+    {"name": "Shaped agent dispatch produces PR on lapis/<target_id>/<slug>", "status": "pending"},
+    {"name": "PM perceives PR, digest screen classifies, brief posted", "status": "pending"},
+    {"name": "Accept or reject based on brief; land thread via `lapis-pm land`", "status": "pending"},
+]
+
 
 def _read_spec(source: str) -> str:
     if source == "-":
@@ -31,16 +41,57 @@ def _read_spec(source: str) -> str:
     return Path(source).read_text()
 
 
+def _derive_tags(repo: str, target_id: str, extra_tags: list[str]) -> list[str]:
+    """Build tag list: repo name first, then extra --tag flags. Deduped, insertion order."""
+    seen: dict[str, None] = {}
+    for t in ([repo] if repo else []) + list(extra_tags):
+        if t and t not in seen:
+            seen[t] = None
+    return list(seen)
+
+
 def cmd_bind(args) -> int:
     store = TargetStore()
-    target = store.get(args.target_id)
-    if target is None:
-        print(f"ERROR: target not found: {args.target_id}", file=sys.stderr)
-        return 2
+
+    if args.create:
+        if not args.title:
+            print("ERROR: --title is required with --create", file=sys.stderr)
+            return 2
+
+        target = store.get(args.target_id)
+        if target is not None and not args.force:
+            print(
+                f"ERROR: target {args.target_id!r} already exists. "
+                "Use --force to replace spec binding.",
+                file=sys.stderr,
+            )
+            return 2
+
+        if target is None:
+            tags = _derive_tags(args.repo, args.target_id, args.tag)
+            target = store.create(
+                args.target_id,
+                title=args.title,
+                urgency=args.urgency,
+                work_mode=args.work_mode,
+                description=args.description,
+                stages=list(PM_LIFECYCLE_STAGES),
+                category="active-work",
+            )
+            if tags:
+                target.data["tags"] = tags
+            if args.product:
+                target.data["product"] = args.product
+            target.save()
+    else:
+        target = store.get(args.target_id)
+        if target is None:
+            print(f"ERROR: target not found: {args.target_id}", file=sys.stderr)
+            return 2
 
     existing_spec = episodic.spec(args.target_id)
     if existing_spec and not args.force:
-        print(f"ERROR: target already has a spec bound. Use --force to replace.",
+        print("ERROR: target already has a spec bound. Use --force to replace.",
               file=sys.stderr)
         return 2
 
@@ -261,6 +312,18 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--repo", required=True, help="Forgejo repo name (Erah/<name>)")
     b.add_argument("--authority", default="advisory", choices=["advisory", "auto"])
     b.add_argument("--force", action="store_true", help="Replace existing spec binding")
+    # --create flags: create target YAML if it doesn't exist
+    b.add_argument("--create", action="store_true",
+                   help="Create target YAML if it doesn't exist (errors if exists without --force)")
+    b.add_argument("--title", default="", help="Target title (required with --create)")
+    b.add_argument("--description", default="", help="Target description")
+    b.add_argument("--urgency", default="medium", choices=["low", "medium", "high"],
+                   help="Target urgency (default: medium)")
+    b.add_argument("--work-mode", default="anywhere", dest="work_mode",
+                   help="Target work mode (default: anywhere)")
+    b.add_argument("--tag", action="append", default=[], metavar="TAG",
+                   help="Add a tag (repeatable; repo name always included)")
+    b.add_argument("--product", default="", help="Product name (e.g. 'Archetypal Intelligence')")
     b.set_defaults(func=cmd_bind)
 
     u = sub.add_parser("unbind", help="Remove PM binding from a target.")

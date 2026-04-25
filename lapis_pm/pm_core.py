@@ -952,6 +952,68 @@ def _encode_pr_sha_updates(target_id: str, open_prs: list[dict]) -> int:
     return written
 
 
+def _recover_reviewer_verdict(raw: str) -> dict | None:
+    """Attempt to recover a reviewer verdict dict from malformed JSON.
+
+    Recovery strategies tried in order:
+    1. Strip code fences (``` or ```json) and re-parse. (Mostly redundant with
+       the eager fence-strip in _encode_gpu_results' live path; retained so
+       the helper is also useful when called directly.)
+    2. Extract outermost {...} via string-aware balanced-brace scan and
+       re-parse. Braces inside JSON string literals are ignored so prose like
+       `"note": "} oops"` doesn't close the object early.
+    3. Regex extraction of verdict literal as last resort — returns
+       issues=[], confidence=0.0 if the structure is otherwise unparseable.
+
+    Returns a parsed dict on success, None if all strategies fail.
+    """
+    # Strategy 1: strip code fences
+    stripped = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    stripped = re.sub(r"\s*```\s*$", "", stripped.strip())
+    if stripped != raw.strip():
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 2: extract outermost {...} via string-aware balanced-brace scan
+    start = raw.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i, ch in enumerate(raw[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    # Strategy 3: regex extraction of verdict field (verdict-only recovery).
+    # confidence=0.0 signals "structure was lost, only the verdict survived"
+    # so any downstream consumer can treat it as low-trust if needed.
+    m = re.search(r'"verdict"\s*:\s*"(clean|fixable|needs-human|blocked)"', raw)
+    if m:
+        return {"verdict": m.group(1), "issues": [], "confidence": 0.0}
+
+    return None
+
+
 def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
     """For each pending dispatch, check for completion and encode result.
 
@@ -1054,22 +1116,32 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 if raw_output.startswith("```"):
                     raw_output = re.sub(r"^```(?:json)?\s*", "", raw_output)
                     raw_output = re.sub(r"\s*```$", "", raw_output.strip())
+                parse_recovered = False
                 try:
                     verdict_data = json.loads(raw_output)
                     verdict_val = verdict_data.get("verdict", "needs-human")
                     stored_json = json.dumps(verdict_data)
                 except json.JSONDecodeError:
-                    verdict_val = "needs-human"
-                    stored_json = json.dumps({"verdict": "needs-human", "issues": [],
-                                              "confidence": 0.0,
-                                              "_parse_error": raw_output[:200]})
+                    recovered = _recover_reviewer_verdict(raw_output)
+                    if recovered is not None:
+                        verdict_val = recovered.get("verdict", "needs-human")
+                        stored_json = json.dumps(recovered)
+                        parse_recovered = True
+                    else:
+                        verdict_val = "needs-human"
+                        stored_json = json.dumps({"verdict": "needs-human", "issues": [],
+                                                  "confidence": 0.0,
+                                                  "_parse_error": raw_output[:200]})
+                result_tags = tags + [
+                    f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
+                    f"pm:pr={pr_num}",
+                ]
+                if parse_recovered:
+                    result_tags.append("pm:reviewer:parse-recovered")
                 episodic.write_result(
                     target_id,
                     f"Reviewer verdict for PR #{pr_num}:\n{stored_json}",
-                    extra_tags=tags + [
-                        f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
-                        f"pm:pr={pr_num}",
-                    ],
+                    extra_tags=result_tags,
                 )
             else:
                 episodic.write_result(

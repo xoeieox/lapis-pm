@@ -987,7 +987,9 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                             f"pm:pr={pr_num}",
                         ],
                     )
-            continue  # fixer_retry doesn't use GPU output file path
+                continue  # fixer_retry uses SHA-advance signal, not GPU output file
+            # fixer_retry without pr_number: fall through to GPU output file path
+            # as defensive fallback (shouldn't happen in practice).
 
         out_path = _gpu_output_path(rec["gpu_id"])
         if not out_path:

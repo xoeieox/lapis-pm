@@ -17,6 +17,7 @@ fixers that produced prose without using tools.
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -182,11 +183,17 @@ def main():
         if spec.get("worktree_required"):
             try:
                 from lapis_pm.worktree import setup_worktree
-                worktree_path = setup_worktree(
+                handle = setup_worktree(
                     spec["task_id"], base_cwd,
                     spec.get("base_branch", "main"),
                 )
+                worktree_path = handle.path
                 cwd = str(worktree_path)
+                # Propagate pip-isolation env into this process so the claude -p
+                # subprocess (spawned by call_claude_cli) inherits them. Each
+                # _runner.py invocation is a dedicated subprocess per dispatch,
+                # so mutating os.environ here does not leak across tasks.
+                os.environ.update(handle.env)
             except Exception as e:
                 print(f"ERROR: worktree_setup: {e}", file=sys.stderr)
                 sys.exit(2)

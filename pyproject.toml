@@ -15,6 +15,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: slow tests that require network / real pip; run with pytest -m integration",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lapis_pm*"]

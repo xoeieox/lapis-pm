@@ -8,6 +8,26 @@ together) on 2026-04-22. See mem `fix/lapis-pm-runner-shared-working-tree-race`.
 
 WORKTREE_ROOT is the single source of truth for the worktree path,
 imported by `agents_core.claude_queue_runner` for its startup sweep.
+
+## Python pip isolation invariant
+
+Fixer worktrees must not mutate host-global Python state. On 2026-04-24 a
+fixer ran `pip install -e .` from inside its worktree, writing an editable-
+install pointer into `~/.local/lib/python3.12/site-packages/`. When
+`teardown_worktree` later removed the worktree, `pip show agents-core` still
+claimed installed but `from agents_core import ...` raised `ModuleNotFoundError`
+host-wide, breaking `mem`, `lapis-pm`, and all transitive consumers.
+See mem key `fix/lapis-pm-fixer-worktree-mutates-host-pip-2026-04-24`.
+
+The fix: `setup_worktree` sets `PYTHONUSERBASE=<worktree>/.pyuserbase` and
+`PIP_USER=yes` in the shaped agent's subprocess environment. Any `pip install`
+the agent runs defaults to `--user` and lands under the worktree. When
+`teardown_worktree` removes the worktree tree, `.pyuserbase` is cleaned up
+automatically. The host `~/.local/` is never touched.
+
+This isolation covers *Python pip installs only*. systemd unit modifications,
+mem.db writes outside the fixer's target scope, and other side effects are
+separate concerns (file them as separate targets if they bite).
 """
 
 from __future__ import annotations
@@ -15,12 +35,24 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 WORKTREE_ROOT = Path("/tmp/lapis-pm-worktrees")
 
+_PYUSERBASE_SITE = "lib/python3.12/site-packages"
 
-def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> Path:
+
+@dataclass
+class WorktreeHandle:
+    """Return value of setup_worktree — bundles the worktree path with the
+    isolation env vars that must be forwarded to the shaped agent subprocess.
+    """
+    path: Path
+    env: dict[str, str]
+
+
+def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> WorktreeHandle:
     """Create a detached worktree at WORKTREE_ROOT/<task_id>.
 
     Symlinks the parent clone's `.claude/` into the worktree root because
@@ -43,6 +75,11 @@ def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> Pa
     Known constraint: the symlink means concurrent workers share one
     `.claude/settings.json` + `.claude/projects/*/memory/`. Safe at
     CLAUDE_QUEUE_WORKERS=2; revisit before raising beyond 4.
+
+    Returns a WorktreeHandle whose .env dict must be merged into the
+    shaped-agent subprocess environment (see _runner.py). This prevents
+    `pip install` from writing to the host's ~/.local/ — see module
+    docstring and mem `fix/lapis-pm-fixer-worktree-mutates-host-pip-2026-04-24`.
     """
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     path = WORKTREE_ROOT / task_id
@@ -80,7 +117,17 @@ def setup_worktree(task_id: str, repo_cwd: str, base_branch: str = "main") -> Pa
             file=sys.stderr,
         )
 
-    return path
+    # Create the per-worktree pip user-base so pip --user installs land here
+    # instead of ~/.local/. The directory is cleaned up automatically by
+    # teardown_worktree (which rmtrees the entire worktree path).
+    pyuserbase = path / ".pyuserbase"
+    (pyuserbase / _PYUSERBASE_SITE).mkdir(parents=True, exist_ok=True)
+
+    env = {
+        "PYTHONUSERBASE": str(pyuserbase),
+        "PIP_USER": "yes",
+    }
+    return WorktreeHandle(path=path, env=env)
 
 
 def teardown_worktree(task_id: str, repo_cwd: str) -> None:

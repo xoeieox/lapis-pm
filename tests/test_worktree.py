@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from lapis_pm.worktree import WORKTREE_ROOT, setup_worktree, teardown_worktree
+from lapis_pm.worktree import WORKTREE_ROOT, WorktreeHandle, setup_worktree, teardown_worktree
 
 
 def _init_minimal_clone(tmp_path: Path) -> Path:
@@ -46,9 +46,10 @@ def test_setup_worktree_warns_on_missing_claude_md_and_settings(tmp_path, capfd)
     task_id = "test-missing-claude-md-and-settings"
 
     try:
-        path = setup_worktree(task_id, str(clone))
-        assert path == WORKTREE_ROOT / task_id
-        assert path.exists()
+        handle = setup_worktree(task_id, str(clone))
+        assert isinstance(handle, WorktreeHandle)
+        assert handle.path == WORKTREE_ROOT / task_id
+        assert handle.path.exists()
 
         captured = capfd.readouterr()
         stderr = captured.err
@@ -75,8 +76,8 @@ def test_setup_worktree_silent_when_both_present(tmp_path, capfd):
 
     task_id = "test-both-present"
     try:
-        path = setup_worktree(task_id, str(clone))
-        assert path.exists()
+        handle = setup_worktree(task_id, str(clone))
+        assert handle.path.exists()
 
         captured = capfd.readouterr()
         assert "WARN:" not in captured.err, f"expected silent setup, got warnings: {captured.err!r}"

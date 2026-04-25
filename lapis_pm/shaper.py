@@ -201,12 +201,16 @@ def dispatch(
 
     cmd = f"python3 {shlex.quote(RUNNER)} {shlex.quote(str(spec_path))}"
 
-    # Route by agent.model. Sonnet/Haiku → ClaudeQueue (API-backed, parallel,
-    # per-task worktree). Qwen → GPUQueue (GPU-serialized, no worktree).
+    # Route by agent.model. Anthropic-API models (sonnet/haiku/opus) →
+    # ClaudeQueue (API-backed, parallel, per-task worktree). Qwen → GPUQueue
+    # (GPU-serialized, no worktree, TOU-paused 4–9 PM because it uses real
+    # local GPU hardware). Opus was previously routed to GPUQueue as a cutover
+    # oversight; it shares the Anthropic API path with sonnet/haiku and has no
+    # local-GPU resource to gate on.
     # LAPIS_PM_FORCE_GPU_QUEUE=1 is the emergency rollback knob that sends
     # everything back to GPUQueue.
     route_to_claude = (
-        agent.model in {"sonnet", "haiku"}
+        agent.model in {"sonnet", "haiku", "opus"}
         and os.getenv("LAPIS_PM_FORCE_GPU_QUEUE") != "1"
     )
 

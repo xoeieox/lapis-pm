@@ -705,3 +705,272 @@ class TestReviewGateCli:
             ret = main(["review-gate", "resume"])
         assert ret == 0
         mock_resume.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# fixer_retry completion observation (encode path)
+# ---------------------------------------------------------------------------
+
+class TestFixerRetryCompletion:
+    """Tests for fixer_retry completion detection via PR SHA advancement."""
+
+    def _pending_fixer_record(self, pr_number=42, cycle=1,
+                               ts="2026-01-01T10:00:00") -> dict:
+        return {
+            "gpu_id": "claude_abc123_fixer_retry",
+            "spec_id": "spec-abc",
+            "agent_type": "fixer_retry",
+            "intent": f"fix PR #{pr_number} after reviewer cycle {cycle}",
+            "repo": "myrepo",
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "ts": ts,
+            "status": "pending",
+            "retry_count": 0,
+        }
+
+    def _sha_comment(self, pr_number: int, sha: str, ts: str) -> MagicMock:
+        c = MagicMock()
+        c.ts = ts
+        c.tags = [f"pm:pr={pr_number}", f"pm:pr={pr_number}:sha={sha}"]
+        c.content = f"PR #{pr_number} head SHA: {sha}"
+        return c
+
+    def test_fixer_retry_processed_when_sha_advances(self):
+        """fixer_retry transitions to processed when a SHA observation appears after dispatch ts."""
+        record = self._pending_fixer_record(ts="2026-01-01T10:00:00")
+        sha_obs = self._sha_comment(42, "abc123newsha", "2026-01-01T10:05:00")
+
+        written = []
+
+        def capture_result(target_id, content, extra_tags=None):
+            written.append(content)
+            c = MagicMock()
+            c.id = "result-1"
+            return c
+
+        with (
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[record]),
+            patch("lapis_pm.pm_core.save_dispatched") as mock_save,
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+            patch("lapis_pm.pm_core.episodic.write_result", side_effect=capture_result),
+        ):
+            encoded, failed = pm_core._encode_gpu_results("tid")
+
+        assert encoded == 1
+        assert record["status"] == "processed"
+        assert record["completed_at"] == sha_obs.ts
+        mock_save.assert_called_once()
+        assert not failed
+        assert written  # episodic result was written
+
+    def test_fixer_retry_stays_pending_when_sha_unchanged(self):
+        """fixer_retry stays pending if no SHA observation exists after dispatch ts."""
+        record = self._pending_fixer_record(ts="2026-01-01T10:00:00")
+        # SHA observation exists but BEFORE dispatch_ts — does not qualify
+        old_obs = self._sha_comment(42, "old_sha_xyz", "2026-01-01T09:00:00")
+
+        with (
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[record]),
+            patch("lapis_pm.pm_core.save_dispatched") as mock_save,
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[old_obs]),
+        ):
+            encoded, failed = pm_core._encode_gpu_results("tid")
+
+        assert encoded == 0
+        assert record["status"] == "pending"
+        mock_save.assert_not_called()
+        assert not failed
+
+    def test_fixer_retry_completion_idempotent(self):
+        """Already-processed fixer_retry records are not re-encoded."""
+        record = self._pending_fixer_record(ts="2026-01-01T10:00:00")
+        record["status"] = "processed"
+        record["completed_at"] = "2026-01-01T10:05:00"
+        sha_obs = self._sha_comment(42, "abc123", "2026-01-01T10:05:00")
+
+        with (
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[record]),
+            patch("lapis_pm.pm_core.save_dispatched") as mock_save,
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+        ):
+            encoded, failed = pm_core._encode_gpu_results("tid")
+
+        assert encoded == 0
+        mock_save.assert_not_called()
+
+    def test_reviewer_completion_still_uses_gpu_output(self):
+        """Reviewer (non-fixer_retry) still uses GPU output file path."""
+        reviewer_record = {
+            "gpu_id": "gpu_rev_abc",
+            "spec_id": "spec-rev",
+            "agent_type": "reviewer",
+            "intent": "review PR #42 cycle 1",
+            "repo": "myrepo",
+            "pr_number": 42,
+            "cycle": 1,
+            "ts": "2026-01-01T09:00:00",
+            "status": "pending",
+            "retry_count": 0,
+        }
+        output = json.dumps({"verdict": "fixable", "issues": ISSUES, "confidence": 0.8})
+
+        mock_path = MagicMock()
+        mock_path.read_text.return_value = output
+        mock_path.parent = object()  # not FAILED_DIR or CLAUDE_QUEUE_FAILED_DIR
+
+        with (
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_record]),
+            patch("lapis_pm.pm_core.save_dispatched"),
+            patch("lapis_pm.pm_core._gpu_output_path", return_value=mock_path),
+            patch("lapis_pm.pm_core._read_fixer_meta", return_value=None),
+            patch("lapis_pm.pm_core._consume_fixer_meta"),
+            patch("lapis_pm.pm_core.episodic.write_result", return_value=MagicMock()),
+            patch("lapis_pm.pm_core.FAILED_DIR", object()),
+            patch("lapis_pm.pm_core.CLAUDE_QUEUE_FAILED_DIR", object()),
+        ):
+            encoded, failed = pm_core._encode_gpu_results("tid")
+
+        assert encoded == 1
+        assert reviewer_record["status"] == "processed"
+
+
+# ---------------------------------------------------------------------------
+# Cycle K→K+1 progression (decide path)
+# ---------------------------------------------------------------------------
+
+class TestCycleKProgression:
+    """Tests for reviewer cycle K+1 dispatch after fixer_retry completion."""
+
+    def _reviewer_dispatch_record(self, pr_number=42, cycle=1,
+                                   ts="2026-01-01T09:00:00") -> dict:
+        return {
+            "gpu_id": "gpu_rev_abc",
+            "agent_type": "reviewer",
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "ts": ts,
+            "status": "processed",
+        }
+
+    def _sha_observation(self, pr_number: int, sha: str, ts: str) -> MagicMock:
+        c = MagicMock()
+        c.ts = ts
+        c.tags = [f"pm:pr={pr_number}", f"pm:pr={pr_number}:sha={sha}"]
+        c.content = ""
+        return c
+
+    def test_cycle2_dispatched_when_fixer_processed_and_sha_advanced(self):
+        """reviewer=1 fixer=1 SHA advanced → dispatch reviewer cycle 2 (advisory)."""
+        reviewer_rec = self._reviewer_dispatch_record(cycle=1, ts="2026-01-01T09:00:00")
+        sha_obs = self._sha_observation(42, "newsha_abc", "2026-01-01T10:00:00")
+
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+
+        assert d.kind == "dispatch_reviewer"
+        assert d.payload["cycle"] == 2
+        assert d.payload["mode"] == "same"  # advisory keeps same-reviewer mode
+
+    def test_no_progression_guard_sha_unchanged(self):
+        """reviewer=1 fixer=1 SHA NOT advanced → noop (no-progression guard)."""
+        reviewer_rec = self._reviewer_dispatch_record(cycle=1, ts="2026-01-01T09:00:00")
+        # SHA observation exists but BEFORE reviewer dispatch ts — does not count
+        old_sha = self._sha_observation(42, "oldsha", "2026-01-01T08:00:00")
+
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[old_sha]),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+
+        assert d.kind == "noop"
+
+    def test_budget_exhaustion_after_cycle2_fixable(self):
+        """reviewer=2 fixer=2 SHA advanced → review_exhausted_brief (advisory budget=2)."""
+        # Cycle 2 reviewer dispatch record
+        reviewer_rec = self._reviewer_dispatch_record(cycle=2, ts="2026-01-01T11:00:00")
+        sha_obs = self._sha_observation(42, "sha2", "2026-01-01T11:30:00")
+
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=[
+                {"cycle": 1, "verdict": "fixable", "issues": ISSUES},
+                {"cycle": 2, "verdict": "fixable", "issues": ISSUES},
+            ]),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+
+        assert d.kind == "review_exhausted_brief"
+        assert len(d.payload["history"]) == 2
+
+    def test_same_reviewer_mode_preserved_at_cycle2_advisory(self):
+        """Advisory: cycle 2 reviewer uses mode=same (same-reviewer context)."""
+        reviewer_rec = self._reviewer_dispatch_record(cycle=1, ts="2026-01-01T09:00:00")
+        sha_obs = self._sha_observation(42, "newsha", "2026-01-01T10:00:00")
+
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+
+        assert d.kind == "dispatch_reviewer"
+        assert d.payload["mode"] == "same"
+
+    def test_fresh_reviewer_mode_preserved_at_cycle2_hold(self):
+        """Hold: cycle 2 reviewer uses mode=fresh (fresh-reviewer, no prior context)."""
+        reviewer_rec = self._reviewer_dispatch_record(cycle=1, ts="2026-01-01T09:00:00")
+        reviewer_rec["agent_type"] = "reviewer_fresh"
+        sha_obs = self._sha_observation(42, "newsha", "2026-01-01T10:00:00")
+
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "hold")
+
+        assert d.kind == "dispatch_reviewer"
+        assert d.payload["mode"] == "fresh"

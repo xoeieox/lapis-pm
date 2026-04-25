@@ -38,6 +38,8 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 COMPLETED_DIR = Path("/srv/lapis/gpu-queue/completed")
 FAILED_DIR = Path("/srv/lapis/gpu-queue/failed")
 SHAPED_DIR = Path("/srv/lapis/gpu-queue/shaped")  # _runner.py meta sidecars
+CLAUDE_QUEUE_COMPLETED_DIR = Path("/srv/lapis/claude-queue/completed")
+CLAUDE_QUEUE_FAILED_DIR = Path("/srv/lapis/claude-queue/failed")
 MAX_DISPATCH_RETRIES = 2
 
 # Review-gate loop constants
@@ -382,6 +384,49 @@ def _collect_review_history(target_id: str, pr_number: int) -> list[dict]:
     return history
 
 
+def _last_observed_pr_sha(target_id: str, pr_number: int) -> str | None:
+    """Return the most recently observed head SHA for this PR from episodic, or None."""
+    prefix = f"pm:pr={pr_number}:sha="
+    last: str | None = None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix):
+                last = t[len(prefix):]
+    return last
+
+
+def _fixer_sha_completion_ts(target_id: str, pr_number: int, dispatch_ts: str) -> str | None:
+    """Return ts of first SHA-advance observation for PR N after dispatch_ts, or None."""
+    prefix = f"pm:pr={pr_number}:sha="
+    for c in episodic.all_comments(target_id):
+        if c.ts > dispatch_ts:
+            for t in c.tags:
+                if t.startswith(prefix):
+                    return c.ts
+    return None
+
+
+def _reviewer_dispatch_ts(target_id: str, pr_number: int, cycle: int) -> str | None:
+    """Return dispatch ts of reviewer at cycle K for PR N, or None."""
+    for r in load_dispatched(target_id):
+        if (r.get("agent_type") in ("reviewer", "reviewer_fresh")
+                and r.get("pr_number") == pr_number
+                and r.get("cycle") == cycle):
+            return r.get("ts")
+    return None
+
+
+def _pr_sha_advanced_since(target_id: str, pr_number: int, since_ts: str) -> bool:
+    """Return True if any SHA-advance observation for PR N exists after since_ts."""
+    prefix = f"pm:pr={pr_number}:sha="
+    for c in episodic.all_comments(target_id):
+        if c.ts > since_ts:
+            for t in c.tags:
+                if t.startswith(prefix):
+                    return True
+    return False
+
+
 def _active_review_state(target_id: str, open_prs: list[dict]) -> dict | None:
     """Return active review-loop state for status display, or None."""
     classified_ids = _classified_pr_ids(target_id)
@@ -407,12 +452,16 @@ def _active_review_state(target_id: str, open_prs: list[dict]) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _gpu_output_path(task_id: str) -> Path | None:
-    p = COMPLETED_DIR / f"{task_id}-output.md"
-    if p.exists():
-        return p
-    p = FAILED_DIR / f"{task_id}-output.md"
-    if p.exists():
-        return p
+    for completed_dir, failed_dir in [
+        (COMPLETED_DIR, FAILED_DIR),
+        (CLAUDE_QUEUE_COMPLETED_DIR, CLAUDE_QUEUE_FAILED_DIR),
+    ]:
+        p = completed_dir / f"{task_id}-output.md"
+        if p.exists():
+            return p
+        p = failed_dir / f"{task_id}-output.md"
+        if p.exists():
+            return p
     return None
 
 
@@ -485,7 +534,19 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
     mode = "fresh" if pm_authority == "hold" else "same"
 
     if reviewer_count == fixer_count:
-        # Either initial dispatch (both==0) or post-fixer dispatch (both==N)
+        # Either initial dispatch (both==0) or post-fixer dispatch (both==N).
+        # For post-fixer (N>0): guard against dispatching reviewer K+1 when the
+        # fixer didn't push any code (SHA unchanged since cycle K dispatch).
+        # If reviewer_ts is unavailable (e.g. record cleared), default to proceed.
+        if reviewer_count > 0:
+            reviewer_ts = _reviewer_dispatch_ts(target_id, pr_number, reviewer_count)
+            if reviewer_ts and not _pr_sha_advanced_since(target_id, pr_number, reviewer_ts):
+                return Decision("noop", {
+                    "reason": (
+                        f"PR #{pr_number} head SHA unchanged since reviewer "
+                        f"cycle {reviewer_count} dispatch — waiting for fixer commit"
+                    )
+                })
         if reviewer_count >= budget:
             # Both sides exhausted budget
             history = _collect_review_history(target_id, pr_number)
@@ -873,6 +934,24 @@ def _encode_user_comments(target_id: str, comments: list) -> list:
 _GPU_FAIL_PREFIXES = ("ERROR", "EXIT ", "TIMEOUT")
 
 
+def _encode_pr_sha_updates(target_id: str, open_prs: list[dict]) -> int:
+    """Write SHA-advance observation when a PR's head SHA changes. Returns count written."""
+    written = 0
+    for pr in open_prs:
+        pr_num = pr.get("number")
+        sha = (pr.get("head") or {}).get("sha")
+        if not sha or not pr_num:
+            continue
+        if sha != _last_observed_pr_sha(target_id, pr_num):
+            episodic.write_observation(
+                target_id,
+                f"PR #{pr_num} head SHA: {sha}",
+                extra_tags=[f"pm:pr={pr_num}", f"pm:pr={pr_num}:sha={sha}"],
+            )
+            written += 1
+    return written
+
+
 def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
     """For each pending dispatch, check for completion and encode result.
 
@@ -885,6 +964,33 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
     for rec in records:
         if rec.get("status") != "pending":
             continue
+
+        # fixer_retry uses PR SHA advancement as completion signal (preferred per spec)
+        # rather than GPU output file, so we can detect completion even when the
+        # fixer pushed code but the queue output path differs (e.g. claude-queue).
+        if rec.get("agent_type") == "fixer_retry":
+            pr_num = rec.get("pr_number")
+            dispatch_ts = rec.get("ts", "")
+            if pr_num is not None:
+                completion_ts = _fixer_sha_completion_ts(target_id, pr_num, dispatch_ts)
+                if completion_ts:
+                    rec["status"] = "processed"
+                    rec["completed_at"] = completion_ts
+                    changed = True
+                    total_encoded += 1
+                    episodic.write_result(
+                        target_id,
+                        f"Fixer retry for PR #{pr_num} completed: head SHA advanced after dispatch",
+                        extra_tags=[
+                            f"pm:gpu={rec['gpu_id']}",
+                            "pm:agent=fixer_retry",
+                            f"pm:pr={pr_num}",
+                        ],
+                    )
+                continue  # fixer_retry uses SHA-advance signal, not GPU output file
+            # fixer_retry without pr_number: fall through to GPU output file path
+            # as defensive fallback (shouldn't happen in practice).
+
         out_path = _gpu_output_path(rec["gpu_id"])
         if not out_path:
             continue
@@ -894,7 +1000,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
             continue
 
         is_failure = (
-            out_path.parent == FAILED_DIR
+            out_path.parent in (FAILED_DIR, CLAUDE_QUEUE_FAILED_DIR)
             or any(text.lstrip().startswith(p) for p in _GPU_FAIL_PREFIXES)
         )
 
@@ -1057,6 +1163,10 @@ def tick(target_id: str) -> TickResult:
     seen_pr_ids = _seen_pr_ids(target_id)
     new_prs = _encode_new_prs(target_id, repo, open_prs, seen_pr_ids)
     encoded += len(new_prs)
+
+    # Track PR head SHA advances (must precede _encode_gpu_results so the SHA
+    # observation is visible when fixer_retry completion is checked below).
+    encoded += _encode_pr_sha_updates(target_id, open_prs)
 
     gpu_encoded, failed_dispatches = _encode_gpu_results(target_id)
     encoded += gpu_encoded

@@ -974,3 +974,179 @@ class TestCycleKProgression:
 
         assert d.kind == "dispatch_reviewer"
         assert d.payload["mode"] == "fresh"
+
+
+# ---------------------------------------------------------------------------
+# _recover_reviewer_verdict — parse hardening
+# ---------------------------------------------------------------------------
+
+class TestRecoverReviewerVerdict:
+
+    def test_strict_valid_json_unaffected(self):
+        """Recovery helper is not involved when json.loads succeeds — verify
+        that the helper itself also parses clean JSON correctly."""
+        raw = json.dumps({"verdict": "fixable", "issues": ISSUES, "confidence": 0.9})
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "fixable"
+
+    def test_code_fence_json_recovered(self):
+        """JSON wrapped in ```json ... ``` fences is recovered."""
+        payload = {"verdict": "fixable", "issues": ISSUES, "confidence": 0.8}
+        raw = f"```json\n{json.dumps(payload)}\n```"
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "fixable"
+        assert result["issues"] == ISSUES
+
+    def test_plain_code_fence_json_recovered(self):
+        """JSON wrapped in plain ``` ... ``` fences is recovered."""
+        payload = {"verdict": "clean", "issues": [], "confidence": 0.95}
+        raw = f"```\n{json.dumps(payload)}\n```"
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "clean"
+
+    def test_prose_prefixed_json_recovered(self):
+        """JSON preceded by prose ('Here is my analysis: {...}') is recovered."""
+        payload = {"verdict": "fixable", "issues": ISSUES, "confidence": 0.7}
+        raw = f"Here is my analysis:\n{json.dumps(payload)}"
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "fixable"
+        assert result["issues"] == ISSUES
+
+    def test_truncated_json_with_verdict_literal_gives_verdict_only(self):
+        """Truncated JSON where full structure is unparseable but verdict is
+        visible falls back to regex recovery: issues=[], confidence=0.0."""
+        raw = '{"verdict": "fixable", "issues": [{"severity": "high", "note": "broken'
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "fixable"
+        assert result["issues"] == []
+        assert result["confidence"] == 0.0
+
+    def test_garbage_no_recognizable_verdict_returns_none(self):
+        """Completely unparseable input with no recognizable verdict → None."""
+        raw = "I could not complete the review due to an error. Please retry."
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is None
+
+    def test_brace_inside_string_does_not_close_object_early(self):
+        """Regression: a `}` inside a JSON string literal must not be treated
+        as the closing brace by the balanced-brace scan."""
+        payload = {"verdict": "fixable", "issues": [
+            {"severity": "high", "note": "saw `} oops` in code"},
+        ], "confidence": 0.6}
+        raw = f"Reviewer notes:\n{json.dumps(payload)}\ntrailing prose"
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "fixable"
+        assert result["issues"] == payload["issues"]
+        assert result["confidence"] == 0.6
+
+    def test_escaped_quote_in_string_does_not_break_scan(self):
+        """An escaped quote inside a string must not flip the in-string state
+        and let a subsequent `}` close the object early."""
+        payload = {"verdict": "clean", "issues": [
+            {"severity": "low", "note": 'has \\"quote\\" and } brace'},
+        ], "confidence": 0.9}
+        raw = f"prefix\n{json.dumps(payload)}"
+        result = pm_core._recover_reviewer_verdict(raw)
+        assert result is not None
+        assert result["verdict"] == "clean"
+
+    def test_encode_gpu_results_uses_recovery_on_bad_json(self):
+        """When reviewer output fails strict parse, _encode_gpu_results uses
+        recovery and tags the episodic entry with pm:reviewer:parse-recovered."""
+        record = {
+            "gpu_id": "gpu-recover1",
+            "spec_id": "spec-r",
+            "agent_type": "reviewer",
+            "intent": "review PR #42 cycle 1",
+            "repo": "myrepo",
+            "pr_number": 42,
+            "cycle": 1,
+            "status": "pending",
+        }
+        payload = {"verdict": "fixable", "issues": ISSUES, "confidence": 0.8}
+        # Wrap in prose to force json.loads failure, but balanced-brace scan recovers it
+        bad_json = f"Here is my analysis:\n{json.dumps(payload)}"
+
+        written_tags = []
+        written_content = []
+
+        def capture_write_result(target_id, content, extra_tags=None):
+            written_tags.extend(extra_tags or [])
+            written_content.append(content)
+            c = MagicMock()
+            c.id = "comment-recover"
+            return c
+
+        mock_path = MagicMock()
+        mock_path.read_text.return_value = bad_json
+        mock_path.parent = object()
+
+        with (
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[record]),
+            patch("lapis_pm.pm_core.save_dispatched"),
+            patch("lapis_pm.pm_core._gpu_output_path", return_value=mock_path),
+            patch("lapis_pm.pm_core._read_fixer_meta", return_value=None),
+            patch("lapis_pm.pm_core._consume_fixer_meta"),
+            patch("lapis_pm.pm_core.episodic.write_result",
+                  side_effect=capture_write_result),
+            patch("lapis_pm.pm_core.FAILED_DIR", object()),
+        ):
+            encoded, failed = pm_core._encode_gpu_results("tid")
+
+        assert encoded == 1
+        assert not failed
+        assert any("pm:reviewer:parse-recovered" in t for t in written_tags), \
+            f"parse-recovered tag missing from {written_tags}"
+        verdict_tags = [t for t in written_tags if "verdict=fixable" in t]
+        assert verdict_tags, f"Expected verdict=fixable tag in {written_tags}"
+
+    def test_encode_gpu_results_needs_human_on_unrecoverable(self):
+        """When recovery also fails, verdict stays needs-human and no
+        parse-recovered tag is emitted."""
+        record = {
+            "gpu_id": "gpu-garbage",
+            "spec_id": "spec-g",
+            "agent_type": "reviewer",
+            "intent": "review PR #42 cycle 1",
+            "repo": "myrepo",
+            "pr_number": 42,
+            "cycle": 1,
+            "status": "pending",
+        }
+        garbage = "Completely unparseable output with no verdict whatsoever!!!"
+
+        written_tags = []
+
+        def capture_write_result(target_id, content, extra_tags=None):
+            written_tags.extend(extra_tags or [])
+            c = MagicMock()
+            c.id = "comment-garbage"
+            return c
+
+        mock_path = MagicMock()
+        mock_path.read_text.return_value = garbage
+        mock_path.parent = object()
+
+        with (
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[record]),
+            patch("lapis_pm.pm_core.save_dispatched"),
+            patch("lapis_pm.pm_core._gpu_output_path", return_value=mock_path),
+            patch("lapis_pm.pm_core._read_fixer_meta", return_value=None),
+            patch("lapis_pm.pm_core._consume_fixer_meta"),
+            patch("lapis_pm.pm_core.episodic.write_result",
+                  side_effect=capture_write_result),
+            patch("lapis_pm.pm_core.FAILED_DIR", object()),
+        ):
+            encoded, failed = pm_core._encode_gpu_results("tid")
+
+        assert encoded == 1
+        assert not any("pm:reviewer:parse-recovered" in t for t in written_tags), \
+            f"Unexpected parse-recovered tag in {written_tags}"
+        verdict_tags = [t for t in written_tags if "verdict=needs-human" in t]
+        assert verdict_tags, f"Expected verdict=needs-human tag in {written_tags}"

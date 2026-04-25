@@ -955,7 +955,7 @@ def _encode_pr_sha_updates(target_id: str, open_prs: list[dict]) -> int:
 def _recover_reviewer_verdict(raw: str) -> dict | None:
     """Attempt to recover a reviewer verdict dict from malformed JSON.
 
-    Tries in order:
+    Recovery strategies tried in order:
     1. Strip code fences (``` or ```json) and re-parse. (Mostly redundant with
        the eager fence-strip in _encode_gpu_results' live path; retained so
        the helper is also useful when called directly.)

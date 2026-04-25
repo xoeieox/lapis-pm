@@ -301,6 +301,21 @@ def _encode_merged_prs(target_id: str, repo: str) -> int:
     return new_obs
 
 
+def _detect_pr_count_from_spec(spec_text: str) -> int:
+    """Count '^### PR \\d+' headers in spec; return max(count, 1). Regex-only, LLM-free."""
+    matches = re.findall(r"^### PR \d+(?=\s|$)", spec_text, re.MULTILINE)
+    return max(len(matches), 1)
+
+
+def _has_auto_land_waiting_comment(target_id: str, pr_count: int) -> bool:
+    """Return True if a pm:auto-land:waiting comment for this pr_count already exists."""
+    tag = f"pm:auto-land:waiting:count={pr_count}"
+    for c in episodic.all_comments(target_id):
+        if tag in c.tags:
+            return True
+    return False
+
+
 def _is_auto_land_eligible(target_id: str) -> bool:
     """Return True if this target meets all auto-land conditions.
 
@@ -309,6 +324,7 @@ def _is_auto_land_eligible(target_id: str) -> bool:
       - No pending dispatches
       - At least one merged PR is observed
       - The most recently seen PR is the merged one (no newer open PR)
+      - All declared PRs have merged (len(merged) >= target.pr_count)
       - The PR's head branch is deleted (or Forgejo unavailable, per proxy)
     Paused check is handled in tick() before this is reached.
     """
@@ -323,9 +339,20 @@ def _is_auto_land_eligible(target_id: str) -> bool:
     # Guard: a newer (higher-numbered) open PR must not exist
     if max(seen) != max(merged):
         return False
+    # Guard: all declared PRs must have merged
+    target = TargetStore().get(target_id)
+    required = target.data.get("pr_count", 1) if target else 1
+    if len(merged) < required:
+        # Emit one audit comment per (target_id, pr_count) tuple — de-dup by tag
+        if not _has_auto_land_waiting_comment(target_id, required):
+            episodic.write_observation(
+                target_id,
+                f"auto-land deferred: {len(merged)}/{required} PRs merged on lapis/{target_id}/*",
+                extra_tags=["pm:auto-land:waiting", f"pm:auto-land:waiting:count={required}"],
+            )
+        return False
     # Branch deletion check: confirm the PR's head branch is gone
     if _forgejo_get_pr is not None and _forgejo_get_branch is not None:
-        target = TargetStore().get(target_id)
         if target and target.pm_repo:
             try:
                 pr_data = _forgejo_get_pr(target.pm_repo, max(merged))

@@ -281,6 +281,26 @@ ARC_MTIME2=$(stat -c %Y "/srv/lapis/lapis-state/${TID_LAND4}.md")
 _cleanup_land_target "$TID_LAND4"
 green "auto-land idempotency OK"
 
+# --- Auto-land: closed-not-merged sibling does not block ----------------
+step "13. Auto-land: a newer closed-not-merged PR does not suppress landing"
+TID_LAND5="pm-smoke-land-closed-$$"
+_setup_land_target "$TID_LAND5"
+# Inject a newer (higher-numbered) PR that was closed without merging.
+/usr/bin/python3 -c "
+from agents_core.comments import CommentStore
+cs = CommentStore()
+cs.append('${TID_LAND5}', 'PR #100 opened in lapis-test: superseded fix', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr=100'])
+cs.append('${TID_LAND5}', 'PR #100 closed without merge at 2026-04-25T00:30:00', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr-closed:100', 'pm:pr=100'])
+"
+TICK_OUT5=$($LAPIS tick --target "$TID_LAND5")
+echo "$TICK_OUT5"
+echo "$TICK_OUT5" | grep -q "decision=auto_land:" || red "auto-land did not fire when newer PR is closed-not-merged"
+[ -f "/srv/lapis/lapis-state/${TID_LAND5}.md" ] || red "arc doc missing for ${TID_LAND5}"
+_cleanup_land_target "$TID_LAND5"
+green "closed-not-merged sibling does not block auto-land OK"
+
 # --- Done ----------------------------------------------------------------
 echo
 green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land all OK"

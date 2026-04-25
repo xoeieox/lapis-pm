@@ -244,12 +244,11 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
 # Auto-land helpers
 # ---------------------------------------------------------------------------
 
-def _merged_pr_numbers_observed(target_id: str) -> set[int]:
-    """PR numbers for which a pm:pr-merged observation has been recorded in episodic."""
+def _pr_numbers_with_tag_prefix(target_id: str, prefix: str) -> set[int]:
     out: set[int] = set()
     for c in episodic.all_comments(target_id):
         for t in c.tags:
-            if t.startswith("pm:pr-merged:"):
+            if t.startswith(prefix):
                 try:
                     out.add(int(t.split(":", 2)[2]))
                 except (ValueError, IndexError):
@@ -257,23 +256,40 @@ def _merged_pr_numbers_observed(target_id: str) -> set[int]:
     return out
 
 
-def _encode_merged_prs(target_id: str, repo: str) -> int:
-    """Check Forgejo for newly merged lapis PRs and write pm:pr-merged observations.
+def _merged_pr_numbers_observed(target_id: str) -> set[int]:
+    """PR numbers for which a pm:pr-merged observation has been recorded in episodic."""
+    return _pr_numbers_with_tag_prefix(target_id, "pm:pr-merged:")
 
-    Only calls get_pr for PR numbers not already noted. Returns count of new
-    observations written. Gracefully degrades when Forgejo is unavailable.
+
+def _closed_pr_numbers_observed(target_id: str) -> set[int]:
+    """PR numbers for which a pm:pr-closed observation has been recorded (closed-without-merge)."""
+    return _pr_numbers_with_tag_prefix(target_id, "pm:pr-closed:")
+
+
+def _encode_merged_prs(target_id: str, repo: str) -> int:
+    """Check Forgejo for newly merged or closed lapis PRs and write observations.
+
+    Writes pm:pr-merged:<n> for merged PRs and pm:pr-closed:<n> for closed-
+    without-merge PRs. Only calls get_pr for PR numbers not already noted in
+    either bucket, so closed PRs aren't re-queried every tick. Returns the
+    count of new observations written. Gracefully degrades when Forgejo is
+    unavailable.
     """
     if not repo or not _forgejo_get_pr:
         return 0
     seen = _seen_pr_ids(target_id)
-    already_noted = _merged_pr_numbers_observed(target_id)
+    already_noted = _merged_pr_numbers_observed(target_id) | _closed_pr_numbers_observed(target_id)
     new_obs = 0
     for pr_num in sorted(seen - already_noted):
         try:
             pr_data = _forgejo_get_pr(repo, pr_num)
         except Exception:
             continue
-        if pr_data.get("merged") and pr_data.get("state") == "closed":
+        state = pr_data.get("state")
+        if state != "closed":
+            # Still open (or unknown) — leave it for a future tick.
+            continue
+        if pr_data.get("merged"):
             merged_at = pr_data.get("merged_at") or _now_iso()
             head_sha = (pr_data.get("head") or {}).get("sha", "")
             episodic.write_observation(
@@ -281,7 +297,14 @@ def _encode_merged_prs(target_id: str, repo: str) -> int:
                 f"PR #{pr_num} merged at {merged_at}, head_sha={head_sha}",
                 extra_tags=[f"pm:pr-merged:{pr_num}", f"pm:pr={pr_num}"],
             )
-            new_obs += 1
+        else:
+            closed_at = pr_data.get("closed_at") or _now_iso()
+            episodic.write_observation(
+                target_id,
+                f"PR #{pr_num} closed without merge at {closed_at}",
+                extra_tags=[f"pm:pr-closed:{pr_num}", f"pm:pr={pr_num}"],
+            )
+        new_obs += 1
     return new_obs
 
 
@@ -292,7 +315,7 @@ def _is_auto_land_eligible(target_id: str) -> bool:
       - No pm/landed/<tid> entry already exists
       - No pending dispatches
       - At least one merged PR is observed
-      - The most recently seen PR is the merged one (no newer open PR)
+      - No seen PR is still open (every seen PR is either merged or closed-without-merge)
     Paused check is handled in tick() before this is reached.
     """
     if _mem().get(_landed_key(target_id)):
@@ -303,8 +326,10 @@ def _is_auto_land_eligible(target_id: str) -> bool:
     merged = _merged_pr_numbers_observed(target_id)
     if not merged or not seen:
         return False
-    # Guard: a newer (higher-numbered) open PR must not exist
-    if max(seen) != max(merged):
+    closed = _closed_pr_numbers_observed(target_id)
+    # Any seen PR that is neither merged nor closed-without-merge is still
+    # open (or its state hasn't been queried yet) — wait for it to resolve.
+    if seen - merged - closed:
         return False
     return True
 

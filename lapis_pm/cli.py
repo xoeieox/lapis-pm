@@ -331,12 +331,10 @@ def cmd_land(args) -> int:
     # the landed target stops appearing in tick loops and `lapis-pm status`.
     # Previously land stopped after writing the arc doc, leaving
     # pm_bound=True + stale cursor/dispatched/brief entries indefinitely.
-    import json as _json
-    from agents_core.mem import MemoryStore as _MemoryStore
-    _MemoryStore().set(
+    pm_core._mem().set(
         pm_core._landed_key(args.target_id),
-        _json.dumps({"manual": True, "ts": pm_core._now_iso(),
-                     "arc_path": str(path)}),
+        json.dumps({"manual": True, "ts": pm_core._now_iso(),
+                    "arc_path": str(path)}),
         tags=["lapis-pm", "landed"],
     )
     store.archive(args.target_id)          # sets status=archived + saves

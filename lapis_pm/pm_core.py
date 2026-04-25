@@ -26,11 +26,12 @@ from agents_core.targets import TargetStore
 from agents_core.mem import MemoryStore
 
 try:
-    from agents_core.forgejo import get_open_prs, merge_pr, get_pr as _forgejo_get_pr
+    from agents_core.forgejo import get_open_prs, merge_pr, get_pr as _forgejo_get_pr, get_branch as _forgejo_get_branch
 except Exception:
     get_open_prs = None  # type: ignore
     merge_pr = None  # type: ignore
     _forgejo_get_pr = None  # type: ignore
+    _forgejo_get_branch = None  # type: ignore
 
 from . import episodic, shaper, brief, authority
 
@@ -244,11 +245,12 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
 # Auto-land helpers
 # ---------------------------------------------------------------------------
 
-def _pr_numbers_with_tag_prefix(target_id: str, prefix: str) -> set[int]:
+def _merged_pr_numbers_observed(target_id: str) -> set[int]:
+    """PR numbers for which a pm:pr-merged observation has been recorded in episodic."""
     out: set[int] = set()
     for c in episodic.all_comments(target_id):
         for t in c.tags:
-            if t.startswith(prefix):
+            if t.startswith("pm:pr-merged:"):
                 try:
                     out.add(int(t.split(":", 2)[2]))
                 except (ValueError, IndexError):
@@ -256,40 +258,38 @@ def _pr_numbers_with_tag_prefix(target_id: str, prefix: str) -> set[int]:
     return out
 
 
-def _merged_pr_numbers_observed(target_id: str) -> set[int]:
-    """PR numbers for which a pm:pr-merged observation has been recorded in episodic."""
-    return _pr_numbers_with_tag_prefix(target_id, "pm:pr-merged:")
+def _merged_at_for_pr(target_id: str, pr_num: int) -> str:
+    """Return the actual Forgejo merged_at timestamp for *pr_num* from episodic.
 
-
-def _closed_pr_numbers_observed(target_id: str) -> set[int]:
-    """PR numbers for which a pm:pr-closed observation has been recorded (closed-without-merge)."""
-    return _pr_numbers_with_tag_prefix(target_id, "pm:pr-closed:")
+    Falls back to _now_iso() if the observation is missing (shouldn't happen
+    in practice, but keeps _act_auto_land safe on retry after partial failure).
+    """
+    tag = f"pm:pr-merged:{pr_num}"
+    for c in episodic.all_comments(target_id):
+        if tag in c.tags:
+            m = re.search(r"merged at (\S+),", c.content)
+            if m:
+                return m.group(1)
+    return _now_iso()
 
 
 def _encode_merged_prs(target_id: str, repo: str) -> int:
-    """Check Forgejo for newly merged or closed lapis PRs and write observations.
+    """Check Forgejo for newly merged lapis PRs and write pm:pr-merged observations.
 
-    Writes pm:pr-merged:<n> for merged PRs and pm:pr-closed:<n> for closed-
-    without-merge PRs. Only calls get_pr for PR numbers not already noted in
-    either bucket, so closed PRs aren't re-queried every tick. Returns the
-    count of new observations written. Gracefully degrades when Forgejo is
-    unavailable.
+    Only calls get_pr for PR numbers not already noted. Returns count of new
+    observations written. Gracefully degrades when Forgejo is unavailable.
     """
     if not repo or not _forgejo_get_pr:
         return 0
     seen = _seen_pr_ids(target_id)
-    already_noted = _merged_pr_numbers_observed(target_id) | _closed_pr_numbers_observed(target_id)
+    already_noted = _merged_pr_numbers_observed(target_id)
     new_obs = 0
     for pr_num in sorted(seen - already_noted):
         try:
             pr_data = _forgejo_get_pr(repo, pr_num)
         except Exception:
             continue
-        state = pr_data.get("state")
-        if state != "closed":
-            # Still open (or unknown) — leave it for a future tick.
-            continue
-        if pr_data.get("merged"):
+        if pr_data.get("merged") and pr_data.get("state") == "closed":
             merged_at = pr_data.get("merged_at") or _now_iso()
             head_sha = (pr_data.get("head") or {}).get("sha", "")
             episodic.write_observation(
@@ -297,14 +297,7 @@ def _encode_merged_prs(target_id: str, repo: str) -> int:
                 f"PR #{pr_num} merged at {merged_at}, head_sha={head_sha}",
                 extra_tags=[f"pm:pr-merged:{pr_num}", f"pm:pr={pr_num}"],
             )
-        else:
-            closed_at = pr_data.get("closed_at") or _now_iso()
-            episodic.write_observation(
-                target_id,
-                f"PR #{pr_num} closed without merge at {closed_at}",
-                extra_tags=[f"pm:pr-closed:{pr_num}", f"pm:pr={pr_num}"],
-            )
-        new_obs += 1
+            new_obs += 1
     return new_obs
 
 
@@ -315,7 +308,8 @@ def _is_auto_land_eligible(target_id: str) -> bool:
       - No pm/landed/<tid> entry already exists
       - No pending dispatches
       - At least one merged PR is observed
-      - No seen PR is still open (every seen PR is either merged or closed-without-merge)
+      - The most recently seen PR is the merged one (no newer open PR)
+      - The PR's head branch is deleted (or Forgejo unavailable, per proxy)
     Paused check is handled in tick() before this is reached.
     """
     if _mem().get(_landed_key(target_id)):
@@ -326,11 +320,25 @@ def _is_auto_land_eligible(target_id: str) -> bool:
     merged = _merged_pr_numbers_observed(target_id)
     if not merged or not seen:
         return False
-    closed = _closed_pr_numbers_observed(target_id)
-    # Any seen PR that is neither merged nor closed-without-merge is still
-    # open (or its state hasn't been queried yet) — wait for it to resolve.
-    if seen - merged - closed:
+    # Guard: a newer (higher-numbered) open PR must not exist
+    if max(seen) != max(merged):
         return False
+    # Branch deletion check: confirm the PR's head branch is gone
+    if _forgejo_get_pr is not None and _forgejo_get_branch is not None:
+        target = TargetStore().get(target_id)
+        if target and target.pm_repo:
+            try:
+                pr_data = _forgejo_get_pr(target.pm_repo, max(merged))
+                head_ref = (pr_data.get("head") or {}).get("ref", "")
+                if head_ref:
+                    try:
+                        _forgejo_get_branch(target.pm_repo, head_ref)
+                        # Branch still exists — not yet eligible
+                        return False
+                    except Exception:
+                        pass  # 404 or network error → treat as deleted
+            except Exception:
+                pass  # Forgejo unavailable → fall through to merge-status proxy
     return True
 
 
@@ -353,7 +361,8 @@ def _act_auto_land(target_id: str) -> str:
 
     merged = _merged_pr_numbers_observed(target_id)
     pr_num = max(merged) if merged else 0
-    merged_at = _now_iso()
+    merged_at = _merged_at_for_pr(target_id, pr_num)
+    landed_at = _now_iso()
 
     # 1. Generate and write arc doc (idempotent on retry)
     arc = land_module.generate_arc_doc(target_id)
@@ -363,7 +372,7 @@ def _act_auto_land(target_id: str) -> str:
     _mem().set(
         _landed_key(target_id),
         json.dumps({"pr_num": pr_num, "merged_at": merged_at,
-                    "ts": _now_iso(), "arc_path": str(path)}),
+                    "landed_at": landed_at, "arc_path": str(path)}),
         tags=["lapis-pm", "landed"],
     )
 

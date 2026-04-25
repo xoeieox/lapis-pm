@@ -26,10 +26,12 @@ from agents_core.targets import TargetStore
 from agents_core.mem import MemoryStore
 
 try:
-    from agents_core.forgejo import get_open_prs, merge_pr
+    from agents_core.forgejo import get_open_prs, merge_pr, get_pr as _forgejo_get_pr, get_branch as _forgejo_get_branch
 except Exception:
     get_open_prs = None  # type: ignore
     merge_pr = None  # type: ignore
+    _forgejo_get_pr = None  # type: ignore
+    _forgejo_get_branch = None  # type: ignore
 
 from . import episodic, shaper, brief, authority
 
@@ -162,6 +164,10 @@ def get_outstanding_brief(target_id: str) -> str | None:
     return rec["content"] if rec else None
 
 
+def _landed_key(target_id: str) -> str:
+    return f"pm/landed/{target_id}"
+
+
 def _classified_pr_ids(target_id: str) -> set[int]:
     """PR numbers that have already been classified (hold/advisory/merge) this target."""
     rec = _mem().get(_classified_prs_key(target_id))
@@ -233,6 +239,160 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
     summary["dispatched_pending"] = len(pending)
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Auto-land helpers
+# ---------------------------------------------------------------------------
+
+def _merged_pr_numbers_observed(target_id: str) -> set[int]:
+    """PR numbers for which a pm:pr-merged observation has been recorded in episodic."""
+    out: set[int] = set()
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith("pm:pr-merged:"):
+                try:
+                    out.add(int(t.split(":", 2)[2]))
+                except (ValueError, IndexError):
+                    pass
+    return out
+
+
+def _merged_at_for_pr(target_id: str, pr_num: int) -> str:
+    """Return the actual Forgejo merged_at timestamp for *pr_num* from episodic.
+
+    Falls back to _now_iso() if the observation is missing (shouldn't happen
+    in practice, but keeps _act_auto_land safe on retry after partial failure).
+    """
+    tag = f"pm:pr-merged:{pr_num}"
+    for c in episodic.all_comments(target_id):
+        if tag in c.tags:
+            m = re.search(r"merged at (\S+),", c.content)
+            if m:
+                return m.group(1)
+    return _now_iso()
+
+
+def _encode_merged_prs(target_id: str, repo: str) -> int:
+    """Check Forgejo for newly merged lapis PRs and write pm:pr-merged observations.
+
+    Only calls get_pr for PR numbers not already noted. Returns count of new
+    observations written. Gracefully degrades when Forgejo is unavailable.
+    """
+    if not repo or not _forgejo_get_pr:
+        return 0
+    seen = _seen_pr_ids(target_id)
+    already_noted = _merged_pr_numbers_observed(target_id)
+    new_obs = 0
+    for pr_num in sorted(seen - already_noted):
+        try:
+            pr_data = _forgejo_get_pr(repo, pr_num)
+        except Exception:
+            continue
+        if pr_data.get("merged") and pr_data.get("state") == "closed":
+            merged_at = pr_data.get("merged_at") or _now_iso()
+            head_sha = (pr_data.get("head") or {}).get("sha", "")
+            episodic.write_observation(
+                target_id,
+                f"PR #{pr_num} merged at {merged_at}, head_sha={head_sha}",
+                extra_tags=[f"pm:pr-merged:{pr_num}", f"pm:pr={pr_num}"],
+            )
+            new_obs += 1
+    return new_obs
+
+
+def _is_auto_land_eligible(target_id: str) -> bool:
+    """Return True if this target meets all auto-land conditions.
+
+    Conditions (all must hold):
+      - No pm/landed/<tid> entry already exists
+      - No pending dispatches
+      - At least one merged PR is observed
+      - The most recently seen PR is the merged one (no newer open PR)
+      - The PR's head branch is deleted (or Forgejo unavailable, per proxy)
+    Paused check is handled in tick() before this is reached.
+    """
+    if _mem().get(_landed_key(target_id)):
+        return False
+    if _has_pending_dispatch(target_id):
+        return False
+    seen = _seen_pr_ids(target_id)
+    merged = _merged_pr_numbers_observed(target_id)
+    if not merged or not seen:
+        return False
+    # Guard: a newer (higher-numbered) open PR must not exist
+    if max(seen) != max(merged):
+        return False
+    # Branch deletion check: confirm the PR's head branch is gone
+    if _forgejo_get_pr is not None and _forgejo_get_branch is not None:
+        target = TargetStore().get(target_id)
+        if target and target.pm_repo:
+            try:
+                pr_data = _forgejo_get_pr(target.pm_repo, max(merged))
+                head_ref = (pr_data.get("head") or {}).get("ref", "")
+                if head_ref:
+                    try:
+                        _forgejo_get_branch(target.pm_repo, head_ref)
+                        # Branch still exists — not yet eligible
+                        return False
+                    except Exception:
+                        pass  # 404 or network error → treat as deleted
+            except Exception:
+                pass  # Forgejo unavailable → fall through to merge-status proxy
+    return True
+
+
+def _spec_bound_ts(target_id: str) -> str:
+    """Return ts of the spec:bound comment (proxy for bind time); used for sorting."""
+    for c in episodic.all_comments(target_id):
+        if episodic.TAG_SPEC in c.tags:
+            return c.ts
+    return "9999-99-99"  # unbound targets sort last
+
+
+def _act_auto_land(target_id: str) -> str:
+    """Perform automatic landing: arc doc + archive + unbind + mem cleanup.
+
+    Writes pm/landed/<tid> BEFORE unbinding so any partial failure between
+    the mem write and unbind is observable and the target can be manually
+    completed. The arc doc write is idempotent (overwrites on retry).
+    """
+    from . import land as land_module
+
+    merged = _merged_pr_numbers_observed(target_id)
+    pr_num = max(merged) if merged else 0
+    merged_at = _merged_at_for_pr(target_id, pr_num)
+    landed_at = _now_iso()
+
+    # 1. Generate and write arc doc (idempotent on retry)
+    arc = land_module.generate_arc_doc(target_id)
+    path = land_module.write_arc_doc(arc)
+
+    # 2. Write pm/landed/<tid> — commit marker (must succeed before unbind)
+    _mem().set(
+        _landed_key(target_id),
+        json.dumps({"pr_num": pr_num, "merged_at": merged_at,
+                    "landed_at": landed_at, "arc_path": str(path)}),
+        tags=["lapis-pm", "landed"],
+    )
+
+    # 3. Audit comment in the target JSONL (spec-required format)
+    episodic.write(
+        target_id,
+        f"auto-landed: PR #{pr_num} merged at {merged_at}, "
+        f"branch deleted, no pending dispatches. arc={path}",
+        tags=["pm:auto-land"],
+    )
+
+    # 4. Archive + unbind + clear mem state
+    store = TargetStore()
+    store.archive(target_id)
+    target = store.get(target_id)
+    target.unbind_pm()
+    target.save()
+    clear_landed_state(target_id)
+
+    return f"auto_land:pr={pr_num}:arc={path}"
 
 
 # ---------------------------------------------------------------------------
@@ -1196,7 +1356,7 @@ class TickResult:
     decision: str         # the action taken or "noop"
 
 
-def tick(target_id: str) -> TickResult:
+def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     store = TargetStore()
     target = store.get(target_id)
     if target is None:
@@ -1242,6 +1402,10 @@ def tick(target_id: str) -> TickResult:
 
     gpu_encoded, failed_dispatches = _encode_gpu_results(target_id)
     encoded += gpu_encoded
+
+    # Check Forgejo for newly merged PRs and write pm:pr-merged observations.
+    # This is bookkeeping (encoding), not action — safe to do before decide.
+    encoded += _encode_merged_prs(target_id, repo)
 
     # 4. Decide (priority order, single action)
     decision_str = "noop"
@@ -1311,20 +1475,37 @@ def tick(target_id: str) -> TickResult:
             set_outstanding_brief(target_id, b.comment_id)
             decision_str = f"abandon_brief:{b.comment_id}"
 
+    elif allow_auto_land and _is_auto_land_eligible(target_id):
+        decision_str = _act_auto_land(target_id)
+
     # 5. Advance cursor to now (we've considered everything as of this tick).
     set_cursor(target_id, _now_iso())
     return TickResult(target_id, False, "ok", encoded, decision_str)
 
 
 def tick_all() -> list[TickResult]:
-    """Tick every pm_bound target. Returns one TickResult per target."""
+    """Tick every pm_bound target. Returns one TickResult per target.
+
+    At most one auto-land fires per tick_all call. When multiple targets are
+    land-eligible, the oldest-bound (earliest spec:bound comment) is chosen;
+    others have auto-land suppressed and become eligible next tick.
+    """
     store = TargetStore()
+    bound = [t for t in store.load_all() if t.pm_bound]
+
+    # Pre-select which target (if any) gets the auto-land slot this tick.
+    # This check uses observations from previous ticks; targets that become
+    # eligible for the first time this tick are deferred to the next tick.
+    eligible_ids = sorted(
+        [t.id for t in bound if _is_auto_land_eligible(t.id)],
+        key=_spec_bound_ts,
+    )
+    auto_land_chosen = eligible_ids[0] if eligible_ids else None
+
     results: list[TickResult] = []
-    for t in store.load_all():
-        if not t.pm_bound:
-            continue
+    for t in bound:
         try:
-            results.append(tick(t.id))
+            results.append(tick(t.id, allow_auto_land=(t.id == auto_land_chosen)))
         except Exception as e:
             # Advance cursor even on exception so the same percepts don't get
             # re-encoded as duplicate observations on the next tick.

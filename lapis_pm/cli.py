@@ -42,6 +42,7 @@ def _read_spec(source: str) -> str:
     return Path(source).read_text()
 
 
+
 def _derive_tags(repo: str, target_id: str, extra_tags: list[str]) -> list[str]:
     """Build tag list: repo name first, then extra --tag flags. Deduped, insertion order."""
     seen: dict[str, None] = {}
@@ -100,6 +101,24 @@ def cmd_bind(args) -> int:
     if not spec_body:
         print("ERROR: empty spec body", file=sys.stderr)
         return 2
+
+    # Resolve pr_count: explicit flag > auto-detect (on --create) > preserve existing
+    pr_count = getattr(args, "pr_count", None)
+    if pr_count is not None:
+        if pr_count < 1:
+            print("ERROR: --pr-count must be >= 1", file=sys.stderr)
+            return 2
+        if not args.create and target.data.get("pr_count", 1) != pr_count and not args.force:
+            print(
+                f"ERROR: --pr-count {pr_count} differs from existing pr_count "
+                f"{target.data.get('pr_count', 1)}. Use --force to override.",
+                file=sys.stderr,
+            )
+            return 2
+        target.data["pr_count"] = pr_count
+    elif args.create:
+        detected = pm_core._detect_pr_count_from_spec(spec_body)
+        target.data["pr_count"] = detected
 
     target.bind_pm(repo=args.repo, authority=args.authority)
     target.save()
@@ -389,6 +408,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--tag", action="append", default=[], metavar="TAG",
                    help="Add a tag (repeatable; repo name always included)")
     b.add_argument("--product", default="", help="Product name (e.g. 'Archetypal Intelligence')")
+    b.add_argument("--pr-count", dest="pr_count", type=int, default=None, metavar="N",
+                   help="Number of PRs that must merge before auto-land fires (>= 1). "
+                        "With --create and no --pr-count: auto-detected from '### PR N' headers.")
     b.set_defaults(func=cmd_bind)
 
     u = sub.add_parser("unbind", help="Remove PM binding from a target.")

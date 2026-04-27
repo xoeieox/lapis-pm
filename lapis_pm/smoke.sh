@@ -281,6 +281,133 @@ ARC_MTIME2=$(stat -c %Y "/srv/lapis/lapis-state/${TID_LAND4}.md")
 _cleanup_land_target "$TID_LAND4"
 green "auto-land idempotency OK"
 
+# =========================================================================
+# Multi-PR auto-land guard smoke tests (lapis-pm-auto-land-multipr-guard)
+# =========================================================================
+
+# --- Auto-land: multi-PR positive case -----------------------------------
+step "13. Multi-PR guard: pr_count=2, one PR merged → noop; second merged → auto-land fires"
+TID_MULTI="pm-smoke-multi-$$"
+MULTI_SPEC="/tmp/${TID_MULTI}-spec.md"
+cat > "$MULTI_SPEC" <<EOF
+# Multi-PR smoke spec
+
+### PR 1
+First PR details.
+
+### PR 2
+Second PR details.
+EOF
+
+# Create target + bind with --pr-count 2 (explicit)
+cat > "$TARGETS_DIR/${TID_MULTI}.yaml" <<EOF
+id: ${TID_MULTI}
+title: Multi-PR smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Multi-PR guard smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_MULTI" --spec-from "$MULTI_SPEC" --repo lapis-test --authority advisory --pr-count 2
+
+# Simulate PR #1 opened and merged only
+/usr/bin/python3 -c "
+from agents_core.comments import CommentStore
+cs = CommentStore()
+cs.append('${TID_MULTI}', 'PR #1 opened in lapis-test', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr=1'])
+cs.append('${TID_MULTI}', 'PR #1 merged at 2026-04-25T00:00:00, head_sha=aaa111', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr-merged:1', 'pm:pr=1'])
+"
+
+# Tick 1: only 1/2 PRs merged → no auto-land, pm:auto-land:waiting emitted
+TICK_MULTI1=$($LAPIS tick --target "$TID_MULTI")
+echo "$TICK_MULTI1"
+! echo "$TICK_MULTI1" | grep -q "decision=auto_land:" || red "multi-PR: auto-land should NOT fire after 1/2 merged"
+[ ! -f "/srv/lapis/lapis-state/${TID_MULTI}.md" ] || red "arc doc should not exist after 1/2 PRs merged"
+grep -q '"pm:auto-land:waiting"' "$COMMENTS_DIR/${TID_MULTI}.jsonl" \
+    || red "pm:auto-land:waiting audit comment not written after 1/2"
+
+# Tick 2 (still 1/2): waiting comment NOT written again (de-dup)
+LINES_BEFORE=$(wc -l < "$COMMENTS_DIR/${TID_MULTI}.jsonl")
+$LAPIS tick --target "$TID_MULTI" >/dev/null
+LINES_AFTER=$(wc -l < "$COMMENTS_DIR/${TID_MULTI}.jsonl")
+[ "$LINES_BEFORE" -eq "$LINES_AFTER" ] \
+    || red "pm:auto-land:waiting was emitted again on second tick (de-dup failed)"
+
+# Simulate PR #2 opened and merged
+/usr/bin/python3 -c "
+from agents_core.comments import CommentStore
+cs = CommentStore()
+cs.append('${TID_MULTI}', 'PR #2 opened in lapis-test', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr=2'])
+cs.append('${TID_MULTI}', 'PR #2 merged at 2026-04-25T01:00:00, head_sha=bbb222', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr-merged:2', 'pm:pr=2'])
+"
+
+# Tick 3: 2/2 PRs merged → auto-land fires
+TICK_MULTI3=$($LAPIS tick --target "$TID_MULTI")
+echo "$TICK_MULTI3"
+echo "$TICK_MULTI3" | grep -q "decision=auto_land:" || red "multi-PR: auto-land did not fire after 2/2 merged"
+[ -f "/srv/lapis/lapis-state/${TID_MULTI}.md" ] || red "arc doc not written after 2/2 PRs merged"
+
+# Cleanup
+rm -f "$TARGETS_DIR/${TID_MULTI}.yaml" "$COMMENTS_DIR/${TID_MULTI}.jsonl" "$MULTI_SPEC"
+rm -f "/srv/lapis/lapis-state/${TID_MULTI}.md"
+/usr/local/bin/mem delete "pm/cursor/${TID_MULTI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_MULTI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_MULTI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_MULTI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_MULTI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/landed/${TID_MULTI}" 2>/dev/null || true
+green "multi-PR guard: 1/2→noop+waiting, de-dup, 2/2→auto-land all OK"
+
+# --- Auto-detect: bind --create infers pr_count from spec headers ---------
+step "14. Auto-detect: bind --create with ### PR N headers sets pr_count automatically"
+TID_AUTODET="pm-smoke-autodet-$$"
+AUTODET_SPEC="/tmp/${TID_AUTODET}-spec.md"
+cat > "$AUTODET_SPEC" <<EOF
+# Auto-detect spec
+
+### PR 1
+First.
+
+### PR 2
+Second.
+EOF
+
+# Bind with --create, no --pr-count → auto-detect should find 2
+$LAPIS bind "$TID_AUTODET" \
+    --spec-from "$AUTODET_SPEC" \
+    --repo lapis-test \
+    --authority advisory \
+    --create \
+    --title "Auto-detect target"
+
+/usr/bin/python3 -c "
+import yaml
+from pathlib import Path
+data = yaml.safe_load(Path('$TARGETS_DIR/${TID_AUTODET}.yaml').read_text())
+pr_count = data.get('pr_count', 1)
+assert pr_count == 2, f'Expected pr_count=2, got {pr_count}'
+print(f'pr_count={pr_count} ✓')
+" || red "auto-detect: pr_count not set to 2 in target YAML"
+
+# Cleanup
+rm -f "$TARGETS_DIR/${TID_AUTODET}.yaml" "$COMMENTS_DIR/${TID_AUTODET}.jsonl" "$AUTODET_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_AUTODET}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_AUTODET}" 2>/dev/null || true
+green "auto-detect: pr_count=2 set from ### PR N headers OK"
+
 # --- Done ----------------------------------------------------------------
 echo
 green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land all OK"

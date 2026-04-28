@@ -24,11 +24,13 @@ synthesizes an arc doc at `/srv/lapis/lapis-state/<tid>.md` (RoomRAG-indexed).
 - **Episodic memory adapter** — `episodic.py`: wraps the shared CommentStore
   with PM-specific tagging, 5-factor recall, and classification of events
   into encoding-trigger categories.
-- **Shaped-agent dispatch** — `shaper.py` + `registry.yaml`: composes a
-  chub-enriched system prompt + user prompt, writes a spec JSON, submits
-  a GPU queue subprocess task whose command runs `lapis_pm._runner` against
-  the spec. `_runner.py` invokes `agents_core.llm.call_claude_cli` and
-  emits output + confabulation meta-sidecar.
+- **Shaped-agent dispatch** — `agents_core.shaper.Shaper` + `registry.yaml`:
+  composes a chub-enriched system prompt + user prompt, writes a spec JSON,
+  submits a queue subprocess task whose command runs
+  `python3 -m agents_core.shaped_runner` against the spec.
+  `agents_core.shaped_runner` invokes `agents_core.llm.call_claude_cli` and
+  emits output + confabulation meta-sidecar. (Moved from `lapis_pm/shaper.py`
+  + `_runner.py` → `agents_core` 2026-04-28.)
 - **Authority gate** — `authority.py`: classifies PRs against held paths,
   size, CI gates, and a Sonnet verdict (`call_claude_cli` with `json_mode`).
 - **Briefs** — `brief.py`: Haiku-based synthesis from spec + recent PM
@@ -59,15 +61,16 @@ synthesizes an arc doc at `/srv/lapis/lapis-state/<tid>.md` (RoomRAG-indexed).
 ## Known couplings (tracked as follow-ups)
 
 1. **chub_broker** still lives at `/data/agents/scripts/chub_broker.py`.
-   `shaper.py` adds `/data/agents/scripts` to `sys.path` at module top to
-   find it. Removing this shim requires either (a) moving `chub_broker`
+   `agents_core.shaper` adds `/data/agents/scripts` to `sys.path` at module
+   top to find it. Removing this shim requires either (a) moving `chub_broker`
    into `agents-core`, or (b) publishing a `chub_broker`-compatible
    package in the chub repo. Tracked in the agents-core migration plan.
 
-2. **lapis_pm.shaper writes to `/srv/lapis/gpu-queue/shaped/`** — the GPU queue
-   runner (in conductor) reads from this path to execute `_runner.py`.
-   This is shared on-disk state, not a Python coupling, and is intentional
-   (GPU queue tasks are filesystem-orchestrated).
+2. **agents_core.shaper writes to `/srv/lapis/gpu-queue/shaped/`** — the GPU queue
+   runner (in conductor) reads from this path to execute
+   `python3 -m agents_core.shaped_runner`. This is shared on-disk state, not
+   a Python coupling, and is intentional (GPU queue tasks are
+   filesystem-orchestrated).
 
 3. **Ops-layer integration** — `agents_core.gpu.GPUQueue.submit` probes
    `intention_registry` via `sys.path` when available. lapis-pm benefits

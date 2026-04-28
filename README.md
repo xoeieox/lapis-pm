@@ -61,8 +61,6 @@ lapis_pm/
 ├── cli.py              CLI dispatch (bind, tick, land, status, ...)
 ├── pm_core.py          perceive → score → encode → decide → act loop
 ├── episodic.py         CommentStore adapter (5-factor recall, tag taxonomy)
-├── shaper.py           shaped-agent dispatch via GPU queue + registry.yaml
-├── _runner.py          subprocess target for shaped-agent GPU tasks
 ├── authority.py        PR classification: auto / advisory / hold
 ├── brief.py            pm:brief synthesis + Pushover delivery
 ├── land.py             arc-doc synthesis to /srv/lapis/lapis-state/<tid>.md
@@ -79,6 +77,7 @@ CLAUDE.md                role spec for PM-shaped sessions in this repo
 - `agents-core` — shared primitives (llm, forgejo, notify, targets, comments, gpu, mem)
 - `pyyaml` — registry.yaml parsing
 
-`shaper.py` has a runtime dep on `chub_broker`, which still lives in
+`agents_core.shaper` (now the canonical shaper — promoted from `lapis_pm/shaper.py`
+2026-04-28) has a runtime dep on `chub_broker`, which still lives in
 `/data/agents/scripts/` (deferred from agents-core day-one scope). See
 `SPEC.md` § "Known couplings".

@@ -41,6 +41,8 @@ shared_preamble: |
 agents:
   reviewer:
     chub_bundles: []
+    capture_meta: false
+    notify: true
     system_template: |
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
@@ -74,6 +76,8 @@ agents:
 
   reviewer_fresh:
     chub_bundles: []
+    capture_meta: false
+    notify: false
     system_template: |
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
@@ -110,6 +114,8 @@ agents:
 
   fixer:
     chub_bundles: []
+    capture_meta: true
+    notify: true
     system_template: |
       You are a fix agent for repo {repo}, working on target {target_id}.
 
@@ -150,6 +156,8 @@ agents:
 
   fixer_retry:
     chub_bundles: []
+    capture_meta: false
+    notify: false
     system_template: |
       You are a fix agent for repo {repo}, working on target {target_id}.
       This is a RETRY to fix reviewer-flagged issues on an existing PR.
@@ -194,6 +202,8 @@ agents:
 
   scout:
     chub_bundles: []
+    capture_meta: false
+    notify: false
     system_template: |
       You are a scout for repo {repo}.
 

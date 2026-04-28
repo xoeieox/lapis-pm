@@ -522,12 +522,18 @@ def _last_review_verdict(target_id: str, pr_number: int) -> dict | None:
 
 
 def _fixer_retry_count(target_id: str, pr_number: int) -> int:
-    """Count completed fixer_retry dispatches for this PR via dispatch records."""
+    """Count fixer_retry dispatches that actually advanced the PR for this PR.
+
+    Only `status == "processed"` records count — those are the dispatches the
+    SHA-advance perceiver (~pm_core.py _perceive_pr_sha_advance) has confirmed
+    pushed code. Failed dispatches did not push, so they do not advance cycle
+    accounting.
+    """
     return sum(
         1 for r in load_dispatched(target_id)
         if r.get("agent_type") == "fixer_retry"
         and r.get("pr_number") == pr_number
-        and r.get("status") in ("processed", "failed")
+        and r.get("status") == "processed"
     )
 
 
@@ -1448,6 +1454,15 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         t = terminal.get(gpu_id)
         if t is None:
             continue
+
+        # fixer_retry carve-out: SHA-advance perception is the sole authority
+        # for fixer_retry → processed. If the queue says "completed" for a
+        # fixer_retry, we leave the record as pending — the SHA-advance
+        # perceiver will flip it when it confirms the PR head advanced.
+        # Failed flips for fixer_retry are still permitted (the job crashed or
+        # was rejected; that doesn't advance the cycle regardless).
+        if rec.get("agent_type") == "fixer_retry" and t["state"] == "processed":
+            continue  # SHA-advance perceiver owns fixer_retry → processed
 
         # Flip the record to the terminal state.
         rec["status"] = t["state"]

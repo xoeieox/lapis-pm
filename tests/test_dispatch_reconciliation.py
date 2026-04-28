@@ -3,9 +3,13 @@
 Coverage per spec:
   - pending dispatch + queue failed entry matching gpu_id → flipped to failed
   - pending dispatch + queue completed entry matching gpu_id → flipped to processed
+    (non-fixer_retry only — fixer_retry completed is left pending per carve-out)
   - pending dispatch + no matching queue entry → left as pending (no-op)
   - already-failed dispatch + matching queue failed entry → left untouched
   - audit comment written exactly once per flip (de-dup: second call writes nothing)
+  - fixer_retry carve-out: queue completed → stays pending (SHA-advance owns processed)
+  - fixer_retry carve-out: queue failed → still flipped to failed
+  - non-fixer_retry (fixer): queue completed → flipped to processed (regression)
 """
 
 from __future__ import annotations
@@ -116,9 +120,13 @@ def test_pending_flips_to_failed_on_queue_failure():
 # ---------------------------------------------------------------------------
 
 def test_pending_flips_to_processed_on_queue_completion():
-    """Pending record with gpu_id=Y; queue reports Y completed → status=processed, completed_at set."""
+    """Pending non-fixer_retry record + queue completed → status=processed, completed_at set.
+
+    Uses agent_type="fixer" — non-fixer_retry agents are flipped to processed by the
+    reconciler. fixer_retry is handled separately (carve-out tests below).
+    """
     gpu_id = "claude_20260426_120000_0001_fixer_myrepo"
-    rec = _pending_record(gpu_id)
+    rec = _pending_record(gpu_id, agent_type="fixer")  # NOT fixer_retry
     completed_at = "2026-04-26T12:05:00-07:00"
 
     queue = _make_queue(
@@ -321,3 +329,91 @@ def test_tick_result_includes_reconciled_count():
         result = pm_core.tick("my-target")
 
     assert result.reconciled == 1
+
+
+# ---------------------------------------------------------------------------
+# fixer_retry carve-out: SHA-advance perceiver owns fixer_retry → processed
+# ---------------------------------------------------------------------------
+
+def test_fixer_retry_queue_completed_stays_pending():
+    """fixer_retry + queue completed → stays pending (SHA-advance perceiver owns processed).
+
+    The reconciler must NOT flip a fixer_retry to processed based on queue
+    completion alone. The SHA-advance perceiver (~pm_core _perceive_pr_sha_advance)
+    is the sole authority for that transition.
+    """
+    gpu_id = "claude_20260427_210000_0001_fixer_retry_myrepo"
+    rec = _pending_record(gpu_id, agent_type="fixer_retry")
+
+    queue = _make_queue(
+        completed=[{"id": gpu_id, "completed_at": "2026-04-27T21:05:00-07:00"}],
+    )
+
+    with patch.object(pm_core, "_ClaudeQueue", return_value=queue), \
+         patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]), \
+         patch("lapis_pm.pm_core.save_dispatched") as mock_save, \
+         patch("lapis_pm.episodic.all_comments", return_value=[]), \
+         patch("lapis_pm.episodic.write_observation") as mock_obs:
+
+        count = pm_core._reconcile_dispatched_with_queue("my-target")
+
+    assert count == 0, "fixer_retry queue-completed must not count as a reconciled flip"
+    assert rec["status"] == "pending", "fixer_retry must remain pending after queue completion"
+    mock_save.assert_not_called()
+    mock_obs.assert_not_called()
+
+
+def test_fixer_retry_queue_failed_flips_to_failed():
+    """fixer_retry + queue failed → flips to failed (failure carve-out still permitted).
+
+    Failed retries do not advance cycle accounting, so the reconciler is allowed
+    to flip them to failed — this is safe and necessary for operational hygiene.
+    """
+    gpu_id = "claude_20260427_070000_0001_fixer_retry_myrepo"
+    error_msg = "ERROR: runner exited non-zero"
+    rec = _pending_record(gpu_id, agent_type="fixer_retry")
+
+    queue = _make_queue(
+        failed=[{"id": gpu_id, "error": error_msg, "completed_at": "2026-04-27T07:05:00-07:00"}],
+    )
+
+    with patch.object(pm_core, "_ClaudeQueue", return_value=queue), \
+         patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]), \
+         patch("lapis_pm.pm_core.save_dispatched") as mock_save, \
+         patch("lapis_pm.episodic.all_comments", return_value=[]), \
+         patch("lapis_pm.episodic.write_observation"):
+
+        count = pm_core._reconcile_dispatched_with_queue("my-target")
+
+    assert count == 1
+    assert rec["status"] == "failed"
+    assert rec["error"] == error_msg
+    mock_save.assert_called_once()
+
+
+def test_non_fixer_retry_queue_completed_flips_to_processed():
+    """Non-fixer_retry (e.g. fixer) + queue completed → flipped to processed.
+
+    Regression: the carve-out must not affect other agent types. fixer, reviewer,
+    and scout records are reconciled normally in both directions.
+    """
+    gpu_id = "claude_20260427_080000_0001_fixer_myrepo"
+    completed_at = "2026-04-27T08:05:00-07:00"
+    rec = _pending_record(gpu_id, agent_type="fixer")
+
+    queue = _make_queue(
+        completed=[{"id": gpu_id, "completed_at": completed_at}],
+    )
+
+    with patch.object(pm_core, "_ClaudeQueue", return_value=queue), \
+         patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]), \
+         patch("lapis_pm.pm_core.save_dispatched") as mock_save, \
+         patch("lapis_pm.episodic.all_comments", return_value=[]), \
+         patch("lapis_pm.episodic.write_observation"):
+
+        count = pm_core._reconcile_dispatched_with_queue("my-target")
+
+    assert count == 1
+    assert rec["status"] == "processed"
+    assert rec["completed_at"] == completed_at
+    mock_save.assert_called_once()

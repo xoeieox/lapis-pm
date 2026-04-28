@@ -505,6 +505,115 @@ rm -f "$TARGETS_DIR/${TID_RECON}.yaml" "$COMMENTS_DIR/${TID_RECON}.jsonl" "$RECO
 /usr/local/bin/mem delete "pm/classified-prs/${TID_RECON}" 2>/dev/null || true
 green "reconciliation positive case OK (flip + audit comment + de-dup idempotency)"
 
+# =========================================================================
+# Cycle-accounting phantom-record regression (lapis-pm-cycle-accounting-sha-truth)
+# =========================================================================
+
+# --- Part A: _fixer_retry_count counts processed only -------------------
+step "16a. Phantom-record regression: _fixer_retry_count counts processed only (not failed)"
+/usr/bin/python3 -c "
+import json, sys
+from unittest.mock import patch
+from lapis_pm import pm_core
+
+processed = {'agent_type': 'fixer_retry', 'pr_number': 1, 'status': 'processed', 'gpu_id': 'gpu-1', 'ts': '2026-04-27T00:00:00-07:00'}
+failed    = {'agent_type': 'fixer_retry', 'pr_number': 1, 'status': 'failed',    'gpu_id': 'gpu-2', 'ts': '2026-04-27T00:00:00-07:00'}
+with patch('lapis_pm.pm_core.load_dispatched', return_value=[processed, failed]):
+    count = pm_core._fixer_retry_count('ignored', 1)
+assert count == 1, f'expected 1, got {count} — failed record is being counted (cascade bug)'
+print(f'_fixer_retry_count with 1 processed + 1 failed = {count} ✓')
+" || red "phantom-record: _fixer_retry_count is counting failed records"
+green "_fixer_retry_count: 1 processed + 1 failed → count=1 (cascade fix confirmed)"
+
+# --- Part B: _fixer_retry_count returns 0 for all-failed scenario -------
+step "16b. Phantom-record regression: _fixer_retry_count returns 0 for all-failed (cascade scenario)"
+/usr/bin/python3 -c "
+from unittest.mock import patch
+from lapis_pm import pm_core
+
+failed1 = {'agent_type': 'fixer_retry', 'pr_number': 1, 'status': 'failed', 'gpu_id': 'gpu-a', 'ts': '2026-04-27T00:00:00-07:00'}
+failed2 = {'agent_type': 'fixer_retry', 'pr_number': 1, 'status': 'failed', 'gpu_id': 'gpu-b', 'ts': '2026-04-27T00:00:00-07:00'}
+with patch('lapis_pm.pm_core.load_dispatched', return_value=[failed1, failed2]):
+    count = pm_core._fixer_retry_count('ignored', 1)
+assert count == 0, f'expected 0, got {count} — failed records causing phantom count'
+print(f'_fixer_retry_count with 2 failed records = {count} ✓')
+" || red "phantom-record: _fixer_retry_count returns non-zero for all-failed scenario"
+green "_fixer_retry_count: 2 failed records → count=0 OK"
+
+# --- Part C: reconciler carve-out — fixer_retry completed stays pending --
+step "16c. Reconciler carve-out: fixer_retry + queue completed → stays pending (SHA-advance owns it)"
+TID_CARVEOUT="pm-smoke-carveout-$$"
+CARVEOUT_SPEC="/tmp/${TID_CARVEOUT}-spec.md"
+cat > "$CARVEOUT_SPEC" <<EOF
+# Carve-out smoke spec for $TID_CARVEOUT
+EOF
+
+cat > "$TARGETS_DIR/${TID_CARVEOUT}.yaml" <<EOF
+id: ${TID_CARVEOUT}
+title: Carve-out smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Reconciler carve-out smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_CARVEOUT" --spec-from "$CARVEOUT_SPEC" --repo lapis-test --authority advisory
+
+# Inject a pending fixer_retry dispatch into mem (simulates a real dispatch).
+CARVEOUT_GPU_ID="claude_smoke_carveout_$$"
+/usr/local/bin/mem set "pm/dispatched/${TID_CARVEOUT}" \
+    "[{\"gpu_id\":\"${CARVEOUT_GPU_ID}\",\"spec_id\":\"spec-smoke\",\"agent_type\":\"fixer_retry\",\"intent\":\"test carveout\",\"repo\":\"lapis-test\",\"ts\":\"2026-04-27T10:00:00-07:00\",\"status\":\"pending\",\"retry_count\":0,\"pr_number\":1}]" \
+    >/dev/null
+
+# Fake a ClaudeQueue *completed* entry for that fixer_retry gpu_id.
+# With the carve-out, this must NOT flip the record to processed.
+CARVEOUT_QUEUE_DIR="/srv/lapis/claude-queue/completed"
+mkdir -p "$CARVEOUT_QUEUE_DIR"
+cat > "$CARVEOUT_QUEUE_DIR/${CARVEOUT_GPU_ID}.yaml" <<EOF
+id: ${CARVEOUT_GPU_ID}
+status: completed
+completed_at: "2026-04-27T10:05:00-07:00"
+submitted_at: "2026-04-27T10:00:00-07:00"
+submitted_by: lapis-pm
+description: smoke-test fake completion
+EOF
+
+# Tick — reconciler should skip the fixer_retry completed entry.
+CARVEOUT_TICK=$($LAPIS tick --target "$TID_CARVEOUT")
+echo "$CARVEOUT_TICK"
+
+# The record must still be pending (SHA-advance perceiver hasn't fired).
+/usr/bin/python3 -c "
+from lapis_pm.pm_core import load_dispatched
+records = load_dispatched('${TID_CARVEOUT}')
+assert records, 'no dispatched records found'
+rec = records[0]
+assert rec.get('status') == 'pending', f'expected pending, got {rec.get(\"status\")} — carve-out failed: reconciler flipped fixer_retry to processed'
+print(f'fixer_retry status after queue-completed tick = {rec[\"status\"]} ✓')
+" || red "carve-out: reconciler flipped fixer_retry to processed (SHA-advance perceiver must own this)"
+
+# Assert no pm:dispatch-reconciled tag for this gpu_id (carve-out produces no audit comment).
+! grep -q "pm:dispatch-reconciled:gpu=${CARVEOUT_GPU_ID}" "$COMMENTS_DIR/${TID_CARVEOUT}.jsonl" \
+    || red "carve-out: reconcile audit comment written for fixer_retry completed (should be silent)"
+
+# Cleanup
+rm -f "$CARVEOUT_QUEUE_DIR/${CARVEOUT_GPU_ID}.yaml"
+rm -f "$TARGETS_DIR/${TID_CARVEOUT}.yaml" "$COMMENTS_DIR/${TID_CARVEOUT}.jsonl" "$CARVEOUT_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_CARVEOUT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_CARVEOUT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_CARVEOUT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_CARVEOUT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_CARVEOUT}" 2>/dev/null || true
+green "reconciler carve-out: fixer_retry completed → stays pending OK"
+
 # --- Done ----------------------------------------------------------------
 echo
 green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land all OK"

@@ -313,6 +313,7 @@ updated: $(date +%F)
 decay_days: 0
 decay_threshold: 30
 description: Multi-PR guard smoke target.
+pr_count: 2
 stages:
   - name: smoke-stage
     status: active
@@ -337,12 +338,14 @@ echo "$TICK_MULTI1"
 grep -q '"pm:auto-land:waiting"' "$COMMENTS_DIR/${TID_MULTI}.jsonl" \
     || red "pm:auto-land:waiting audit comment not written after 1/2"
 
-# Tick 2 (still 1/2): waiting comment NOT written again (de-dup)
-LINES_BEFORE=$(wc -l < "$COMMENTS_DIR/${TID_MULTI}.jsonl")
+# Tick 2 (still 1/2): waiting comment NOT written again (de-dup).
+# Count only pm:auto-land:waiting occurrences (not total lines — pm:error
+# from Forgejo 404s on the test repo is written every tick and is expected).
+WAIT_BEFORE=$(grep -c '"pm:auto-land:waiting"' "$COMMENTS_DIR/${TID_MULTI}.jsonl" || true)
 $LAPIS tick --target "$TID_MULTI" >/dev/null
-LINES_AFTER=$(wc -l < "$COMMENTS_DIR/${TID_MULTI}.jsonl")
-[ "$LINES_BEFORE" -eq "$LINES_AFTER" ] \
-    || red "pm:auto-land:waiting was emitted again on second tick (de-dup failed)"
+WAIT_AFTER=$(grep -c '"pm:auto-land:waiting"' "$COMMENTS_DIR/${TID_MULTI}.jsonl" || true)
+[ "$WAIT_BEFORE" -eq "$WAIT_AFTER" ] \
+    || red "pm:auto-land:waiting was emitted again on second tick (de-dup failed, count before=$WAIT_BEFORE after=$WAIT_AFTER)"
 
 # Simulate PR #2 opened and merged
 /usr/bin/python3 -c "
@@ -407,6 +410,100 @@ rm -f "$TARGETS_DIR/${TID_AUTODET}.yaml" "$COMMENTS_DIR/${TID_AUTODET}.jsonl" "$
 /usr/local/bin/mem delete "pm/cursor/${TID_AUTODET}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/classified-prs/${TID_AUTODET}" 2>/dev/null || true
 green "auto-detect: pr_count=2 set from ### PR N headers OK"
+
+# =========================================================================
+# Dispatch–queue reconciliation smoke test
+# =========================================================================
+
+# --- Reconciliation: positive case ----------------------------------------
+step "15. Reconciliation: pending dispatch + faked queue failure → flipped to failed + audit comment"
+TID_RECON="pm-smoke-recon-$$"
+RECON_SPEC="/tmp/${TID_RECON}-spec.md"
+cat > "$RECON_SPEC" <<EOF
+# Reconciliation smoke spec for $TID_RECON
+EOF
+
+cat > "$TARGETS_DIR/${TID_RECON}.yaml" <<EOF
+id: ${TID_RECON}
+title: Reconciliation smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Reconciliation smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_RECON" --spec-from "$RECON_SPEC" --repo lapis-test --authority advisory
+
+# Inject a pending dispatch record directly into mem (simulates a real dispatch).
+FAKE_GPU_ID="claude_smoke_recon_fake_gpu_$$"
+/usr/local/bin/mem set "pm/dispatched/${TID_RECON}" \
+    "[{\"gpu_id\":\"${FAKE_GPU_ID}\",\"spec_id\":\"spec-smoke\",\"agent_type\":\"fixer_retry\",\"intent\":\"test reconcile\",\"repo\":\"lapis-test\",\"ts\":\"2026-04-25T16:51:00-07:00\",\"status\":\"pending\",\"retry_count\":0,\"pr_number\":1}]" \
+    >/dev/null
+
+# Fake a ClaudeQueue failure entry for that gpu_id by writing a YAML file
+# directly into /srv/lapis/claude-queue/failed/ — this is the same path ClaudeQueue reads.
+RECON_QUEUE_DIR="/srv/lapis/claude-queue/failed"
+mkdir -p "$RECON_QUEUE_DIR"
+cat > "$RECON_QUEUE_DIR/${FAKE_GPU_ID}.yaml" <<EOF
+id: ${FAKE_GPU_ID}
+status: failed
+error: "ERROR: call_claude_cli returned None (smoke test)"
+completed_at: "2026-04-25T16:51:30-07:00"
+submitted_at: "2026-04-25T16:51:00-07:00"
+submitted_by: lapis-pm
+description: smoke-test fake failure
+EOF
+
+# Tick — reconcile should fire and flip the pending record to failed.
+RECON_TICK_OUT=$($LAPIS tick --target "$TID_RECON")
+echo "$RECON_TICK_OUT"
+
+# Assert reconciled=1 appears in tick output.
+echo "$RECON_TICK_OUT" | grep -q "reconciled=1" || red "reconcile: tick did not report reconciled=1"
+
+# Assert the dispatched record was flipped to failed in mem.
+/usr/bin/python3 -c "
+import json
+from lapis_pm.pm_core import load_dispatched
+records = load_dispatched('${TID_RECON}')
+assert records, 'no dispatched records found'
+rec = records[0]
+assert rec.get('status') == 'failed', f'expected failed, got {rec.get(\"status\")}'
+assert 'ERROR' in (rec.get('error') or ''), f'error field not set: {rec.get(\"error\")}'
+print(f'dispatched status={rec[\"status\"]} error={rec.get(\"error\")[:40]}')
+" || red "reconcile: dispatched record not flipped to failed"
+
+# Assert the audit comment was written.
+RECON_JSONL="$COMMENTS_DIR/${TID_RECON}.jsonl"
+grep -q '"pm:dispatch-reconciled"' "$RECON_JSONL" || red "reconcile: pm:dispatch-reconciled audit comment missing"
+grep -q "pm:dispatch-reconciled:gpu=${FAKE_GPU_ID}" "$RECON_JSONL" || red "reconcile: gpu dedup tag missing from audit comment"
+
+# Assert idempotency: second tick writes no new reconcile audit comment.
+# Count only pm:dispatch-reconciled occurrences, not total lines — pm:error
+# from Forgejo 404s on the test repo is written every tick and is expected.
+RECON_BEFORE=$(grep -c '"pm:dispatch-reconciled"' "$RECON_JSONL" || true)
+$LAPIS tick --target "$TID_RECON" >/dev/null
+RECON_AFTER=$(grep -c '"pm:dispatch-reconciled"' "$RECON_JSONL" || true)
+[ "$RECON_BEFORE" -eq "$RECON_AFTER" ] \
+    || red "reconcile: audit comment written again on second tick (de-dup failed, count before=$RECON_BEFORE after=$RECON_AFTER)"
+
+# Cleanup
+rm -f "$RECON_QUEUE_DIR/${FAKE_GPU_ID}.yaml"
+rm -f "$TARGETS_DIR/${TID_RECON}.yaml" "$COMMENTS_DIR/${TID_RECON}.jsonl" "$RECON_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_RECON}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_RECON}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_RECON}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_RECON}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_RECON}" 2>/dev/null || true
+green "reconciliation positive case OK (flip + audit comment + de-dup idempotency)"
 
 # --- Done ----------------------------------------------------------------
 echo

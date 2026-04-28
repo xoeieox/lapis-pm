@@ -224,8 +224,9 @@ def cmd_tick(args) -> int:
         results = pm_core.tick_all()
 
     for r in results:
-        print(f"[{r.target_id}] skipped={r.skipped} reason={r.reason} "
-              f"encoded={r.encoded} decision={r.decision}")
+        rec_part = f" reconciled={r.reconciled}" if r.reconciled else ""
+        print(f"[{r.target_id}] skipped={r.skipped} reason={r.reason}"
+              f"{rec_part} encoded={r.encoded} decision={r.decision}")
     return 0
 
 

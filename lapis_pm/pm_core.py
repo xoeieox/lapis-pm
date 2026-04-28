@@ -33,6 +33,11 @@ except Exception:
     _forgejo_get_pr = None  # type: ignore
     _forgejo_get_branch = None  # type: ignore
 
+try:
+    from agents_core.claude_queue import ClaudeQueue as _ClaudeQueue
+except Exception:
+    _ClaudeQueue = None  # type: ignore
+
 from . import episodic, shaper, brief, authority
 
 
@@ -1371,6 +1376,107 @@ def _seen_pr_ids(target_id: str) -> set[int]:
 
 
 # ---------------------------------------------------------------------------
+# Dispatch–queue reconciliation
+# ---------------------------------------------------------------------------
+
+def _reconcile_dispatched_with_queue(target_id: str) -> int:
+    """Flip pending dispatch records to terminal state based on ClaudeQueue.
+
+    Returns count of records flipped. Idempotent — calling twice in a row
+    with no new queue activity is a no-op (returns 0 the second time).
+
+    Reads get_recent_failed(limit=50) and get_recent_completed(limit=50)
+    once per call (not once per record). Matches on gpu_id (the queue's
+    `id` field) — covers all agent types naturally without agent-specific
+    logic. Only `pending` records are eligible; already-terminal records
+    are never re-flipped.
+
+    Limit=50: large enough that a 10-min tick interval plus typical queue
+    throughput cannot push a terminal record past the window before we
+    observe it. Raise to 200 if get_recent_* proves cheap and throughput
+    grows significantly.
+    """
+    if _ClaudeQueue is None:
+        return 0
+
+    try:
+        cq = _ClaudeQueue()
+        failed_entries = cq.get_recent_failed(limit=50)
+        completed_entries = cq.get_recent_completed(limit=50)
+    except Exception:
+        return 0
+
+    # Build gpu_id → terminal-state index from both lists.
+    # failed wins if a task somehow appears in both (shouldn't happen).
+    terminal: dict[str, dict] = {}
+    for entry in completed_entries:
+        task_id = entry.get("id")
+        if task_id:
+            terminal[task_id] = {
+                "state": "processed",
+                "error": None,
+                "completed_at": entry.get("completed_at"),
+            }
+    for entry in failed_entries:
+        task_id = entry.get("id")
+        if task_id:
+            terminal[task_id] = {
+                "state": "failed",
+                "error": entry.get("error"),
+                "completed_at": entry.get("completed_at"),
+            }
+
+    records = load_dispatched(target_id)
+    flipped = 0
+    changed = False
+
+    # Pre-load existing reconcile tags for de-dup: one audit comment per
+    # gpu_id, never written again if the tag already exists in the JSONL.
+    existing_dedup_tags: set[str] = set()
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith("pm:dispatch-reconciled:gpu="):
+                existing_dedup_tags.add(t)
+
+    for rec in records:
+        if rec.get("status") != "pending":
+            # Only pending records are touched. Terminal records are left alone.
+            continue
+        gpu_id = rec.get("gpu_id")
+        if not gpu_id:
+            continue
+        t = terminal.get(gpu_id)
+        if t is None:
+            continue
+
+        # Flip the record to the terminal state.
+        rec["status"] = t["state"]
+        if t["error"] is not None:
+            rec["error"] = t["error"]
+        if t["completed_at"] is not None:
+            rec["completed_at"] = t["completed_at"]
+        changed = True
+        flipped += 1
+
+        # Audit comment — one per flip, de-duped by tag so a second call
+        # with the same gpu_id in a later tick writes nothing.
+        dedup_tag = f"pm:dispatch-reconciled:gpu={gpu_id}"
+        if dedup_tag not in existing_dedup_tags:
+            error_note = f" ({t['error']})" if t["error"] else ""
+            episodic.write_observation(
+                target_id,
+                f"Reconciled dispatch {gpu_id}: pending → {t['state']}{error_note}",
+                extra_tags=["pm:dispatch-reconciled", dedup_tag],
+            )
+            existing_dedup_tags.add(dedup_tag)
+
+    if changed:
+        save_dispatched(target_id, records)
+
+    return flipped
+
+
+# ---------------------------------------------------------------------------
 # Tick
 # ---------------------------------------------------------------------------
 
@@ -1381,6 +1487,7 @@ class TickResult:
     reason: str
     encoded: int          # number of percepts encoded as PM comments
     decision: str         # the action taken or "noop"
+    reconciled: int = 0   # number of dispatch records flipped this tick
 
 
 def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
@@ -1405,6 +1512,10 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         return TickResult(target_id, True, "paused", 0, "noop")
 
     # 2. Cursor + perceive
+    # Reconcile pending dispatch records against ClaudeQueue terminal state
+    # before any encode pass that reads dispatched (prevents stale-pending wedge).
+    reconciled = _reconcile_dispatched_with_queue(target_id)
+
     cursor = get_cursor(target_id)
     new_comments = [
         c for c in episodic.since(target_id, cursor)
@@ -1507,7 +1618,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
 
     # 5. Advance cursor to now (we've considered everything as of this tick).
     set_cursor(target_id, _now_iso())
-    return TickResult(target_id, False, "ok", encoded, decision_str)
+    return TickResult(target_id, False, "ok", encoded, decision_str, reconciled=reconciled)
 
 
 def tick_all() -> list[TickResult]:

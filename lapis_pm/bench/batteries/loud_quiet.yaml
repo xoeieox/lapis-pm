@@ -32,7 +32,7 @@ pairs:
         What model currently serves LLM inference in the Lapis stack and
         on what port, and is Ollama still involved?
       expected_awareness: >-
-        qwen3.5-35b-a3b via llama-server on port 8081 at 203.0.113.12;
+        qwen3.6-35b-a3b via llama-server on port 8081 at 203.0.113.12;
         Ollama was removed — llama.cpp's own server replaced it.
 
   - id: synapse-is-what

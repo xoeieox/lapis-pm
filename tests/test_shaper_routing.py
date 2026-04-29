@@ -66,7 +66,7 @@ def test_anthropic_models_route_to_claude_queue(shaper_mocks, model):
 
 def test_qwen_routes_to_gpu_queue(shaper_mocks):
     claude_q, gpu_q = shaper_mocks
-    _dispatch("qwen3.5-35b-a3b")
+    _dispatch("qwen3.6-35b-a3b")
     assert gpu_q.submit.called, "qwen should route to GPUQueue"
     assert not claude_q.submit.called, "qwen must not touch ClaudeQueue"
 

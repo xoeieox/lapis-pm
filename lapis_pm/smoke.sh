@@ -614,9 +614,104 @@ rm -f "$TARGETS_DIR/${TID_CARVEOUT}.yaml" "$COMMENTS_DIR/${TID_CARVEOUT}.jsonl" 
 /usr/local/bin/mem delete "pm/classified-prs/${TID_CARVEOUT}" 2>/dev/null || true
 green "reconciler carve-out: fixer_retry completed → stays pending OK"
 
+# =========================================================================
+# Reviewer verdict-encode carve-out smoke test
+# (lapis-pm-reviewer-verdict-encode-carveout)
+# =========================================================================
+
+# --- Step 17: reviewer dispatch → verdict=fixable encoded (not verdict=pending) ---
+step "17. Reviewer carve-out: reviewer dispatch + synthesized output file → verdict=fixable encoded"
+TID_REV="pm-smoke-reviewer-$$"
+REV_SPEC="/tmp/${TID_REV}-spec.md"
+cat > "$REV_SPEC" <<EOF
+# Reviewer carve-out smoke spec for $TID_REV
+EOF
+
+cat > "$TARGETS_DIR/${TID_REV}.yaml" <<EOF
+id: ${TID_REV}
+title: Reviewer carve-out smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Reviewer verdict-encode carve-out smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_REV" --spec-from "$REV_SPEC" --repo lapis-test --authority advisory
+
+# Inject a pending reviewer dispatch record directly into mem.
+REV_GPU_ID="claude_smoke_reviewer_$$"
+/usr/local/bin/mem set "pm/dispatched/${TID_REV}" \
+    "[{\"gpu_id\":\"${REV_GPU_ID}\",\"spec_id\":\"spec-smoke\",\"agent_type\":\"reviewer\",\"intent\":\"review PR #1\",\"repo\":\"lapis-test\",\"ts\":\"2026-04-29T12:00:00-07:00\",\"status\":\"pending\",\"retry_count\":0,\"pr_number\":1,\"cycle\":1}]" \
+    >/dev/null
+
+# Fake a ClaudeQueue completed entry for that reviewer gpu_id.
+# With the carve-out, the reconciler must NOT flip this to processed —
+# _encode_gpu_results owns the terminal flip for reviewer completed.
+REV_QUEUE_DIR="/srv/lapis/claude-queue/completed"
+mkdir -p "$REV_QUEUE_DIR"
+cat > "$REV_QUEUE_DIR/${REV_GPU_ID}.yaml" <<EOF
+id: ${REV_GPU_ID}
+status: completed
+completed_at: "2026-04-29T12:05:00-07:00"
+submitted_at: "2026-04-29T12:00:00-07:00"
+submitted_by: lapis-pm
+description: smoke-test fake reviewer completion
+EOF
+
+# Write the synthesized reviewer output file (JSON verdict the reviewer agent produced).
+mkdir -p "$GPU_COMPLETED"
+cat > "$GPU_COMPLETED/${REV_GPU_ID}-output.md" <<EOF
+{"verdict":"fixable","issues":[{"summary":"missing test coverage","severity":"medium"}],"confidence":0.88}
+EOF
+
+# Tick — reconciler carve-out keeps reviewer pending; encoder reads the
+# output file and writes a Reviewer verdict episodic entry with verdict=fixable.
+REV_TICK=$($LAPIS tick --target "$TID_REV")
+echo "$REV_TICK"
+
+# Assert the dispatched record was flipped to processed by the encoder (not the reconciler).
+/usr/bin/python3 -c "
+from lapis_pm.pm_core import load_dispatched
+records = load_dispatched('${TID_REV}')
+assert records, 'no dispatched records found'
+rec = records[0]
+assert rec.get('status') == 'processed', f'expected processed, got {rec.get(\"status\")} — encoder did not flip reviewer'
+print(f'reviewer dispatch status={rec[\"status\"]} ✓')
+" || red "reviewer carve-out: dispatched record not processed after encode tick"
+
+# Assert episodic has the Reviewer verdict entry (non-pending verdict).
+REV_JSONL="$COMMENTS_DIR/${TID_REV}.jsonl"
+grep -q 'Reviewer verdict for PR #1:' "$REV_JSONL" \
+    || red "reviewer carve-out: 'Reviewer verdict for PR #1:' entry missing from episodic"
+grep -q 'verdict=fixable' "$REV_JSONL" \
+    || red "reviewer dispatch produces verdict=fixable episodic entry (REGRESSION: verdict stayed pending)"
+
+# Assert reconciler did NOT write a dispatch-reconciled audit for this gpu_id
+# (the carve-out must be silent — no audit comment on the skipped completed entry).
+! grep -q "pm:dispatch-reconciled:gpu=${REV_GPU_ID}" "$REV_JSONL" \
+    || red "reviewer carve-out: reconcile audit comment written (reconciler bypassed carve-out)"
+
+# Cleanup
+rm -f "$REV_QUEUE_DIR/${REV_GPU_ID}.yaml" "$GPU_COMPLETED/${REV_GPU_ID}-output.md"
+rm -f "$TARGETS_DIR/${TID_REV}.yaml" "$COMMENTS_DIR/${TID_REV}.jsonl" "$REV_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_REV}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_REV}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_REV}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_REV}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_REV}" 2>/dev/null || true
+green "reviewer dispatch produces verdict=fixable episodic entry (not verdict=pending) OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

@@ -38,13 +38,18 @@ try:
 except Exception:
     _ClaudeQueue = None  # type: ignore
 
-from . import episodic, shaper, brief, authority
+from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
+from . import episodic, brief, authority
+
+# Module-level singleton — constructed at import time so a malformed
+# registry.yaml crashes the daemon immediately, not at first dispatch.
+_SHAPER = Shaper(Path(__file__).parent / "registry.yaml")
 
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 COMPLETED_DIR = Path("/srv/lapis/gpu-queue/completed")
 FAILED_DIR = Path("/srv/lapis/gpu-queue/failed")
-SHAPED_DIR = Path("/srv/lapis/gpu-queue/shaped")  # _runner.py meta sidecars
+SHAPED_DIR = Path("/srv/lapis/gpu-queue/shaped")  # shaped_runner meta sidecars
 CLAUDE_QUEUE_COMPLETED_DIR = Path("/srv/lapis/claude-queue/completed")
 CLAUDE_QUEUE_FAILED_DIR = Path("/srv/lapis/claude-queue/failed")
 MAX_DISPATCH_RETRIES = 2
@@ -881,7 +886,7 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
         "pr_number": dispatch_record.get("pr_number", ""),
         "slug": dispatch_record.get("slug", "retry"),
     }
-    res = shaper.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
+    res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
     new_record = {
         "gpu_id": res.task_id,
         "spec_id": res.spec_id,
@@ -929,7 +934,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "target_id": target_id,
         "spec_summary": spec_summary,
         "repo": repo,
-        "repo_cwd": shaper._resolve_repo_cwd(repo),
+        "repo_cwd": Shaper.resolve_repo_cwd(repo),
         "pr_number": pr_number,
         "slug": f"pr{pr_number}-review-c{cycle}",
         "question": f"review PR #{pr_number}",
@@ -955,7 +960,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     # Increment kill-switch counter before dispatch
     _increment_review_gate_counter()
 
-    res = shaper.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
+    res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
 
     record = {
         "gpu_id": res.task_id,
@@ -1006,7 +1011,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
         "target_id": target_id,
         "spec_summary": spec_summary,
         "repo": cls.repo,
-        "repo_cwd": shaper._resolve_repo_cwd(cls.repo),
+        "repo_cwd": Shaper.resolve_repo_cwd(cls.repo),
         "pr_number": pr_number,
         "slug": f"pr{pr_number}-fix-c{cycle}",
         "existing_branch": pr_branch,
@@ -1020,7 +1025,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
         f"Push to the existing branch — do NOT create a new branch or new PR."
     )
 
-    res = shaper.dispatch("fixer_retry", target_id, user_prompt, vars_=vars_)
+    res = _SHAPER.dispatch("fixer_retry", target_id, user_prompt, vars_=vars_)
 
     record = {
         "gpu_id": res.task_id,
@@ -1266,7 +1271,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
 
         # Confabulation check: fixer agents that produced substantial prose
         # without using tools are stochastic failures and should be retried.
-        # Meta sidecar is only written for fixers (capture_meta in shaper.py).
+        # Meta sidecar is only written for fixers (capture_meta=true in registry.yaml).
         confabulation_note = ""
         spec_id = rec.get("spec_id") if rec.get("agent_type") == "fixer" else None
         if spec_id and not is_failure:

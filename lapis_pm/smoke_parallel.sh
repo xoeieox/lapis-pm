@@ -67,7 +67,7 @@ git -c user.email=smoke@test -c user.name=smoke commit -m "initial" >/dev/null
 git push origin main >/dev/null 2>&1
 cd - >/dev/null
 
-# Symlink so shaper._resolve_repo_cwd("lapis-pm-parallel-test") finds the clone.
+# Symlink so Shaper.resolve_repo_cwd("lapis-pm-parallel-test") finds the clone.
 # Pre-flight guard: refuse to clobber a real working-clone by that name.
 if [ -e "$CLONE_SYMLINK" ] && [ ! -L "$CLONE_SYMLINK" ]; then
     red "$CLONE_SYMLINK exists and is not a symlink — refusing to clobber"
@@ -101,8 +101,10 @@ EOF
 done
 
 python3 - <<PY || red "dispatch script failed"
-from lapis_pm.shaper import dispatch
-dispatch("fixer", "$TID_A",
+from pathlib import Path
+from agents_core.shaper import Shaper
+_shaper = Shaper(Path("/srv/lapis/lapis-pm/lapis_pm/registry.yaml"))
+_shaper.dispatch("fixer", "$TID_A",
          "edit a.md so its sole content is the word 'hello'. "
          "Do NOT open a Forgejo PR — the test repo is not on the Forgejo server. "
          "Stop after \`git push\`.",
@@ -112,7 +114,7 @@ dispatch("fixer", "$TID_A",
              "spec_summary": "Parallel-dispatch smoke test. Edit a.md to contain the single word 'hello'.",
              "slug": "smoke-a",
          })
-dispatch("fixer", "$TID_B",
+_shaper.dispatch("fixer", "$TID_B",
          "edit b.md so its sole content is the word 'world'. "
          "Do NOT open a Forgejo PR — the test repo is not on the Forgejo server. "
          "Stop after \`git push\`.",

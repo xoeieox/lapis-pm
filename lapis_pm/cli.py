@@ -25,7 +25,7 @@ from pathlib import Path
 from agents_core.targets import TargetStore
 
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
-from . import episodic, shaper, brief, pm_core, land
+from . import episodic, brief, pm_core, land
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
 PM_LIFECYCLE_STAGES = [
@@ -190,7 +190,7 @@ def cmd_tick(args) -> int:
             "pr_number": "",
             "slug": "forced",
         }
-        res = shaper.dispatch(agent_type, args.target, intent, vars_=vars_)
+        res = pm_core._SHAPER.dispatch(agent_type, args.target, intent, vars_=vars_)
         pm_core.append_dispatched(args.target, {
             "gpu_id": res.task_id,
             "spec_id": res.spec_id,

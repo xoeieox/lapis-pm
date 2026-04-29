@@ -115,6 +115,47 @@ def _classified_prs_key(target_id: str) -> str:
     return f"pm/classified-prs/{target_id}"
 
 
+REVIEW_STATE_KEY_PREFIX = "pm/review-state/"
+
+
+def _review_state_key(target_id: str) -> str:
+    return f"{REVIEW_STATE_KEY_PREFIX}{target_id}"
+
+
+def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) -> None:
+    """Write or delete pm/review-state/<tid> from current tick state.
+
+    Called once per tick after decide-step. Side-effect only; never raises
+    (failures logged via episodic.write_observation with pm:error tag,
+    but never abort the tick — cache is best-effort visibility).
+    """
+    state = _active_review_state(target_id, open_prs)
+    key = _review_state_key(target_id)
+    if state is None:
+        # No active review loop — delete stale cache entry if present.
+        _mem().delete(key)
+        return
+
+    authority_level = target.pm_authority or "advisory"
+    budget = _REVIEW_CYCLE_BUDGETS.get(authority_level, 2)
+    mode = "fresh-reviewer" if authority_level == "hold" else "same-reviewer"
+    verdict = state.get("verdict")
+    has_real_verdict = verdict and verdict != "pending"
+
+    payload = {
+        "pr_number": state["pr_number"],
+        "cycle": state["cycle"],
+        "budget": budget,
+        "mode": mode,
+        "last_verdict": verdict if has_real_verdict else None,
+        "last_issues": state.get("issues") if (has_real_verdict and verdict == "fixable") else None,
+        "paused": _review_gate_paused(),
+        "updated_at": _now_iso(),
+    }
+    _mem().set(key, json.dumps(payload),
+               tags=["lapis-pm", "review-state"])
+
+
 def _now_iso() -> str:
     """Microsecond-precision so it interleaves cleanly with comment timestamps."""
     return datetime.now(PACIFIC).isoformat(timespec="microseconds")
@@ -211,6 +252,9 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
     marked `status: "landed"` (not deleted) so the history stays
     queryable from mem for future arc-doc regeneration or audit.
 
+    Clears: outstanding_brief, classified_prs, cursor, pause_state,
+    dispatched_pending (marked landed), review_state cache.
+
     Returns a dict describing what was non-empty at clear time —
     for a caller (the `land` command) to print a useful summary.
     Idempotent: safe to call on a target that has no state.
@@ -222,6 +266,7 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
         "cursor": 0,
         "pause_state": 0,
         "dispatched_pending": 0,
+        "review_state": 0,
     }
 
     if get_outstanding_brief(target_id) is not None:
@@ -247,6 +292,10 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
                 r["status"] = "landed"
         save_dispatched(target_id, records)
     summary["dispatched_pending"] = len(pending)
+
+    if mem.get(_review_state_key(target_id)) is not None:
+        summary["review_state"] = 1
+    mem.delete(_review_state_key(target_id))
 
     return summary
 
@@ -1655,6 +1704,15 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
 
     elif allow_auto_land and _is_auto_land_eligible(target_id):
         decision_str = _act_auto_land(target_id)
+
+    # 4.5. Persist review-state cache (best-effort visibility for claude-view).
+    try:
+        _persist_review_state_cache(target_id, target, open_prs)
+    except Exception as e:
+        episodic.write_observation(
+            target_id, f"review-state cache write failed: {e}",
+            extra_tags=["pm:error"],
+        )
 
     # 5. Advance cursor to now (we've considered everything as of this tick).
     set_cursor(target_id, _now_iso())

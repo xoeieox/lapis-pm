@@ -3,13 +3,16 @@
 Coverage per spec:
   - pending dispatch + queue failed entry matching gpu_id → flipped to failed
   - pending dispatch + queue completed entry matching gpu_id → flipped to processed
-    (non-fixer_retry only — fixer_retry completed is left pending per carve-out)
+    (non-fixer_retry/non-reviewer only — both carve-outs leave completed as pending)
   - pending dispatch + no matching queue entry → left as pending (no-op)
   - already-failed dispatch + matching queue failed entry → left untouched
   - audit comment written exactly once per flip (de-dup: second call writes nothing)
   - fixer_retry carve-out: queue completed → stays pending (SHA-advance owns processed)
   - fixer_retry carve-out: queue failed → still flipped to failed
   - non-fixer_retry (fixer): queue completed → flipped to processed (regression)
+  - reviewer carve-out: queue completed + output file → stays pending in reconciler,
+    then _encode_gpu_results writes verdict entry and flips to processed
+  - reviewer carve-out: queue failed → still flipped to failed by reconciler
 """
 
 from __future__ import annotations
@@ -392,10 +395,10 @@ def test_fixer_retry_queue_failed_flips_to_failed():
 
 
 def test_non_fixer_retry_queue_completed_flips_to_processed():
-    """Non-fixer_retry (e.g. fixer) + queue completed → flipped to processed.
+    """Non-fixer_retry non-reviewer (e.g. fixer) + queue completed → flipped to processed.
 
-    Regression: the carve-out must not affect other agent types. fixer, reviewer,
-    and scout records are reconciled normally in both directions.
+    Regression: the carve-out must not affect agent types beyond fixer_retry and
+    reviewer/reviewer_fresh. fixer and scout records are reconciled normally.
     """
     gpu_id = "claude_20260427_080000_0001_fixer_myrepo"
     completed_at = "2026-04-27T08:05:00-07:00"
@@ -417,3 +420,112 @@ def test_non_fixer_retry_queue_completed_flips_to_processed():
     assert rec["status"] == "processed"
     assert rec["completed_at"] == completed_at
     mock_save.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# reviewer carve-out: output-file verdict-encoder owns reviewer → processed
+# ---------------------------------------------------------------------------
+
+def test_reviewer_queue_completed_stays_pending_then_encodes_verdict(tmp_path):
+    """reviewer + queue completed + output file → reconciler skips, encoder writes verdict.
+
+    Full carve-out integration: _reconcile_dispatched_with_queue leaves the
+    reviewer pending (carve-out fires), then _encode_gpu_results reads the
+    output file, writes the 'Reviewer verdict for PR #N:' episodic entry
+    tagged pm:reviewer:pr=N:cycle=K:verdict=fixable, and flips to processed.
+    """
+    gpu_id = "claude_20260429_120000_0001_reviewer_myrepo"
+    pr_num = 5
+    cycle_num = 1
+    rec = _pending_record(gpu_id, agent_type="reviewer", pr_number=pr_num)
+    rec["cycle"] = cycle_num
+
+    verdict_payload = {
+        "verdict": "fixable",
+        "issues": [{"summary": "missing test coverage"}],
+        "confidence": 0.88,
+    }
+    out_file = tmp_path / f"{gpu_id}-output.md"
+    out_file.write_text(json.dumps(verdict_payload))
+
+    queue = _make_queue(
+        completed=[{"id": gpu_id, "completed_at": "2026-04-29T12:05:00-07:00"}],
+    )
+
+    shared_records = [rec]
+    written_results = []
+
+    def fake_write_result(target_id, content, extra_tags=None):
+        c = MagicMock()
+        c.tags = extra_tags or []
+        c.content = content
+        written_results.append(c)
+        return c
+
+    with patch.object(pm_core, "_ClaudeQueue", return_value=queue), \
+         patch("lapis_pm.pm_core.load_dispatched", return_value=shared_records), \
+         patch("lapis_pm.pm_core.save_dispatched") as mock_save, \
+         patch("lapis_pm.episodic.all_comments", return_value=[]), \
+         patch("lapis_pm.episodic.write_observation"), \
+         patch("lapis_pm.episodic.write_result", side_effect=fake_write_result), \
+         patch("lapis_pm.pm_core._gpu_output_path", return_value=out_file):
+
+        # Step 1: reconcile — carve-out must leave reviewer pending.
+        reconciled = pm_core._reconcile_dispatched_with_queue("my-target")
+        assert reconciled == 0, "reconciler must not flip reviewer+completed"
+        assert rec["status"] == "pending", "reviewer must remain pending after queue-completed reconcile"
+
+        # Step 2: encode — reads output file, writes verdict, flips to processed.
+        encoded, failed = pm_core._encode_gpu_results("my-target")
+
+    assert encoded == 1, "encode must count the reviewer result"
+    assert not failed, "reviewer success must not appear in failed list"
+    assert rec["status"] == "processed", "reviewer must be processed after encode"
+    mock_save.assert_called()  # encode must persist the status flip
+
+    assert len(written_results) == 1, f"expected 1 result entry, got {len(written_results)}"
+    result = written_results[0]
+    assert f"Reviewer verdict for PR #{pr_num}:" in result.content
+    assert "fixable" in result.content
+    verdict_tag = f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict=fixable"
+    assert verdict_tag in result.tags, f"verdict tag missing; got {result.tags}"
+
+
+def test_reviewer_queue_failed_flips_to_failed():
+    """reviewer + queue failed → reconciler flips to failed (carve-out does not apply).
+
+    Failed reviewer dispatches must flip immediately — there is no output file
+    coming from a crashed job, so the record must not be left pending forever.
+    """
+    gpu_id = "claude_20260429_130000_0001_reviewer_myrepo"
+    rec = _pending_record(gpu_id, agent_type="reviewer", pr_number=3)
+    error_msg = "ERROR: runner exited non-zero"
+
+    queue = _make_queue(
+        failed=[{"id": gpu_id, "error": error_msg, "completed_at": "2026-04-29T13:05:00-07:00"}],
+    )
+
+    written_comments = []
+
+    def fake_write_observation(target_id, content, extra_tags=None):
+        c = MagicMock()
+        c.tags = extra_tags or []
+        c.content = content
+        written_comments.append(c)
+        return c
+
+    with patch.object(pm_core, "_ClaudeQueue", return_value=queue), \
+         patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]), \
+         patch("lapis_pm.pm_core.save_dispatched") as mock_save, \
+         patch("lapis_pm.episodic.all_comments", return_value=[]), \
+         patch("lapis_pm.episodic.write_observation", side_effect=fake_write_observation):
+
+        count = pm_core._reconcile_dispatched_with_queue("my-target")
+
+    assert count == 1, "failed reviewer must count as a reconcile flip"
+    assert rec["status"] == "failed"
+    assert rec.get("error") == error_msg
+    mock_save.assert_called_once()
+    assert len(written_comments) == 1
+    assert "pm:dispatch-reconciled" in written_comments[0].tags
+    assert f"pm:dispatch-reconciled:gpu={gpu_id}" in written_comments[0].tags

@@ -1406,6 +1406,15 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
     throughput cannot push a terminal record past the window before we
     observe it. Raise to 200 if get_recent_* proves cheap and throughput
     grows significantly.
+
+    Carve-outs (two):
+    - fixer_retry + completed: left pending so the SHA-advance perceiver in
+      _encode_gpu_results owns the terminal flip.
+    - reviewer/reviewer_fresh + completed: left pending so the output-file
+      verdict-encoder in _encode_gpu_results owns the terminal flip (reads
+      the output file, parses JSON, writes "Reviewer verdict for PR #N:").
+    Failed flips for both carve-out types are still permitted — a crashed
+    job produces no output file, so the record must fail rather than wait.
     """
     if _ClaudeQueue is None:
         return 0
@@ -1468,6 +1477,17 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         # was rejected; that doesn't advance the cycle regardless).
         if rec.get("agent_type") == "fixer_retry" and t["state"] == "processed":
             continue  # SHA-advance perceiver owns fixer_retry → processed
+
+        # reviewer/reviewer_fresh carve-out: output-file verdict-encoder in
+        # _encode_gpu_results is the sole authority for reviewer → processed.
+        # If the queue says "completed" for a reviewer/reviewer_fresh, leave
+        # the record as pending — _encode_gpu_results reads the output file,
+        # parses the JSON verdict, writes the "Reviewer verdict for PR #N:"
+        # episodic entry, and then flips to processed.
+        # Failed flips for reviewers are still permitted (crashed job → no
+        # output file coming; must fail fast rather than wait forever).
+        if rec.get("agent_type") in ("reviewer", "reviewer_fresh") and t["state"] == "processed":
+            continue  # output-file verdict-encoder owns reviewer → processed
 
         # Flip the record to the terminal state.
         rec["status"] = t["state"]

@@ -128,6 +128,41 @@ def _review_state_key(target_id: str) -> str:
     return f"{REVIEW_STATE_KEY_PREFIX}{target_id}"
 
 
+# ---------------------------------------------------------------------------
+# Corroboration follow-up pass helpers (cross-node-corroboration-v0, PR 3)
+# ---------------------------------------------------------------------------
+
+def _diff_text_for_corr(repo: str, pr_num: int | str) -> str:
+    """Fetch PR diff for the corroboration pass. Returns '' on any failure."""
+    try:
+        from agents_core.forgejo import get_pr_diff as _get_diff
+        return _get_diff(repo, int(pr_num))
+    except Exception:
+        return ""
+
+
+def _run_corroboration_pass_sync(diff_text: str, repo: str) -> dict:
+    """Run corroboration follow-up pass synchronously.
+
+    Returns an uncertain-shaped dict on any error so the caller never
+    needs to handle exceptions (Compost invariant: all outputs are nutrients).
+    This function is a named wrapper so tests can patch it directly.
+    """
+    try:
+        from .corroboration_adapter import run_corroboration_pass
+        return run_corroboration_pass(diff_text, repo)
+    except Exception as exc:
+        return {
+            "verdict": "uncertain",
+            "claim": "",
+            "citations": [],
+            "freshness_stamp": _now_iso(),
+            "scope_id": f"repo:{repo}",
+            "drift_class": None,
+            "notes": f"corroboration pass unavailable: {type(exc).__name__}",
+        }
+
+
 def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) -> None:
     """Write or delete pm/review-state/<tid> from current tick state.
 
@@ -148,6 +183,21 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
     verdict = state.get("verdict")
     has_real_verdict = verdict and verdict != "pending"
 
+    # Compact corroboration summary for quick display in claude-view.
+    # Full evidence-packet lives in the episodic entry; cache stores verdict+drift only.
+    last_corroboration: dict | None = None
+    if has_real_verdict:
+        pr_number = state.get("pr_number")
+        if pr_number is not None:
+            verdict_info = _last_review_verdict(target_id, pr_number)
+            if verdict_info:
+                corr = verdict_info.get("corroboration_result")
+                if corr:
+                    last_corroboration = {
+                        "verdict": corr.get("verdict"),
+                        "drift_class": corr.get("drift_class"),
+                    }
+
     payload = {
         "pr_number": state["pr_number"],
         "cycle": state["cycle"],
@@ -157,6 +207,7 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
         "last_issues": state.get("issues") if (has_real_verdict and verdict == "fixable") else None,
         "paused": _review_gate_paused(),
         "updated_at": _now_iso(),
+        "last_corroboration": last_corroboration,
     }
     _mem().set(key, json.dumps(payload),
                tags=["lapis-pm", "review-state"])
@@ -1406,6 +1457,17 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                         stored_json = json.dumps({"verdict": "needs-human", "issues": [],
                                                   "confidence": 0.0,
                                                   "_parse_error": raw_output[:200]})
+                # Corroboration follow-up pass (q4 resolution: two LLM calls per
+                # review; prompt-cached overlap; reviewer read-only invariant preserved
+                # — corroboration_result is additive only, never mutates mainline fields).
+                try:
+                    _corr_diff = _diff_text_for_corr(rec.get("repo", ""), pr_num)
+                    _corr_result = _run_corroboration_pass_sync(_corr_diff, rec.get("repo", ""))
+                    _stored_dict = json.loads(stored_json)
+                    _stored_dict["corroboration_result"] = _corr_result
+                    stored_json = json.dumps(_stored_dict)
+                except Exception:
+                    pass  # corroboration is best-effort; never fail verdict encoding
                 result_tags = tags + [
                     f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
                     f"pm:pr={pr_num}",

@@ -84,19 +84,21 @@ class TestPersistReviewStateCacheWrite:
         assert payload["paused"] is False
         assert "updated_at" in payload
 
-    def test_all_eight_fields_present(self):
-        """Payload must have exactly the eight schema fields."""
+    def test_all_nine_fields_present(self):
+        """Payload must have exactly the nine schema fields (eight base + last_corroboration)."""
         mem = _make_mem()
         target = _make_target("advisory")
         expected_fields = {
             "pr_number", "cycle", "budget", "mode",
             "last_verdict", "last_issues", "paused", "updated_at",
+            "last_corroboration",
         }
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
             patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
         ):
             pm_core._persist_review_state_cache("my-target", target, [])
 

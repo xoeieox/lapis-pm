@@ -699,6 +699,83 @@ grep -q 'verdict=fixable' "$REV_JSONL" \
 ! grep -q "pm:dispatch-reconciled:gpu=${REV_GPU_ID}" "$REV_JSONL" \
     || red "reviewer carve-out: reconcile audit comment written (reconciler bypassed carve-out)"
 
+# Assert corroboration_result field present in reviewer verdict JSON
+# (cross-node-corroboration-v0 PR 3: verdict carries corroboration_result)
+python3 - "$REV_JSONL" <<'PYEOF' || red "corroboration_result missing or malformed in reviewer verdict episodic entry"
+import json, sys
+jsonl_path = sys.argv[1]
+try:
+    lines = open(jsonl_path).readlines()
+except FileNotFoundError:
+    print('no jsonl file — skipping corroboration check')
+    sys.exit(0)
+for line in lines:
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    content = entry.get('content', '')
+    if 'Reviewer verdict for PR #1:' not in content:
+        continue
+    try:
+        json_part = content.split('\n', 1)[-1].strip()
+        verdict_data = json.loads(json_part)
+    except Exception:
+        print(f'FAIL: could not parse verdict JSON')
+        sys.exit(1)
+    if 'corroboration_result' not in verdict_data:
+        print('FAIL: corroboration_result missing from verdict JSON')
+        sys.exit(1)
+    corr = verdict_data['corroboration_result']
+    required = {'verdict', 'scope_id', 'freshness_stamp', 'citations', 'claim'}
+    missing = required - set(corr.keys())
+    if missing:
+        print(f'FAIL: corroboration_result missing fields: {missing}')
+        sys.exit(1)
+    print(f'corroboration_result present: verdict={corr["verdict"]}, scope_id={corr["scope_id"]} OK')
+    sys.exit(0)
+print('FAIL: no Reviewer verdict entry found in episodic')
+sys.exit(1)
+PYEOF
+
+# Assert resume read-back preserves corroboration_result
+# (_last_review_verdict parses the full JSON including corroboration_result)
+python3 - "$TID_REV" "$REV_JSONL" <<'PYEOF3' || red "corroboration_result not preserved through _last_review_verdict (resume path)"
+import json, sys
+target_id, jsonl_path = sys.argv[1], sys.argv[2]
+try:
+    lines = open(jsonl_path).readlines()
+except FileNotFoundError:
+    print('no jsonl file — skipping resume check')
+    sys.exit(0)
+# Parse the verdict data directly from episodic (same path _last_review_verdict uses)
+for line in lines:
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    content = entry.get('content', '')
+    if 'Reviewer verdict for PR #1:' not in content:
+        continue
+    tags = entry.get('tags', [])
+    if not any('verdict=' in t and ':verdict=pending' not in t for t in tags):
+        continue
+    try:
+        json_part = content.split('\n', 1)[-1].strip()
+        result = json.loads(json_part)
+    except Exception:
+        print('FAIL: could not parse verdict JSON for resume check')
+        sys.exit(1)
+    if 'corroboration_result' not in result:
+        print(f'FAIL: corroboration_result not in verdict JSON (resume path): {list(result.keys())}')
+        sys.exit(1)
+    corr = result['corroboration_result']
+    print(f'resume read-back: corroboration_result preserved, verdict={corr.get("verdict")} OK')
+    sys.exit(0)
+print('no non-pending reviewer entry found — skipping resume check')
+sys.exit(0)
+PYEOF3
+
 # Cleanup
 rm -f "$REV_QUEUE_DIR/${REV_GPU_ID}.yaml" "$GPU_COMPLETED/${REV_GPU_ID}-output.md"
 rm -f "$TARGETS_DIR/${TID_REV}.yaml" "$COMMENTS_DIR/${TID_REV}.jsonl" "$REV_SPEC"
@@ -707,6 +784,7 @@ rm -f "$TARGETS_DIR/${TID_REV}.yaml" "$COMMENTS_DIR/${TID_REV}.jsonl" "$REV_SPEC
 /usr/local/bin/mem delete "pm/pause-state/${TID_REV}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/outstanding-brief/${TID_REV}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/classified-prs/${TID_REV}" 2>/dev/null || true
+green "reviewer verdict: corroboration_result present + resume read-back OK (cross-node-corroboration-v0)"
 green "reviewer dispatch produces verdict=fixable episodic entry (not verdict=pending) OK"
 
 # --- Chain smoke phase (step 18) ----------------------------------------

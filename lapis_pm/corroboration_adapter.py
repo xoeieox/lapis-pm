@@ -52,6 +52,7 @@ class CorroborationResult:
     scope_id: str              # e.g. "repo:lapis-pm"
     drift_class: str | None = None   # "missing_referent" | "stale_referent" | "renamed_referent" | "none"
     notes: str | None = None
+    primitive_decomposition: dict | None = None  # entry-time decomposition; compost-routing handle (spec Compost invariant)
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +63,7 @@ class CorroborationResult:
             "scope_id": self.scope_id,
             "drift_class": self.drift_class,
             "notes": self.notes,
+            "primitive_decomposition": self.primitive_decomposition,
         }
 
 
@@ -235,7 +237,7 @@ class LapisPMReviewerAdapter:
         rpath = repo_path or self._repo_path or f"/srv/git/{repo}-working"
         identifiers = _extract_identifiers(diff_text)
         substrates = []
-        for ident in identifiers[:10]:  # cap to 10 to bound LLM prompt
+        for ident in identifiers[:_MAX_IDENTIFIERS]:
             substrates.append(_IdentifierSubstrate(
                 identifier=ident,
                 repo_hits=_grep_repo(ident, rpath),

@@ -72,6 +72,11 @@ _REVIEWER_MODES: dict[str, str] = {
     "hold": "fresh-reviewer",
 }
 
+# Tick-local corroboration cache: (target_id, pr_number) -> corr_result dict.
+# Populated by _encode_gpu_results; consumed by _persist_review_state_cache in
+# the same tick to avoid re-scanning episodic for data already in hand.
+_tick_corr_cache: dict[tuple[str, int], dict] = {}
+
 
 def _read_fixer_meta(spec_id: str) -> dict | None:
     """Read the {spec_id}-meta.json sidecar written by _runner.py for fixers."""
@@ -189,14 +194,18 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
     if has_real_verdict:
         pr_number = state.get("pr_number")
         if pr_number is not None:
-            verdict_info = _last_review_verdict(target_id, pr_number)
-            if verdict_info:
-                corr = verdict_info.get("corroboration_result")
-                if corr:
-                    last_corroboration = {
-                        "verdict": corr.get("verdict"),
-                        "drift_class": corr.get("drift_class"),
-                    }
+            # Prefer tick-local cache (populated by _encode_gpu_results this same tick)
+            # to avoid re-scanning episodic for data already in hand.
+            corr = _tick_corr_cache.get((target_id, pr_number))
+            if corr is None:
+                verdict_info = _last_review_verdict(target_id, pr_number)
+                if verdict_info:
+                    corr = verdict_info.get("corroboration_result")
+            if corr:
+                last_corroboration = {
+                    "verdict": corr.get("verdict"),
+                    "drift_class": corr.get("drift_class"),
+                }
 
     payload = {
         "pr_number": state["pr_number"],
@@ -1344,6 +1353,11 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
 
     Returns (total_encoded, failed_for_retry).
     """
+    # Clear any stale tick-local corroboration entries for this target so
+    # _persist_review_state_cache always sees fresh data from this tick.
+    for k in list(_tick_corr_cache):
+        if k[0] == target_id:
+            del _tick_corr_cache[k]
     records = load_dispatched(target_id)
     failed_for_retry: list[dict] = []
     total_encoded = 0
@@ -1466,8 +1480,14 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     _stored_dict = json.loads(stored_json)
                     _stored_dict["corroboration_result"] = _corr_result
                     stored_json = json.dumps(_stored_dict)
-                except Exception:
-                    pass  # corroboration is best-effort; never fail verdict encoding
+                    if isinstance(pr_num, int):
+                        _tick_corr_cache[(target_id, pr_num)] = _corr_result
+                except Exception as _corr_exc:
+                    episodic.write_observation(
+                        target_id,
+                        f"corroboration pass skipped for PR #{pr_num}: {type(_corr_exc).__name__}",
+                        extra_tags=["pm:corroboration-skipped"],
+                    )  # best-effort; never fail verdict encoding
                 result_tags = tags + [
                     f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
                     f"pm:pr={pr_num}",

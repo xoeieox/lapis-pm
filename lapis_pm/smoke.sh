@@ -709,9 +709,229 @@ rm -f "$TARGETS_DIR/${TID_REV}.yaml" "$COMMENTS_DIR/${TID_REV}.jsonl" "$REV_SPEC
 /usr/local/bin/mem delete "pm/classified-prs/${TID_REV}" 2>/dev/null || true
 green "reviewer dispatch produces verdict=fixable episodic entry (not verdict=pending) OK"
 
+# --- Chain smoke phase (step 18) ----------------------------------------
+step "18. Chain: 3-leg bind → simulated land → auto-dispatch cascade → state.complete"
+
+CHAIN_GROUP="pm-smoke-chain-$$"
+TID_L1="pm-smoke-chain-l1-$$"
+TID_L2="pm-smoke-chain-l2-$$"
+TID_L3="pm-smoke-chain-l3-$$"
+CHAIN_SPEC="/tmp/${CHAIN_GROUP}-spec.md"
+CHAIN_LEGS="/tmp/${CHAIN_GROUP}-legs.yaml"
+
+chain_cleanup() {
+    rm -f "$CHAIN_SPEC" "$CHAIN_LEGS"
+    for T in "$TID_L1" "$TID_L2" "$TID_L3"; do
+        rm -f "$TARGETS_DIR/${T}.yaml" "$COMMENTS_DIR/${T}.jsonl" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/cursor/${T}" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/dispatched/${T}" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/pause-state/${T}" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/outstanding-brief/${T}" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/classified-prs/${T}" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/landed/${T}" 2>/dev/null || true
+        /usr/local/bin/mem delete "pm/review-state/${T}" 2>/dev/null || true
+    done
+    /usr/local/bin/mem delete "chain/${CHAIN_GROUP}/state" 2>/dev/null || true
+}
+trap 'chain_cleanup; cleanup' EXIT
+
+cat > "$CHAIN_SPEC" <<EOF
+# Chain smoke spec
+What: 3-leg chain smoke test.
+EOF
+
+cat > "$CHAIN_LEGS" <<EOF
+legs:
+  - tid: ${TID_L1}
+    repo: lapis-test
+    authority: advisory
+    intent: |
+      Implement leg 1 of chain smoke.
+  - tid: ${TID_L2}
+    repo: lapis-test
+    authority: advisory
+    intent: |
+      Implement leg 2 of chain smoke.
+    depends_on:
+      - ${TID_L1}
+  - tid: ${TID_L3}
+    repo: lapis-test
+    authority: advisory
+    intent: |
+      Implement leg 3 of chain smoke.
+    depends_on:
+      - ${TID_L2}
+EOF
+
+# 18a. Bind the 3-leg chain (with --no-auto-fire to avoid real GPU dispatch)
+/usr/bin/python3 -m lapis_pm.cli bind "$CHAIN_GROUP" \
+    --spec-from "$CHAIN_SPEC" \
+    --legs-from "$CHAIN_LEGS" \
+    --create --no-auto-fire
+green "3-leg chain bound with --no-auto-fire"
+
+# 18b. Verify all 3 leg targets exist and are pm_bound with correct chain fields
+/usr/bin/python3 -c "
+from agents_core.targets import TargetStore
+store = TargetStore()
+for tid in ['${TID_L1}', '${TID_L2}', '${TID_L3}']:
+    t = store.get(tid)
+    assert t is not None, f'target {tid!r} not found'
+    assert t.pm_bound, f'target {tid!r} not pm_bound'
+    assert t.data.get('chain_group') == '${CHAIN_GROUP}', f'{tid}: wrong chain_group'
+    assert t.data.get('initial_dispatch'), f'{tid}: missing initial_dispatch'
+print('all 3 legs bound with chain_group and initial_dispatch OK')
+
+# L1 has no depends_on; L2 depends on L1; L3 depends on L2
+t1 = store.get('${TID_L1}')
+t2 = store.get('${TID_L2}')
+t3 = store.get('${TID_L3}')
+assert not (t1.data.get('depends_on') or []), 'L1 should have no depends_on'
+assert t2.data.get('depends_on') == ['${TID_L1}'], f'L2 depends_on wrong: {t2.data.get(\"depends_on\")}'
+assert t3.data.get('depends_on') == ['${TID_L2}'], f'L3 depends_on wrong: {t3.data.get(\"depends_on\")}'
+print('depends_on fields correct OK')
+" || red "chain bind: leg fields incorrect"
+
+# 18c. Verify chain/<group>/state is written with pending/dispatched statuses
+/usr/bin/python3 -c "
+from lapis_pm.chain import get_chain_state
+state = get_chain_state('${CHAIN_GROUP}')
+assert state is not None, 'chain state not written'
+assert state['group_id'] == '${CHAIN_GROUP}', 'wrong group_id in state'
+assert not state['complete'], 'state.complete should be false before any legs land'
+legs_by_tid = {leg['tid']: leg for leg in state['legs']}
+assert '${TID_L1}' in legs_by_tid, 'L1 missing from state'
+assert '${TID_L2}' in legs_by_tid, 'L2 missing from state'
+assert '${TID_L3}' in legs_by_tid, 'L3 missing from state'
+print(f'chain state written, complete={state[\"complete\"]}, legs={list(legs_by_tid.keys())} OK')
+" || red "chain state not written correctly"
+
+# 18d. Simulate leg 1 landing: write pm/landed/L1 (what _act_auto_land does),
+#      then call check_chain_advance → L2 should get an auto-dispatched record.
+#      We need L2 to be pm_bound and have initial_dispatch, which it does.
+#      We pause the GPU queue so the fixer dispatch doesn't run for real.
+/usr/local/bin/gpu-submit pause >/dev/null 2>&1 || true
+
+/usr/bin/python3 -c "
+import json
+from lapis_pm.pm_core import _mem, _landed_key, _now_iso
+from lapis_pm.chain import check_chain_advance, on_leg_landed, get_chain_state
+
+# Write pm/landed for L1 (simulating auto-land completion)
+_mem().set(_landed_key('${TID_L1}'),
+    json.dumps({'pr_num': 0, 'merged_at': _now_iso(), 'landed_at': _now_iso(), 'arc_path': '/tmp/none'}),
+    tags=['lapis-pm', 'landed'])
+
+on_leg_landed('${TID_L1}', '${CHAIN_GROUP}')
+fired = check_chain_advance('${TID_L1}')
+print(f'check_chain_advance fired: {fired}')
+assert '${TID_L2}' in fired, f'L2 not auto-dispatched after L1 land; fired={fired}'
+
+# State should now show L2 as dispatched
+state = get_chain_state('${CHAIN_GROUP}')
+legs_by_tid = {leg['tid']: leg for leg in state['legs']}
+assert legs_by_tid['${TID_L1}']['status'] == 'landed', 'L1 status should be landed'
+assert legs_by_tid['${TID_L2}']['status'] == 'dispatched', f'L2 status should be dispatched, got {legs_by_tid[\"${TID_L2}\"][\"status\"]}'
+assert legs_by_tid['${TID_L3}']['status'] == 'pending', f'L3 status should still be pending'
+print('L2 auto-dispatched, L1=landed L2=dispatched L3=pending OK')
+" || red "chain advance: L2 not auto-dispatched after L1 land"
+green "leg 1 land → leg 2 auto-dispatch verified"
+
+# 18e. Idempotency: calling check_chain_advance again should NOT double-fire L2
+/usr/bin/python3 -c "
+from lapis_pm.chain import check_chain_advance
+fired2 = check_chain_advance('${TID_L1}')
+assert '${TID_L2}' not in fired2, f'L2 double-fired! fired2={fired2}'
+print(f'idempotent: second check_chain_advance fired: {fired2} (L2 not in it) OK')
+" || red "chain idempotency: L2 double-fired"
+green "idempotency check OK (no double-fire)"
+
+# 18f. Simulate leg 2 landing → leg 3 should auto-dispatch
+/usr/bin/python3 -c "
+import json
+from lapis_pm.pm_core import _mem, _landed_key, _now_iso, load_dispatched, save_dispatched
+from lapis_pm.chain import check_chain_advance, on_leg_landed, get_chain_state
+
+# First mark L2's pending dispatch as landed so _is_dispatched returns False
+records = load_dispatched('${TID_L2}')
+for r in records:
+    if r.get('status') == 'pending':
+        r['status'] = 'landed'
+save_dispatched('${TID_L2}', records)
+
+# Write pm/landed for L2
+_mem().set(_landed_key('${TID_L2}'),
+    json.dumps({'pr_num': 0, 'merged_at': _now_iso(), 'landed_at': _now_iso(), 'arc_path': '/tmp/none'}),
+    tags=['lapis-pm', 'landed'])
+
+on_leg_landed('${TID_L2}', '${CHAIN_GROUP}')
+fired = check_chain_advance('${TID_L2}')
+print(f'check_chain_advance after L2 land fired: {fired}')
+assert '${TID_L3}' in fired, f'L3 not auto-dispatched after L2 land; fired={fired}'
+
+state = get_chain_state('${CHAIN_GROUP}')
+legs_by_tid = {leg['tid']: leg for leg in state['legs']}
+assert legs_by_tid['${TID_L2}']['status'] == 'landed', 'L2 status should be landed'
+assert legs_by_tid['${TID_L3}']['status'] == 'dispatched', f'L3 status should be dispatched'
+print('L3 auto-dispatched, L2=landed L3=dispatched OK')
+" || red "chain advance: L3 not auto-dispatched after L2 land"
+green "leg 2 land → leg 3 auto-dispatch verified"
+
+# 18g. Simulate leg 3 landing → state.complete should flip true
+/usr/bin/python3 -c "
+import json
+from lapis_pm.pm_core import _mem, _landed_key, _now_iso, load_dispatched, save_dispatched
+from lapis_pm.chain import check_chain_advance, on_leg_landed, get_chain_state
+
+# Clear L3's pending dispatch
+records = load_dispatched('${TID_L3}')
+for r in records:
+    if r.get('status') == 'pending':
+        r['status'] = 'landed'
+save_dispatched('${TID_L3}', records)
+
+_mem().set(_landed_key('${TID_L3}'),
+    json.dumps({'pr_num': 0, 'merged_at': _now_iso(), 'landed_at': _now_iso(), 'arc_path': '/tmp/none'}),
+    tags=['lapis-pm', 'landed'])
+
+on_leg_landed('${TID_L3}', '${CHAIN_GROUP}')
+check_chain_advance('${TID_L3}')  # nothing to fire, but should not error
+
+state = get_chain_state('${CHAIN_GROUP}')
+print(f'final chain state: complete={state[\"complete\"]}')
+assert state['complete'], f'state.complete should be True after all legs land; state={state}'
+print('state.complete=True OK')
+" || red "chain: state.complete not true after all legs land"
+green "all 3 legs landed → state.complete=True OK"
+
+# 18h. Verify chain event log has bind + auto_dispatch events
+/usr/bin/python3 -c "
+from agents_core.mem import MemoryStore
+mem = MemoryStore()
+events = mem.list_all(tag='chain-group:${CHAIN_GROUP}', limit=100)
+kinds = set()
+for e in events:
+    try:
+        import json
+        key = e.get('key', '')
+        if '/event/' in key:
+            data = json.loads(e['content'])
+            kinds.add(data.get('kind'))
+    except Exception:
+        pass
+print(f'chain event kinds found: {kinds}')
+assert 'bind' in kinds, f'bind event missing; kinds={kinds}'
+assert 'auto_dispatch' in kinds, f'auto_dispatch event missing; kinds={kinds}'
+print('chain event log has bind + auto_dispatch events OK')
+" || red "chain event log missing expected events"
+green "chain event log verified OK"
+
+chain_cleanup
+green "Chain smoke phase complete: 3-leg chain, auto-dispatch cascade, state.complete, event log all OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

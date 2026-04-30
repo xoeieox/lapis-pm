@@ -2,9 +2,11 @@
 """lapis-pm CLI.
 
 Commands:
-    bind <target_id> --spec-from PATH|- --repo REPO [--authority advisory|auto]
+    bind <target_id> --spec-from PATH|- --repo REPO [--authority advisory|auto|hold]
                [--create --title TITLE [--description TEXT] [--urgency medium]
                 [--tag TAG ...] [--product NAME]] [--force]
+    bind <chain-group-id> --spec-from PATH|- --legs-from YAML-PATH
+               [--create --title TITLE ...] [--no-auto-fire]
     unbind <target_id>
     tick [--target ID | --all] [--force-brief] [--force-dispatch AGENT:INTENT]
     status [target_id] [--explain]
@@ -22,10 +24,15 @@ import json
 import sys
 from pathlib import Path
 
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None  # type: ignore
+
 from agents_core.targets import TargetStore
 
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
-from . import episodic, brief, pm_core, land
+from . import episodic, brief, pm_core, land, chain as chain_mod
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
 PM_LIFECYCLE_STAGES = [
@@ -52,7 +59,28 @@ def _derive_tags(repo: str, target_id: str, extra_tags: list[str]) -> list[str]:
     return list(seen)
 
 
+def _normalize_authority(auth: str | None) -> str:
+    """Normalize authority string; accept 'auto-merge' as alias for 'auto'."""
+    if auth is None:
+        return "advisory"
+    if auth == "auto-merge":
+        return "auto"
+    return auth
+
+
 def cmd_bind(args) -> int:
+    # Route to chain bind if --legs-from is present
+    if getattr(args, "legs_from", None):
+        return cmd_bind_chain(args)
+
+    # Single-target mode: --repo is required
+    if not args.repo:
+        print("ERROR: --repo is required for single-target bind", file=sys.stderr)
+        return 2
+
+    if args.authority is None:
+        args.authority = "advisory"
+
     store = TargetStore()
 
     if args.create:
@@ -127,6 +155,204 @@ def cmd_bind(args) -> int:
     pm_core.clear_classified_prs(args.target_id)
     print(f"Bound {args.target_id} → repo={args.repo}, authority={args.authority}")
     print(f"Spec: {len(spec_body)} chars")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Chain-mode bind
+# ---------------------------------------------------------------------------
+
+def cmd_bind_chain(args) -> int:
+    """Bind a multi-leg chain from a legs YAML file.
+
+    Expects args.target_id = chain-group-id, args.legs_from = path to legs YAML.
+    Reads the spec from args.spec_from (applied to all legs).
+
+    Legs YAML shape:
+      legs:
+        - tid: <target-id>
+          repo: <repo-name>
+          authority: advisory | auto | auto-merge | hold
+          intent: |
+            Multi-line fixer intent...
+          # depends_on optional; absent = fires immediately on bind
+          depends_on:
+            - <prior-tid>
+          title: <optional per-leg title>
+    """
+    if _yaml is None:
+        print("ERROR: PyYAML not installed; cannot parse --legs-from YAML", file=sys.stderr)
+        return 2
+
+    chain_group = args.target_id
+    legs_path = Path(args.legs_from)
+    if not legs_path.exists():
+        print(f"ERROR: legs file not found: {legs_path}", file=sys.stderr)
+        return 2
+
+    try:
+        legs_raw = _yaml.safe_load(legs_path.read_text())
+    except Exception as e:
+        print(f"ERROR: failed to parse legs YAML: {e}", file=sys.stderr)
+        return 2
+
+    if not isinstance(legs_raw, dict) or "legs" not in legs_raw:
+        print("ERROR: legs YAML must have a top-level 'legs' key", file=sys.stderr)
+        return 2
+
+    legs: list[dict] = legs_raw["legs"]
+    if not legs:
+        print("ERROR: legs list is empty", file=sys.stderr)
+        return 2
+
+    # Validate required fields per leg
+    for i, leg in enumerate(legs):
+        for field in ("tid", "repo", "authority", "intent"):
+            if not leg.get(field):
+                print(f"ERROR: leg[{i}] missing required field {field!r}", file=sys.stderr)
+                return 2
+        leg["authority"] = _normalize_authority(leg["authority"])
+        if leg["authority"] not in ("advisory", "auto", "hold"):
+            print(
+                f"ERROR: leg[{i}] authority {leg['authority']!r} invalid; "
+                "must be advisory | auto | auto-merge | hold",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Chain validation (cycle detection, duplicate tids, unknown deps)
+    try:
+        chain_mod.validate_legs(legs)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    spec_body = _read_spec(args.spec_from).strip()
+    if not spec_body:
+        print("ERROR: empty spec body", file=sys.stderr)
+        return 2
+
+    store = TargetStore()
+
+    # Atomicity check: validate all legs before creating any
+    for leg in legs:
+        tid = leg["tid"]
+        existing = store.get(tid)
+        if existing is not None and not getattr(args, "force", False):
+            print(
+                f"ERROR: target {tid!r} already exists. Use --force to replace.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Create/bind all legs
+    initial_state_legs: list[dict] = []
+    for leg in legs:
+        tid = leg["tid"]
+        leg_depends_on: list[str] = leg.get("depends_on") or []
+        leg_intent: str = leg["intent"].strip()
+        has_deps = bool(leg_depends_on)
+
+        target = store.get(tid)
+        if target is None:
+            if not getattr(args, "create", False):
+                print(
+                    f"ERROR: target {tid!r} not found. Use --create to create it.",
+                    file=sys.stderr,
+                )
+                return 2
+            title = leg.get("title") or f"{chain_group}: {tid}"
+            tags = _derive_tags(leg["repo"], tid, getattr(args, "tag", []) or [])
+            target = store.create(
+                tid,
+                title=title,
+                urgency=getattr(args, "urgency", "medium"),
+                work_mode=getattr(args, "work_mode", "anywhere"),
+                description=leg.get("description", getattr(args, "description", "") or ""),
+                stages=list(PM_LIFECYCLE_STAGES),
+                category="active-work",
+            )
+            if tags:
+                target.data["tags"] = tags
+            if getattr(args, "product", None):
+                target.data["product"] = args.product
+
+        # Set chain fields on the target
+        target.data["chain_group"] = chain_group
+        if leg_depends_on:
+            target.data["depends_on"] = leg_depends_on
+        target.data["initial_dispatch"] = leg_intent
+
+        target.bind_pm(repo=leg["repo"], authority=leg["authority"])
+        target.save()
+
+        existing_spec = episodic.spec(tid)
+        if existing_spec and not getattr(args, "force", False):
+            print(f"ERROR: target {tid!r} already has a spec bound. Use --force.",
+                  file=sys.stderr)
+            return 2
+        episodic.write_spec(tid, spec_body)
+        pm_core.clear_classified_prs(tid)
+
+        leg_status = "pending" if has_deps else "dispatched"
+        initial_state_legs.append({"tid": tid, "status": leg_status})
+        print(f"  Bound leg {tid} → repo={leg['repo']}, authority={leg['authority']}, "
+              f"depends_on={leg_depends_on or '(none)'}")
+
+    # Write initial chain state + emit bind event
+    chain_mod.update_chain_state(chain_group, initial_state_legs)
+    chain_mod.emit_chain_event(
+        chain_group, "bind", chain_group,
+        details={"legs": [leg["tid"] for leg in legs]},
+    )
+    print(f"Chain {chain_group!r} bound: {len(legs)} leg(s)")
+
+    # Fire initial_dispatch for legs with no depends_on (unless --no-auto-fire)
+    no_auto_fire = getattr(args, "no_auto_fire", False)
+    if not no_auto_fire:
+        for leg in legs:
+            if not (leg.get("depends_on") or []):
+                tid = leg["tid"]
+                target = store.get(tid)
+                if target is None:
+                    continue
+                intent = leg["intent"].strip()
+                spec_sum = episodic.spec_summary(tid)
+                vars_ = {
+                    "target_id": tid,
+                    "spec_summary": spec_sum,
+                    "repo": target.pm_repo or "",
+                    "question": intent,
+                    "pr_number": "",
+                    "slug": "chain-init",
+                }
+                res = pm_core._SHAPER.dispatch("fixer", tid, intent, vars_=vars_)
+                pm_core.append_dispatched(tid, {
+                    "gpu_id": res.task_id,
+                    "spec_id": res.spec_id,
+                    "agent_type": "fixer",
+                    "intent": intent,
+                    "repo": target.pm_repo or "",
+                    "ts": pm_core._now_iso(),
+                    "status": "pending",
+                    "retry_count": 0,
+                })
+                episodic.write_dispatch(
+                    tid,
+                    f"Chain initial dispatch: fixer → {res.task_id}\nIntent: {intent}",
+                    extra_tags=[
+                        f"pm:gpu={res.task_id}",
+                        "pm:agent=fixer",
+                        f"pm:chain-group={chain_group}",
+                        "pm:chain-initial",
+                    ],
+                )
+                chain_mod.emit_chain_event(
+                    chain_group, "dispatch", tid,
+                    details={"task_id": res.task_id, "initial": True},
+                )
+                print(f"  Dispatched leg {tid}: fixer task_id={res.task_id}")
+
     return 0
 
 
@@ -351,12 +577,23 @@ def cmd_land(args) -> int:
     # the landed target stops appearing in tick loops and `lapis-pm status`.
     # Previously land stopped after writing the arc doc, leaving
     # pm_bound=True + stale cursor/dispatched/brief entries indefinitely.
+    # Read chain_group before unbinding (unbind_pm strips it from data)
+    chain_group = target.data.get("chain_group") or ""
+
     pm_core._mem().set(
         pm_core._landed_key(args.target_id),
         json.dumps({"manual": True, "ts": pm_core._now_iso(),
                     "arc_path": str(path)}),
         tags=["lapis-pm", "landed"],
     )
+
+    # Chain advance: auto-fire dependent legs before archiving this target
+    chain_mod.on_leg_landed(args.target_id, chain_group)
+    try:
+        chain_mod.check_chain_advance(args.target_id)
+    except Exception as e:
+        print(f"Warning: chain advance failed: {e}", file=sys.stderr)
+
     store.archive(args.target_id)          # sets status=archived + saves
     target = store.get(args.target_id)     # re-read after archive saved
     target.unbind_pm()
@@ -391,11 +628,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lapis-pm", description="Lapis PM agent CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("bind", help="Bind a target to the PM with a spec.")
-    b.add_argument("target_id")
+    b = sub.add_parser("bind", help="Bind a target (or chain) to the PM with a spec.")
+    b.add_argument("target_id",
+                   help="Target ID (single-target) or chain-group-id (with --legs-from)")
     b.add_argument("--spec-from", required=True, help="Path to spec, or '-' for stdin")
-    b.add_argument("--repo", required=True, help="Forgejo repo name (Erah/<name>)")
-    b.add_argument("--authority", default="advisory", choices=["advisory", "auto"])
+    b.add_argument("--repo", default=None, help="Forgejo repo name (required for single-target)")
+    b.add_argument("--authority", default=None, choices=["advisory", "auto", "hold"],
+                   help="Authority level (default: advisory; hold = fresh-reviewer + 4-cycle budget)")
+    b.add_argument("--legs-from", dest="legs_from", default=None, metavar="PATH",
+                   help="Path to chain legs YAML; switches to chain-mode (mutex with --repo)")
+    b.add_argument("--no-auto-fire", dest="no_auto_fire", action="store_true",
+                   help="In chain mode: do not fire initial leg dispatch at bind time")
     b.add_argument("--force", action="store_true", help="Replace existing spec binding")
     # --create flags: create target YAML if it doesn't exist
     b.add_argument("--create", action="store_true",

@@ -470,8 +470,23 @@ def _act_auto_land(target_id: str) -> str:
         tags=["pm:auto-land"],
     )
 
-    # 4. Archive + unbind + clear mem state
+    # 3a. Chain advance: update chain state + auto-fire dependent legs.
+    # Read chain_group before unbind (unbind_pm strips it from data).
     store = TargetStore()
+    _target_for_chain = store.get(target_id)
+    _chain_group = _target_for_chain.data.get("chain_group") or "" if _target_for_chain else ""
+    try:
+        from . import chain as _chain
+        _chain.on_leg_landed(target_id, _chain_group)
+        _chain.check_chain_advance(target_id)
+    except Exception as _chain_err:
+        episodic.write_observation(
+            target_id,
+            f"chain-advance error (non-fatal): {_chain_err}",
+            extra_tags=["pm:chain-error"],
+        )
+
+    # 4. Archive + unbind + clear mem state
     store.archive(target_id)
     target = store.get(target_id)
     target.unbind_pm()

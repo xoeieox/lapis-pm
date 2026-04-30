@@ -360,6 +360,41 @@ class TestCheckChainAdvance:
 
         assert "leg_b" not in fired
 
+    def test_idempotent_when_dispatch_progressed_past_pending(self):
+        """A leg whose dispatch moved to 'processed'/'failed' (not 'landed') must
+        still be considered fired — chain state is canonical, dispatched-record
+        status is not the only signal.
+        """
+        mem = _make_mem_store()
+        leg_b = self._make_target("leg_b", ["leg_a"], "implement B", "grp")
+
+        with (
+            patch("lapis_pm.chain._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
+        ):
+            mem.set("pm/landed/leg_a",
+                    json.dumps({"landed_at": "2026-04-30T00:00:00+00:00"}),
+                    tags=["lapis-pm", "landed"])
+            # Dispatch already moved past 'pending' — e.g. GPU finished but PR
+            # never opened/merged. Without a chain-state-aware guard, the
+            # leg would re-fire on every subsequent sibling land.
+            mem.set("pm/dispatched/leg_b",
+                    json.dumps([{"status": "processed", "gpu_id": "old-task"}]),
+                    tags=["lapis-pm"])
+            # Chain state correctly reflects that leg_b was already dispatched.
+            update_chain_state("grp", [
+                {"tid": "leg_a", "status": "landed"},
+                {"tid": "leg_b", "status": "dispatched"},
+            ])
+
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = [leg_b]
+
+            with patch("lapis_pm.chain.TargetStore", return_value=mock_store):
+                fired = check_chain_advance("leg_a")
+
+        assert "leg_b" not in fired
+
 
 # ---------------------------------------------------------------------------
 # Chain bind atomicity (pre-flight + rollback)
@@ -446,3 +481,59 @@ class TestChainBindAtomicity:
         rc = cli_mod.cmd_bind(args)
         assert rc == 2
         assert (tmp_path / "leg_x.yaml").exists() is False
+
+    def test_no_auto_fire_writes_pending_status_for_no_dep_legs(self, tmp_path, monkeypatch):
+        """--no-auto-fire must NOT mark no-dep legs as 'dispatched' in chain state.
+
+        Pre-fix: chain state recorded "dispatched" for no-dep legs based purely on
+        depends_on, even when --no-auto-fire suppressed the actual dispatch loop.
+        That made chain state lie about what fired. Fix: status is 'dispatched' only
+        when we'll actually fire below.
+        """
+        from lapis_pm import cli as cli_mod
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        mem = _make_mem_store()
+        monkeypatch.setattr("lapis_pm.chain._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.pm_core._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.episodic.spec", lambda tid: None)
+        monkeypatch.setattr("lapis_pm.episodic.write_spec",
+                            lambda tid, body: None)
+        monkeypatch.setattr("lapis_pm.pm_core.clear_classified_prs",
+                            lambda tid: None)
+
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "root", "repo": "r", "authority": "advisory",
+                 "intent": "do root"},
+                {"tid": "child", "repo": "r", "authority": "advisory",
+                 "intent": "do child", "depends_on": ["root"]},
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "grp",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            "--create",
+            "--no-auto-fire",
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 0, "bind should succeed"
+
+        state = get_chain_state("grp")
+        assert state is not None
+        legs_by_tid = {leg["tid"]: leg for leg in state["legs"]}
+        # Root has no deps but --no-auto-fire suppressed firing → must be pending.
+        assert legs_by_tid["root"]["status"] == "pending", (
+            f"--no-auto-fire root should be pending, got "
+            f"{legs_by_tid['root']['status']!r}"
+        )
+        # Child depends on root → pending regardless.
+        assert legs_by_tid["child"]["status"] == "pending"

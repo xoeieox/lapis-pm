@@ -10,8 +10,10 @@ that target's initial_dispatch.
 
 Invariants:
 - Idempotent: re-entering check_chain_advance with the same tid never double-fires.
-- No double-fire: _is_dispatched() guards against firing when target already has
-  a pending dispatch.
+- No double-fire: _is_dispatched() consults the chain state snapshot. A leg whose
+  chain status is anything other than 'pending' is treated as already fired —
+  this catches dispatches that progressed past 'pending' (processed/failed/landed)
+  without the chain advancing, so subsequent sibling lands won't re-fire them.
 - Backwards compat: targets without chain fields are untouched by chain logic.
 """
 
@@ -244,10 +246,26 @@ def _landed_tids() -> set[str]:
     return tids
 
 
-def _is_dispatched(tid: str) -> bool:
-    """Return True if target already has a pending dispatch (idempotency guard)."""
+def _is_dispatched(tid: str, chain_group: str = "") -> bool:
+    """Return True if this leg has already been fired (idempotency guard).
+
+    Canonical source: the chain state snapshot. A leg with status other than
+    'pending' (i.e. 'dispatched' or 'landed') has already been fired — this
+    correctly skips legs whose dispatch record has progressed past 'pending'
+    (processed / failed / queue-terminal) without the chain having advanced.
+
+    Fallback (no chain_group, or state missing): any dispatched record at all
+    is treated as 'already fired'. Conservative — avoids re-firing on lifecycle
+    states beyond 'pending'.
+    """
+    if chain_group:
+        state = get_chain_state(chain_group)
+        if state:
+            for leg in state.get("legs", []):
+                if leg.get("tid") == tid:
+                    return leg.get("status") != "pending"
     from lapis_pm.pm_core import load_dispatched
-    return any(r.get("status") == "pending" for r in load_dispatched(tid))
+    return bool(load_dispatched(tid))
 
 
 # ---------------------------------------------------------------------------
@@ -294,11 +312,12 @@ def check_chain_advance(just_landed_tid: str) -> list[str]:
         if not initial_dispatch:
             continue
 
-        # Idempotency: skip if already has a pending dispatch
-        if _is_dispatched(target.id):
-            continue
-
         chain_group: str = target.data.get("chain_group") or ""
+
+        # Idempotency: skip if chain state shows this leg already fired
+        # (status != 'pending'), or — without chain_group — any dispatch record exists.
+        if _is_dispatched(target.id, chain_group):
+            continue
 
         try:
             _fire_initial_dispatch(

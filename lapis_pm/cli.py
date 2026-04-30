@@ -242,6 +242,7 @@ def cmd_bind_chain(args) -> int:
     store = TargetStore()
     force = bool(getattr(args, "force", False))
     create = bool(getattr(args, "create", False))
+    no_auto_fire = bool(getattr(args, "no_auto_fire", False))
 
     # Pre-flight: validate every leg upfront before mutating anything.
     # Catches existing-target / missing-target / existing-spec failures
@@ -322,7 +323,10 @@ def cmd_bind_chain(args) -> int:
             episodic.write_spec(tid, spec_body)
             pm_core.clear_classified_prs(tid)
 
-            leg_status = "pending" if has_deps else "dispatched"
+            # No-dep legs are 'dispatched' only if we'll actually fire them below.
+            # With --no-auto-fire the dispatch loop is skipped, so they stay 'pending'
+            # until manually dispatched — keeps chain state honest about what fired.
+            leg_status = "dispatched" if (not has_deps and not no_auto_fire) else "pending"
             initial_state_legs.append({"tid": tid, "status": leg_status})
             print(f"  Bound leg {tid} → repo={leg['repo']}, authority={leg['authority']}, "
                   f"depends_on={leg_depends_on or '(none)'}")
@@ -345,7 +349,6 @@ def cmd_bind_chain(args) -> int:
     print(f"Chain {chain_group!r} bound: {len(legs)} leg(s)")
 
     # Fire initial_dispatch for legs with no depends_on (unless --no-auto-fire)
-    no_auto_fire = getattr(args, "no_auto_fire", False)
     if not no_auto_fire:
         for leg in legs:
             if not (leg.get("depends_on") or []):

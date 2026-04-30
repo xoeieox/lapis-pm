@@ -477,7 +477,8 @@ def _act_auto_land(target_id: str) -> str:
     )
 
     # 3a. Chain advance: update chain state + auto-fire dependent legs.
-    # Read chain_group before unbind (unbind_pm strips it from data).
+    # Read chain_group before archive — `archive()` reloads the target and
+    # subsequent state changes can leave the in-memory copy stale.
     store = TargetStore()
     _target_for_chain = store.get(target_id)
     _chain_group = _target_for_chain.data.get("chain_group") or "" if _target_for_chain else ""

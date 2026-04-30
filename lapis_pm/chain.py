@@ -25,7 +25,7 @@ from agents_core.targets import TargetStore
 
 try:
     from agents_core.notify import send_notification, Priority as NotifyPriority
-except Exception:
+except ImportError:
     send_notification = None  # type: ignore
     NotifyPriority = None  # type: ignore
 

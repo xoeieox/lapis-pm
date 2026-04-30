@@ -584,7 +584,8 @@ def cmd_land(args) -> int:
     # the landed target stops appearing in tick loops and `lapis-pm status`.
     # Previously land stopped after writing the arc doc, leaving
     # pm_bound=True + stale cursor/dispatched/brief entries indefinitely.
-    # Read chain_group before unbinding (unbind_pm strips it from data)
+    # Read chain_group before archive — `archive()` reloads the target and
+    # subsequent state changes can leave the in-memory copy stale.
     chain_group = target.data.get("chain_group") or ""
 
     pm_core._mem().set(
@@ -594,9 +595,11 @@ def cmd_land(args) -> int:
         tags=["lapis-pm", "landed"],
     )
 
-    # Chain advance: auto-fire dependent legs before archiving this target
-    chain_mod.on_leg_landed(args.target_id, chain_group)
+    # Chain advance: auto-fire dependent legs before archiving this target.
+    # Wrap both calls — if either raises, we still want to archive/unbind so
+    # the target doesn't get stuck in a half-landed state.
     try:
+        chain_mod.on_leg_landed(args.target_id, chain_group)
         chain_mod.check_chain_advance(args.target_id)
     except Exception as e:
         print(f"Warning: chain advance failed: {e}", file=sys.stderr)

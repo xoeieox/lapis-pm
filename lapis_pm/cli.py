@@ -179,7 +179,7 @@ def cmd_bind_chain(args) -> int:
       legs:
         - tid: <target-id>
           repo: <repo-name>
-          authority: advisory | auto | auto-merge | hold
+          authority: advisory | auto | hold
           intent: |
             Multi-line fixer intent...
           # depends_on optional; absent = fires immediately on bind
@@ -222,7 +222,7 @@ def cmd_bind_chain(args) -> int:
         if leg["authority"] not in ("advisory", "auto", "hold"):
             print(
                 f"ERROR: leg[{i}] authority {leg['authority']!r} invalid; "
-                "must be advisory | auto | auto-merge | hold",
+                "must be advisory | auto | hold",
                 file=sys.stderr,
             )
             return 2
@@ -240,71 +240,101 @@ def cmd_bind_chain(args) -> int:
         return 2
 
     store = TargetStore()
+    force = bool(getattr(args, "force", False))
+    create = bool(getattr(args, "create", False))
 
-    # Atomicity check: validate all legs before creating any
+    # Pre-flight: validate every leg upfront before mutating anything.
+    # Catches existing-target / missing-target / existing-spec failures
+    # before we partially bind a chain.
     for leg in legs:
         tid = leg["tid"]
         existing = store.get(tid)
-        if existing is not None and not getattr(args, "force", False):
+        if existing is not None and not force:
             print(
                 f"ERROR: target {tid!r} already exists. Use --force to replace.",
                 file=sys.stderr,
             )
             return 2
+        if existing is None and not create:
+            print(
+                f"ERROR: target {tid!r} not found. Use --create to create it.",
+                file=sys.stderr,
+            )
+            return 2
+        if episodic.spec(tid) and not force:
+            print(
+                f"ERROR: target {tid!r} already has a spec bound. Use --force.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Track new YAMLs we create so we can roll them back if a later
+    # leg's mutation step raises unexpectedly.
+    created_tids: list[str] = []
+
+    def _rollback() -> None:
+        for created_tid in created_tids:
+            try:
+                t = store.get(created_tid)
+                if t is not None and t.path.exists():
+                    t.path.unlink()
+            except Exception:
+                pass
 
     # Create/bind all legs
     initial_state_legs: list[dict] = []
-    for leg in legs:
-        tid = leg["tid"]
-        leg_depends_on: list[str] = leg.get("depends_on") or []
-        leg_intent: str = leg["intent"].strip()
-        has_deps = bool(leg_depends_on)
+    try:
+        for leg in legs:
+            tid = leg["tid"]
+            leg_depends_on: list[str] = leg.get("depends_on") or []
+            leg_intent: str = leg["intent"].strip()
+            has_deps = bool(leg_depends_on)
 
-        target = store.get(tid)
-        if target is None:
-            if not getattr(args, "create", False):
-                print(
-                    f"ERROR: target {tid!r} not found. Use --create to create it.",
-                    file=sys.stderr,
+            target = store.get(tid)
+            newly_created = target is None
+            if target is None:
+                title = leg.get("title") or f"{chain_group}: {tid}"
+                tags = _derive_tags(leg["repo"], tid, getattr(args, "tag", []) or [])
+                target = store.create(
+                    tid,
+                    title=title,
+                    urgency=getattr(args, "urgency", "medium"),
+                    work_mode=getattr(args, "work_mode", "anywhere"),
+                    description=leg.get("description", getattr(args, "description", "") or ""),
+                    stages=list(PM_LIFECYCLE_STAGES),
+                    category="active-work",
                 )
-                return 2
-            title = leg.get("title") or f"{chain_group}: {tid}"
-            tags = _derive_tags(leg["repo"], tid, getattr(args, "tag", []) or [])
-            target = store.create(
-                tid,
-                title=title,
-                urgency=getattr(args, "urgency", "medium"),
-                work_mode=getattr(args, "work_mode", "anywhere"),
-                description=leg.get("description", getattr(args, "description", "") or ""),
-                stages=list(PM_LIFECYCLE_STAGES),
-                category="active-work",
-            )
-            if tags:
-                target.data["tags"] = tags
-            if getattr(args, "product", None):
-                target.data["product"] = args.product
+                created_tids.append(tid)
+                if tags:
+                    target.data["tags"] = tags
+                if getattr(args, "product", None):
+                    target.data["product"] = args.product
 
-        # Set chain fields on the target
-        target.data["chain_group"] = chain_group
-        if leg_depends_on:
-            target.data["depends_on"] = leg_depends_on
-        target.data["initial_dispatch"] = leg_intent
+            # Set chain fields on the target
+            target.data["chain_group"] = chain_group
+            if leg_depends_on:
+                target.data["depends_on"] = leg_depends_on
+            target.data["initial_dispatch"] = leg_intent
 
-        target.bind_pm(repo=leg["repo"], authority=leg["authority"])
-        target.save()
+            target.bind_pm(repo=leg["repo"], authority=leg["authority"])
+            target.save()
 
-        existing_spec = episodic.spec(tid)
-        if existing_spec and not getattr(args, "force", False):
-            print(f"ERROR: target {tid!r} already has a spec bound. Use --force.",
-                  file=sys.stderr)
-            return 2
-        episodic.write_spec(tid, spec_body)
-        pm_core.clear_classified_prs(tid)
+            episodic.write_spec(tid, spec_body)
+            pm_core.clear_classified_prs(tid)
 
-        leg_status = "pending" if has_deps else "dispatched"
-        initial_state_legs.append({"tid": tid, "status": leg_status})
-        print(f"  Bound leg {tid} → repo={leg['repo']}, authority={leg['authority']}, "
-              f"depends_on={leg_depends_on or '(none)'}")
+            leg_status = "pending" if has_deps else "dispatched"
+            initial_state_legs.append({"tid": tid, "status": leg_status})
+            print(f"  Bound leg {tid} → repo={leg['repo']}, authority={leg['authority']}, "
+                  f"depends_on={leg_depends_on or '(none)'}")
+    except Exception as e:
+        _rollback()
+        print(
+            f"ERROR: chain bind failed mid-loop: {e}\n"
+            f"Rolled back {len(created_tids)} newly-created leg target(s); "
+            "pre-existing targets bound earlier in the loop may need manual unbind.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Write initial chain state + emit bind event
     chain_mod.update_chain_state(chain_group, initial_state_legs)

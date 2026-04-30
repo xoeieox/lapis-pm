@@ -268,7 +268,7 @@ def check_chain_advance(just_landed_tid: str) -> list[str]:
 
     Returns list of tids that were auto-dispatched this call.
     """
-    from lapis_pm import pm_core, episodic
+    from lapis_pm import episodic
 
     store = TargetStore()
     landed = _landed_tids()

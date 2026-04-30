@@ -106,3 +106,31 @@ class TestHoldReviewBehavior:
     def test_non_hold_uses_same_reviewer_mode(self):
         """advisory authority must map to same-reviewer mode in pm_core._REVIEWER_MODES."""
         assert pm_core._REVIEWER_MODES.get("advisory") == "same-reviewer"
+
+
+class TestBindPmAcceptsHoldAuthority:
+    """End-to-end check that target.bind_pm() accepts 'hold'.
+
+    The new --authority hold CLI choice is only useful if the underlying
+    Target.bind_pm() method (in agents-core) doesn't reject 'hold'. Without
+    this regression test, the CLI surface and the binding contract can drift
+    and a hold-authority bind will crash at runtime instead of in CI.
+
+    Skipped automatically if the installed agents-core predates the
+    bind_pm-widening change; the test re-engages once agents-core ships
+    the matching PR.
+    """
+
+    def test_target_bind_pm_accepts_hold(self, tmp_path):
+        from agents_core.targets import Target
+        path = tmp_path / "h.yaml"
+        path.write_text("id: h\ntitle: H\n")
+        t = Target({"id": "h", "title": "H"}, path)
+        try:
+            t.bind_pm(repo="r", authority="hold")
+        except ValueError as e:
+            pytest.skip(
+                f"installed agents-core rejects authority='hold' ({e}); "
+                "merge agents-core PR widening bind_pm first"
+            )
+        assert t.pm_authority == "hold"

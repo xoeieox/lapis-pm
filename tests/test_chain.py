@@ -359,3 +359,90 @@ class TestCheckChainAdvance:
                 fired = check_chain_advance("leg_a")
 
         assert "leg_b" not in fired
+
+
+# ---------------------------------------------------------------------------
+# Chain bind atomicity (pre-flight + rollback)
+# ---------------------------------------------------------------------------
+
+class TestChainBindAtomicity:
+    """Bind-mode atomicity:
+    - Pre-flight checks every leg's existence + spec status before any mutation.
+    - If any pre-flight fails, no targets are created and no specs are written.
+    """
+
+    def _write_legs_yaml(self, tmp_path, legs_data: dict) -> str:
+        import yaml
+        legs_path = tmp_path / "legs.yaml"
+        legs_path.write_text(yaml.safe_dump(legs_data))
+        return str(legs_path)
+
+    def _write_spec(self, tmp_path) -> str:
+        spec_path = tmp_path / "spec.md"
+        spec_path.write_text("# spec\nbody")
+        return str(spec_path)
+
+    def test_preflight_existing_target_no_force_aborts_before_create(self, tmp_path, monkeypatch):
+        """If leg N's target exists and --force is absent, no leg gets created."""
+        from lapis_pm import cli as cli_mod
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        # Pre-create only leg_b — leg_a does NOT exist
+        store = TargetStore(targets_dir=tmp_path)
+        store.create("leg_b", title="Pre-existing", urgency="medium",
+                     description="x", category="active-work")
+
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "leg_a", "repo": "r", "authority": "advisory",
+                 "intent": "do a"},
+                {"tid": "leg_b", "repo": "r", "authority": "advisory",
+                 "intent": "do b", "depends_on": ["leg_a"]},
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "grp",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            "--create",
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 2
+
+        # leg_a must NOT have been created (pre-flight aborts before any create)
+        assert (tmp_path / "leg_a.yaml").exists() is False
+
+    def test_preflight_missing_target_no_create_aborts(self, tmp_path, monkeypatch):
+        """Without --create, leg with no existing target aborts pre-flight."""
+        from lapis_pm import cli as cli_mod
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "leg_x", "repo": "r", "authority": "advisory",
+                 "intent": "do x"},
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "grp",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            # NO --create
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 2
+        assert (tmp_path / "leg_x.yaml").exists() is False

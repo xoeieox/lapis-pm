@@ -214,7 +214,7 @@ def cmd_bind_chain(args) -> int:
 
     # Validate required fields per leg
     for i, leg in enumerate(legs):
-        for field in ("tid", "repo", "authority", "intent"):
+        for field in ("tid", "repo", "authority", "intent", "branch_slug"):
             if not leg.get(field):
                 print(f"ERROR: leg[{i}] missing required field {field!r}", file=sys.stderr)
                 return 2
@@ -311,11 +311,17 @@ def cmd_bind_chain(args) -> int:
                 if getattr(args, "product", None):
                     target.data["product"] = args.product
 
+            # Construct canonical branch and inject as first line of initial_dispatch.
+            # Fixer sees the branch first; it cannot miss it regardless of spec wording.
+            branch_slug = leg["branch_slug"]
+            canonical_branch = f"lapis/{tid}/{branch_slug}"
+            injected_dispatch = f"Branch: {canonical_branch}\n\n{leg_intent}"
+
             # Set chain fields on the target
             target.data["chain_group"] = chain_group
             if leg_depends_on:
                 target.data["depends_on"] = leg_depends_on
-            target.data["initial_dispatch"] = leg_intent
+            target.data["initial_dispatch"] = injected_dispatch
 
             target.bind_pm(repo=leg["repo"], authority=leg["authority"])
             target.save()

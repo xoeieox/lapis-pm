@@ -61,51 +61,97 @@ def _make_mem_store():
 
 class TestValidateLegs:
     def test_valid_single_leg(self):
-        legs = [{"tid": "a", "repo": "r", "authority": "advisory", "intent": "do it"}]
+        legs = [{"tid": "a", "repo": "r", "authority": "advisory", "intent": "do it",
+                 "branch_slug": "implement"}]
         validate_legs(legs)  # should not raise
 
     def test_valid_chain_linear(self):
         legs = [
-            {"tid": "a", "depends_on": []},
-            {"tid": "b", "depends_on": ["a"]},
-            {"tid": "c", "depends_on": ["b"]},
+            {"tid": "a", "depends_on": [], "branch_slug": "step-a"},
+            {"tid": "b", "depends_on": ["a"], "branch_slug": "step-b"},
+            {"tid": "c", "depends_on": ["b"], "branch_slug": "step-c"},
         ]
         validate_legs(legs)
 
     def test_valid_parallel_rejoin(self):
         # legs b and c both depend on a; d depends on b and c
         legs = [
-            {"tid": "a", "depends_on": []},
-            {"tid": "b", "depends_on": ["a"]},
-            {"tid": "c", "depends_on": ["a"]},
-            {"tid": "d", "depends_on": ["b", "c"]},
+            {"tid": "a", "depends_on": [], "branch_slug": "a"},
+            {"tid": "b", "depends_on": ["a"], "branch_slug": "b"},
+            {"tid": "c", "depends_on": ["a"], "branch_slug": "c"},
+            {"tid": "d", "depends_on": ["b", "c"], "branch_slug": "d"},
         ]
         validate_legs(legs)
 
+    # --- branch_slug validation ---
+
+    def test_branch_slug_missing_raises(self):
+        legs = [{"tid": "a", "repo": "r", "authority": "advisory", "intent": "x"}]
+        with pytest.raises(ValueError, match="branch_slug"):
+            validate_legs(legs)
+
+    def test_branch_slug_empty_raises(self):
+        legs = [{"tid": "a", "branch_slug": ""}]
+        with pytest.raises(ValueError, match="branch_slug"):
+            validate_legs(legs)
+
+    def test_branch_slug_with_slash_raises(self):
+        legs = [{"tid": "a", "branch_slug": "foo/bar"}]
+        with pytest.raises(ValueError, match="slash"):
+            validate_legs(legs)
+
+    def test_branch_slug_with_lapis_prefix_raises(self):
+        legs = [{"tid": "a", "branch_slug": "lapis/implement"}]
+        with pytest.raises(ValueError, match="lapis/"):
+            validate_legs(legs)
+
+    def test_branch_slug_leading_dash_raises(self):
+        legs = [{"tid": "a", "branch_slug": "-foo"}]
+        with pytest.raises(ValueError, match="invalid"):
+            validate_legs(legs)
+
+    def test_branch_slug_trailing_dash_raises(self):
+        legs = [{"tid": "a", "branch_slug": "foo-"}]
+        with pytest.raises(ValueError, match="invalid"):
+            validate_legs(legs)
+
+    def test_branch_slug_single_char_valid(self):
+        legs = [{"tid": "a", "branch_slug": "v"}]
+        validate_legs(legs)  # single char is valid
+
+    def test_branch_slug_with_numbers_valid(self):
+        legs = [{"tid": "a", "branch_slug": "impl-v2"}]
+        validate_legs(legs)
+
+    def test_branch_slug_uppercase_raises(self):
+        legs = [{"tid": "a", "branch_slug": "Implement"}]
+        with pytest.raises(ValueError, match="invalid"):
+            validate_legs(legs)
+
     def test_duplicate_tid(self):
-        legs = [{"tid": "a"}, {"tid": "a"}]
+        legs = [{"tid": "a", "branch_slug": "s"}, {"tid": "a", "branch_slug": "s"}]
         with pytest.raises(ValueError, match="Duplicate tid"):
             validate_legs(legs)
 
     def test_cyclic_direct(self):
         legs = [
-            {"tid": "a", "depends_on": ["b"]},
-            {"tid": "b", "depends_on": ["a"]},
+            {"tid": "a", "depends_on": ["b"], "branch_slug": "s"},
+            {"tid": "b", "depends_on": ["a"], "branch_slug": "s"},
         ]
         with pytest.raises(ValueError, match="Cyclic"):
             validate_legs(legs)
 
     def test_cyclic_indirect(self):
         legs = [
-            {"tid": "a", "depends_on": ["c"]},
-            {"tid": "b", "depends_on": ["a"]},
-            {"tid": "c", "depends_on": ["b"]},
+            {"tid": "a", "depends_on": ["c"], "branch_slug": "s"},
+            {"tid": "b", "depends_on": ["a"], "branch_slug": "s"},
+            {"tid": "c", "depends_on": ["b"], "branch_slug": "s"},
         ]
         with pytest.raises(ValueError, match="Cyclic"):
             validate_legs(legs)
 
     def test_unknown_dep(self):
-        legs = [{"tid": "a", "depends_on": ["nonexistent"]}]
+        legs = [{"tid": "a", "depends_on": ["nonexistent"], "branch_slug": "s"}]
         with pytest.raises(ValueError, match="unknown tid"):
             validate_legs(legs)
 
@@ -434,9 +480,9 @@ class TestChainBindAtomicity:
         legs_path = self._write_legs_yaml(tmp_path, {
             "legs": [
                 {"tid": "leg_a", "repo": "r", "authority": "advisory",
-                 "intent": "do a"},
+                 "intent": "do a", "branch_slug": "implement"},
                 {"tid": "leg_b", "repo": "r", "authority": "advisory",
-                 "intent": "do b", "depends_on": ["leg_a"]},
+                 "intent": "do b", "depends_on": ["leg_a"], "branch_slug": "implement"},
             ]
         })
         spec_path = self._write_spec(tmp_path)
@@ -466,7 +512,7 @@ class TestChainBindAtomicity:
         legs_path = self._write_legs_yaml(tmp_path, {
             "legs": [
                 {"tid": "leg_x", "repo": "r", "authority": "advisory",
-                 "intent": "do x"},
+                 "intent": "do x", "branch_slug": "implement"},
             ]
         })
         spec_path = self._write_spec(tmp_path)
@@ -509,9 +555,9 @@ class TestChainBindAtomicity:
         legs_path = self._write_legs_yaml(tmp_path, {
             "legs": [
                 {"tid": "root", "repo": "r", "authority": "advisory",
-                 "intent": "do root"},
+                 "intent": "do root", "branch_slug": "implement"},
                 {"tid": "child", "repo": "r", "authority": "advisory",
-                 "intent": "do child", "depends_on": ["root"]},
+                 "intent": "do child", "depends_on": ["root"], "branch_slug": "implement"},
             ]
         })
         spec_path = self._write_spec(tmp_path)
@@ -537,3 +583,156 @@ class TestChainBindAtomicity:
         )
         # Child depends on root → pending regardless.
         assert legs_by_tid["child"]["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Branch slug injection tests
+# ---------------------------------------------------------------------------
+
+class TestBranchSlugInjection:
+    """Test that cmd_bind_chain injects the Branch: line into initial_dispatch."""
+
+    def _write_legs_yaml(self, tmp_path, legs_data: dict) -> str:
+        import yaml
+        legs_path = tmp_path / "legs.yaml"
+        legs_path.write_text(yaml.safe_dump(legs_data))
+        return str(legs_path)
+
+    def _write_spec(self, tmp_path) -> str:
+        spec_path = tmp_path / "spec.md"
+        spec_path.write_text("# spec\nbody")
+        return str(spec_path)
+
+    def test_branch_injected_into_initial_dispatch(self, tmp_path, monkeypatch):
+        """Each leg's initial_dispatch starts with 'Branch: lapis/<tid>/<slug>'."""
+        from lapis_pm import cli as cli_mod
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        mem = _make_mem_store()
+        monkeypatch.setattr("lapis_pm.chain._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.pm_core._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.episodic.spec", lambda tid: None)
+        monkeypatch.setattr("lapis_pm.episodic.write_spec", lambda tid, body: None)
+        monkeypatch.setattr("lapis_pm.pm_core.clear_classified_prs", lambda tid: None)
+
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "my-spec-leg1", "repo": "repo1", "authority": "advisory",
+                 "intent": "Implement the thing.", "branch_slug": "primitive"},
+                {"tid": "my-spec-leg2", "repo": "repo2", "authority": "advisory",
+                 "intent": "Implement the other thing.", "branch_slug": "integrate",
+                 "depends_on": ["my-spec-leg1"]},
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "my-chain",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            "--create",
+            "--no-auto-fire",
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 0
+
+        store = TargetStore(targets_dir=tmp_path)
+        leg1 = store.get("my-spec-leg1")
+        leg2 = store.get("my-spec-leg2")
+
+        # Leg 1: branch must be lapis/my-spec-leg1/primitive
+        dispatch1 = leg1.data["initial_dispatch"]
+        assert dispatch1.startswith("Branch: lapis/my-spec-leg1/primitive\n\n"), (
+            f"leg1 initial_dispatch does not start with Branch: line: {dispatch1!r}"
+        )
+        assert "Implement the thing." in dispatch1
+
+        # Leg 2: branch must be lapis/my-spec-leg2/integrate
+        dispatch2 = leg2.data["initial_dispatch"]
+        assert dispatch2.startswith("Branch: lapis/my-spec-leg2/integrate\n\n"), (
+            f"leg2 initial_dispatch does not start with Branch: line: {dispatch2!r}"
+        )
+        assert "Implement the other thing." in dispatch2
+
+    def test_intent_preserved_verbatim_after_branch_line(self, tmp_path, monkeypatch):
+        """The original intent body is preserved exactly after the injected Branch: line."""
+        from lapis_pm import cli as cli_mod
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        mem = _make_mem_store()
+        monkeypatch.setattr("lapis_pm.chain._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.pm_core._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.episodic.spec", lambda tid: None)
+        monkeypatch.setattr("lapis_pm.episodic.write_spec", lambda tid, body: None)
+        monkeypatch.setattr("lapis_pm.pm_core.clear_classified_prs", lambda tid: None)
+
+        intent_body = "Line one.\nLine two.\nLine three."
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "leg-a", "repo": "r", "authority": "advisory",
+                 "intent": intent_body, "branch_slug": "impl"},
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "grp2",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            "--create",
+            "--no-auto-fire",
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 0
+
+        store = TargetStore(targets_dir=tmp_path)
+        leg = store.get("leg-a")
+        dispatch = leg.data["initial_dispatch"]
+
+        expected = f"Branch: lapis/leg-a/impl\n\n{intent_body.strip()}"
+        assert dispatch == expected, (
+            f"initial_dispatch does not match expected.\n"
+            f"Expected: {expected!r}\n"
+            f"Got:      {dispatch!r}"
+        )
+
+    def test_missing_branch_slug_rejected_before_any_leg_created(self, tmp_path, monkeypatch):
+        """A chain.yaml without branch_slug fails bind before any target is written."""
+        from lapis_pm import cli as cli_mod
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "leg-x", "repo": "r", "authority": "advisory",
+                 "intent": "do x"},  # missing branch_slug
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "grp3",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            "--create",
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 2, "bind should fail (rc=2) when branch_slug is missing"
+        # No target YAML should have been created
+        assert not (tmp_path / "leg-x.yaml").exists(), (
+            "leg-x.yaml was created despite missing branch_slug (atomicity violated)"
+        )

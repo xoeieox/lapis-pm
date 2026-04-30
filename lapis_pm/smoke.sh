@@ -745,11 +745,13 @@ legs:
   - tid: ${TID_L1}
     repo: lapis-test
     authority: advisory
+    branch_slug: leg1
     intent: |
       Implement leg 1 of chain smoke.
   - tid: ${TID_L2}
     repo: lapis-test
     authority: advisory
+    branch_slug: leg2
     intent: |
       Implement leg 2 of chain smoke.
     depends_on:
@@ -757,6 +759,7 @@ legs:
   - tid: ${TID_L3}
     repo: lapis-test
     authority: advisory
+    branch_slug: leg3
     intent: |
       Implement leg 3 of chain smoke.
     depends_on:
@@ -791,6 +794,57 @@ assert t2.data.get('depends_on') == ['${TID_L1}'], f'L2 depends_on wrong: {t2.da
 assert t3.data.get('depends_on') == ['${TID_L2}'], f'L3 depends_on wrong: {t3.data.get(\"depends_on\")}'
 print('depends_on fields correct OK')
 " || red "chain bind: leg fields incorrect"
+
+# 18b2. Verify branch injection: each leg's initial_dispatch starts with Branch: lapis/<tid>/<slug>
+/usr/bin/python3 -c "
+from agents_core.targets import TargetStore
+store = TargetStore()
+checks = [
+    ('${TID_L1}', 'leg1'),
+    ('${TID_L2}', 'leg2'),
+    ('${TID_L3}', 'leg3'),
+]
+for tid, slug in checks:
+    t = store.get(tid)
+    dispatch = t.data.get('initial_dispatch', '')
+    expected_prefix = f'Branch: lapis/{tid}/{slug}'
+    assert dispatch.startswith(expected_prefix + '\n\n'), (
+        f'{tid}: initial_dispatch does not start with {expected_prefix!r}; '
+        f'got: {dispatch[:80]!r}'
+    )
+    print(f'{tid}: Branch injection OK → {expected_prefix}')
+print('All leg branch injections correct')
+" || red "chain branch injection: Branch: line not found or incorrect in initial_dispatch"
+green "branch injection into initial_dispatch verified for all 3 legs"
+
+# 18b3. Verify missing branch_slug is rejected before any leg target is created
+CHAIN_NOSLUG_GROUP="pm-smoke-noslug-$$"
+CHAIN_NOSLUG_LEGS="/tmp/${CHAIN_NOSLUG_GROUP}-legs.yaml"
+CHAIN_NOSLUG_SPEC="/tmp/${CHAIN_NOSLUG_GROUP}-spec.md"
+TID_NOSLUG="pm-smoke-noslug-leg-$$"
+cat > "$CHAIN_NOSLUG_SPEC" <<'SPECEOF'
+# No-slug smoke spec
+SPECEOF
+cat > "$CHAIN_NOSLUG_LEGS" <<NOSEOF
+legs:
+  - tid: ${TID_NOSLUG}
+    repo: lapis-test
+    authority: advisory
+    intent: |
+      Implement without branch_slug.
+NOSEOF
+# bind should fail with rc=2 (branch_slug missing)
+NOSLUG_OUT=$(/usr/bin/python3 -m lapis_pm.cli bind "$CHAIN_NOSLUG_GROUP" \
+    --spec-from "$CHAIN_NOSLUG_SPEC" \
+    --legs-from "$CHAIN_NOSLUG_LEGS" \
+    --create 2>&1 || true)
+echo "$NOSLUG_OUT"
+echo "$NOSLUG_OUT" | grep -qi "branch_slug" \
+    || red "chain missing branch_slug: error message did not mention 'branch_slug'"
+[ ! -f "${TARGETS_DIR}/${TID_NOSLUG}.yaml" ] \
+    || red "chain missing branch_slug: leg target was created despite missing branch_slug (atomicity violated)"
+rm -f "$CHAIN_NOSLUG_SPEC" "$CHAIN_NOSLUG_LEGS"
+green "missing branch_slug rejected before any leg target created (atomicity preserved)"
 
 # 18c. Verify chain/<group>/state is written with pending/dispatched statuses
 /usr/bin/python3 -c "

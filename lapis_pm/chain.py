@@ -90,7 +90,6 @@ def validate_legs(legs: list[dict]) -> None:
 
     def dfs(start: str) -> None:
         stack = [(start, iter(deps.get(start, set())))]
-        in_stack: set[str] = {start}
         visited[start] = 1
         while stack:
             node, children = stack[-1]
@@ -102,11 +101,9 @@ def validate_legs(legs: list[dict]) -> None:
                     )
                 if visited.get(child, 0) == 0:
                     visited[child] = 1
-                    in_stack.add(child)
                     stack.append((child, iter(deps.get(child, set()))))
             except StopIteration:
                 visited[node] = 2
-                in_stack.discard(node)
                 stack.pop()
 
     for tid in tids:
@@ -226,9 +223,19 @@ def send_auto_dispatch_brief(group_id: str, tid: str, triggered_by: str) -> bool
 # Landed-tids helper
 # ---------------------------------------------------------------------------
 
+_LANDED_LIMIT = 10_000
+
+
 def _landed_tids() -> set[str]:
     """Return set of all tids that have pm/landed/<tid> entries in mem."""
-    results = _mem().list_all(tag="landed", limit=500)
+    results = _mem().list_all(tag="landed", limit=_LANDED_LIMIT)
+    if len(results) >= _LANDED_LIMIT:
+        import logging
+        logging.getLogger(__name__).warning(
+            "_landed_tids: result count hit limit=%d; landed tids may be truncated, "
+            "chain advance may miss satisfied deps. Consider pruning pm/landed/* entries.",
+            _LANDED_LIMIT,
+        )
     tids: set[str] = set()
     for r in results:
         key = r.get("key", "")

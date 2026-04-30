@@ -66,6 +66,12 @@ _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
     "hold": 4,
 }
 
+# Reviewer mode per authority level (fresh-reviewer = cold full-diff each cycle)
+_REVIEWER_MODES: dict[str, str] = {
+    "advisory": "same-reviewer",
+    "hold": "fresh-reviewer",
+}
+
 
 def _read_fixer_meta(spec_id: str) -> dict | None:
     """Read the {spec_id}-meta.json sidecar written by _runner.py for fixers."""
@@ -138,7 +144,7 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
 
     authority_level = target.pm_authority or "advisory"
     budget = _REVIEW_CYCLE_BUDGETS.get(authority_level, 2)
-    mode = "fresh-reviewer" if authority_level == "hold" else "same-reviewer"
+    mode = _REVIEWER_MODES.get(authority_level, "same-reviewer")
     verdict = state.get("verdict")
     has_real_verdict = verdict and verdict != "pending"
 

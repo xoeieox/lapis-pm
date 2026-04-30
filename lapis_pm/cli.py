@@ -71,6 +71,13 @@ def _normalize_authority(auth: str | None) -> str:
 def cmd_bind(args) -> int:
     # Route to chain bind if --legs-from is present
     if getattr(args, "legs_from", None):
+        if getattr(args, "repo", None):
+            print(
+                "ERROR: --legs-from and --repo are mutually exclusive; "
+                "use --legs-from for chain-mode or --repo for single-target mode",
+                file=sys.stderr,
+            )
+            return 2
         return cmd_bind_chain(args)
 
     # Single-target mode: --repo is required

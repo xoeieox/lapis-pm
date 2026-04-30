@@ -100,11 +100,9 @@ class TestHoldReviewBehavior:
         assert pm_core._REVIEW_CYCLE_BUDGETS.get("advisory") == 2
 
     def test_hold_uses_fresh_reviewer_mode(self):
-        """The mode string for hold should be 'fresh' (for fresh-reviewer)."""
-        # This mirrors the logic in _decide_for_pr
-        mode = "fresh" if "hold" == "hold" else "same"
-        assert mode == "fresh"
+        """hold authority must map to fresh-reviewer mode in pm_core._REVIEWER_MODES."""
+        assert pm_core._REVIEWER_MODES.get("hold") == "fresh-reviewer"
 
     def test_non_hold_uses_same_reviewer_mode(self):
-        mode = "fresh" if "advisory" == "hold" else "same"
-        assert mode == "same"
+        """advisory authority must map to same-reviewer mode in pm_core._REVIEWER_MODES."""
+        assert pm_core._REVIEWER_MODES.get("advisory") == "same-reviewer"

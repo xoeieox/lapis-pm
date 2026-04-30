@@ -66,6 +66,12 @@ _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
     "hold": 4,
 }
 
+# Reviewer mode per authority level (fresh-reviewer = cold full-diff each cycle)
+_REVIEWER_MODES: dict[str, str] = {
+    "advisory": "same-reviewer",
+    "hold": "fresh-reviewer",
+}
+
 
 def _read_fixer_meta(spec_id: str) -> dict | None:
     """Read the {spec_id}-meta.json sidecar written by _runner.py for fixers."""
@@ -138,7 +144,7 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
 
     authority_level = target.pm_authority or "advisory"
     budget = _REVIEW_CYCLE_BUDGETS.get(authority_level, 2)
-    mode = "fresh-reviewer" if authority_level == "hold" else "same-reviewer"
+    mode = _REVIEWER_MODES.get(authority_level, "same-reviewer")
     verdict = state.get("verdict")
     has_real_verdict = verdict and verdict != "pending"
 
@@ -470,8 +476,24 @@ def _act_auto_land(target_id: str) -> str:
         tags=["pm:auto-land"],
     )
 
-    # 4. Archive + unbind + clear mem state
+    # 3a. Chain advance: update chain state + auto-fire dependent legs.
+    # Read chain_group before archive — `archive()` reloads the target and
+    # subsequent state changes can leave the in-memory copy stale.
     store = TargetStore()
+    _target_for_chain = store.get(target_id)
+    _chain_group = _target_for_chain.data.get("chain_group") or "" if _target_for_chain else ""
+    try:
+        from . import chain as _chain
+        _chain.on_leg_landed(target_id, _chain_group)
+        _chain.check_chain_advance(target_id)
+    except Exception as _chain_err:
+        episodic.write_observation(
+            target_id,
+            f"chain-advance error (non-fatal): {_chain_err}",
+            extra_tags=["pm:chain-error"],
+        )
+
+    # 4. Archive + unbind + clear mem state
     store.archive(target_id)
     target = store.get(target_id)
     target.unbind_pm()

@@ -1,0 +1,9 @@
+[Unit]
+Description=Lapis PM afternoon brief — daily at 13:00 America/Los_Angeles
+
+[Timer]
+OnCalendar=*-*-* 13:00:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target

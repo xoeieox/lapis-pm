@@ -14,6 +14,7 @@ Commands:
     resume <target_id>
     list
     land <target_id> [--dry-run]
+    brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
     review-gate {status,resume}
 """
 
@@ -730,6 +731,16 @@ def cmd_land(args) -> int:
     return 0
 
 
+def cmd_brief(args) -> int:
+    from . import state_brief
+    period = args.period
+    out = state_brief.generate_brief(period)
+    if out is not None:
+        print(f"Brief written: {out}")
+        print(f"Symlink updated: /srv/lapis/briefs/latest-{period}.md")
+    return 0
+
+
 def cmd_review_gate(args) -> int:
     sub = args.review_gate_sub
     if sub == "status":
@@ -814,6 +825,15 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--dry-run", action="store_true",
                     help="Print arc doc to stdout instead of writing to /srv/lapis/lapis-state/")
     ld.set_defaults(func=cmd_land)
+
+    br = sub.add_parser("brief", help="Generate a state-of-work brief.")
+    br.add_argument(
+        "--period",
+        required=True,
+        choices=["morning", "afternoon", "weekly", "live"],
+        help="Brief cadence: morning/afternoon/live use Qwen; weekly uses Sonnet via Claude CLI.",
+    )
+    br.set_defaults(func=cmd_brief)
 
     rg = sub.add_parser("review-gate",
                         help="Manage the Opus reviewer kill-switch.")

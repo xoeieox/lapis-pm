@@ -1940,9 +1940,53 @@ rm -f "$TARGETS_DIR/${TID_SHA}.yaml" "$COMMENTS_DIR/${TID_SHA}.jsonl" "$SHA_SPEC
 /usr/local/bin/mem delete "pm/dispatched/${TID_SHA}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/classified-prs/${TID_SHA}" 2>/dev/null || true
 
+# --- Phase 23: state brief (dry-run) ------------------------------------
+step "23. state-brief: dry-run morning brief"
+
+BRIEFS_ROOT="/srv/lapis/briefs"
+# Clean up any stale smoke artifacts first
+rm -f "${BRIEFS_ROOT}/latest-morning.md"
+rm -f "${BRIEFS_ROOT}/daily/"*-morning.md 2>/dev/null || true
+
+LAPIS_BRIEF_DRY_RUN=1 $LAPIS brief --period morning \
+    || red "state-brief: lapis-pm brief --period morning exited non-zero"
+
+# (a) Placeholder file written at correct /srv/lapis/briefs/daily/ path
+BRIEF_FILE=$(ls -t "${BRIEFS_ROOT}/daily/"*-morning.md 2>/dev/null | head -1)
+[ -n "$BRIEF_FILE" ] || red "state-brief: no *-morning.md file found under ${BRIEFS_ROOT}/daily/"
+[ -f "$BRIEF_FILE" ] || red "state-brief: expected file at ${BRIEF_FILE}, not found"
+green "state-brief: brief file written at ${BRIEF_FILE}"
+
+# (b) latest-morning.md symlink points to it
+SYMLINK="${BRIEFS_ROOT}/latest-morning.md"
+[ -L "$SYMLINK" ] || red "state-brief: latest-morning.md is not a symlink"
+RESOLVED=$(readlink -f "$SYMLINK")
+EXPECTED=$(readlink -f "$BRIEF_FILE")
+[ "$RESOLVED" = "$EXPECTED" ] || red "state-brief: latest-morning.md -> ${RESOLVED} but expected ${EXPECTED}"
+green "state-brief: latest-morning.md symlink points to correct file"
+
+# (c) All five bucket headings present in file (prevents vacuous pass)
+grep -q "^## Built (since" "$BRIEF_FILE" \
+    || red "state-brief: missing 'Built (since' heading in ${BRIEF_FILE}"
+grep -q "^## Notable ratifications (since" "$BRIEF_FILE" \
+    || red "state-brief: missing 'Notable ratifications (since' heading in ${BRIEF_FILE}"
+grep -q "^## In flight" "$BRIEF_FILE" \
+    || red "state-brief: missing 'In flight' heading in ${BRIEF_FILE}"
+grep -q "^## Captured" "$BRIEF_FILE" \
+    || red "state-brief: missing 'Captured' heading in ${BRIEF_FILE}"
+grep -q "^## Awaiting your call" "$BRIEF_FILE" \
+    || red "state-brief: missing 'Awaiting your call' heading in ${BRIEF_FILE}"
+green "state-brief: all five bucket headings present in brief file"
+
+# Cleanup brief artifacts
+rm -f "$BRIEF_FILE" "${SYMLINK}" 2>/dev/null || true
+rmdir "${BRIEFS_ROOT}/daily" "${BRIEFS_ROOT}/weekly" "${BRIEFS_ROOT}" 2>/dev/null || true
+
+green "Phase 23 complete: state-brief dry-run passed (file path, symlink, five headings)"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

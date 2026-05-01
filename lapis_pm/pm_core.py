@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 from agents_core.targets import TargetStore
 from agents_core.mem import MemoryStore
+from agents_core.notify import Priority as NotifyPriority
 
 try:
     from agents_core.forgejo import get_open_prs, merge_pr, get_pr as _forgejo_get_pr, get_branch as _forgejo_get_branch
@@ -995,6 +996,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         query=cls.title,
         diff_snippet=cls.diff or None,
         screen_issues=cls.issues or None,
+        notify=NotifyPriority.NORMAL if hold else None,
     )
     set_outstanding_brief(target_id, b.comment_id)
     _mark_pr_classified(target_id, cls.pr_number)
@@ -1214,6 +1216,7 @@ def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
         query=f"PR #{cls.pr_number} review exhausted: {cls.title}",
         diff_snippet=cls.diff or None,
         screen_issues=None,
+        notify=NotifyPriority.HIGH,
     )
     set_outstanding_brief(target_id, b.comment_id)
     _mark_pr_classified(target_id, cls.pr_number)
@@ -1239,6 +1242,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
         target_id,
         trigger=f"Review-gate loop soft-paused after {count} Opus reviewer calls",
         query="review-gate pause — token budget exceeded",
+        notify=NotifyPriority.HIGH,
     )
     set_outstanding_brief(target_id, b.comment_id)
     _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
@@ -1754,7 +1758,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         )
         encoded += 1
         b = brief.synthesize(target_id, trigger=f"user directive: {d.content[:80]}",
-                             query=d.content)
+                             query=d.content, notify=None)
         set_outstanding_brief(target_id, b.comment_id)
         decision_str = f"directive_brief:{b.comment_id}"
 
@@ -1803,6 +1807,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                 target_id,
                 trigger=f"shaped agent {rec.get('agent_type')} failed after {rec.get('retry_count')} retries",
                 query=rec.get("intent", ""),
+                notify=NotifyPriority.HIGH,
             )
             set_outstanding_brief(target_id, b.comment_id)
             decision_str = f"abandon_brief:{b.comment_id}"

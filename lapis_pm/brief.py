@@ -72,11 +72,15 @@ def synthesize(
     query: str = "",
     diff_snippet: str | None = None,
     screen_issues: list[dict] | None = None,
+    *,
+    notify: NotifyPriority | None = NotifyPriority.NORMAL,
 ) -> Brief:
-    """Produce a brief, write it as a comment, push to Pushover.
+    """Produce a brief, write it as a comment, optionally push to Pushover.
 
     diff_snippet: first ~3000 chars of the PR diff (from PRClassification.diff)
     screen_issues: structured issue list from the authority screen
+    notify: NotifyPriority.X → write comment AND call send_notification at that priority.
+            None → write pm:brief comment but skip send_notification; Brief.pushed=False.
     """
     spec_summary = episodic.spec_summary(target_id, max_chars=4000)
     recent = episodic.recall(target_id, query or trigger, k=6)
@@ -121,12 +125,14 @@ def synthesize(
     comment = episodic.write_brief(target_id, body)
 
     deep_link = f"{DASHBOARD_BASE}/thread/{target_id}"
-    pushed = send_notification(
-        message=body,
-        title=f"Lapis PM: {target_id}",
-        priority=NotifyPriority.NORMAL,
-        url=deep_link,
-        url_title="Open thread",
-    )
+    pushed = False
+    if notify is not None:
+        pushed = send_notification(
+            message=body,
+            title=f"Lapis PM: {target_id}",
+            priority=notify,
+            url=deep_link,
+            url_title="Open thread",
+        )
 
     return Brief(target_id=target_id, body=body, comment_id=comment.id, pushed=pushed)

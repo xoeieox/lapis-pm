@@ -115,6 +115,7 @@ CLI wrapper at `bin/lapis-pm` adds env-loading; symlink it to
   The reviewer agent returns a verdict JSON and nothing else. Any reviewer
   template change that adds tool instructions beyond read/report is a
   violation of the role-separation invariant.
+- **classified-prs is invalidated by SHA advance.** When a PR's head SHA advances, its entry is removed from `pm/classified-prs/<tid>` so the next decide loop re-screens the new code instead of noop'ing on a stale brief.
 
 ## Versioning
 

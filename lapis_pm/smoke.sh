@@ -1870,9 +1870,79 @@ print('brief persistence: all suppressed-push paths still write pm:brief comment
 " || red "brief persistence: pm:brief comment not written for a suppressed-push path"
 green "brief persistence: advisory/directive/force-brief all write pm:brief comment OK"
 
+# --- Phase 22: classified-prs SHA-invalidation ---------------------------
+step "22. classified-prs SHA-invalidation: SHA advance removes PR from classified set"
+TID_SHA="pm-smoke-sha-inv-$$"
+SHA_SPEC="/tmp/${TID_SHA}-spec.md"
+cat > "$SHA_SPEC" <<EOF
+# SHA-invalidation smoke spec for $TID_SHA
+EOF
+
+cat > "$TARGETS_DIR/${TID_SHA}.yaml" <<EOF
+id: ${TID_SHA}
+title: SHA-invalidation smoke target
+status: active
+category: active-work
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: classified-prs SHA-invalidation smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_SHA" --spec-from "$SHA_SPEC" --repo lapis-pm --authority auto-merge
+
+# Pre-populate classified-prs with PR #42.
+/usr/local/bin/mem set "pm/classified-prs/${TID_SHA}" "[42]" --tags "lapis-pm,classified-prs" >/dev/null
+
+# Verify it's there before the tick.
+/usr/bin/python3 -c "
+import sys; sys.path.insert(0, '/srv/git/agents-core-working')
+from lapis_pm.pm_core import _classified_pr_ids
+ids = _classified_pr_ids('${TID_SHA}')
+assert 42 in ids, f'pre-condition failed: 42 not in classified-prs before tick; ids={ids}'
+print(f'pre-condition: classified-prs={ids} ✓')
+" || red "SHA-invalidation smoke: pre-condition check failed"
+
+# Write a simulated open-PR observation with a new SHA so _encode_pr_sha_updates
+# sees a SHA advance for PR #42.  We inject the PR directly via a synthetic
+# tick that mocks the Forgejo get_open_prs call.
+/usr/bin/python3 - "${TID_SHA}" <<'PYEOF21'
+import sys, json
+sys.path.insert(0, '/srv/git/agents-core-working')
+
+from unittest.mock import patch
+from lapis_pm import pm_core
+
+target_id = sys.argv[1]
+fake_pr = {"number": 42, "head": {"sha": "abc123newsha"}, "title": "smoke PR", "state": "open"}
+
+# _last_observed_pr_sha returns None (no prior observation) → SHA "advance".
+with patch("lapis_pm.pm_core.get_open_prs", return_value=[fake_pr]):
+    written = pm_core._encode_pr_sha_updates(target_id, [fake_pr])
+
+print(f"encode written={written}")
+ids = pm_core._classified_pr_ids(target_id)
+print(f"classified-prs after encode: {ids}")
+assert 42 not in ids, f"FAIL: 42 still in classified-prs after SHA advance; ids={ids}"
+print("SHA advance → classified-prs invalidated ✓")
+PYEOF21
+green "Phase 22: classified-prs SHA-invalidation — SHA advance removes PR #42 from classified set OK"
+
+# Cleanup
+rm -f "$TARGETS_DIR/${TID_SHA}.yaml" "$COMMENTS_DIR/${TID_SHA}.jsonl" "$SHA_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_SHA}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_SHA}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_SHA}" 2>/dev/null || true
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

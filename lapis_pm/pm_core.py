@@ -1287,6 +1287,16 @@ def _encode_pr_sha_updates(target_id: str, open_prs: list[dict]) -> int:
                 f"PR #{pr_num} head SHA: {sha}",
                 extra_tags=[f"pm:pr={pr_num}", f"pm:pr={pr_num}:sha={sha}"],
             )
+            # SHA changed → invalidate classification so the next decide loop
+            # re-screens the new code instead of noop'ing on a stale brief.
+            ids = _classified_pr_ids(target_id)
+            if pr_num in ids:
+                ids.discard(pr_num)
+                _mem().set(
+                    _classified_prs_key(target_id),
+                    json.dumps(sorted(ids)),
+                    tags=["lapis-pm", "classified-prs"],
+                )
             written += 1
     return written
 

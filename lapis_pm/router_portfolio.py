@@ -78,7 +78,7 @@ class RouterPortfolioEntry:
     intent_summary: str | None = None           # short prose for human readability
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in asdict(self).items()}
+        return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False)
@@ -88,10 +88,16 @@ class RouterPortfolioEntry:
 # Mem access
 # ---------------------------------------------------------------------------
 
+_mem_store = None
+
+
 def _mem():
-    """Return a MemoryStore instance."""
-    from agents_core.mem import MemoryStore
-    return MemoryStore()
+    """Return the shared module-level MemoryStore instance (lazy init)."""
+    global _mem_store
+    if _mem_store is None:
+        from agents_core.mem import MemoryStore
+        _mem_store = MemoryStore()
+    return _mem_store
 
 
 def _now_iso() -> str:

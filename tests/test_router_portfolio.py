@@ -300,7 +300,7 @@ class TestCheckpointSkillConsolidates:
 # 4. Checkpoint labels missing primitive_decomposition
 # ---------------------------------------------------------------------------
 
-class TestCheckpointLabelsPrivmitives:
+class TestCheckpointLabelsPrimitives:
     def test_entry_missing_primitive_decomposition_can_be_labeled(self) -> None:
         """An entry with primitive_decomposition=None can receive a label post-hoc.
 

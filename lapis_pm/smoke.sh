@@ -15,6 +15,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
 TID="pm-smoke-$$"
 TARGETS_DIR="${PM_TARGETS_DIR:-/srv/lapis/targets}"
 COMMENTS_DIR="/srv/lapis/targets/comments"
@@ -1075,7 +1078,7 @@ portfolio_cleanup() {
 # 19a. Emit 3 portfolio events (kickoff + dispatch + ratify-confirm)
 /usr/bin/python3 -c "
 import sys
-sys.path.insert(0, '/srv/lapis/lapis-pm')
+sys.path.insert(0, '${REPO_ROOT}')
 from lapis_pm.router_portfolio import (
     emit_decision_kickoff,
     emit_decision_dispatch,
@@ -1116,7 +1119,7 @@ green "3 portfolio events emitted (kickoff + dispatch + ratify-confirm)"
 # 19b. Invoke checkpoint — read events + write session summary
 /usr/bin/python3 -c "
 import sys
-sys.path.insert(0, '/srv/lapis/lapis-pm')
+sys.path.insert(0, '${REPO_ROOT}')
 from lapis_pm.router_portfolio import read_session_entries, write_session_summary
 
 tid = '${PORTFOLIO_TID}'
@@ -1149,7 +1152,7 @@ green "portfolio: checkpoint written with all 3 events referenced"
 # 19c. Bootstrap query: verify prior session summary is readable
 /usr/bin/python3 -c "
 import sys
-sys.path.insert(0, '/srv/lapis/lapis-pm')
+sys.path.insert(0, '${REPO_ROOT}')
 from lapis_pm.router_portfolio import session_checkpoint_exists
 
 found = session_checkpoint_exists(since_iso='2020-01-01T00:00:00Z')

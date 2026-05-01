@@ -1061,9 +1061,110 @@ green "chain event log verified OK"
 chain_cleanup
 green "Chain smoke phase complete: 3-leg chain, auto-dispatch cascade, state.complete, event log all OK"
 
+# --- Phase 19: Router portfolio persistence smoke --------------------------
+step "19. Router portfolio persistence (router-portfolio-persistence-v0)"
+
+PORTFOLIO_TID="smoke-portfolio-$$"
+
+portfolio_cleanup() {
+    /usr/local/bin/mem delete "router/lapis-pm/decisions/smoke-kickoff-${PORTFOLIO_TID}" 2>/dev/null || true
+    /usr/local/bin/mem delete "router/lapis-pm/decisions/smoke-dispatch-${PORTFOLIO_TID}" 2>/dev/null || true
+    /usr/local/bin/mem delete "router/lapis-pm/ratification-outcomes/smoke-confirm-${PORTFOLIO_TID}" 2>/dev/null || true
+}
+
+# 19a. Emit 3 portfolio events (kickoff + dispatch + ratify-confirm)
+/usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '/srv/lapis/lapis-pm')
+from lapis_pm.router_portfolio import (
+    emit_decision_kickoff,
+    emit_decision_dispatch,
+    emit_ratify_confirm,
+)
+
+tid = '${PORTFOLIO_TID}'
+k1 = emit_decision_kickoff(
+    target_id=tid,
+    expert_chosen='haiku',
+    intent_summary='smoke kickoff for portfolio test',
+    event_id=f'smoke-kickoff-{tid}',
+)
+print(f'kickoff key: {k1}')
+assert k1.startswith('router/lapis-pm/decisions/'), f'Bad kickoff key: {k1}'
+
+k2 = emit_decision_dispatch(
+    target_id=tid,
+    fragment_id='tick',
+    expert_chosen='haiku',
+    intent_summary='smoke dispatch for portfolio test',
+    event_id=f'smoke-dispatch-{tid}',
+)
+print(f'dispatch key: {k2}')
+assert k2.startswith('router/lapis-pm/decisions/'), f'Bad dispatch key: {k2}'
+
+k3 = emit_ratify_confirm(
+    target_id=tid,
+    prior_decision_event_id=f'smoke-kickoff-{tid}',
+    event_id=f'smoke-confirm-{tid}',
+)
+print(f'confirm key: {k3}')
+assert k3.startswith('router/lapis-pm/ratification-outcomes/'), f'Bad confirm key: {k3}'
+print('3 portfolio events written OK')
+" || red "portfolio: event emission failed"
+green "3 portfolio events emitted (kickoff + dispatch + ratify-confirm)"
+
+# 19b. Invoke checkpoint — read events + write session summary
+/usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '/srv/lapis/lapis-pm')
+from lapis_pm.router_portfolio import read_session_entries, write_session_summary
+
+tid = '${PORTFOLIO_TID}'
+entries = read_session_entries()
+our_entries = [e for e in entries if e.get('target_id') == tid]
+print(f'Found {len(our_entries)} entries for {tid}')
+assert len(our_entries) == 3, f'Expected 3, got {len(our_entries)}'
+
+summary = '''## Smoke session portfolio checkpoint
+
+Attempted: kickoff + dispatch for {tid}
+Landed: ratify-confirm received
+Stalled: none
+Gradient: 1 ratify-confirm
+Next: none (smoke test)
+'''.format(tid=tid)
+
+session_key = write_session_summary(
+    slug=f'smoke-{tid}',
+    summary_markdown=summary.strip(),
+    entries=our_entries,
+)
+print(f'Session checkpointed -> {session_key}')
+assert session_key.startswith('router/lapis-pm/sessions/'), f'Bad session key: {session_key}'
+assert f'smoke-{tid}' in session_key, f'Slug missing: {session_key}'
+print('Checkpoint OK: all 3 events referenced')
+" || red "portfolio: checkpoint write failed"
+green "portfolio: checkpoint written with all 3 events referenced"
+
+# 19c. Bootstrap query: verify prior session summary is readable
+/usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '/srv/lapis/lapis-pm')
+from lapis_pm.router_portfolio import session_checkpoint_exists
+
+found = session_checkpoint_exists(since_iso='2020-01-01T00:00:00Z')
+print(f'session_checkpoint_exists (wide window) = {found}')
+assert found, 'session_checkpoint_exists returned False after writing checkpoint'
+print('Bootstrap query verified: prior session summary readable OK')
+" || red "portfolio: bootstrap session-start query failed"
+green "portfolio: bootstrap query returns prior session summary OK"
+
+portfolio_cleanup
+green "Router portfolio smoke phase complete: 3 events, checkpoint, bootstrap query all OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

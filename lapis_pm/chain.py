@@ -20,6 +20,7 @@ Invariants:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 
 from agents_core.mem import MemoryStore
@@ -53,6 +54,9 @@ def _now_iso() -> str:
 # Validation
 # ---------------------------------------------------------------------------
 
+_BRANCH_SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
 def validate_legs(legs: list[dict]) -> None:
     """Validate a chain leg list. Raises ValueError with a clear message on failure.
 
@@ -60,6 +64,7 @@ def validate_legs(legs: list[dict]) -> None:
     - No duplicate tids.
     - depends_on only references tids within the same leg set.
     - No cyclic deps (topological sort).
+    - branch_slug present, non-empty, kebab-case, no slashes, no lapis/ prefix.
     """
     if not legs:
         raise ValueError("Chain must have at least one leg")
@@ -74,6 +79,32 @@ def validate_legs(legs: list[dict]) -> None:
         seen.add(tid)
 
     tid_set = set(tids)
+
+    # branch_slug validation per leg
+    for leg in legs:
+        tid = leg.get("tid", "<unknown>")
+        slug = leg.get("branch_slug")
+        if not slug:
+            raise ValueError(
+                f"Leg {tid!r} is missing required field 'branch_slug'. "
+                "Add a non-empty kebab-case string (e.g. 'implement') to the leg."
+            )
+        if "/" in slug:
+            raise ValueError(
+                f"Leg {tid!r} branch_slug {slug!r} contains '/'; "
+                "branch_slug must not contain slashes."
+            )
+        if slug.startswith("lapis/") or slug == "lapis":
+            raise ValueError(
+                f"Leg {tid!r} branch_slug {slug!r} must not start with 'lapis/'; "
+                "the prefix is constructed automatically."
+            )
+        if not _BRANCH_SLUG_RE.match(slug):
+            raise ValueError(
+                f"Leg {tid!r} branch_slug {slug!r} is invalid; "
+                "must be kebab-case (lowercase alphanumeric, hyphens allowed in the middle, "
+                "no leading/trailing hyphens)."
+            )
 
     # Unknown deps check
     for leg in legs:

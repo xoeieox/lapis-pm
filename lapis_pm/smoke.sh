@@ -30,6 +30,8 @@ green() { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 red()   { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 step()  { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
 
+TRAJ_SMOKE_DIR="/tmp/traj-smoke-$$"
+
 cleanup() {
     rm -f "$TARGETS_DIR/${TID}.yaml" "$COMMENTS_DIR/${TID}.jsonl" "$SPEC_FILE"
     rm -rf "/srv/lapis/gpu-queue/shaped/${TID}-"*.json 2>/dev/null || true
@@ -47,6 +49,8 @@ cleanup() {
     /usr/local/bin/mem delete "pm/pause-state/${TID}" 2>/dev/null || true
     /usr/local/bin/mem delete "pm/outstanding-brief/${TID}" 2>/dev/null || true
     /usr/local/bin/mem delete "pm/classified-prs/${TID}" 2>/dev/null || true
+    # Trajectory smoke cleanup
+    rm -rf "$TRAJ_SMOKE_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -1984,15 +1988,91 @@ rmdir "${BRIEFS_ROOT}/daily" "${BRIEFS_ROOT}/weekly" "${BRIEFS_ROOT}" 2>/dev/nul
 
 green "Phase 23 complete: state-brief dry-run passed (file path, symlink, five headings)"
 
+# =========================================================================
+# Trajectory rollup smoke tests
+# Exercises: --rebuild-index, --period per-target (dry-run), CLI surface.
+# All LLM calls are suppressed via LAPIS_TRAJECTORY_DRY_RUN=1.
+# =========================================================================
+step "24. Trajectory rollup smoke: --rebuild-index (no LLM)"
+mkdir -p "$TRAJ_SMOKE_DIR"
+
+TRAJ_OUT=$($LAPIS trajectory-rollup --rebuild-index 2>&1) || red "trajectory-rollup --rebuild-index failed"
+echo "$TRAJ_OUT"
+[ -f "/srv/lapis/trajectory/index.json" ] || red "index.json not written by --rebuild-index"
+/usr/bin/python3 -c "
+import json, sys
+data = json.load(open('/srv/lapis/trajectory/index.json'))
+assert 'nodes' in data, 'index.json missing nodes'
+assert 'edges' in data, 'index.json missing edges'
+assert 'generated_at' in data, 'index.json missing generated_at'
+print(f'index.json OK: {len(data[\"nodes\"])} nodes, {len(data[\"edges\"])} edges')
+" || red "index.json shape validation failed"
+green "trajectory-rollup --rebuild-index OK"
+
+step "25. Trajectory rollup smoke: --period per-target --target (dry-run, fixture arc doc)"
+FIXTURE_TID="smoke-traj-fixture-$$"
+FIXTURE_ARC="/tmp/${FIXTURE_TID}.md"
+cat > "$FIXTURE_ARC" <<'ARCEOF'
+---
+target_id: smoke-traj-fixture
+generated: 2026-05-01T00:00:00-07:00
+kind: arc-doc
+---
+
+# smoke-traj-fixture — Arc Doc
+
+## Origin
+Smoke test fixture for trajectory rollup dry-run mode.
+
+## Key decisions
+- Used dry-run mode to avoid real LLM calls.
+
+## Dispatches and results
+No real dispatches. Fixture only.
+
+## Landing summary
+Fixture landed. PR #0 merged.
+
+## Open threads
+- Follow-on: add more fixtures.
+ARCEOF
+
+/usr/local/bin/mem set "pm/landed/${FIXTURE_TID}" \
+    "{\"manual\":true,\"ts\":\"2026-05-01T00:00:00-07:00\",\"arc_path\":\"${FIXTURE_ARC}\"}" \
+    --tags "lapis-pm,landed" >/dev/null 2>&1 || true
+
+LAPIS_TRAJECTORY_DRY_RUN=1 $LAPIS trajectory-rollup --period per-target --target "$FIXTURE_TID" 2>&1 | tee "/tmp/traj-smoke-$$.out"
+[ -f "/srv/lapis/trajectory/per-target/${FIXTURE_TID}.json" ] || red "per-target JSON not written for $FIXTURE_TID"
+/usr/bin/python3 -c "
+import json, sys
+data = json.load(open('/srv/lapis/trajectory/per-target/${FIXTURE_TID}.json'))
+assert data.get('one_liner') == '(dry run)', f'one_liner should be (dry run), got: {data.get(\"one_liner\")}'
+assert 'arc_doc_sha256' in data, 'arc_doc_sha256 missing'
+assert 'generated_at' in data, 'generated_at missing'
+print(f'per-target JSON OK: one_liner={data[\"one_liner\"]!r}, sha256={data[\"arc_doc_sha256\"][:12]}...')
+" || red "per-target JSON shape or dry-run placeholder check failed (vacuous-pass detection)"
+green "trajectory-rollup --period per-target dry-run OK (one_liner=(dry run) confirmed)"
+
+MTIME1=$(stat -c %Y "/srv/lapis/trajectory/per-target/${FIXTURE_TID}.json")
+LAPIS_TRAJECTORY_DRY_RUN=1 $LAPIS trajectory-rollup --period per-target --target "$FIXTURE_TID" >/dev/null 2>&1
+MTIME2=$(stat -c %Y "/srv/lapis/trajectory/per-target/${FIXTURE_TID}.json")
+[ "$MTIME1" = "$MTIME2" ] || red "per-target idempotency violated: file was rewritten on unchanged arc doc"
+green "per-target idempotency OK (no-op on unchanged arc doc)"
+
+/usr/local/bin/mem delete "pm/landed/${FIXTURE_TID}" 2>/dev/null || true
+rm -f "$FIXTURE_ARC" "/tmp/traj-smoke-$$.out"
+rm -f "/srv/lapis/trajectory/per-target/${FIXTURE_TID}.json"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup all OK"
 cat <<MSG
 
 Skipped automatically (need live state):
   - authority gate against a real Forgejo PR (touch a held path → expect hold + brief)
   - auto-merge a clean PR (target authority=auto, diff <400 LOC, no held paths)
   - Pushover delivery confirmation — check phone after the directive step above
+  - trajectory weekly/monthly rollup (requires Qwen endpoint — suppressed in smoke)
 
 Cleanup runs on exit. Target id was: $TID
 MSG

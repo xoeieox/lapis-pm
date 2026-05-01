@@ -16,6 +16,10 @@ Commands:
     land <target_id> [--dry-run]
     brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
     review-gate {status,resume}
+    trajectory-rollup --rebuild-index
+    trajectory-rollup --period per-target [--target TID | --all]
+    trajectory-rollup --period weekly [--week YYYY-Www]
+    trajectory-rollup --period monthly [--month YYYY-MM]
 """
 
 from __future__ import annotations
@@ -718,6 +722,16 @@ def cmd_land(args) -> int:
     except Exception as e:
         print(f"Warning: chain advance failed: {e}", file=sys.stderr)
 
+    # Trajectory rollup hook: fire per-target + rebuild-index AFTER chain advance.
+    # Non-fatal — Qwen can take 30-120s; failures are logged at WARNING only.
+    # The nightly timer will catch any missed rollup on the next tick.
+    try:
+        from . import trajectory as _traj
+        _traj.on_land(args.target_id)
+    except Exception as e:
+        import warnings
+        warnings.warn(f"trajectory on_land failed (non-fatal): {e}", stacklevel=2)
+
     store.archive(args.target_id)          # sets status=archived + saves
     target = store.get(args.target_id)     # re-read after archive saved
     target.unbind_pm()
@@ -755,6 +769,53 @@ def cmd_review_gate(args) -> int:
         print(f"Review-gate counter reset (was {prev}). Opus reviewer active again.")
         return 0
     print(f"ERROR: unknown review-gate subcommand: {sub}", file=sys.stderr)
+    return 2
+
+
+def cmd_trajectory_rollup(args) -> int:
+    """Handle `lapis-pm trajectory-rollup` subcommand."""
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    from . import trajectory as _traj
+
+    if args.rebuild_index:
+        try:
+            path = _traj.rebuild_index()
+            print(f"index.json written: {path}")
+        except SystemExit as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        return 0
+
+    period = args.period
+    if not period:
+        print("ERROR: --period or --rebuild-index is required", file=sys.stderr)
+        return 2
+
+    if period == "per-target":
+        if not args.target and not args.all:
+            print("ERROR: --period per-target requires --target TID or --all",
+                  file=sys.stderr)
+            return 2
+        paths = _traj.rollup_per_target(
+            tid=args.target or None,
+            all_targets=bool(args.all),
+        )
+        print(f"per-target: wrote {len(paths)} file(s)")
+        return 0
+
+    if period == "weekly":
+        path = _traj.rollup_weekly(week=args.week or None)
+        print(f"weekly digest written: {path}")
+        return 0
+
+    if period == "monthly":
+        path = _traj.rollup_monthly(month=args.month or None)
+        print(f"monthly digest written: {path}")
+        return 0
+
+    print(f"ERROR: unknown --period {period!r}", file=sys.stderr)
     return 2
 
 
@@ -841,6 +902,50 @@ def build_parser() -> argparse.ArgumentParser:
     rg_sub.add_parser("status", help="Print current counter + threshold.")
     rg_sub.add_parser("resume", help="Reset counter; re-enable Opus reviewer.")
     rg.set_defaults(func=cmd_review_gate)
+
+    tr = sub.add_parser(
+        "trajectory-rollup",
+        help="Generate trajectory reports: DAG index, per-target one-liners, "
+             "weekly and monthly digests.",
+    )
+    tr.add_argument(
+        "--rebuild-index",
+        dest="rebuild_index",
+        action="store_true",
+        help="Regenerate /srv/lapis/trajectory/index.json (deterministic, no LLM). "
+             "Errors on depends_on cycles.",
+    )
+    tr.add_argument(
+        "--period",
+        choices=["per-target", "weekly", "monthly"],
+        default=None,
+        help="Report period to generate.",
+    )
+    tr.add_argument(
+        "--target",
+        default=None,
+        metavar="TID",
+        help="Target ID (with --period per-target).",
+    )
+    tr.add_argument(
+        "--all",
+        action="store_true",
+        dest="all",
+        help="Process all landed targets (with --period per-target).",
+    )
+    tr.add_argument(
+        "--week",
+        default=None,
+        metavar="YYYY-Www",
+        help="ISO week to generate (default: current week). With --period weekly.",
+    )
+    tr.add_argument(
+        "--month",
+        default=None,
+        metavar="YYYY-MM",
+        help="Month to generate (default: current month). With --period monthly.",
+    )
+    tr.set_defaults(func=cmd_trajectory_rollup)
 
     return p
 

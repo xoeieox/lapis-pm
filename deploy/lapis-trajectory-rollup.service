@@ -1,0 +1,20 @@
+[Unit]
+Description=Lapis PM — trajectory rollup (rebuild index + per-target + weekly + monthly digests)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/lapis/lapis-pm
+ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --rebuild-index
+ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --period per-target --all
+ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --period weekly
+ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --period monthly
+EnvironmentFile=-/data/agents/config/conductor.env
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

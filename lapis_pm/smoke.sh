@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lapis PM end-to-end smoke test (no real Forgejo PRs, no Pushover assertion).
+# Lapis PM end-to-end smoke test (queue-paused; chain-mode may create + tear down real Forgejo PRs).
 #
 # Exercises:
 #   - bind / spec:bound comment / tags field
@@ -797,7 +797,78 @@ TID_L3="pm-smoke-chain-l3-$$"
 CHAIN_SPEC="/tmp/${CHAIN_GROUP}-spec.md"
 CHAIN_LEGS="/tmp/${CHAIN_GROUP}-legs.yaml"
 
+# Close leaked Forgejo PRs from chain-auto dispatch (best-effort; no-op if
+# FORGEJO_TOKEN unset or Forgejo unreachable). Must run before mem deletion
+# because we read each leg's dispatched record to find the target repo.
+_smoke_chain_close_prs() {
+    if [ -z "${FORGEJO_TOKEN:-}" ]; then
+        echo "[smoke] chain-pr-cleanup: skipped (FORGEJO_TOKEN unset)"
+        return 0
+    fi
+    local _tid
+    for _tid in "$@"; do
+        /usr/bin/python3 -c "
+import os, json, sys
+import httpx
+from agents_core.mem import MemoryStore
+
+tid = '${_tid}'
+FORGEJO_URL = os.environ.get('FORGEJO_URL', 'http://203.0.113.12:3000')
+OWNER = 'Erah'
+API = f'{FORGEJO_URL}/api/v1'
+token = os.environ.get('FORGEJO_TOKEN', '')
+HDRS = {'Authorization': f'token {token}', 'Accept': 'application/json',
+        'Content-Type': 'application/json'}
+T = 15
+
+try:
+    rec = MemoryStore().get(f'pm/dispatched/{tid}')
+    if not rec:
+        sys.exit(0)
+    records = json.loads(rec['content'])
+    if not isinstance(records, list):
+        records = [records]
+except Exception as e:
+    print(f'[smoke] chain-pr-cleanup: cannot read dispatched/{tid}: {e}')
+    sys.exit(0)
+
+repos = {r.get('repo') for r in records if r.get('repo')}
+prefix = f'lapis/{tid}/'
+for repo in repos:
+    try:
+        r = httpx.get(f'{API}/repos/{OWNER}/{repo}/pulls', headers=HDRS,
+                      params={'state': 'open', 'limit': 50}, timeout=T)
+        r.raise_for_status()
+        open_prs = r.json()
+    except Exception as e:
+        print(f'[smoke] chain-pr-cleanup: list-prs {repo}: {e}')
+        continue
+    for pr in open_prs:
+        head_ref = (pr.get('head') or {}).get('ref', '')
+        if not head_ref.startswith(prefix):
+            continue
+        pr_num = pr['number']
+        try:
+            httpx.patch(f'{API}/repos/{OWNER}/{repo}/pulls/{pr_num}', headers=HDRS,
+                        json={'state': 'closed'}, timeout=T).raise_for_status()
+            print(f'[smoke] chain-pr-cleanup: closed {repo}#{pr_num} ({head_ref})')
+        except Exception as e:
+            print(f'[smoke] chain-pr-cleanup: close {repo}#{pr_num}: {e}')
+            continue
+        try:
+            httpx.delete(f'{API}/repos/{OWNER}/{repo}/branches/{head_ref}',
+                         headers=HDRS, timeout=T)
+        except Exception:
+            pass
+" || true
+    done
+}
+
 chain_cleanup() {
+    # Close leaked Forgejo PRs from chain-auto dispatch (best-effort; no-op if
+    # FORGEJO_TOKEN unset or Forgejo unreachable). Must run before mem deletion
+    # because we read each leg's dispatched record to find the target repo.
+    _smoke_chain_close_prs "$TID_L1" "$TID_L2" "$TID_L3"
     rm -f "$CHAIN_SPEC" "$CHAIN_LEGS"
     for T in "$TID_L1" "$TID_L2" "$TID_L3"; do
         rm -f "$TARGETS_DIR/${T}.yaml" "$COMMENTS_DIR/${T}.jsonl" 2>/dev/null || true

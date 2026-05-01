@@ -165,6 +165,7 @@ def _run_corroboration_pass_sync(diff_text: str, repo: str) -> dict:
             "scope_id": f"repo:{repo}",
             "drift_class": None,
             "notes": f"corroboration pass unavailable: {type(exc).__name__}",
+            "primitive_decomposition": None,
         }
 
 

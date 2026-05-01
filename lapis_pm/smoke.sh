@@ -1236,6 +1236,397 @@ green "portfolio: bootstrap query returns prior session summary OK"
 portfolio_cleanup
 green "Router portfolio smoke phase complete: 3 events, checkpoint, bootstrap query all OK"
 
+# =========================================================================
+# Phase 20: Router portfolio wire-emitter smoke tests
+# (router-portfolio-wire-emitters-v0)
+# Verifies that production CLI paths (bind / tick --force-dispatch / land)
+# emit portfolio entries end-to-end via subprocess invocation of lapis-pm.
+# =========================================================================
+
+_wire_tid_cleanup() {
+    local tid="$1"
+    rm -f "$TARGETS_DIR/${tid}.yaml" "$COMMENTS_DIR/${tid}.jsonl"
+    rm -f "/srv/lapis/lapis-state/${tid}.md"
+    /usr/local/bin/mem delete "pm/cursor/${tid}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/dispatched/${tid}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/pause-state/${tid}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/outstanding-brief/${tid}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/classified-prs/${tid}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/landed/${tid}" 2>/dev/null || true
+    # Delete any router-portfolio entries written for this tid
+    /usr/bin/python3 -c "
+from agents_core.mem import MemoryStore
+m = MemoryStore()
+rows = m.list_all(tag='target:${tid}', limit=200)
+for r in rows:
+    k = r.get('key', '')
+    if k.startswith('router/lapis-pm/'):
+        m.delete(k)
+" 2>/dev/null || true
+}
+
+# --- 20a. test_bind_emits_kickoff_decision --------------------------------
+step "20a. wire-emitter: bind emits kickoff decision entry"
+TID_W1="pm-wire-bind-$$"
+W1_SPEC="/tmp/${TID_W1}-spec.md"
+cat > "$W1_SPEC" <<'SPECEOF'
+# Wire Emitter Bind Test Spec
+Implement the bind kickoff portfolio emission.
+SPECEOF
+cat > "$TARGETS_DIR/${TID_W1}.yaml" <<EOF
+id: ${TID_W1}
+title: Wire emitter bind test
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Wire emitter smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+TEST_START_W1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+$LAPIS bind "$TID_W1" --spec-from "$W1_SPEC" --repo lapis-test --authority advisory
+/usr/bin/python3 -c "
+import json
+from lapis_pm.router_portfolio import read_session_entries
+
+tid = '${TID_W1}'
+test_start = '${TEST_START_W1}'
+entries = read_session_entries(since_iso=test_start)
+ours = [e for e in entries
+        if e.get('target_id') == tid and e.get('_mem_key', '').startswith('router/lapis-pm/decisions/')]
+print(f'decisions entries since test_start: {len(ours)}')
+assert len(ours) == 1, f'Expected 1 kickoff entry, got {len(ours)}: {ours}'
+e = ours[0]
+assert e.get('fragment_id') == 'kickoff', f'fragment_id not kickoff: {e.get(\"fragment_id\")}'
+assert e.get('expert_chosen') is None, f'expert_chosen should be None: {e.get(\"expert_chosen\")}'
+assert e.get('target_id') == tid, f'target_id mismatch: {e.get(\"target_id\")}'
+print(f'kickoff entry OK: fragment_id={e[\"fragment_id\"]} expert_chosen={e[\"expert_chosen\"]} target_id={e[\"target_id\"]}')
+" || red "wire-emitter: bind did not emit exactly one kickoff decision entry"
+rm -f "$W1_SPEC"
+_wire_tid_cleanup "$TID_W1"
+green "wire-emitter: bind emits kickoff decision entry OK"
+
+# --- 20b. test_chain_bind_emits_n_kickoff_decisions -----------------------
+step "20b. wire-emitter: chain bind emits N kickoff + 1 dispatch entry"
+TID_WC="pm-wire-chain-$$"
+TID_WC_L1="${TID_WC}-l1"
+TID_WC_L2="${TID_WC}-l2"
+WC_SPEC="/tmp/${TID_WC}-spec.md"
+WC_LEGS="/tmp/${TID_WC}-legs.yaml"
+cat > "$WC_SPEC" <<'SPECEOF'
+# Wire Emitter Chain Test Spec
+Implement chain leg work per spec.
+SPECEOF
+cat > "$WC_LEGS" <<EOF
+legs:
+  - tid: ${TID_WC_L1}
+    repo: lapis-test
+    authority: advisory
+    branch_slug: implement
+    intent: |
+      Implement leg 1 per spec.
+  - tid: ${TID_WC_L2}
+    repo: lapis-test
+    authority: advisory
+    branch_slug: integrate
+    intent: |
+      Implement leg 2 per spec.
+    depends_on:
+      - ${TID_WC_L1}
+EOF
+for leg_tid in "$TID_WC_L1" "$TID_WC_L2"; do
+    cat > "$TARGETS_DIR/${leg_tid}.yaml" <<EOF2
+id: ${leg_tid}
+title: Wire emitter chain leg
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Wire emitter chain smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF2
+done
+/usr/local/bin/gpu-submit pause >/dev/null 2>&1 || true
+TEST_START_WC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+CHAIN_OUT=$($LAPIS bind "$TID_WC" --spec-from "$WC_SPEC" --legs-from "$WC_LEGS" --force 2>&1)
+echo "$CHAIN_OUT"
+# Clean up any pending GPU tasks created by chain auto-fire
+for f in "${GPU_PENDING}"/*.yaml; do
+    [ -e "$f" ] || continue
+    if grep -q "$TID_WC_L1" "$f" 2>/dev/null; then rm -f "$f"; fi
+done
+/usr/local/bin/gpu-submit resume >/dev/null 2>&1 || true
+/usr/bin/python3 -c "
+import json
+from lapis_pm.router_portfolio import read_session_entries
+
+l1 = '${TID_WC_L1}'
+l2 = '${TID_WC_L2}'
+test_start = '${TEST_START_WC}'
+entries = read_session_entries(since_iso=test_start)
+# 2 kickoff decisions (one per leg)
+kickoffs = [e for e in entries
+            if e.get('fragment_id') == 'kickoff'
+            and e.get('target_id') in (l1, l2)
+            and e.get('expert_chosen') is None
+            and e.get('_mem_key', '').startswith('router/lapis-pm/decisions/')]
+print(f'kickoff decisions: {len(kickoffs)} (target_ids: {[e[\"target_id\"] for e in kickoffs]})')
+assert len(kickoffs) == 2, f'Expected 2 kickoff decisions, got {len(kickoffs)}'
+# 1 dispatch (from leg 1 auto-fire, expert_chosen is NOT None)
+dispatches = [e for e in entries
+              if e.get('fragment_id') == 'kickoff'
+              and e.get('target_id') == l1
+              and e.get('expert_chosen') is not None
+              and e.get('_mem_key', '').startswith('router/lapis-pm/decisions/')]
+print(f'dispatch entries for l1: {len(dispatches)}')
+assert len(dispatches) == 1, f'Expected 1 dispatch entry for leg1, got {len(dispatches)}'
+print('chain bind portfolio entries OK: 2 kickoffs + 1 dispatch')
+" || red "wire-emitter: chain bind did not emit 2 kickoff + 1 dispatch entries"
+rm -f "$WC_SPEC" "$WC_LEGS"
+_wire_tid_cleanup "$TID_WC_L1"
+_wire_tid_cleanup "$TID_WC_L2"
+for key in "chain/${TID_WC}/state" "pm/classified-prs/${TID_WC}"; do
+    /usr/local/bin/mem delete "$key" 2>/dev/null || true
+done
+/usr/bin/python3 -c "
+from agents_core.mem import MemoryStore
+m = MemoryStore()
+rows = m.list_all(tag='chain-group:${TID_WC}', limit=100)
+for r in rows: m.delete(r.get('key', ''))
+" 2>/dev/null || true
+green "wire-emitter: chain bind emits 2 kickoff + 1 dispatch entries OK"
+
+# --- 20c. test_force_dispatch_emits_dispatch_decision ---------------------
+step "20c. wire-emitter: force-dispatch emits dispatch decision entry"
+TID_W3="pm-wire-disp-$$"
+W3_SPEC="/tmp/${TID_W3}-spec.md"
+cat > "$W3_SPEC" <<'SPECEOF'
+# Wire Emitter Dispatch Test Spec
+Implement spec for dispatch portfolio emission test.
+SPECEOF
+cat > "$TARGETS_DIR/${TID_W3}.yaml" <<EOF
+id: ${TID_W3}
+title: Wire emitter dispatch test
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Wire emitter dispatch smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_W3" --spec-from "$W3_SPEC" --repo lapis-test --authority advisory
+/usr/local/bin/gpu-submit pause >/dev/null 2>&1 || true
+LONG_INTENT="$(python3 -c "print('x' * 250)")"
+TEST_START_W3=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+DISP_OUT=$($LAPIS tick --target "$TID_W3" --force-dispatch "fixer:${LONG_INTENT}")
+echo "$DISP_OUT"
+TASK_ID_W3=$(echo "$DISP_OUT" | grep -oE 'task_id=[^ ]+' | sed 's/task_id=//')
+[ -n "$TASK_ID_W3" ] && rm -f "$GPU_PENDING/${TASK_ID_W3}.yaml"
+/usr/local/bin/gpu-submit resume >/dev/null 2>&1 || true
+/usr/bin/python3 -c "
+from lapis_pm.router_portfolio import read_session_entries
+
+tid = '${TID_W3}'
+test_start = '${TEST_START_W3}'
+entries = read_session_entries(since_iso=test_start)
+# Force-dispatch entries have expert_chosen != None; bind kickoffs have expert_chosen=None.
+# This distinguishes them even if both fall in the same second.
+dispatches = [e for e in entries
+              if e.get('target_id') == tid
+              and e.get('expert_chosen') is not None
+              and e.get('_mem_key', '').startswith('router/lapis-pm/decisions/')]
+print(f'dispatch entries (expert_chosen != None): {len(dispatches)}')
+assert len(dispatches) == 1, f'Expected 1 dispatch entry, got {len(dispatches)}'
+e = dispatches[0]
+# First dispatch on this target → fragment_id='kickoff'
+assert e.get('fragment_id') == 'kickoff', f'Expected kickoff (first dispatch), got {e.get(\"fragment_id\")}'
+# expert_chosen must not be None (resolved via _SHAPER)
+assert e.get('expert_chosen') is not None, 'expert_chosen must not be None for dispatch'
+# intent_summary truncated at 200 chars
+intent_summary = e.get('intent_summary', '')
+assert len(intent_summary) <= 200, f'intent_summary not truncated: len={len(intent_summary)}'
+print(f'dispatch entry OK: fragment_id={e[\"fragment_id\"]} expert_chosen={e[\"expert_chosen\"]} intent_len={len(intent_summary)}')
+" || red "wire-emitter: force-dispatch did not emit correct dispatch decision entry"
+rm -f "$W3_SPEC"
+_wire_tid_cleanup "$TID_W3"
+green "wire-emitter: force-dispatch emits dispatch decision entry OK"
+
+# --- 20d. test_land_emits_land_decision ------------------------------------
+step "20d. wire-emitter: land emits land decision entry"
+TID_W4="pm-wire-land-$$"
+W4_SPEC="/tmp/${TID_W4}-spec.md"
+cat > "$W4_SPEC" <<'SPECEOF'
+# Wire Emitter Land Test Spec
+Implement spec for land portfolio emission test.
+SPECEOF
+cat > "$TARGETS_DIR/${TID_W4}.yaml" <<EOF
+id: ${TID_W4}
+title: Wire emitter land test
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Wire emitter land smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_W4" --spec-from "$W4_SPEC" --repo lapis-test --authority advisory
+/usr/bin/python3 -c "
+from agents_core.comments import CommentStore
+cs = CommentStore()
+cs.append('${TID_W4}', 'PR #99 opened in lapis-test: fake PR', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr=99'])
+cs.append('${TID_W4}', 'PR #99 merged at 2026-04-25T00:00:00, head_sha=abc123', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr-merged:99', 'pm:pr=99'])
+"
+TEST_START_W4=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+$LAPIS land "$TID_W4"
+[ -f "/srv/lapis/lapis-state/${TID_W4}.md" ] || red "arc doc not written for land test"
+/usr/bin/python3 -c "
+from lapis_pm.router_portfolio import read_session_entries
+
+tid = '${TID_W4}'
+test_start = '${TEST_START_W4}'
+entries = read_session_entries(since_iso=test_start)
+lands = [e for e in entries
+         if e.get('target_id') == tid
+         and e.get('fragment_id') == 'land'
+         and e.get('_mem_key', '').startswith('router/lapis-pm/decisions/')]
+print(f'land entries: {len(lands)}')
+assert len(lands) == 1, f'Expected 1 land entry, got {len(lands)}'
+e = lands[0]
+intent = e.get('intent_summary', '')
+assert intent, 'intent_summary must not be empty (should contain arc doc path)'
+print(f'land entry OK: fragment_id={e[\"fragment_id\"]} intent_summary={intent[:60]}')
+" || red "wire-emitter: land did not emit land decision entry"
+rm -f "$W4_SPEC"
+_wire_tid_cleanup "$TID_W4"
+green "wire-emitter: land emits land decision entry OK"
+
+# --- 20e. test_dry_run_land_does_not_emit ----------------------------------
+step "20e. wire-emitter: dry-run land does NOT emit any decision entry"
+TID_W5="pm-wire-dryrun-$$"
+W5_SPEC="/tmp/${TID_W5}-spec.md"
+cat > "$W5_SPEC" <<'SPECEOF'
+# Wire Emitter Dry Run Test Spec
+Implement spec for dry-run land test.
+SPECEOF
+cat > "$TARGETS_DIR/${TID_W5}.yaml" <<EOF
+id: ${TID_W5}
+title: Wire emitter dry run test
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Wire emitter dry-run smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_W5" --spec-from "$W5_SPEC" --repo lapis-test --authority advisory
+/usr/bin/python3 -c "
+from agents_core.comments import CommentStore
+cs = CommentStore()
+cs.append('${TID_W5}', 'PR #99 merged at 2026-04-25T00:00:00, head_sha=abc123', 'lapis-pm', 'agent',
+          tags=['pm:observation', 'pm:pr-merged:99', 'pm:pr=99'])
+"
+# Capture test_start AFTER bind (bind emits a kickoff; we only care that dry-run
+# does NOT emit a 'land' fragment, which is the one dry-run must skip).
+TEST_START_W5=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+$LAPIS land --dry-run "$TID_W5" >/dev/null
+/usr/bin/python3 -c "
+from lapis_pm.router_portfolio import read_session_entries
+
+tid = '${TID_W5}'
+test_start = '${TEST_START_W5}'
+entries = read_session_entries(since_iso=test_start)
+# Dry-run must not emit a 'land' entry; any pre-existing 'kickoff' from bind is filtered
+# by time unless the second boundary was hit (handled by checking fragment_id='land').
+land_entries = [e for e in entries
+                if e.get('target_id') == tid and e.get('fragment_id') == 'land']
+print(f'land entries after dry-run land: {len(land_entries)}')
+assert len(land_entries) == 0, f'dry-run land must not emit a land entry; got {land_entries}'
+print('dry-run land emitted no land portfolio entry OK')
+" || red "wire-emitter: dry-run land emitted a portfolio entry (must not)"
+rm -f "$W5_SPEC"
+_wire_tid_cleanup "$TID_W5"
+green "wire-emitter: dry-run land does not emit OK"
+
+# --- 20f. test_emit_failure_does_not_block_command ------------------------
+step "20f. wire-emitter: emit failure does not block bind command"
+TID_W6="pm-wire-fail-$$"
+W6_SPEC="/tmp/${TID_W6}-spec.md"
+cat > "$W6_SPEC" <<'SPECEOF'
+# Wire Emitter Failure Test Spec
+Implement spec for emit-failure-safe bind test.
+SPECEOF
+cat > "$TARGETS_DIR/${TID_W6}.yaml" <<EOF
+id: ${TID_W6}
+title: Wire emitter failure test
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Wire emitter failure smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+BIND_STDERR=$( ROUTER_PORTFOLIO_FAIL_WRITES=1 $LAPIS bind "$TID_W6" \
+    --spec-from "$W6_SPEC" --repo lapis-test --authority advisory 2>&1 >/dev/null )
+echo "bind stderr: $BIND_STDERR"
+echo "$BIND_STDERR" | grep -q "\[router-portfolio:emit-failed\]" \
+    || red "wire-emitter: expected [router-portfolio:emit-failed] in stderr; got: $BIND_STDERR"
+# Target YAML must exist (bind succeeded despite emit failure)
+[ -f "$TARGETS_DIR/${TID_W6}.yaml" ] || red "wire-emitter: target YAML missing — bind was blocked by emit failure"
+# Also verify bind exited 0
+BIND_RC=0
+ROUTER_PORTFOLIO_FAIL_WRITES=1 $LAPIS bind "$TID_W6" \
+    --spec-from "$W6_SPEC" --repo lapis-test --authority advisory --force >/dev/null 2>&1 || BIND_RC=$?
+[ "$BIND_RC" -eq 0 ] || red "wire-emitter: bind exited $BIND_RC when emit failed (must exit 0)"
+rm -f "$W6_SPEC"
+_wire_tid_cleanup "$TID_W6"
+green "wire-emitter: emit failure does not block bind, stderr contains [router-portfolio:emit-failed] OK"
+
+green "Phase 20 complete: all 6 wire-emitter portfolio smoke tests passed"
+
 # --- Done ----------------------------------------------------------------
 echo
 green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio all OK"

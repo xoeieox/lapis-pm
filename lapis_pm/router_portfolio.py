@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -118,7 +119,12 @@ def _write_entry(mem_key: str, entry: RouterPortfolioEntry, tags: list[str]) -> 
 
     Idempotent: if the key already exists with identical content, the write is
     a no-op (mem.set overwrites but content is stable for same event_id payload).
+
+    Set ROUTER_PORTFOLIO_FAIL_WRITES=1 in the environment to force all writes to
+    raise RuntimeError — used by smoke tests to exercise the try/except guard in callers.
     """
+    if os.environ.get("ROUTER_PORTFOLIO_FAIL_WRITES"):
+        raise RuntimeError("ROUTER_PORTFOLIO_FAIL_WRITES is set (test mode)")
     _mem().set(mem_key, entry.to_json(), tags=tags)
     return mem_key
 

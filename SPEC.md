@@ -42,6 +42,16 @@ synthesizes an arc doc at `/srv/lapis/lapis-state/<tid>.md` (RoomRAG-indexed).
   list/land`. `bind` accepts `--create` to create the target YAML and bind in one
   step (eliminates the historic two-step `TargetStore.create()` + `bind` flow).
   `systemd/lapis-pm.service` + `.timer` runs `tick --all` every 10 minutes.
+- **Router portfolio auto-fill** — `router_portfolio.py` (`router-portfolio-persistence-v0`,
+  M0.5) provides `emit_*` helpers that are wired into the three main CLI paths:
+  `bind` emits a `kickoff` decision entry (one per target / chain leg),
+  `tick --force-dispatch` emits a `dispatch` entry (fragment_id derived from agent_type
+  and dispatch context), and `land` emits a `land` entry. All emits are best-effort
+  (wrapped in try/except; failures log `[router-portfolio:emit-failed]` to stderr and
+  do not block the primary command). Portfolio entries accumulate in mem.db under
+  `router/lapis-pm/decisions/` and are queryable via `mem search "router/lapis-pm/decisions"`.
+  Daemon-side wires (tick-loop dispatches, chain auto-advance) are deferred to
+  `router-portfolio-wire-emitters-v1`.
 
 ## What lapis-pm does NOT own
 

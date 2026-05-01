@@ -551,9 +551,9 @@ def cmd_tick(args) -> int:
         if not args.target:
             print("ERROR: --force-brief requires --target", file=sys.stderr)
             return 2
-        b = brief.synthesize(args.target, trigger="manual force-brief")
+        b = brief.synthesize(args.target, trigger="manual force-brief", notify=None)
         pm_core.set_outstanding_brief(args.target, b.comment_id)
-        print(f"Brief posted: comment={b.comment_id} pushed={b.pushed}")
+        print(f"Brief posted: comment={b.comment_id}")
         return 0
 
     if args.target:

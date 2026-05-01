@@ -26,12 +26,6 @@ from datetime import datetime, timezone
 from agents_core.mem import MemoryStore
 from agents_core.targets import TargetStore
 
-try:
-    from agents_core.notify import send_notification, Priority as NotifyPriority
-except ImportError:
-    send_notification = None  # type: ignore
-    NotifyPriority = None  # type: ignore
-
 _CHAIN_PREFIX = "chain"
 _STATE_SUFFIX = "state"
 _EVENT_SUFFIX = "event"
@@ -234,22 +228,12 @@ def _update_leg_status_in_state(group_id: str, tid: str, new_status: str,
 
 
 # ---------------------------------------------------------------------------
-# Pushover brief
+# Pushover brief (deprecated)
 # ---------------------------------------------------------------------------
 
 def send_auto_dispatch_brief(group_id: str, tid: str, triggered_by: str) -> bool:
-    """Send Pushover brief for a chain auto-dispatch event. Returns True on success."""
-    if send_notification is None:
-        return False
-    msg = (
-        f"Chain {group_id!r} leg {tid!r} auto-dispatched on "
-        f"{triggered_by!r} land. PR opening shortly."
-    )
-    return send_notification(
-        message=msg,
-        title=f"Lapis PM Chain: {group_id}",
-        priority=NotifyPriority.NORMAL,
-    )
+    """Deprecated: chain auto-dispatch no longer pushes Pushover. Returns False."""
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -413,10 +397,7 @@ def _fire_initial_dispatch(target, intent: str, chain_group: str, triggered_by: 
         details={"triggered_by": triggered_by, "task_id": res.task_id},
     )
     _update_leg_status_in_state(chain_group, target.id, "dispatched")
-
-    # Pushover brief (suppressed if target has chain_quiet=true)
-    if not target.data.get("chain_quiet", False):
-        send_auto_dispatch_brief(chain_group, target.id, triggered_by)
+    # chain_quiet YAML field is deprecated and currently a no-op (Pushover auto-dispatch removed).
 
 
 # ---------------------------------------------------------------------------

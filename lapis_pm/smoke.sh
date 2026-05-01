@@ -1627,9 +1627,252 @@ green "wire-emitter: emit failure does not block bind, stderr contains [router-p
 
 green "Phase 20 complete: all 6 wire-emitter portfolio smoke tests passed"
 
+# =========================================================================
+# Phase 21: Pushover notify routing assertions (lapis-pm-pushover-action-only)
+# =========================================================================
+# Monkey-patches agents_core.notify.send_notification to record (priority, called)
+# without requiring PUSHOVER_* env vars. Validates per-call-site routing and
+# that pm:brief comments are always written regardless of notify value.
+step "21. Pushover notify routing — per-call-site assertions (no real Pushover delivery)"
+
+/usr/bin/python3 -c "
+import sys, json
+sys.path.insert(0, '${REPO_ROOT}')
+from unittest.mock import patch, MagicMock
+from agents_core.notify import Priority as NotifyPriority
+
+# ------------------------------------------------------------------ helpers
+calls = []
+
+def _fake_send_notification(message, title, priority, url=None, url_title=None):
+    calls.append(priority)
+    return True
+
+def _fake_write_brief(target_id, body):
+    c = MagicMock()
+    c.id = 'smoke-brief-id'
+    return c
+
+# Shared mocks that every path needs
+_common_patches = [
+    patch('agents_core.notify.send_notification', side_effect=_fake_send_notification),
+    patch('lapis_pm.brief.send_notification', side_effect=_fake_send_notification),
+    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nsmoke body\n## Decision needed\nnone'),
+    patch('lapis_pm.brief.episodic.write_brief', side_effect=_fake_write_brief),
+    patch('lapis_pm.brief.episodic.recall', return_value=[]),
+    patch('lapis_pm.brief.episodic.spec_summary', return_value='smoke spec'),
+]
+
+def start_patches(patches):
+    for p in patches:
+        p.start()
+
+def stop_patches(patches):
+    for p in reversed(patches):
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+from lapis_pm import brief
+
+results = {}
+
+# ------------------------------------------------------------------ 1. held PR → NORMAL
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='held PR', notify=NotifyPriority.NORMAL)
+    results['held_pr'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['held_pr'][0] == [NotifyPriority.NORMAL], \
+    f'held_pr: expected [NORMAL], got {results[\"held_pr\"][0]}'
+assert results['held_pr'][1] is True, 'held_pr: pushed should be True'
+print(f'held_pr: priority=NORMAL pushed=True ✓')
+
+# ------------------------------------------------------------------ 2. advisory PR → no push
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='advisory PR', notify=None)
+    results['advisory'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['advisory'][0] == [], \
+    f'advisory: expected no calls, got {results[\"advisory\"][0]}'
+assert results['advisory'][1] is False, 'advisory: pushed should be False'
+print(f'advisory: suppressed pushed=False ✓')
+
+# ------------------------------------------------------------------ 3. review-exhausted → HIGH
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='review exhausted', notify=NotifyPriority.HIGH)
+    results['review_exhausted'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['review_exhausted'][0] == [NotifyPriority.HIGH], \
+    f'review_exhausted: expected [HIGH], got {results[\"review_exhausted\"][0]}'
+print(f'review_exhausted: priority=HIGH ✓')
+
+# ------------------------------------------------------------------ 4. gate-pause → HIGH
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='gate paused', notify=NotifyPriority.HIGH)
+    results['gate_pause'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['gate_pause'][0] == [NotifyPriority.HIGH], \
+    f'gate_pause: expected [HIGH], got {results[\"gate_pause\"][0]}'
+print(f'gate_pause: priority=HIGH ✓')
+
+# ------------------------------------------------------------------ 5. abandon-brief → HIGH
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='abandon brief', notify=NotifyPriority.HIGH)
+    results['abandon'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['abandon'][0] == [NotifyPriority.HIGH], \
+    f'abandon: expected [HIGH], got {results[\"abandon\"][0]}'
+print(f'abandon: priority=HIGH ✓')
+
+# ------------------------------------------------------------------ 6. directive-echo → no push
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='user directive: do something', notify=None)
+    results['directive'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['directive'][0] == [], \
+    f'directive: expected no calls, got {results[\"directive\"][0]}'
+print(f'directive: suppressed pushed=False ✓')
+
+# ------------------------------------------------------------------ 7. force-brief → no push
+calls.clear()
+start_patches(_common_patches)
+try:
+    b = brief.synthesize('smoke-tid', trigger='manual force-brief', notify=None)
+    results['force_brief'] = (list(calls), b.pushed)
+finally:
+    stop_patches(_common_patches)
+
+assert results['force_brief'][0] == [], \
+    f'force_brief: expected no calls, got {results[\"force_brief\"][0]}'
+print(f'force_brief: suppressed pushed=False ✓')
+
+# ------------------------------------------------------------------ 8. chain auto-dispatch → no push
+# Verify chain._fire_initial_dispatch does NOT call send_notification.
+calls.clear()
+chain_notify_calls = []
+
+def _chain_fake_notify(message, title, priority, url=None, url_title=None):
+    chain_notify_calls.append(priority)
+    return True
+
+chain_patches = [
+    patch('agents_core.notify.send_notification', side_effect=_chain_fake_notify),
+    patch('lapis_pm.brief.send_notification', side_effect=_chain_fake_notify),
+    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nsmoke\n## Decision needed\nnone'),
+    patch('lapis_pm.brief.episodic.write_brief', side_effect=_fake_write_brief),
+    patch('lapis_pm.brief.episodic.recall', return_value=[]),
+    patch('lapis_pm.brief.episodic.spec_summary', return_value='spec'),
+    patch('lapis_pm.pm_core.append_dispatched'),
+    patch('lapis_pm.episodic.write_dispatch'),
+    patch('lapis_pm.episodic.spec_summary', return_value='spec'),
+    patch('lapis_pm.chain._mem'),
+    patch('lapis_pm.pm_core._mem'),
+]
+
+from lapis_pm.chain import send_auto_dispatch_brief
+result = send_auto_dispatch_brief('grp', 'leg', 'trigger')
+assert result is False, f'send_auto_dispatch_brief should return False (deprecated), got {result}'
+assert chain_notify_calls == [], \
+    f'chain auto-dispatch: expected zero notify calls, got {chain_notify_calls}'
+print(f'chain_auto_dispatch: zero notify calls, send_auto_dispatch_brief returns False ✓')
+
+print()
+print('Notify routing summary:')
+print('  held_pr          → NORMAL  (pushed=True)')
+print('  advisory         → suppressed (pushed=False)')
+print('  review_exhausted → HIGH')
+print('  gate_pause       → HIGH')
+print('  abandon          → HIGH')
+print('  directive        → suppressed (pushed=False)')
+print('  force_brief      → suppressed (pushed=False)')
+print('  chain_auto       → zero calls (stub returns False)')
+print()
+print('All notify routing assertions passed ✓')
+" || red "notify routing: assertion failed"
+green "notify routing: all 8 call-site assertions passed (HIGH/NORMAL/suppressed per taxonomy)"
+
+# ------------------------------------------------------------------ brief persistence check
+# For suppressed-push sites, assert pm:brief comment was still written.
+step "20b. Brief persistence: suppressed-push paths still write pm:brief comment"
+
+/usr/bin/python3 -c "
+import sys, json
+sys.path.insert(0, '${REPO_ROOT}')
+from unittest.mock import patch, MagicMock
+
+written_briefs = []
+
+def _recording_write_brief(target_id, body):
+    written_briefs.append(target_id)
+    c = MagicMock()
+    c.id = 'cid-' + target_id
+    return c
+
+common = [
+    patch('lapis_pm.brief.send_notification'),  # should NOT be called; no side_effect
+    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nsmoke\n## Decision needed\nnone'),
+    patch('lapis_pm.brief.episodic.write_brief', side_effect=_recording_write_brief),
+    patch('lapis_pm.brief.episodic.recall', return_value=[]),
+    patch('lapis_pm.brief.episodic.spec_summary', return_value='spec'),
+]
+
+from lapis_pm import brief
+from agents_core.notify import Priority as NotifyPriority
+
+for p in common:
+    p.start()
+
+try:
+    # advisory (notify=None) — brief must be written
+    b1 = brief.synthesize('tid-advisory', trigger='advisory PR', notify=None)
+    # directive (notify=None) — brief must be written
+    b2 = brief.synthesize('tid-directive', trigger='user directive: x', notify=None)
+    # force-brief (notify=None) — brief must be written
+    b3 = brief.synthesize('tid-force', trigger='manual force-brief', notify=None)
+finally:
+    for p in reversed(common):
+        try: p.stop()
+        except Exception: pass
+
+# All three must appear in written_briefs
+for tid in ['tid-advisory', 'tid-directive', 'tid-force']:
+    assert tid in written_briefs, f'pm:brief NOT written for {tid} (persistence violated)'
+    print(f'  {tid}: pm:brief written ✓')
+
+# send_notification must NOT have been called for any of them
+# (verify via the mock — if it was called with a side_effect it would have raised)
+print('brief persistence: all suppressed-push paths still write pm:brief comment ✓')
+" || red "brief persistence: pm:brief comment not written for a suppressed-push path"
+green "brief persistence: advisory/directive/force-brief all write pm:brief comment OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

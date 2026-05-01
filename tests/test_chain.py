@@ -312,7 +312,6 @@ class TestCheckChainAdvance:
                 patch("lapis_pm.pm_core._now_iso", return_value="2026-04-30T00:00:00+00:00"),
                 patch("lapis_pm.episodic.write_dispatch"),
                 patch("lapis_pm.episodic.spec_summary", return_value="spec text"),
-                patch("lapis_pm.chain.send_auto_dispatch_brief", return_value=True),
             ):
                 fired = check_chain_advance("leg_a")
 

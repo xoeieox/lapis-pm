@@ -33,6 +33,7 @@ from agents_core.targets import TargetStore
 
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod
+from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
 PM_LIFECYCLE_STAGES = [
@@ -160,6 +161,15 @@ def cmd_bind(args) -> int:
 
     episodic.write_spec(args.target_id, spec_body)
     pm_core.clear_classified_prs(args.target_id)
+    try:
+        _spec_title = spec_body.split("\n")[0].lstrip("# ").strip()[:200]
+        emit_decision_kickoff(
+            target_id=args.target_id,
+            intent_summary=_spec_title,
+            expert_chosen=None,
+        )
+    except Exception as _e:
+        print(f"[router-portfolio:emit-failed] kickoff: {_e}", file=sys.stderr)
     print(f"Bound {args.target_id} → repo={args.repo}, authority={args.authority}")
     print(f"Spec: {len(spec_body)} chars")
     return 0
@@ -328,6 +338,16 @@ def cmd_bind_chain(args) -> int:
 
             episodic.write_spec(tid, spec_body)
             pm_core.clear_classified_prs(tid)
+            try:
+                _kickoff_summary = (leg_intent[:200] if leg_intent
+                                    else spec_body.split("\n")[0].lstrip("# ").strip()[:200])
+                emit_decision_kickoff(
+                    target_id=tid,
+                    intent_summary=_kickoff_summary,
+                    expert_chosen=None,
+                )
+            except Exception as _e:
+                print(f"[router-portfolio:emit-failed] kickoff leg {tid}: {_e}", file=sys.stderr)
 
             # No-dep legs are 'dispatched' only if we'll actually fire them below.
             # With --no-auto-fire the dispatch loop is skipped, so they stay 'pending'
@@ -393,6 +413,25 @@ def cmd_bind_chain(args) -> int:
                         "pm:chain-initial",
                     ],
                 )
+                try:
+                    _model = "unknown"
+                    try:
+                        _model = pm_core._SHAPER.get_agent("fixer").model
+                    except Exception:
+                        pass
+                    _TIER_MAP = {
+                        "haiku": "haiku", "sonnet": "sonnet", "opus": "opus",
+                        "qwen-3.6-35b-a3b": "qwen-local", "qwen3.6-35b-a3b": "qwen-local",
+                    }
+                    emit_decision_dispatch(
+                        target_id=tid,
+                        fragment_id="kickoff",
+                        expert_chosen=_TIER_MAP.get(_model.lower(), _model.lower()),
+                        intent_summary=intent[:200],
+                    )
+                except Exception as _e:
+                    print(f"[router-portfolio:emit-failed] chain dispatch {tid}: {_e}",
+                          file=sys.stderr)
                 chain_mod.emit_chain_event(
                     chain_group, "dispatch", tid,
                     details={"task_id": res.task_id, "initial": True},
@@ -478,6 +517,33 @@ def cmd_tick(args) -> int:
             f"Forced dispatch: {agent_type} → {res.task_id}\nIntent: {intent}",
             extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"],
         )
+        try:
+            _dispatched = pm_core.load_dispatched(args.target)
+            if agent_type == "fixer":
+                _frag = "kickoff" if len(_dispatched) == 1 else "tick"
+            elif agent_type == "reviewer":
+                _frag = "review-cycle"
+            elif agent_type == "brief":
+                _frag = "human-judgment"
+            else:
+                _frag = agent_type
+            _model = "unknown"
+            try:
+                _model = pm_core._SHAPER.get_agent(agent_type).model
+            except Exception:
+                pass
+            _TIER_MAP = {
+                "haiku": "haiku", "sonnet": "sonnet", "opus": "opus",
+                "qwen-3.6-35b-a3b": "qwen-local", "qwen3.6-35b-a3b": "qwen-local",
+            }
+            emit_decision_dispatch(
+                target_id=args.target,
+                fragment_id=_frag,
+                expert_chosen=_TIER_MAP.get(_model.lower(), _model.lower()),
+                intent_summary=intent[:200],
+            )
+        except Exception as _e:
+            print(f"[router-portfolio:emit-failed] dispatch: {_e}", file=sys.stderr)
         print(f"Dispatched: {agent_type} task_id={res.task_id} output={res.output_path}")
         return 0
 
@@ -626,6 +692,14 @@ def cmd_land(args) -> int:
     # Read chain_group before archive — `archive()` reloads the target and
     # subsequent state changes can leave the in-memory copy stale.
     chain_group = target.data.get("chain_group") or ""
+
+    try:
+        emit_decision_land(
+            target_id=args.target_id,
+            intent_summary=str(path),
+        )
+    except Exception as _e:
+        print(f"[router-portfolio:emit-failed] land: {_e}", file=sys.stderr)
 
     pm_core._mem().set(
         pm_core._landed_key(args.target_id),

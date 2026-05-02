@@ -517,6 +517,8 @@ def cmd_tick(args) -> int:
         results = pm_core.tick_all()
 
     for r in results:
+        if r.decision == "skipped:forgejo_unreachable":
+            continue  # tick_all() already printed this line
         rec_part = f" reconciled={r.reconciled}" if r.reconciled else ""
         print(f"[{r.target_id}] skipped={r.skipped} reason={r.reason}"
               f"{rec_part} encoded={r.encoded} decision={r.decision}")

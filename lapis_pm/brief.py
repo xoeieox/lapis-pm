@@ -77,7 +77,7 @@ Rules:
 # ---------------------------------------------------------------------------
 
 # The four supported action kinds.  Any other string is an error.
-_ACTION_KINDS = {"merge_pr", "force_dispatch_retry", "pause_target", "acknowledge_and_clear"}
+_ACTION_KINDS = {"merge_pr", "force_dispatch_retry", "pause_target", "unbind_target", "acknowledge_and_clear"}
 
 # Closed-form trigger strings → option list templates.
 # For merge_pr actions the actual pr number is injected at synthesize() time
@@ -111,6 +111,23 @@ _CLOSED_FORM_TRIGGERS: dict[str, list[dict]] = {
             "id": "B",
             "label": "Acknowledge and clear brief",
             "action": {"kind": "acknowledge_and_clear"},
+        },
+    ],
+    "lost-dispatch": [
+        {
+            "id": "A",
+            "label": "Retry again",
+            "action": {"kind": "force_dispatch_retry"},
+        },
+        {
+            "id": "B",
+            "label": "Amend spec and retry",
+            "action": {"kind": "acknowledge_and_clear"},
+        },
+        {
+            "id": "C",
+            "label": "Unbind this target",
+            "action": {"kind": "unbind_target"},
         },
     ],
 }
@@ -344,6 +361,8 @@ def apply_decision(target_id: str, brief_id: str, option_id: str) -> dict:
             result_detail = _act_force_dispatch_retry(target_id, brief_id)
         elif kind == "pause_target":
             result_detail = _act_pause_target(target_id)
+        elif kind == "unbind_target":
+            result_detail = _act_unbind_target(target_id)
         elif kind == "acknowledge_and_clear":
             result_detail = _act_acknowledge_and_clear(target_id)
         else:
@@ -420,6 +439,19 @@ def _act_pause_target(target_id: str) -> str:
         target.set_paused(True, reason="brief option: pause_target")
         target.save()
     return "target paused"
+
+
+def _act_unbind_target(target_id: str) -> str:
+    """Remove pm_bound from the target (hard stop — no further ticks)."""
+    from agents_core.targets import TargetStore
+    from . import pm_core as _pm
+    store = TargetStore()
+    target = store.get(target_id)
+    if target is not None:
+        target.unbind_pm()
+        target.save()
+    _pm.clear_classified_prs(target_id)
+    return "target unbound"
 
 
 def _act_acknowledge_and_clear(target_id: str) -> str:

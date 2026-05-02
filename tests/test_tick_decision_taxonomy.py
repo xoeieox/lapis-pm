@@ -77,7 +77,7 @@ def _tick_with_patches(target: MagicMock, extra_patches: dict | None = None):
         ("lapis_pm.pm_core._reconcile_dispatched_with_queue", MagicMock(return_value=0)),
         ("lapis_pm.pm_core.get_cursor", MagicMock(return_value=None)),
         ("lapis_pm.episodic.since", MagicMock(return_value=[])),
-        ("lapis_pm.pm_core._perceive_prs", MagicMock(return_value=[])),
+        ("lapis_pm.pm_core._perceive_prs", MagicMock(return_value=([], True))),
         ("lapis_pm.pm_core._encode_user_comments", MagicMock(return_value=[])),
         ("lapis_pm.pm_core._seen_pr_ids", MagicMock(return_value=set())),
         ("lapis_pm.pm_core._encode_new_prs", MagicMock(return_value=[])),
@@ -158,7 +158,7 @@ class TestNoopTaxonomy:
         cls.static_outcome = _auth.StaticOutcome.static_pass
         cls.verdict = "advisory"
         result = _tick_with_patches(target, {
-            "lapis_pm.pm_core._perceive_prs": MagicMock(return_value=[pr]),
+            "lapis_pm.pm_core._perceive_prs": MagicMock(return_value=([pr], True)),
             "lapis_pm.pm_core._classified_pr_ids": MagicMock(return_value=set()),
             "lapis_pm.pm_core.authority.classify": MagicMock(return_value=cls),
             "lapis_pm.pm_core.episodic.spec_summary": MagicMock(return_value="spec"),
@@ -184,7 +184,7 @@ class TestNoopTaxonomy:
             "status": "pending",
         }
         result = _tick_with_patches(target, {
-            "lapis_pm.pm_core._perceive_prs": MagicMock(return_value=[pr]),
+            "lapis_pm.pm_core._perceive_prs": MagicMock(return_value=([pr], True)),
             "lapis_pm.pm_core._classified_pr_ids": MagicMock(return_value=set()),
             "lapis_pm.pm_core.authority.classify": MagicMock(return_value=cls),
             "lapis_pm.pm_core.episodic.spec_summary": MagicMock(return_value="spec"),

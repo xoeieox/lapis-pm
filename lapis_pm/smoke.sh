@@ -2563,6 +2563,22 @@ id: ${TID_HG}
 title: Health-gate smoke
 status: active
 category: research
+
+# --- Phase 29: lost-dispatch retry→brief sequence -------------------------
+step "28. lost-dispatch: retry on first loss, brief on second loss"
+
+TID_LOST="pm-smoke-lost-$$"
+LOST_SPEC="/tmp/${TID_LOST}-spec.md"
+
+cat > "$LOST_SPEC" <<EOF
+# Lost-dispatch smoke spec for $TID_LOST
+EOF
+
+cat > "$TARGETS_DIR/${TID_LOST}.yaml" <<EOF
+id: ${TID_LOST}
+title: Lost-dispatch smoke
+status: active
+category: active-work
 urgency: low
 work_mode: anywhere
 created: $(date +%F)
@@ -2620,9 +2636,266 @@ rm -f "$TARGETS_DIR/${TID_HG}.yaml" "$COMMENTS_DIR/${TID_HG}.jsonl" "$HG_SPEC"
 /usr/local/bin/mem delete "pm/forgejo_consecutive_fails" 2>/dev/null || true
 green "Phase 28 complete: Forgejo health gate smoke OK"
 
+
+
+$LAPIS bind "$TID_LOST" --spec-from "$LOST_SPEC" --repo lapis-test --authority advisory
+
+# (a) Stage a terminal fixer dispatch with no PR → tick should retry (first loss).
+/usr/bin/python3 - "${TID_LOST}" <<'PYEOF29A'
+import sys, json
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch, MagicMock
+
+target_id = sys.argv[1]
+
+# Stage a terminal failed fixer dispatch (no output file, no PR — the SEGV scenario)
+dispatch_ts = "2026-05-01T10:00:00-07:00"
+orig_record = {
+    "gpu_id": "smoke-lost-gpu-orig",
+    "spec_id": "spec-smoke-lost",
+    "agent_type": "fixer",
+    "intent": "implement the smoke spec",
+    "repo": "lapis-test",
+    "ts": dispatch_ts,
+    "status": "failed",
+    "retry_count": 0,
+    "lost_retry_count": 0,
+    "error": "ERROR: signal: segmentation fault",
+}
+
+fake_res = MagicMock()
+fake_res.task_id = "smoke-lost-gpu-retry"
+fake_res.spec_id = "spec-smoke-retry"
+
+saved_records = []
+
+def capture_save(tid, records):
+    saved_records.clear()
+    saved_records.extend(records)
+
+from agents_core.targets import Target
+mock_target = MagicMock(spec=Target)
+mock_target.pm_bound = True
+mock_target.paused = False
+mock_target.pm_repo = "lapis-test"
+mock_target.pm_authority = "advisory"
+
+patches = [
+    patch('lapis_pm.pm_core.TargetStore'),
+    patch('lapis_pm.pm_core._reconcile_dispatched_with_queue', return_value=0),
+    patch('lapis_pm.pm_core.get_cursor', return_value=None),
+    patch('lapis_pm.pm_core.set_cursor'),
+    patch('lapis_pm.pm_core.get_pause_state', return_value=None),
+    patch('lapis_pm.pm_core.set_pause_state'),
+    # Forgejo reachable this tick, no open PRs
+    patch('lapis_pm.pm_core._perceive_prs', return_value=([], True)),
+    patch('lapis_pm.episodic.since', return_value=[]),
+    patch('lapis_pm.pm_core._encode_new_prs', return_value=[]),
+    patch('lapis_pm.pm_core._encode_pr_sha_updates', return_value=0),
+    patch('lapis_pm.pm_core._encode_gpu_results', return_value=(0, [])),
+    patch('lapis_pm.pm_core._encode_merged_prs', return_value=0),
+    patch('lapis_pm.pm_core._encode_user_comments', return_value=[]),
+    patch('lapis_pm.pm_core._consume_brief_decisions', return_value=None),
+    patch('lapis_pm.pm_core._is_auto_land_eligible', return_value=False),
+    patch('lapis_pm.pm_core._persist_review_state_cache'),
+    patch('lapis_pm.pm_core.load_dispatched', return_value=[orig_record]),
+    patch('lapis_pm.pm_core.save_dispatched', side_effect=capture_save),
+    patch('lapis_pm.pm_core.episodic.spec_summary', return_value='spec'),
+    patch('lapis_pm.pm_core.episodic.spec', return_value='spec summary'),
+    patch('lapis_pm.episodic.all_comments', return_value=[]),
+    patch('lapis_pm.episodic.write_observation'),
+    patch('lapis_pm.pm_core._SHAPER'),
+]
+
+started = []
+for p in patches:
+    started.append(p.start())
+
+try:
+    store_mock = started[0]
+    store_mock.return_value.get.return_value = mock_target
+    shaper_mock = started[-1]
+    shaper_mock.dispatch.return_value = fake_res
+
+    from lapis_pm import pm_core
+    result = pm_core.tick(target_id)
+finally:
+    for p in reversed(patches):
+        try: p.stop()
+        except: pass
+
+assert result.decision.startswith('fixer_lost:retrying:dispatch='), \
+    f'expected fixer_lost:retrying, got: {result.decision!r}'
+
+# Verify child record persisted
+child = next((r for r in saved_records if r.get('gpu_id') == 'smoke-lost-gpu-retry'), None)
+assert child is not None, f'child record not persisted; saved={saved_records}'
+assert child.get('parent_gpu_id') == 'smoke-lost-gpu-orig', f'parent_gpu_id wrong: {child}'
+assert child.get('status') == 'pending', f'child status wrong: {child}'
+
+# Verify original has lost_retry_count=1
+orig_saved = next(r for r in saved_records if r['gpu_id'] == 'smoke-lost-gpu-orig')
+assert orig_saved.get('lost_retry_count') == 1, \
+    f'lost_retry_count not incremented: {orig_saved}'
+
+print(f'Phase 29a: first-loss retry ✓  decision={result.decision}')
+print(f'  child.gpu_id={child["gpu_id"]} parent={child["parent_gpu_id"]}')
+print(f'  original.lost_retry_count={orig_saved["lost_retry_count"]}')
+PYEOF29A
+green "Phase 29a: first-loss retry (lost_retry_count 0→1, child pending) ✓"
+
+# (b) Stage both dispatches as terminal with no PR → tick should brief (second loss).
+/usr/bin/python3 - "${TID_LOST}" <<'PYEOF29B'
+import sys, json
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch, MagicMock
+
+target_id = sys.argv[1]
+
+orig_record = {
+    "gpu_id": "smoke-lost-gpu-orig",
+    "spec_id": "spec-smoke-lost",
+    "agent_type": "fixer",
+    "intent": "implement the smoke spec",
+    "repo": "lapis-test",
+    "ts": "2026-05-01T10:00:00-07:00",
+    "status": "failed",
+    "retry_count": 0,
+    "lost_retry_count": 1,
+    "error": "ERROR: signal: segmentation fault",
+}
+child_record = {
+    "gpu_id": "smoke-lost-gpu-retry",
+    "spec_id": "spec-smoke-retry",
+    "agent_type": "fixer",
+    "intent": "implement the smoke spec",
+    "repo": "lapis-test",
+    "ts": "2026-05-01T10:15:00-07:00",
+    "status": "failed",
+    "retry_count": 0,
+    "lost_retry_count": 0,
+    "parent_gpu_id": "smoke-lost-gpu-orig",
+    "error": "ERROR: general protection fault",
+}
+
+fake_brief = MagicMock()
+fake_brief.comment_id = "smoke-brief-lost-001"
+fake_brief.pushed = False
+fake_brief.body = "lost dispatch brief"
+fake_brief.target_id = target_id
+
+from agents_core.targets import Target
+mock_target = MagicMock(spec=Target)
+mock_target.pm_bound = True
+mock_target.paused = False
+mock_target.pm_repo = "lapis-test"
+mock_target.pm_authority = "advisory"
+
+patches = [
+    patch('lapis_pm.pm_core.TargetStore'),
+    patch('lapis_pm.pm_core._reconcile_dispatched_with_queue', return_value=0),
+    patch('lapis_pm.pm_core.get_cursor', return_value=None),
+    patch('lapis_pm.pm_core.set_cursor'),
+    patch('lapis_pm.pm_core.get_pause_state', return_value=None),
+    patch('lapis_pm.pm_core.set_pause_state'),
+    patch('lapis_pm.pm_core._perceive_prs', return_value=([], True)),
+    patch('lapis_pm.episodic.since', return_value=[]),
+    patch('lapis_pm.pm_core._encode_new_prs', return_value=[]),
+    patch('lapis_pm.pm_core._encode_pr_sha_updates', return_value=0),
+    patch('lapis_pm.pm_core._encode_gpu_results', return_value=(0, [])),
+    patch('lapis_pm.pm_core._encode_merged_prs', return_value=0),
+    patch('lapis_pm.pm_core._encode_user_comments', return_value=[]),
+    patch('lapis_pm.pm_core._consume_brief_decisions', return_value=None),
+    patch('lapis_pm.pm_core._is_auto_land_eligible', return_value=False),
+    patch('lapis_pm.pm_core._persist_review_state_cache'),
+    patch('lapis_pm.pm_core.load_dispatched', return_value=[orig_record, child_record]),
+    patch('lapis_pm.pm_core.save_dispatched'),
+    patch('lapis_pm.pm_core.brief.synthesize', return_value=fake_brief),
+    patch('lapis_pm.pm_core.set_outstanding_brief'),
+    patch('lapis_pm.pm_core.episodic.spec', return_value='spec summary'),
+    patch('lapis_pm.episodic.all_comments', return_value=[]),
+    patch('lapis_pm.episodic.write_observation'),
+]
+
+started = []
+for p in patches:
+    started.append(p.start())
+
+try:
+    store_mock = started[0]
+    store_mock.return_value.get.return_value = mock_target
+
+    from lapis_pm import pm_core
+    result = pm_core.tick(target_id)
+finally:
+    for p in reversed(patches):
+        try: p.stop()
+        except: pass
+
+assert result.decision.startswith('fixer_lost:briefing:dispatches='), \
+    f'expected fixer_lost:briefing, got: {result.decision!r}'
+assert 'smoke-lost-gpu-orig' in result.decision, \
+    f'original dispatch ID missing from decision: {result.decision}'
+assert 'smoke-lost-gpu-retry' in result.decision, \
+    f'retry dispatch ID missing from decision: {result.decision}'
+
+print(f'Phase 29b: second-loss brief ✓  decision={result.decision}')
+PYEOF29B
+green "Phase 29b: second-loss brief (both dispatch IDs in decision) ✓"
+
+# (c) Verify healthy dispatch (with open PR after dispatch) is NOT classified as lost.
+/usr/bin/python3 - "${TID_LOST}" <<'PYEOF29C'
+import sys
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch, MagicMock
+
+target_id = sys.argv[1]
+
+dispatch_ts = "2026-05-01T10:00:00-07:00"
+orig_record = {
+    "gpu_id": "smoke-healthy-gpu",
+    "spec_id": "spec-smoke-healthy",
+    "agent_type": "fixer",
+    "intent": "implement the smoke spec",
+    "repo": "lapis-test",
+    "ts": dispatch_ts,
+    "status": "processed",  # job completed
+    "retry_count": 0,
+    "lost_retry_count": 0,
+}
+# A PR was opened AFTER the dispatch
+open_pr = {
+    "number": 42,
+    "created_at": "2026-05-01T10:30:00-07:00",  # after dispatch_ts
+    "head": {"ref": f"lapis/{target_id}/forced"},
+    "title": "test PR",
+}
+
+from lapis_pm import pm_core
+
+with patch('lapis_pm.episodic.all_comments', return_value=[]):
+    needs_retry, needs_brief = pm_core._find_lost_fixer_dispatches(
+        target_id, [orig_record], open_prs=[open_pr], forgejo_ok=True
+    )
+
+assert needs_retry == [], \
+    f'healthy dispatch (has PR) should not be in needs_retry: {needs_retry}'
+assert needs_brief == [], \
+    f'healthy dispatch (has PR) should not be in needs_brief: {needs_brief}'
+print('Phase 29c: healthy dispatch (open PR after dispatch) NOT classified as lost ✓')
+PYEOF29C
+green "Phase 29c: no false-positive lost classification on healthy dispatch ✓"
+
+# Cleanup phase 29
+rm -f "$TARGETS_DIR/${TID_LOST}.yaml" "$COMMENTS_DIR/${TID_LOST}.jsonl" "$LOST_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_LOST}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_LOST}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_LOST}" 2>/dev/null || true
+green "Phase 29 complete: lost-dispatch retry→brief sequence passed"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

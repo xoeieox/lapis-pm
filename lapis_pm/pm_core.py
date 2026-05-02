@@ -1193,9 +1193,10 @@ def _branch_belongs(target_id: str, branch: str) -> bool:
     return branch.startswith(f"lapis/{target_id}/")
 
 
-def _perceive_prs(target_id: str, repo: str) -> list[dict]:
+def _perceive_prs(target_id: str, repo: str) -> tuple[list[dict], bool]:
+    """Return (open_prs, forgejo_ok).  forgejo_ok=False means Forgejo was unreachable."""
     if not get_open_prs:
-        return []
+        return [], False
     try:
         prs = get_open_prs(repo)
     except Exception as e:
@@ -1203,13 +1204,13 @@ def _perceive_prs(target_id: str, repo: str) -> list[dict]:
             target_id, f"PR fetch failed for {repo}: {e}",
             extra_tags=["pm:error"],
         )
-        return []
+        return [], False
     out = []
     for pr in prs:
         head = (pr.get("head") or {}).get("ref") or ""
         if _branch_belongs(target_id, head):
             out.append(pr)
-    return out
+    return out, True
 
 
 # ---------------------------------------------------------------------------
@@ -2119,6 +2120,170 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Lost-dispatch detection and handling
+# ---------------------------------------------------------------------------
+
+def _find_lost_fixer_dispatches(
+    target_id: str,
+    records: list[dict],
+    open_prs: list[dict],
+    forgejo_ok: bool,
+) -> tuple[list[dict], list[tuple[dict, dict | None]]]:
+    """Classify terminal fixer dispatches with no corresponding PR as lost.
+
+    Returns (needs_retry, needs_brief):
+      needs_retry: original fixer records where lost_retry_count == 0 and no
+                   pending retry child exists (never preempt a live fixer).
+      needs_brief: (original, retry_child_or_None) pairs where lost_retry_count >= 1
+                   and the retry child is absent or also terminal.
+
+    A `lost` classification requires forgejo_ok=True — stale empty PR list is
+    indistinguishable from real empty; returns ([], []) if Forgejo was unreachable.
+
+    Only original dispatches (no parent_gpu_id) are classified; retry children
+    are located by parent pointer and returned as the second tuple element for
+    the brief path (so both dispatch IDs can appear in the brief body).
+    """
+    if not forgejo_ok:
+        return [], []
+
+    # Timestamps of merged-PR observations (proxy for PR creation time)
+    merged_obs_ts: list[str] = [
+        c.ts
+        for c in episodic.all_comments(target_id)
+        if any(t.startswith("pm:pr-merged:") for t in c.tags)
+    ]
+
+    needs_retry: list[dict] = []
+    needs_brief: list[tuple[dict, dict | None]] = []
+
+    for rec in records:
+        if rec.get("agent_type") != "fixer":
+            continue
+        if rec.get("parent_gpu_id"):
+            continue  # Only classify originals, not retry children
+        if rec.get("status") not in ("processed", "failed"):
+            continue  # Not terminal — job may still open a PR
+
+        dispatch_ts = rec.get("ts", "")
+
+        # Does a matching PR exist (created at or after this dispatch)?
+        has_pr = any(pr.get("created_at", "") >= dispatch_ts for pr in open_prs)
+        if not has_pr:
+            has_pr = any(obs_ts >= dispatch_ts for obs_ts in merged_obs_ts)
+        if has_pr:
+            continue  # PR exists; not lost
+
+        # Locate the youngest fixer retry child (if any)
+        orig_gpu_id = rec.get("gpu_id", "")
+        retry_child: dict | None = next(
+            (r for r in records
+             if r.get("parent_gpu_id") == orig_gpu_id
+             and r.get("agent_type") == "fixer"),
+            None,
+        )
+        # Never preempt a live fixer (child pending = retry in flight)
+        if retry_child is not None and retry_child.get("status") == "pending":
+            continue
+
+        lost_retry_count = rec.get("lost_retry_count", 0)
+        if lost_retry_count == 0:
+            needs_retry.append(rec)
+        else:
+            needs_brief.append((rec, retry_child))
+
+    return needs_retry, needs_brief
+
+
+def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
+    """Re-dispatch a lost fixer with the same intent. Retry budget: exactly 1.
+
+    Increments lost_retry_count on the original record and appends a child
+    dispatch record with parent_gpu_id pointing back to the original.
+    Logs decision=fixer_lost:retrying:dispatch=<id>.
+    """
+    agent_type = rec.get("agent_type", "fixer")
+    intent = rec.get("intent", "(no intent)")
+    spec_summary = episodic.spec_summary(target_id)
+    vars_ = {
+        "target_id": target_id,
+        "spec_summary": spec_summary,
+        "repo": rec.get("repo", ""),
+        "question": intent,
+        "pr_number": "",
+        "slug": rec.get("slug", "forced"),
+    }
+    res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
+
+    orig_gpu_id = rec.get("gpu_id", "?")
+    new_record = {
+        "gpu_id": res.task_id,
+        "spec_id": res.spec_id,
+        "agent_type": agent_type,
+        "intent": intent,
+        "repo": rec.get("repo", ""),
+        "ts": _now_iso(),
+        "status": "pending",
+        "retry_count": 0,
+        "lost_retry_count": 0,
+        "parent_gpu_id": orig_gpu_id,
+    }
+
+    # Increment lost_retry_count on original and append child in one save
+    records = load_dispatched(target_id)
+    for r in records:
+        if r.get("gpu_id") == orig_gpu_id:
+            r["lost_retry_count"] = 1
+            break
+    records.append(new_record)
+    save_dispatched(target_id, records)
+
+    episodic.write_observation(
+        target_id,
+        f"Lost dispatch {orig_gpu_id}: retrying → {res.task_id}\nIntent: {intent}",
+        extra_tags=["pm:lost-dispatch-retry", f"pm:gpu={res.task_id}",
+                    f"pm:agent={agent_type}"],
+    )
+    return f"fixer_lost:retrying:dispatch={orig_gpu_id}"
+
+
+def _act_lost_brief(
+    target_id: str, original_rec: dict, retry_rec: dict | None
+) -> str:
+    """Emit a lost-dispatch brief (both attempts terminated, no PR). NORMAL priority.
+
+    Brief body includes both dispatch IDs, error strings, and spec reference.
+    Options: retry-again, amend-spec-and-retry, unbind.
+    Logs decision=fixer_lost:briefing:dispatches=<id1>,<id2>.
+    """
+    orig_id = original_rec.get("gpu_id", "unknown")
+    orig_error = original_rec.get("error") or "no error recorded"
+    retry_id = retry_rec.get("gpu_id", "none") if retry_rec else "none"
+    retry_error = (retry_rec.get("error") or "no error recorded") if retry_rec else ""
+
+    spec_ref = (episodic.spec(target_id) or "")[:80] or "(spec not found)"
+
+    query = (
+        f"Two fixer dispatches for {target_id} terminated without opening a PR.\n"
+        f"Original dispatch: {orig_id} — error: {orig_error}\n"
+        f"Retry dispatch: {retry_id}"
+        + (f" — error: {retry_error}" if retry_error else "")
+        + f"\nSpec: {spec_ref}"
+    )
+
+    b = brief.synthesize(
+        target_id,
+        trigger="lost-dispatch",
+        query=query,
+        notify=NotifyPriority.NORMAL,
+    )
+    set_outstanding_brief(target_id, b.comment_id)
+
+    dispatch_ids = f"{orig_id},{retry_id}" if retry_rec else orig_id
+    return f"fixer_lost:briefing:dispatches={dispatch_ids}"
+
+
+# ---------------------------------------------------------------------------
 # Brief-decision directive consumer
 # ---------------------------------------------------------------------------
 
@@ -2279,7 +2444,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     ]
 
     repo = target.pm_repo or ""
-    open_prs = _perceive_prs(target_id, repo) if repo else []
+    open_prs, forgejo_ok = _perceive_prs(target_id, repo) if repo else ([], False)
 
     # 3. Encode
     encoded = 0
@@ -2300,6 +2465,13 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # Check Forgejo for newly merged PRs and write pm:pr-merged observations.
     # This is bookkeeping (encoding), not action — safe to do before decide.
     encoded += _encode_merged_prs(target_id, repo)
+
+    # Classify lost fixer dispatches (terminal job, no PR produced).
+    # Must run after encode so freshly-flipped records are visible.
+    _lost_all_records = load_dispatched(target_id)
+    _lost_needs_retry, _lost_needs_brief = _find_lost_fixer_dispatches(
+        target_id, _lost_all_records, open_prs, forgejo_ok
+    )
 
     # 4. Decide (priority order, single action)
     decision_str = "noop:no_change"
@@ -2389,6 +2561,15 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
 
     elif _already_satisfied_invalid_pending(target_id) is not None:
         decision_str = _act_brief_already_satisfied_invalid(target_id)
+
+    elif _lost_needs_retry:
+        # Lost dispatch: terminal fixer job, no PR produced, first loss → retry once.
+        decision_str = _act_lost_fixer_retry(target_id, _lost_needs_retry[0])
+
+    elif _lost_needs_brief:
+        # Lost dispatch: retry also produced no PR → surface to human.
+        _orig, _retry_rec = _lost_needs_brief[0]
+        decision_str = _act_lost_brief(target_id, _orig, _retry_rec)
 
     elif allow_auto_land and _is_auto_land_eligible(target_id):
         decision_str = _act_auto_land(target_id)

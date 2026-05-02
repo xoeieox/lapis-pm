@@ -113,6 +113,23 @@ _CLOSED_FORM_TRIGGERS: dict[str, list[dict]] = {
             "action": {"kind": "acknowledge_and_clear"},
         },
     ],
+    "lost-dispatch": [
+        {
+            "id": "A",
+            "label": "Retry again",
+            "action": {"kind": "force_dispatch_retry"},
+        },
+        {
+            "id": "B",
+            "label": "Amend spec and retry",
+            "action": {"kind": "acknowledge_and_clear"},
+        },
+        {
+            "id": "C",
+            "label": "Unbind this target",
+            "action": {"kind": "pause_target"},
+        },
+    ],
 }
 
 # Directive consumer path

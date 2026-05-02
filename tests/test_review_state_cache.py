@@ -418,6 +418,7 @@ class TestTickIntegration:
         t.paused = False
         t.pm_repo = ""
         t.pm_authority = pm_authority
+        t.data = {}
         return t
 
     def test_tick_writes_key_when_active_state(self):
@@ -497,6 +498,7 @@ class TestTickSwallowsPersistErrors:
         mock_target.paused = False
         mock_target.pm_repo = ""
         mock_target.pm_authority = "advisory"
+        mock_target.data = {}
 
         observations = []
 
@@ -527,7 +529,7 @@ class TestTickSwallowsPersistErrors:
 
         # Tick must succeed
         assert result.skipped is False
-        assert result.decision == "noop"
+        assert result.decision == "noop:no_change"
 
         # An pm:error observation must have been written
         error_obs = [(c, t) for c, t in observations if "pm:error" in t]

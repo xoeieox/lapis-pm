@@ -297,27 +297,35 @@ class TestDecideForPr:
         assert d.payload["mode"] == "fresh"
 
     def test_pending_reviewer_returns_noop(self):
-        """Reviewer already pending for this PR → noop (no double-dispatch)."""
+        """Reviewer already pending for this PR → noop_reviewer_in_flight (no double-dispatch)."""
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=True),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
         ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
-        assert d.kind == "noop"
+        assert d.kind == "noop_reviewer_in_flight"
+        assert d.payload["pr_number"] == PR_TEMPLATE["number"]
+        assert d.payload["cycle"] == 1
 
     def test_pending_fixer_returns_noop(self):
-        """Fixer already pending → noop."""
+        """Fixer already pending → noop_fixer_in_flight."""
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=True),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[
+                {"status": "pending", "agent_type": "fixer_retry",
+                 "pr_number": PR_TEMPLATE["number"], "gpu_id": "task-abc123"}
+            ]),
         ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
-        assert d.kind == "noop"
+        assert d.kind == "noop_fixer_in_flight"
+        assert d.payload["dispatch_id"] == "task-abc123"
 
     def test_fixable_cycles_below_budget_dispatches_fixer(self):
         """Reviewed (cycle 1) fixable + cycles < budget → dispatch_fixer_retry."""
@@ -884,7 +892,7 @@ class TestCycleKProgression:
         assert d.payload["mode"] == "same"  # advisory keeps same-reviewer mode
 
     def test_no_progression_guard_sha_unchanged(self):
-        """reviewer=1 fixer=1 SHA NOT advanced → noop (no-progression guard)."""
+        """reviewer=1 fixer=1 SHA NOT advanced → noop_no_change (no-progression guard)."""
         reviewer_rec = self._reviewer_dispatch_record(cycle=1, ts="2026-01-01T09:00:00")
         # SHA observation exists but BEFORE reviewer dispatch ts — does not count
         old_sha = self._sha_observation(42, "oldsha", "2026-01-01T08:00:00")
@@ -902,7 +910,7 @@ class TestCycleKProgression:
         ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
 
-        assert d.kind == "noop"
+        assert d.kind == "noop_no_change"
 
     def test_budget_exhaustion_after_cycle2_fixable(self):
         """reviewer=2 fixer=2 SHA advanced → review_exhausted_brief (advisory budget=2)."""

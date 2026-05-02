@@ -53,6 +53,55 @@ bash lapis_pm/smoke.sh
 Exercises bind → dispatch → encode → pause/resume → directive → brief → status
 end-to-end. No real PRs or GPU calls; queue-paused sandbox.
 
+## Tick Decision Taxonomy
+
+Every tick emits exactly one decision log line per bound target:
+
+```
+[<target_id>] skipped=<bool> reason=<reason> encoded=<n> decision=<tag>
+```
+
+### Noop variants (`decision=noop:*`)
+
+| Tag | Meaning |
+|-----|---------|
+| `noop:no_change` | Perceived state unchanged; nothing to do (healthy common case). |
+| `noop:paused` | Target's `paused: true` flag is set. |
+| `noop:reviewer_in_flight:pr=<n>:cycle=<k>` | PR open, reviewer agent dispatched, waiting for verdict. |
+| `noop:fixer_in_flight:dispatch=<id>` | Fixer retry dispatched (reviewer returned `fixable`), queue job not yet terminal. |
+| `noop:awaiting_chain_dependency:waiting_on=<tid>` | Chain-mode leg: `depends_on` not yet satisfied. |
+
+### Action variants (`decision=action:*`)
+
+| Tag | Meaning |
+|-----|---------|
+| `action:auto_merge:pr=<n>` | PR auto-merged by the daemon. |
+| `action:merge_failed:<err>` | Auto-merge attempted but Forgejo returned an error. |
+| `action:auto_land:pr=<n>:arc=<path>` | PR merged + arc doc written + target unbound. |
+| `action:reviewer_dispatched:pr=<n>:cycle=<k>` | Opus reviewer agent dispatched for PR review cycle k. |
+| `action:fixer_dispatched:source=retry:pr=<n>:cycle=<k>` | Fixer retry dispatched after reviewer returned `fixable`. |
+| `action:fixer_dispatched:source=init:dispatch=<id>` | Initial or re-tried fixer dispatch (no open PR yet). |
+| `action:brief_emitted:kind=<kind>:cid=<id>` | Brief synthesized and posted. `kind` ∈ `hold`, `advisory_clean`, `advisory_screen_issue`. |
+| `action:brief_decision_applied:<brief_id>:<option_id>` | Click-to-resolve directive consumed and applied. |
+| `action:directive_brief:cid=<id>` | Human directive received; brief synthesized for human review. |
+| `action:abandon_brief:cid=<id>` | Fixer failed `MAX_DISPATCH_RETRIES` times; brief posted, dispatch abandoned. |
+| `action:review_exhausted_brief:cid=<id>` | Review cycle budget exhausted; human judgment needed. |
+| `action:review_gate_paused:cid=<id>` | Kill-switch threshold exceeded; review gate soft-paused. |
+| `action:review_gate_pause:already_briefed` | Kill-switch already triggered this period; idempotent. |
+
+### Skip variants (`skipped=True reason=*`)
+
+| Reason | Meaning |
+|--------|---------|
+| `target not found` | Target ID not in the target store. |
+| `target not pm_bound` | Target exists but `pm_bound` is false. |
+| `paused` | Target is paused (`decision=noop:paused` is also set). |
+| `forgejo_unreachable` | Forgejo health gate blocked the tick (added by `lapis-pm-forgejo-health-gate`). |
+| `ratelimit` | Rate limiter blocked the tick. |
+| `cursor_locked` | Concurrent-tick guard fired. |
+
+**Invariants:** Every tick emits exactly one decision tag per target. The `noop:` and `action:` families are disjoint and machine-greppable. Bare `noop` (without `:` qualifier) is a programming error; unit tests enforce the closed enum.
+
 ## Structure
 
 ```

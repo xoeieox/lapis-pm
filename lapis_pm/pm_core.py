@@ -16,6 +16,7 @@ percepts as comments is bookkeeping, not action.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -259,6 +260,72 @@ def append_dispatched(target_id: str, record: dict):
     records = load_dispatched(target_id)
     records.append(record)
     save_dispatched(target_id, records)
+
+
+def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
+    """Dispatch a shaped agent, record it, and emit a router-portfolio event.
+
+    Extracted from cmd_tick's force-dispatch block so that both the CLI and
+    _act_force_dispatch_retry can call the same path.  Returns task_id.
+    """
+    target = TargetStore().get(target_id)
+    if target is None:
+        raise ValueError(f"target not found: {target_id}")
+    spec_sum = episodic.spec_summary(target_id)
+    vars_ = {
+        "target_id": target_id,
+        "spec_summary": spec_sum,
+        "repo": target.pm_repo or "",
+        "question": intent,
+        "pr_number": "",
+        "slug": "forced",
+    }
+    res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
+    append_dispatched(target_id, {
+        "gpu_id": res.task_id,
+        "spec_id": res.spec_id,
+        "agent_type": agent_type,
+        "intent": intent,
+        "repo": target.pm_repo or "",
+        "ts": _now_iso(),
+        "status": "pending",
+        "retry_count": 0,
+    })
+    episodic.write_dispatch(
+        target_id,
+        f"Forced dispatch: {agent_type} → {res.task_id}\nIntent: {intent}",
+        extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"],
+    )
+    try:
+        from .router_portfolio import emit_decision_dispatch as _emit_dispatch
+        dispatched = load_dispatched(target_id)
+        if agent_type == "fixer":
+            frag = "kickoff" if len(dispatched) == 1 else "tick"
+        elif agent_type == "reviewer":
+            frag = "review-cycle"
+        elif agent_type == "brief":
+            frag = "human-judgment"
+        else:
+            frag = agent_type
+        model = "unknown"
+        try:
+            model = _SHAPER.get_agent(agent_type).model
+        except Exception:
+            pass
+        _TIER_MAP = {
+            "haiku": "haiku", "sonnet": "sonnet", "opus": "opus",
+            "qwen-3.6-35b-a3b": "qwen-local", "qwen3.6-35b-a3b": "qwen-local",
+        }
+        _emit_dispatch(
+            target_id=target_id,
+            fragment_id=frag,
+            expert_chosen=_TIER_MAP.get(model.lower(), model.lower()),
+            intent_summary=intent[:200],
+        )
+    except Exception as _e:
+        import sys
+        print(f"[router-portfolio:emit-failed] dispatch: {_e}", file=sys.stderr)
+    return res.task_id
 
 
 def get_pause_state(target_id: str) -> str | None:
@@ -990,12 +1057,21 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             f"Title: {cls.title}\n{cls.html_url}",
             extra_tags=[f"pm:repo={cls.repo}", f"pm:pr={cls.pr_number}"],
         )
+    # For advisory (non-hold) briefs, derive a closed-form trigger string so
+    # the synthesizer emits a pm:brief-options sibling with resolution buttons.
+    effective_trigger = trigger
+    if not hold:
+        if cls.issues:
+            effective_trigger = "advisory-screen-issue"
+        else:
+            effective_trigger = "advisory-clean"
     b = brief.synthesize(
         target_id,
-        trigger=trigger,
+        trigger=effective_trigger,
         query=cls.title,
         diff_snippet=cls.diff or None,
         screen_issues=cls.issues or None,
+        pr_number=cls.pr_number if not hold else None,
         notify=NotifyPriority.NORMAL if hold else None,
     )
     set_outstanding_brief(target_id, b.comment_id)
@@ -1685,6 +1761,117 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Brief-decision directive consumer
+# ---------------------------------------------------------------------------
+
+_DIRECTIVES_BASE = Path("/srv/lapis/directives/brief-decisions")
+
+
+def _consume_brief_decisions(target_id: str) -> str | None:
+    """Consume at most one brief-decision directive for target_id this tick.
+
+    Glob: /srv/lapis/directives/brief-decisions/<target_id>__*.json  (top-level = pending).
+    Also recovers any processing/<target_id>__*.json left by a prior crashed tick.
+
+    Returns decision_str "brief_decision_applied:<brief_id>:<option_id>" if a
+    directive was consumed, else None.
+    """
+    base = _DIRECTIVES_BASE
+    pending_dir = base
+    processing_dir = base / "processing"
+    applied_dir = base / "applied"
+    failed_dir = base / "failed"
+
+    for d in (processing_dir, applied_dir, failed_dir):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    def _load_candidates(directory: Path, glob_pattern: str) -> list[Path]:
+        try:
+            return sorted(directory.glob(glob_pattern), key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return []
+
+    # Recover any file stuck in processing/ from a prior crashed tick.
+    processing_candidates = _load_candidates(processing_dir, f"{target_id}__*.json")
+    # Also pick up top-level pending files.
+    pending_candidates = _load_candidates(pending_dir, f"{target_id}__*.json")
+
+    # Process recovery files first (they're already renamed); then pending.
+    candidates = [(f, True) for f in processing_candidates] + \
+                 [(f, False) for f in pending_candidates]
+
+    for src_path, already_processing in candidates:
+        stem = src_path.stem  # <target_id>__<brief_id>
+        processing_path = processing_dir / src_path.name
+        applied_path = applied_dir / src_path.name
+        failed_path = failed_dir / src_path.name
+
+        # Load directive JSON.
+        try:
+            directive = json.loads(src_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            episodic.write_observation(
+                target_id,
+                f"brief-decision directive unreadable ({src_path.name}): {exc}",
+                extra_tags=["pm:error"],
+            )
+            continue
+
+        brief_id = directive.get("brief_id", "")
+        option_id = directive.get("option_id", "")
+
+        if not already_processing:
+            # Atomic rename to processing/ before calling apply_decision.
+            try:
+                os.rename(src_path, processing_path)
+            except OSError as exc:
+                episodic.write_observation(
+                    target_id,
+                    f"brief-decision rename-to-processing failed ({src_path.name}): {exc}",
+                    extra_tags=["pm:error"],
+                )
+                continue
+
+        # Apply the decision (idempotent).
+        result = brief.apply_decision(target_id, brief_id, option_id)
+
+        ts = _now_iso()
+        if result.get("ok"):
+            # Move to applied/ and append result line.
+            result_payload = json.dumps({**directive, "result": result, "applied_ts": ts},
+                                        ensure_ascii=False)
+            try:
+                applied_path.write_text(result_payload)
+                os.rename(processing_path, applied_path)
+            except OSError:
+                # best-effort: leave in processing if rename fails
+                pass
+            return f"brief_decision_applied:{brief_id}:{option_id}"
+        else:
+            err = result.get("error", "unknown")
+            failed_payload = json.dumps({**directive, "error": err, "failed_ts": ts},
+                                        ensure_ascii=False)
+            try:
+                failed_path.write_text(failed_payload)
+                os.rename(processing_path, failed_path)
+            except OSError:
+                pass
+            episodic.write_observation(
+                target_id,
+                f"brief-decision directive failed ({brief_id}/{option_id}): {err}",
+                extra_tags=["pm:error"],
+            )
+            # A failed directive is still "consumed" this tick — return None
+            # so the rest of the decide chain can run.
+            return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Tick
 # ---------------------------------------------------------------------------
 
@@ -1756,6 +1943,14 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # 4. Decide (priority order, single action)
     decision_str = "noop"
     pm_authority = target.pm_authority
+
+    # 4.0 Brief-decision directive consumer — highest-priority decide branch.
+    # If a directive file exists for this target, apply it and skip the rest.
+    brief_decision_str = _consume_brief_decisions(target_id)
+    if brief_decision_str is not None:
+        set_cursor(target_id, _now_iso())
+        return TickResult(target_id, False, "ok", encoded, brief_decision_str,
+                          reconciled=reconciled)
 
     if directives:
         # v1: surface directives as a brief if any are recent and we don't

@@ -15,6 +15,7 @@ Commands:
     list
     land <target_id> [--dry-run]
     brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
+    brief-resolve <target_id> <option_id>
     review-gate {status,resume}
     trajectory-rollup --rebuild-index
     trajectory-rollup --period per-target [--target TID | --all]
@@ -497,59 +498,8 @@ def cmd_tick(args) -> int:
         if target is None or not target.pm_bound:
             print(f"ERROR: target {args.target} not bound", file=sys.stderr)
             return 2
-        spec_sum = episodic.spec_summary(args.target)
-        vars_ = {
-            "target_id": args.target,
-            "spec_summary": spec_sum,
-            "repo": target.pm_repo or "",
-            "question": intent,
-            "pr_number": "",
-            "slug": "forced",
-        }
-        res = pm_core._SHAPER.dispatch(agent_type, args.target, intent, vars_=vars_)
-        pm_core.append_dispatched(args.target, {
-            "gpu_id": res.task_id,
-            "spec_id": res.spec_id,
-            "agent_type": agent_type,
-            "intent": intent,
-            "repo": target.pm_repo or "",
-            "ts": pm_core._now_iso(),
-            "status": "pending",
-            "retry_count": 0,
-        })
-        episodic.write_dispatch(
-            args.target,
-            f"Forced dispatch: {agent_type} → {res.task_id}\nIntent: {intent}",
-            extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"],
-        )
-        try:
-            _dispatched = pm_core.load_dispatched(args.target)
-            if agent_type == "fixer":
-                _frag = "kickoff" if len(_dispatched) == 1 else "tick"
-            elif agent_type == "reviewer":
-                _frag = "review-cycle"
-            elif agent_type == "brief":
-                _frag = "human-judgment"
-            else:
-                _frag = agent_type
-            _model = "unknown"
-            try:
-                _model = pm_core._SHAPER.get_agent(agent_type).model
-            except Exception:
-                pass
-            _TIER_MAP = {
-                "haiku": "haiku", "sonnet": "sonnet", "opus": "opus",
-                "qwen-3.6-35b-a3b": "qwen-local", "qwen3.6-35b-a3b": "qwen-local",
-            }
-            emit_decision_dispatch(
-                target_id=args.target,
-                fragment_id=_frag,
-                expert_chosen=_TIER_MAP.get(_model.lower(), _model.lower()),
-                intent_summary=intent[:200],
-            )
-        except Exception as _e:
-            print(f"[router-portfolio:emit-failed] dispatch: {_e}", file=sys.stderr)
-        print(f"Dispatched: {agent_type} task_id={res.task_id} output={res.output_path}")
+        task_id = pm_core.force_dispatch(args.target, agent_type, intent)
+        print(f"Dispatched: {agent_type} task_id={task_id}")
         return 0
 
     if args.force_brief:
@@ -745,6 +695,31 @@ def cmd_land(args) -> int:
     return 0
 
 
+def cmd_brief_resolve(args) -> int:
+    """Resolve the current outstanding brief for target_id by choosing option_id.
+
+    Reads the outstanding brief id from mem, then calls brief.apply_decision().
+    Exits 0 on success (including noop_already_applied); non-zero on error.
+    """
+    target_id = args.target_id
+    option_id = args.option_id
+
+    outstanding = pm_core.get_outstanding_brief(target_id)
+    if outstanding is None:
+        print(f"ERROR: no outstanding brief for {target_id}", file=sys.stderr)
+        return 2
+
+    result = brief.apply_decision(target_id, outstanding, option_id)
+    if result.get("ok"):
+        print(f"Resolved: target={target_id} brief={outstanding} "
+              f"option={option_id} action={result.get('action_kind')} "
+              f"detail={result.get('detail')}")
+        return 0
+    else:
+        print(f"ERROR: {result.get('error', 'unknown error')}", file=sys.stderr)
+        return 1
+
+
 def cmd_brief(args) -> int:
     from . import state_brief
     period = args.period
@@ -895,6 +870,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Brief cadence: morning/afternoon/live use Qwen; weekly uses Sonnet via Claude CLI.",
     )
     br.set_defaults(func=cmd_brief)
+
+    brs = sub.add_parser(
+        "brief-resolve",
+        help="Resolve the current outstanding brief by choosing a closed-form option.",
+    )
+    brs.add_argument("target_id", help="Target ID with an outstanding brief.")
+    brs.add_argument("option_id", help="Option ID to apply (e.g. A, B, C).")
+    brs.set_defaults(func=cmd_brief_resolve)
 
     rg = sub.add_parser("review-gate",
                         help="Manage the Opus reviewer kill-switch.")

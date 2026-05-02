@@ -2063,9 +2063,137 @@ green "per-target idempotency OK (no-op on unchanged arc doc)"
 rm -f "$FIXTURE_ARC" "/tmp/traj-smoke-$$.out"
 rm -f "/srv/lapis/trajectory/per-target/${FIXTURE_TID}.json"
 
+# --- Phase 26: closed-form-brief scenario --------------------------------
+step "26. closed-form-brief: synthesize emits sibling + directive consumer resolves"
+
+TID_BRIEF="pm-smoke-brief-$$"
+BRIEF_SPEC="/tmp/${TID_BRIEF}-spec.md"
+DIRECTIVES_DIR="/srv/lapis/directives/brief-decisions"
+
+cat > "$BRIEF_SPEC" <<EOF
+# Closed-form brief smoke spec for $TID_BRIEF
+EOF
+
+cat > "$TARGETS_DIR/${TID_BRIEF}.yaml" <<EOF
+id: ${TID_BRIEF}
+title: Closed-form brief smoke
+status: active
+category: active-work
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Closed-form brief smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+
+$LAPIS bind "$TID_BRIEF" --spec-from "$BRIEF_SPEC" --repo lapis-test --authority advisory
+
+# (a) Synthesize with a closed-form trigger and verify sibling comment written.
+/usr/bin/python3 - "${TID_BRIEF}" <<'PYEOF26'
+import sys, json
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch, MagicMock
+
+target_id = sys.argv[1]
+
+def fake_write_brief(tid, body, extra_tags=None):
+    c = MagicMock()
+    c.id = 'smoke-brief-id-26'
+    return c
+
+captured_options = []
+def fake_write_brief_options(tid, content):
+    c = MagicMock()
+    c.id = 'smoke-brief-options-id-26'
+    captured_options.append((tid, content))
+    return c
+
+patches = [
+    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nok\n## Decision needed\nnone'),
+    patch('lapis_pm.brief.send_notification', return_value=False),
+    patch('lapis_pm.brief.episodic.recall', return_value=[]),
+    patch('lapis_pm.brief.episodic.spec_summary', return_value='spec'),
+    patch('lapis_pm.brief.episodic.write_brief', side_effect=fake_write_brief),
+    patch('lapis_pm.brief.episodic.write_brief_options', side_effect=fake_write_brief_options),
+]
+for p in patches:
+    p.start()
+
+try:
+    from lapis_pm import brief
+    b = brief.synthesize(target_id, trigger='advisory-screen-issue', pr_number=17, notify=None)
+finally:
+    for p in reversed(patches):
+        try: p.stop()
+        except Exception: pass
+
+assert b.comment_id == 'smoke-brief-id-26', f'comment_id mismatch: {b.comment_id}'
+assert len(captured_options) == 1, f'expected 1 sibling, got {len(captured_options)}'
+data = json.loads(captured_options[0][1])
+assert data['brief_id'] == 'smoke-brief-id-26', f'brief_id mismatch: {data}'
+assert data['trigger'] == 'advisory-screen-issue', f'trigger mismatch: {data}'
+assert len(data['options']) == 3, f'expected 3 options: {data}'
+merge_opt = next(o for o in data['options'] if o['action']['kind'] == 'merge_pr')
+assert merge_opt['action'].get('pr') == 17, f'pr_number not injected: {merge_opt}'
+print(f'synthesize: sibling pm:brief-options emitted for advisory-screen-issue ✓')
+print(f'  brief_id={data["brief_id"]} trigger={data["trigger"]} options={len(data["options"])} pr={merge_opt["action"]["pr"]}')
+PYEOF26
+green "Phase 26a: synthesize emits pm:brief-options sibling for advisory-screen-issue ✓"
+
+# (b) Drop a directive file and run _consume_brief_decisions to verify
+#     pending → applied transition and mem audit key written.
+mkdir -p "$DIRECTIVES_DIR"
+BRIEF_ID_SMOKE="smoke-brief-$(date +%s)-$$"
+DIRECTIVE_FILE="$DIRECTIVES_DIR/${TID_BRIEF}__${BRIEF_ID_SMOKE}.json"
+cat > "$DIRECTIVE_FILE" <<EOF
+{"brief_id": "${BRIEF_ID_SMOKE}", "target_id": "${TID_BRIEF}", "option_id": "A",
+ "ts": "$(date -Iseconds)", "submitter": "smoke"}
+EOF
+
+/usr/bin/python3 - "${TID_BRIEF}" "${BRIEF_ID_SMOKE}" <<'PYEOF26B'
+import sys, json, os
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch
+
+target_id, brief_id = sys.argv[1], sys.argv[2]
+
+apply_result = {"ok": True, "action_kind": "acknowledge_and_clear", "detail": "cleared"}
+
+with (
+    patch('lapis_pm.pm_core.brief.apply_decision', return_value=apply_result),
+    patch('lapis_pm.pm_core.episodic.write_observation'),
+):
+    from lapis_pm import pm_core
+    result = pm_core._consume_brief_decisions(target_id)
+
+assert result == f'brief_decision_applied:{brief_id}:A', \
+    f'expected decision_str, got: {result!r}'
+
+applied = f'/srv/lapis/directives/brief-decisions/applied/{target_id}__{brief_id}.json'
+assert os.path.exists(applied), f'applied file missing: {applied}'
+print(f'directive consumer: pending → applied ✓')
+print(f'  decision_str={result}')
+PYEOF26B
+green "Phase 26b: directive consumer pending→applied transition ✓"
+
+# Cleanup phase 26
+rm -f "$TARGETS_DIR/${TID_BRIEF}.yaml" "$COMMENTS_DIR/${TID_BRIEF}.jsonl" "$BRIEF_SPEC"
+rm -f "${DIRECTIVES_DIR}/applied/${TID_BRIEF}__${BRIEF_ID_SMOKE}.json" 2>/dev/null || true
+rm -f "${DIRECTIVE_FILE}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/cursor/${TID_BRIEF}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_BRIEF}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_BRIEF}" 2>/dev/null || true
+green "Phase 26 complete: closed-form-brief scenario passed"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

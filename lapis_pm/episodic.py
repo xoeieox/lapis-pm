@@ -31,6 +31,7 @@ TAG_OBSERVATION = "pm:observation"
 TAG_DISPATCH = "pm:dispatch"
 TAG_RESULT = "pm:result"
 TAG_BRIEF = "pm:brief"
+TAG_BRIEF_OPTIONS = "pm:brief-options"
 TAG_HOLD = "pm:hold"
 TAG_MERGE = "pm:merge"
 TAG_RETRY = "pm:retry"
@@ -100,6 +101,11 @@ def write_result(target_id: str, content: str, extra_tags: list[str] | None = No
 def write_brief(target_id: str, content: str, extra_tags: list[str] | None = None) -> Comment:
     tags = [TAG_BRIEF] + list(extra_tags or [])
     return write(target_id, content, tags)
+
+
+def write_brief_options(target_id: str, content: str) -> Comment:
+    """Write a pm:brief-options sibling comment (JSON document)."""
+    return write(target_id, content, [TAG_BRIEF_OPTIONS])
 
 
 def write_hold(target_id: str, content: str, extra_tags: list[str] | None = None) -> Comment:

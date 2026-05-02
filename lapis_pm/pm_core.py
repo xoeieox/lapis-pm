@@ -1378,6 +1378,9 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
                 f"Review the updated diff in light of these prior concerns.\n"
             )
 
+    existing_branch = (pr.get("head") or {}).get("ref") or f"lapis/{target_id}/pr{pr_number}"
+    base_branch = (pr.get("base") or {}).get("ref") or "main"
+
     vars_: dict = {
         "target_id": target_id,
         "spec_summary": spec_summary,
@@ -1387,14 +1390,16 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "slug": f"pr{pr_number}-review-c{cycle}",
         "question": f"review PR #{pr_number}",
         "prior_review": prior_review_text,
+        "existing_branch": existing_branch,
+        "base_branch": base_branch,
     }
 
     # Get the diff for the reviewer prompt
     try:
         from agents_core.forgejo import get_pr_diff as _get_diff
         diff_text = _get_diff(repo, pr_number)
-        if len(diff_text) > 60000:
-            diff_text = diff_text[:60000] + "\n\n... (diff truncated)"
+        if len(diff_text) > authority.DIFF_INLINE_CAP:
+            diff_text = diff_text[:authority.DIFF_INLINE_CAP] + "\n\n... (diff truncated)"
     except Exception:
         diff_text = "(diff unavailable)"
 

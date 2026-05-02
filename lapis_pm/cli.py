@@ -697,6 +697,100 @@ def cmd_land(args) -> int:
     return 0
 
 
+def cmd_ratify(args) -> int:
+    """Principal-feedback surface: record ratification of a Router decision.
+
+    lapis-pm ratify <target_id> <confirm|correct|override|redirect>
+                    [--intent SUMMARY] [--prior EVENT_ID] [--json]
+    """
+    from .router_portfolio import (
+        find_latest_decision,
+        emit_ratify_confirm,
+        emit_ratify_correct,
+        emit_ratify_override,
+        emit_ratify_redirect,
+    )
+
+    target_id = args.target_id
+    outcome = args.outcome
+    intent = args.intent
+    prior_raw = args.prior
+    as_json = getattr(args, "json", False)
+
+    # --intent is required for non-confirm outcomes
+    if outcome != "confirm" and not intent:
+        print(f"ERROR: --intent is required for outcome {outcome!r}", file=sys.stderr)
+        return 2
+
+    # Normalize --prior: strip namespace prefix if a full mem key was given
+    _DECISIONS_NS = "router/lapis-pm/decisions/"
+    if prior_raw is not None:
+        prior_event_id: str | None = (
+            prior_raw[len(_DECISIONS_NS):]
+            if prior_raw.startswith(_DECISIONS_NS)
+            else prior_raw
+        )
+    else:
+        # Auto-prior resolution: find most recent decision for this target
+        decision = find_latest_decision(target_id)
+        if decision is not None:
+            mem_key = decision.get("_mem_key", "")
+            prior_event_id = (
+                mem_key[len(_DECISIONS_NS):]
+                if mem_key.startswith(_DECISIONS_NS)
+                else mem_key
+            )
+        else:
+            if outcome == "confirm":
+                print(
+                    f"no prior decision found for {target_id}; cannot confirm — "
+                    f"pass --prior <event_id> explicitly",
+                    file=sys.stderr,
+                )
+                return 3
+            else:
+                print(
+                    f"[ratify] no prior decision found for {target_id}; writing with empty citations",
+                    file=sys.stderr,
+                )
+                prior_event_id = None
+
+    # Emit ratification
+    try:
+        if outcome == "confirm":
+            key = emit_ratify_confirm(
+                target_id=target_id,
+                prior_decision_event_id=prior_event_id,
+            )
+        elif outcome == "correct":
+            key = emit_ratify_correct(
+                target_id=target_id,
+                intent_summary=intent,
+                prior_decision_event_id=prior_event_id,
+            )
+        elif outcome == "override":
+            key = emit_ratify_override(
+                target_id=target_id,
+                intent_summary=intent,
+                prior_decision_event_id=prior_event_id,
+            )
+        else:  # redirect
+            key = emit_ratify_redirect(
+                target_id=target_id,
+                intent_summary=intent,
+                prior_decision_event_id=prior_event_id,
+            )
+    except Exception as e:
+        print(f"ERROR: ratification failed: {e}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(json.dumps({"key": key}))
+    else:
+        print(f"Ratified {target_id} ({outcome}): {key}")
+    return 0
+
+
 def cmd_brief_resolve(args) -> int:
     """Resolve the current outstanding brief for target_id by choosing option_id.
 
@@ -863,6 +957,41 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--dry-run", action="store_true",
                     help="Print arc doc to stdout instead of writing to /srv/lapis/lapis-state/")
     ld.set_defaults(func=cmd_land)
+
+    rat = sub.add_parser(
+        "ratify",
+        help="Record principal ratification of a Router decision.",
+    )
+    rat.add_argument("target_id", help="Target ID being ratified")
+    rat.add_argument(
+        "outcome",
+        choices=["confirm", "correct", "override", "redirect"],
+        help="Ratification outcome",
+    )
+    rat.add_argument(
+        "--intent",
+        default=None,
+        metavar="SUMMARY",
+        help=(
+            "One-line summary (required for correct/override/redirect; "
+            "optional for confirm)"
+        ),
+    )
+    rat.add_argument(
+        "--prior",
+        default=None,
+        metavar="EVENT_ID",
+        help=(
+            "Prior decision event_id or full mem key "
+            "(auto-resolved from target if omitted)"
+        ),
+    )
+    rat.add_argument(
+        "--json",
+        action="store_true",
+        help="Print written mem key as JSON {\"key\": ...}",
+    )
+    rat.set_defaults(func=cmd_ratify)
 
     br = sub.add_parser("brief", help="Generate a state-of-work brief.")
     br.add_argument(

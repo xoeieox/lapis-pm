@@ -2947,9 +2947,110 @@ rm -f "$TARGETS_DIR/${TID_LOST}.yaml" "$COMMENTS_DIR/${TID_LOST}.jsonl" "$LOST_S
 /usr/local/bin/mem delete "pm/outstanding-brief/${TID_LOST}" 2>/dev/null || true
 green "Phase 29 complete: lost-dispatch retry→brief sequence passed"
 
+# =========================================================================
+# Phase 30: ratify CLI roundtrip (lapis-pm-ratification-wiring-v0)
+# Verifies: bind emits a kickoff decision → ratify confirm resolves it →
+# a ratification-outcomes entry exists with the correct citation.
+# =========================================================================
+step "30. ratify CLI roundtrip (lapis-pm-ratification-wiring-v0)"
+
+TID_RATIFY="pm-ratify-smoke-$$"
+RATIFY_SPEC="/tmp/${TID_RATIFY}-spec.md"
+
+ratify_cleanup() {
+    rm -f "$TARGETS_DIR/${TID_RATIFY}.yaml" "$COMMENTS_DIR/${TID_RATIFY}.jsonl" "$RATIFY_SPEC"
+    # Delete all router-portfolio entries written for this tid
+    /usr/bin/python3 -c "
+from agents_core.mem import MemoryStore
+m = MemoryStore()
+for ns in ('router/lapis-pm/decisions/', 'router/lapis-pm/ratification-outcomes/'):
+    rows = m.list_all(tag='target:${TID_RATIFY}', limit=200)
+    for r in rows:
+        k = r.get('key', '')
+        if k.startswith(ns):
+            m.delete(k)
+" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/cursor/${TID_RATIFY}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/dispatched/${TID_RATIFY}" 2>/dev/null || true
+    /usr/local/bin/mem delete "pm/classified-prs/${TID_RATIFY}" 2>/dev/null || true
+}
+
+cat > "$RATIFY_SPEC" <<EOF
+# Ratify smoke spec for ${TID_RATIFY}
+What: smoke test the ratify CLI roundtrip.
+EOF
+
+cat > "$TARGETS_DIR/${TID_RATIFY}.yaml" <<EOF
+id: ${TID_RATIFY}
+title: Ratify smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Ratify smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+
+# 30a. Bind (this emits a kickoff decision entry)
+$LAPIS bind "$TID_RATIFY" --spec-from "$RATIFY_SPEC" --repo lapis-test --authority advisory
+green "ratify smoke: target bound, kickoff decision emitted"
+
+# 30b. Run ratify confirm (auto-prior resolves the kickoff decision)
+RATIFY_OUT=$($LAPIS ratify "$TID_RATIFY" confirm --json)
+echo "ratify output: $RATIFY_OUT"
+
+# 30c. Assert a ratification-outcomes entry was written with the correct citation
+/usr/bin/python3 -c "
+import sys, json
+sys.path.insert(0, '${REPO_ROOT}')
+from lapis_pm.router_portfolio import read_session_entries
+
+tid = '${TID_RATIFY}'
+ratify_out = '${RATIFY_OUT}'
+
+# Parse the --json output to get the written key
+try:
+    out = json.loads(ratify_out)
+    ratify_key = out['key']
+except Exception as e:
+    print(f'FAIL: could not parse ratify --json output: {ratify_out!r} error={e}')
+    sys.exit(1)
+
+assert ratify_key.startswith('router/lapis-pm/ratification-outcomes/'), \
+    f'ratify key has wrong namespace: {ratify_key}'
+
+# Read the entry from mem and verify shape
+from agents_core.mem import MemoryStore
+m = MemoryStore()
+row = m.get(ratify_key)
+assert row is not None, f'ratify entry not found in mem: {ratify_key}'
+entry = json.loads(row['content'])
+assert entry['verdict'] == 'ratified', f'expected verdict=ratified, got {entry[\"verdict\"]}'
+assert entry['ratification_outcome'] == 'confirm', \
+    f'expected ratification_outcome=confirm, got {entry[\"ratification_outcome\"]}'
+# The citations list must contain a decisions/ key for this target
+citations = entry.get('citations', [])
+assert any('router/lapis-pm/decisions/' in c for c in citations), \
+    f'citations must reference the prior kickoff decision; got: {citations}'
+
+print(f'ratify entry OK: verdict={entry[\"verdict\"]} outcome={entry[\"ratification_outcome\"]}')
+print(f'citations: {citations}')
+print('Phase 30: ratify CLI roundtrip PASSED')
+" || red "ratify smoke: roundtrip assertion failed"
+
+ratify_cleanup
+green "Phase 30 complete: ratify CLI roundtrip (bind → ratify confirm → outcomes entry with citation) OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

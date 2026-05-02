@@ -437,6 +437,35 @@ def write_session_summary(
     return key
 
 
+def find_latest_decision(target_id: str) -> dict | None:
+    """Return the most recent router/lapis-pm/decisions/* entry for target_id.
+
+    Searches mem by the target:<target_id> tag, filters to the decisions/
+    namespace only, and returns the entry with the latest freshness_stamp.
+    Returns None if no matching decision exists.
+
+    Only router/lapis-pm/decisions/* keys are eligible; ratification-outcomes
+    and other namespaces are ignored.
+    """
+    rows = _mem().list_all(tag=f"target:{target_id}", limit=500)
+    best: dict | None = None
+    best_stamp = ""
+    for row in rows:
+        key = row.get("key", "")
+        if not key.startswith("router/lapis-pm/decisions/"):
+            continue
+        try:
+            data = json.loads(row["content"])
+        except (json.JSONDecodeError, KeyError):
+            continue
+        stamp = data.get("freshness_stamp", "")
+        if stamp > best_stamp:
+            best_stamp = stamp
+            best = dict(data)
+            best["_mem_key"] = key
+    return best
+
+
 def session_checkpoint_exists(since_iso: str) -> bool:
     """Return True if a session summary exists with written_at >= since_iso.
 

@@ -407,12 +407,18 @@ def _landed_key(target_id: str) -> str:
 def probe_forgejo_health() -> tuple[bool, str]:
     """Probe Forgejo reachability with GET /api/v1/version (3-second timeout).
 
+    Sends the same Authorization header as all other agents_core.forgejo calls
+    (Forgejo returns 403 to anonymous requests on this instance).
+
+    Called once per tick from tick_all() only; single-target tick() bypasses
+    the probe entirely.
+
     Returns (True, "") on success.
     Returns (False, reason) on failure where reason is one of:
       "connect_error", "timeout", "http=<code>"
     """
     try:
-        from agents_core.forgejo import FORGEJO_URL
+        from agents_core.forgejo import FORGEJO_URL, FORGEJO_TOKEN
     except Exception:
         return True, ""  # agents_core unavailable — assume reachable
     try:
@@ -420,7 +426,11 @@ def probe_forgejo_health() -> tuple[bool, str]:
     except ImportError:
         return True, ""  # httpx unavailable — assume reachable
     try:
-        r = httpx.get(f"{FORGEJO_URL}/api/v1/version", timeout=3.0)
+        r = httpx.get(
+            f"{FORGEJO_URL}/api/v1/version",
+            headers={"Authorization": f"token {FORGEJO_TOKEN}"},
+            timeout=3.0,
+        )
         if not (200 <= r.status_code < 300):
             return False, f"http={r.status_code}"
         return True, ""

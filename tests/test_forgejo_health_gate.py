@@ -314,3 +314,24 @@ class TestProbeForgejoHealth:
             ok, reason = pm_core.probe_forgejo_health()
         assert ok is False
         assert reason == "connect_error"
+
+    def test_probe_sends_authorization_header(self):
+        """probe_forgejo_health() must send Authorization: token … to Forgejo."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        captured: dict = {}
+
+        def _fake_get(url, **kwargs):
+            captured.update(kwargs)
+            return mock_resp
+
+        with patch("httpx.get", side_effect=_fake_get):
+            ok, _ = pm_core.probe_forgejo_health()
+
+        assert ok is True
+        headers = captured.get("headers", {})
+        assert "Authorization" in headers, "Authorization header missing from probe request"
+        assert headers["Authorization"].startswith("token "), (
+            f"Expected 'token <...>' but got: {headers['Authorization']!r}"
+        )

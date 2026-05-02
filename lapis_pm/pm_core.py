@@ -416,16 +416,17 @@ def probe_forgejo_health() -> tuple[bool, str]:
     except Exception:
         return True, ""  # agents_core unavailable — assume reachable
     try:
-        import httpx as _httpx
-        r = _httpx.get(f"{FORGEJO_URL}/api/v1/version", timeout=3.0)
+        import httpx
+    except ImportError:
+        return True, ""  # httpx unavailable — assume reachable
+    try:
+        r = httpx.get(f"{FORGEJO_URL}/api/v1/version", timeout=3.0)
         if not (200 <= r.status_code < 300):
             return False, f"http={r.status_code}"
         return True, ""
-    except Exception as exc:
-        # Distinguish timeout from other connect failures
-        import httpx as _httpx2
-        if isinstance(exc, _httpx2.TimeoutException):
-            return False, "timeout"
+    except httpx.TimeoutException:
+        return False, "timeout"
+    except Exception:
         return False, "connect_error"
 
 
@@ -2380,10 +2381,17 @@ def tick_all() -> list[TickResult]:
         store = TargetStore()
         bound = [t for t in store.load_all() if t.pm_bound]
         # Cursors are NOT advanced — next healthy tick re-perceives from the same point.
-        return [
+        skipped = [
             TickResult(t.id, True, "forgejo_unreachable", 0, "skipped:forgejo_unreachable")
             for t in bound
         ]
+        for r in skipped:
+            print(
+                f"[{r.target_id}] skipped={r.skipped} reason={r.reason}"
+                f" encoded={r.encoded} decision={r.decision}",
+                flush=True,
+            )
+        return skipped
     # Probe succeeded — reset consecutive-fail counter.
     _set_forgejo_consecutive_fails(0)
 

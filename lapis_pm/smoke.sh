@@ -2492,7 +2492,10 @@ stages:
 EOF
 $LAPIS bind "$TID_HG" --spec-from "$HG_SPEC" --repo lapis-test --authority advisory
 
-# Run tick_all() with probe monkey-patched to return unreachable
+# Run tick_all() with probe monkey-patched to return unreachable.
+# Both the tick-prelude [forgejo:unreachable] line and per-target
+# [<tid>] skipped=... lines are emitted by pm_core.tick_all() itself —
+# capturing real production stdout, not simulated strings.
 HG_OUT=$(python3 - <<PYEOF28
 import sys
 sys.path.insert(0, '.')
@@ -2502,10 +2505,7 @@ from lapis_pm import pm_core
 
 with patch('lapis_pm.pm_core.probe_forgejo_health', return_value=(False, 'connect_error')), \
      patch('lapis_pm.pm_core._notify_forgejo_unreachable'):
-    results = pm_core.tick_all()
-
-for r in results:
-    print(f'[{r.target_id}] skipped={r.skipped} reason={r.reason} encoded={r.encoded} decision={r.decision}')
+    pm_core.tick_all()
 PYEOF28
 )
 echo "$HG_OUT"

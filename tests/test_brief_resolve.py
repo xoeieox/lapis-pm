@@ -526,7 +526,7 @@ def test_consume_brief_decisions_pending_to_applied(tmp_path):
     ):
         result = _pm._consume_brief_decisions(target_id)
 
-    assert result == f"brief_decision_applied:{brief_id}:{option_id}"
+    assert result == f"action:brief_decision_applied:{brief_id}:{option_id}"
     assert not pending_file.exists(), "pending file should be gone"
     applied = tmp_path / "applied" / f"{target_id}__{brief_id}.json"
     assert applied.exists(), "applied file should exist"
@@ -595,7 +595,7 @@ def test_consume_brief_decisions_crash_recovery(tmp_path):
     ):
         result = _pm._consume_brief_decisions(target_id)
 
-    assert result == f"brief_decision_applied:{brief_id}:{option_id}"
+    assert result == f"action:brief_decision_applied:{brief_id}:{option_id}"
     assert not processing_file.exists()
     applied = tmp_path / "applied" / f"{target_id}__{brief_id}.json"
     assert applied.exists()

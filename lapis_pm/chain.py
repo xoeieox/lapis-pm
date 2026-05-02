@@ -243,13 +243,13 @@ def send_auto_dispatch_brief(group_id: str, tid: str, triggered_by: str) -> bool
 _LANDED_LIMIT = 10_000
 
 
-def _landed_tids() -> set[str]:
+def landed_tids() -> set[str]:
     """Return set of all tids that have pm/landed/<tid> entries in mem."""
     results = _mem().list_all(tag="landed", limit=_LANDED_LIMIT)
     if len(results) >= _LANDED_LIMIT:
         import logging
         logging.getLogger(__name__).warning(
-            "_landed_tids: result count hit limit=%d; landed tids may be truncated, "
+            "landed_tids: result count hit limit=%d; landed tids may be truncated, "
             "chain advance may miss satisfied deps. Consider pruning pm/landed/* entries.",
             _LANDED_LIMIT,
         )
@@ -259,6 +259,10 @@ def _landed_tids() -> set[str]:
         if key.startswith("pm/landed/"):
             tids.add(key[len("pm/landed/"):])
     return tids
+
+
+# Keep private alias for internal callers in this module.
+_landed_tids = landed_tids
 
 
 def _is_dispatched(tid: str, chain_group: str = "") -> bool:

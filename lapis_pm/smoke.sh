@@ -221,6 +221,20 @@ $LAPIS tick --target "$TID" >/dev/null
 grep -q "paused → active" "$JSONL" || red "no paused→active transition logged"
 green "pause/resume transitions logged exactly once each"
 
+# --- noop:no_change + noop:paused taxonomy assertions --------------------
+step "6b. Decision taxonomy: healthy tick → noop:no_change; paused tick → noop:paused"
+# Healthy tick on a bound target with no new percepts → noop:no_change
+TICK_NOOP=$($LAPIS tick --target "$TID")
+echo "$TICK_NOOP" | grep -q "decision=noop:no_change" \
+    || red "healthy tick did not emit decision=noop:no_change (got: $TICK_NOOP)"
+# Paused tick → noop:paused
+$LAPIS pause "$TID" --reason "taxonomy-check"
+TICK_PAUSED=$($LAPIS tick --target "$TID")
+echo "$TICK_PAUSED" | grep -q "decision=noop:paused" \
+    || red "paused tick did not emit decision=noop:paused (got: $TICK_PAUSED)"
+$LAPIS resume "$TID"
+green "noop:no_change and noop:paused taxonomy assertions pass"
+
 # --- Directive flow ------------------------------------------------------
 step "7. Post a human:directive — expect a brief comment after tick"
 DIRECTIVE_BODY="Halt all fixer dispatches; investigate manually."
@@ -241,7 +255,7 @@ CommentStore().append('${TID}', '${DIRECTIVE_BODY}', 'Erah', 'user', tags=['huma
 fi
 grep -q '"human:directive"' "$JSONL" || red "human:directive tag not in JSONL"
 $LAPIS tick --target "$TID" | tee /tmp/${TID}-tickout
-grep -q "directive_brief" /tmp/${TID}-tickout || red "tick did not produce a directive brief"
+grep -q "decision=action:directive_brief:" /tmp/${TID}-tickout || red "tick did not produce a directive brief"
 grep -q '"pm:brief"' "$JSONL" || red "pm:brief comment not written"
 /usr/local/bin/mem get "pm/outstanding-brief/${TID}" >/dev/null 2>&1 || red "outstanding-brief not set in mem"
 green "directive → brief flow works (push success depends on PUSHOVER_* env, dashboard_route=${HTTP_OK})"
@@ -307,7 +321,7 @@ TID_LAND="pm-smoke-land-$$"
 _setup_land_target "$TID_LAND"
 TICK_OUT=$($LAPIS tick --target "$TID_LAND")
 echo "$TICK_OUT"
-echo "$TICK_OUT" | grep -q "decision=auto_land:" || red "auto-land did not fire in positive case"
+echo "$TICK_OUT" | grep -q "decision=action:auto_land:" || red "auto-land did not fire in positive case"
 [ -f "/srv/lapis/lapis-state/${TID_LAND}.md" ] || red "arc doc not written for ${TID_LAND}"
 /usr/local/bin/mem get "pm/landed/${TID_LAND}" >/dev/null 2>&1 || red "pm/landed not set after auto-land"
 # Target should be archived and unbound after landing
@@ -332,7 +346,7 @@ _setup_land_target "$TID_LAND2"
     >/dev/null
 TICK_OUT2=$($LAPIS tick --target "$TID_LAND2")
 echo "$TICK_OUT2"
-! echo "$TICK_OUT2" | grep -q "decision=auto_land:" || red "auto-land fired despite pending dispatch"
+! echo "$TICK_OUT2" | grep -q "decision=action:auto_land:" || red "auto-land fired despite pending dispatch"
 [ ! -f "/srv/lapis/lapis-state/${TID_LAND2}.md" ] || red "arc doc should NOT exist when dispatch pending"
 _cleanup_land_target "$TID_LAND2"
 green "auto-land pending-dispatch guard OK"
@@ -356,14 +370,14 @@ _setup_land_target "$TID_LAND4"
 # First tick → auto-land fires
 TICK1=$($LAPIS tick --target "$TID_LAND4")
 echo "$TICK1"
-echo "$TICK1" | grep -q "decision=auto_land:" || red "first tick: auto-land did not fire"
+echo "$TICK1" | grep -q "decision=action:auto_land:" || red "first tick: auto-land did not fire"
 [ -f "/srv/lapis/lapis-state/${TID_LAND4}.md" ] || red "arc doc missing after first tick"
 ARC_MTIME=$(stat -c %Y "/srv/lapis/lapis-state/${TID_LAND4}.md")
 # Second tick → target unbound, auto-land does NOT fire again
 TICK2=$($LAPIS tick --target "$TID_LAND4")
 echo "$TICK2"
 echo "$TICK2" | grep -q "skipped=True" || red "second tick should skip (target unbound)"
-! echo "$TICK2" | grep -q "decision=auto_land:" || red "auto-land fired twice (idempotency violated)"
+! echo "$TICK2" | grep -q "decision=action:auto_land:" || red "auto-land fired twice (idempotency violated)"
 ARC_MTIME2=$(stat -c %Y "/srv/lapis/lapis-state/${TID_LAND4}.md")
 [ "$ARC_MTIME" = "$ARC_MTIME2" ] || red "arc doc was overwritten on second tick (not idempotent)"
 _cleanup_land_target "$TID_LAND4"
@@ -421,7 +435,7 @@ cs.append('${TID_MULTI}', 'PR #1 merged at 2026-04-25T00:00:00, head_sha=aaa111'
 # Tick 1: only 1/2 PRs merged → no auto-land, pm:auto-land:waiting emitted
 TICK_MULTI1=$($LAPIS tick --target "$TID_MULTI")
 echo "$TICK_MULTI1"
-! echo "$TICK_MULTI1" | grep -q "decision=auto_land:" || red "multi-PR: auto-land should NOT fire after 1/2 merged"
+! echo "$TICK_MULTI1" | grep -q "decision=action:auto_land:" || red "multi-PR: auto-land should NOT fire after 1/2 merged"
 [ ! -f "/srv/lapis/lapis-state/${TID_MULTI}.md" ] || red "arc doc should not exist after 1/2 PRs merged"
 grep -q '"pm:auto-land:waiting"' "$COMMENTS_DIR/${TID_MULTI}.jsonl" \
     || red "pm:auto-land:waiting audit comment not written after 1/2"
@@ -448,7 +462,7 @@ cs.append('${TID_MULTI}', 'PR #2 merged at 2026-04-25T01:00:00, head_sha=bbb222'
 # Tick 3: 2/2 PRs merged → auto-land fires
 TICK_MULTI3=$($LAPIS tick --target "$TID_MULTI")
 echo "$TICK_MULTI3"
-echo "$TICK_MULTI3" | grep -q "decision=auto_land:" || red "multi-PR: auto-land did not fire after 2/2 merged"
+echo "$TICK_MULTI3" | grep -q "decision=action:auto_land:" || red "multi-PR: auto-land did not fire after 2/2 merged"
 [ -f "/srv/lapis/lapis-state/${TID_MULTI}.md" ] || red "arc doc not written after 2/2 PRs merged"
 
 # Cleanup
@@ -461,6 +475,77 @@ rm -f "/srv/lapis/lapis-state/${TID_MULTI}.md"
 /usr/local/bin/mem delete "pm/classified-prs/${TID_MULTI}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/landed/${TID_MULTI}" 2>/dev/null || true
 green "multi-PR guard: 1/2→noop+waiting, de-dup, 2/2→auto-land all OK"
+
+# --- noop:reviewer_in_flight taxonomy -----------------------------------
+step "13b. Decision taxonomy: pending reviewer dispatch → noop:reviewer_in_flight"
+TID_RIF="pm-smoke-rif-$$"
+cat > "$TARGETS_DIR/${TID_RIF}.yaml" <<EOF
+id: ${TID_RIF}
+title: Reviewer-in-flight smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: noop:reviewer_in_flight taxonomy smoke target.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_RIF" --spec-from "$SPEC_FILE" --repo lapis-test --authority advisory
+# Inject a pending reviewer dispatch record into mem to simulate in-flight reviewer
+/usr/bin/python3 -c "
+import json
+from lapis_pm.pm_core import append_dispatched
+append_dispatched('${TID_RIF}', {
+    'gpu_id': 'smoke-review-task-001',
+    'agent_type': 'reviewer',
+    'pr_number': 7,
+    'cycle': 1,
+    'status': 'pending',
+    'intent': 'review PR #7',
+    'repo': 'lapis-test',
+    'ts': '2026-05-02T00:00:00+00:00',
+    'retry_count': 0,
+})
+"
+# Also inject a PR observation so the PR appears in open_prs mock path,
+# and mark it as NOT classified so _decide_for_pr will be called.
+# We patch _perceive_prs and authority.classify so the smoke doesn't need a live Forgejo.
+TICK_RIF=$(/usr/bin/python3 -c "
+from unittest.mock import patch, MagicMock
+from lapis_pm import pm_core, authority
+
+pr = {'number': 7, 'title': 'Smoke PR', 'state': 'open',
+      'head': {'ref': 'lapis/${TID_RIF}/smoke'}, 'html_url': 'http://x'}
+
+mock_cls = authority.PRClassification(
+    verdict='advisory', screen_verdict='unknown',
+    static_outcome=authority.StaticOutcome.static_pass,
+    reasons=[], issues=[], pr_number=7, repo='lapis-test',
+    title='Smoke PR', html_url='http://x', changed_paths=[], diff_loc=0, diff='',
+)
+
+with patch('lapis_pm.pm_core._perceive_prs', return_value=[pr]), \
+     patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls):
+    result = pm_core.tick('${TID_RIF}')
+print(f'[{result.target_id}] skipped={result.skipped} reason={result.reason} encoded={result.encoded} decision={result.decision}')
+")
+echo "$TICK_RIF"
+echo "$TICK_RIF" | grep -q "decision=noop:reviewer_in_flight:pr=7:cycle=" \
+    || red "reviewer_in_flight tick did not emit noop:reviewer_in_flight (got: $TICK_RIF)"
+# Cleanup
+rm -f "$TARGETS_DIR/${TID_RIF}.yaml" "$COMMENTS_DIR/${TID_RIF}.jsonl"
+/usr/local/bin/mem delete "pm/cursor/${TID_RIF}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_RIF}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_RIF}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_RIF}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_RIF}" 2>/dev/null || true
+green "noop:reviewer_in_flight taxonomy assertion passes"
 
 # --- Auto-detect: bind --create infers pr_count from spec headers ---------
 step "14. Auto-detect: bind --create with ### PR N headers sets pr_count automatically"

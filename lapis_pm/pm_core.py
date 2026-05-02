@@ -11,6 +11,17 @@ State across ticks lives in mem.db:
 
 Single-action discipline: at most one decision-action per tick. Encoding
 percepts as comments is bookkeeping, not action.
+
+Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
+  Noop:   noop:no_change | noop:paused | noop:reviewer_in_flight:pr=N:cycle=K
+          | noop:fixer_in_flight:dispatch=ID | noop:awaiting_chain_dependency:waiting_on=TID
+  Action: action:auto_merge:pr=N | action:auto_land:pr=N:arc=PATH
+          | action:reviewer_dispatched:pr=N:cycle=K
+          | action:fixer_dispatched:source=(init|retry):...
+          | action:brief_emitted:kind=KIND:cid=CID | action:brief_decision_applied:BID:OID
+          | action:directive_brief:cid=CID | action:abandon_brief:cid=CID | ...
+  Skip:   skipped=True reason=(target not found|target not pm_bound|paused
+          |forgejo_unreachable|ratelimit|cursor_locked)
 """
 
 from __future__ import annotations
@@ -773,7 +784,7 @@ def _act_auto_land(target_id: str) -> str:
     target.save()
     clear_landed_state(target_id)
 
-    return f"auto_land:pr={pr_num}:arc={path}"
+    return f"action:auto_land:pr={pr_num}:arc={path}"
 
 
 def _act_auto_land_already_satisfied(target_id: str) -> str:
@@ -1135,7 +1146,8 @@ def _perceive_prs(target_id: str, repo: str) -> list[dict]:
 
 @dataclass
 class Decision:
-    kind: str   # "noop" | "merge" | "advisory_brief" | "hold_brief" | "retry" | "abandon_brief" | "directive_ack"
+    kind: str   # "merge" | "advisory_brief" | "hold_brief" | "retry" | "abandon_brief" | "directive_ack"
+               #  | "noop_no_change" | "noop_reviewer_in_flight" | "noop_fixer_in_flight"
     payload: dict
 
 
@@ -1165,9 +1177,19 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
 
     # Don't double-dispatch while reviewer or fixer is pending for this PR
     if _has_pending_reviewer_for_pr(target_id, pr_number):
-        return Decision("noop", {"reason": f"reviewer pending for PR #{pr_number}"})
+        cycle = _reviewer_cycle_count(target_id, pr_number)
+        return Decision("noop_reviewer_in_flight",
+                        {"pr_number": pr_number, "cycle": cycle})
     if _has_pending_fixer_for_pr(target_id, pr_number):
-        return Decision("noop", {"reason": f"fixer_retry pending for PR #{pr_number}"})
+        dispatch_id = next(
+            (r.get("gpu_id", "unknown") for r in load_dispatched(target_id)
+             if r.get("status") == "pending"
+             and r.get("agent_type") == "fixer_retry"
+             and r.get("pr_number") == pr_number),
+            "unknown",
+        )
+        return Decision("noop_fixer_in_flight",
+                        {"pr_number": pr_number, "dispatch_id": dispatch_id})
 
     reviewer_count = _reviewer_cycle_count(target_id, pr_number)
     fixer_count = _fixer_retry_count(target_id, pr_number)
@@ -1182,7 +1204,7 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
         if reviewer_count > 0:
             reviewer_ts = _reviewer_dispatch_ts(target_id, pr_number, reviewer_count)
             if reviewer_ts and not _pr_sha_advanced_since(target_id, pr_number, reviewer_ts):
-                return Decision("noop", {
+                return Decision("noop_no_change", {
                     "reason": (
                         f"PR #{pr_number} head SHA unchanged since reviewer "
                         f"cycle {reviewer_count} dispatch — waiting for fixer commit"
@@ -1207,7 +1229,7 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
     verdict_info = _last_review_verdict(target_id, pr_number)
     if verdict_info is None:
         # Shouldn't happen; defensively noop
-        return Decision("noop", {"reason": "reviewer_count > fixer_count but no verdict found"})
+        return Decision("noop_no_change", {"reason": "reviewer_count > fixer_count but no verdict found"})
 
     verdict = verdict_info.get("verdict", "needs-human")
     issues = verdict_info.get("issues", [])
@@ -1275,7 +1297,7 @@ def _act_merge(target_id: str, payload: dict) -> str:
             f"Auto-merge attempted for PR #{cls.pr_number} but failed: {e}",
             extra_tags=[f"pm:repo={cls.repo}"],
         )
-        return f"merge_failed:{e}"
+        return f"action:merge_failed:{e}"
     episodic.write_merge(
         target_id,
         f"Auto-merged PR #{cls.pr_number} ({cls.title}) — "
@@ -1283,7 +1305,7 @@ def _act_merge(target_id: str, payload: dict) -> str:
         extra_tags=[f"pm:repo={cls.repo}", f"pm:pr={cls.pr_number}"],
     )
     _mark_pr_classified(target_id, cls.pr_number)
-    return f"merged:{cls.pr_number}"
+    return f"action:auto_merge:pr={cls.pr_number}"
 
 
 def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
@@ -1314,7 +1336,13 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     )
     set_outstanding_brief(target_id, b.comment_id)
     _mark_pr_classified(target_id, cls.pr_number)
-    return f"brief:{b.comment_id} pushed={b.pushed}"
+    if hold:
+        kind = "hold"
+    elif cls.issues:
+        kind = "advisory_screen_issue"
+    else:
+        kind = "advisory_clean"
+    return f"action:brief_emitted:kind={kind}:cid={b.comment_id}"
 
 
 def _act_retry(target_id: str, dispatch_record: dict) -> str:
@@ -1353,7 +1381,7 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
         f"Intent: {intent}",
         extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"],
     )
-    return f"retry:{res.task_id}"
+    return f"action:fixer_dispatched:source=init:dispatch={res.task_id}"
 
 
 def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassification,
@@ -1435,7 +1463,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
             f"pm:reviewer:pr={pr_number}:cycle={cycle}:verdict=pending",
         ],
     )
-    return f"reviewer_dispatched:pr={pr_number}:cycle={cycle}"
+    return f"action:reviewer_dispatched:pr={pr_number}:cycle={cycle}"
 
 
 def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
@@ -1499,7 +1527,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
             "pm:fixer-retry",
         ],
     )
-    return f"fixer_retry_dispatched:pr={pr_number}:cycle={cycle}"
+    return f"action:fixer_dispatched:source=retry:pr={pr_number}:cycle={cycle}"
 
 
 def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
@@ -1534,7 +1562,7 @@ def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
     )
     set_outstanding_brief(target_id, b.comment_id)
     _mark_pr_classified(target_id, cls.pr_number)
-    return f"review_exhausted_brief:{b.comment_id}"
+    return f"action:review_exhausted_brief:cid={b.comment_id}"
 
 
 def _act_review_gate_pause(target_id: str, payload: dict) -> str:
@@ -1542,7 +1570,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     # Only post the pause brief once (idempotent)
     rec = _mem().get(REVIEW_GATE_PAUSE_BRIEF_KEY)
     if rec:
-        return "review_gate_pause:already_briefed"
+        return "action:review_gate_paused:already_briefed"
 
     count = _review_gate_counter()
     episodic.write_observation(
@@ -1561,7 +1589,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     set_outstanding_brief(target_id, b.comment_id)
     _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
                tags=["lapis-pm", "review-gate"])
-    return f"review_gate_paused:{b.comment_id}"
+    return f"action:review_gate_paused:cid={b.comment_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -2110,7 +2138,7 @@ def _consume_brief_decisions(target_id: str) -> str | None:
             except OSError:
                 # best-effort: leave in processing if write/unlink fails
                 pass
-            return f"brief_decision_applied:{brief_id}:{option_id}"
+            return f"action:brief_decision_applied:{brief_id}:{option_id}"
         else:
             err = result.get("error", "unknown")
             failed_payload = json.dumps({**directive, "error": err, "failed_ts": ts},
@@ -2142,7 +2170,7 @@ class TickResult:
     skipped: bool
     reason: str
     encoded: int          # number of percepts encoded as PM comments
-    decision: str         # the action taken or "noop"
+    decision: str         # the action taken or noop:<reason> — see README.md § "Tick Decision Taxonomy"
     reconciled: int = 0   # number of dispatch records flipped this tick
 
 
@@ -2150,9 +2178,9 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     store = TargetStore()
     target = store.get(target_id)
     if target is None:
-        return TickResult(target_id, True, "target not found", 0, "noop")
+        return TickResult(target_id, True, "target not found", 0, "noop:no_change")
     if not target.pm_bound:
-        return TickResult(target_id, True, "target not pm_bound", 0, "noop")
+        return TickResult(target_id, True, "target not pm_bound", 0, "noop:no_change")
 
     # 1. Pause guard with transition detection
     prev_state = get_pause_state(target_id) or "active"
@@ -2165,7 +2193,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         )
         set_pause_state(target_id, cur_state)
     if cur_state == "paused":
-        return TickResult(target_id, True, "paused", 0, "noop")
+        return TickResult(target_id, True, "paused", 0, "noop:paused")
 
     # 2. Cursor + perceive
     # Reconcile pending dispatch records against ClaudeQueue terminal state
@@ -2202,7 +2230,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     encoded += _encode_merged_prs(target_id, repo)
 
     # 4. Decide (priority order, single action)
-    decision_str = "noop"
+    decision_str = "noop:no_change"
     pm_authority = target.pm_authority
 
     # 4.0 Brief-decision directive consumer — highest-priority decide branch.
@@ -2226,7 +2254,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         b = brief.synthesize(target_id, trigger=f"user directive: {d.content[:80]}",
                              query=d.content, notify=None)
         set_outstanding_brief(target_id, b.comment_id)
-        decision_str = f"directive_brief:{b.comment_id}"
+        decision_str = f"action:directive_brief:cid={b.comment_id}"
 
     elif open_prs:
         # Skip PRs already classified this binding — prevents re-screening a
@@ -2235,7 +2263,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         classified_ids = _classified_pr_ids(target_id)
         actionable_prs = [p for p in open_prs if p.get("number") not in classified_ids]
         if not actionable_prs:
-            decision_str = "noop"
+            decision_str = "noop:no_change"
         else:
             # Pick the lowest-numbered PR (FIFO) so the same one drives action
             # until resolved.
@@ -2260,9 +2288,15 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                 decision_str = _act_brief_review_exhausted(target_id, decision.payload)
             elif decision.kind == "review_gate_pause":
                 decision_str = _act_review_gate_pause(target_id, decision.payload)
+            elif decision.kind == "noop_reviewer_in_flight":
+                p = decision.payload
+                decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"
+            elif decision.kind == "noop_fixer_in_flight":
+                p = decision.payload
+                decision_str = f"noop:fixer_in_flight:dispatch={p['dispatch_id']}"
             else:
-                # noop or unknown — single-action discipline: do nothing
-                decision_str = "noop"
+                # noop_no_change or unknown — single-action discipline: do nothing
+                decision_str = "noop:no_change"
 
     elif failed_dispatches:
         rec = failed_dispatches[-1]
@@ -2276,7 +2310,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                 notify=NotifyPriority.HIGH,
             )
             set_outstanding_brief(target_id, b.comment_id)
-            decision_str = f"abandon_brief:{b.comment_id}"
+            decision_str = f"action:abandon_brief:cid={b.comment_id}"
 
     elif _already_satisfied_pending(target_id) is not None:
         decision_str = _act_auto_land_already_satisfied(target_id)
@@ -2287,7 +2321,17 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     elif allow_auto_land and _is_auto_land_eligible(target_id):
         decision_str = _act_auto_land(target_id)
 
-    # 4.5. Persist review-state cache (best-effort visibility for claude-view).
+    # 4.5 Refine noop decision for chain-mode legs waiting on dependencies.
+    if decision_str == "noop:no_change":
+        _deps = target.data.get("depends_on") or []
+        if _deps:
+            from . import chain as _chain_mod
+            _landed = _chain_mod.landed_tids()
+            _unsatisfied = [d for d in _deps if d not in _landed]
+            if _unsatisfied:
+                decision_str = f"noop:awaiting_chain_dependency:waiting_on={_unsatisfied[0]}"
+
+    # 4.6. Persist review-state cache (best-effort visibility for claude-view).
     try:
         _persist_review_state_cache(target_id, target, open_prs)
     except Exception as e:
@@ -2331,5 +2375,5 @@ def tick_all() -> list[TickResult]:
                 set_cursor(t.id, _now_iso())
             except Exception:
                 pass
-            results.append(TickResult(t.id, True, f"exception: {e}", 0, "noop"))
+            results.append(TickResult(t.id, True, f"exception: {e}", 0, "noop:no_change"))
     return results

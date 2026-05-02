@@ -2278,13 +2278,14 @@ def _act_lost_brief(
     retry_error = (retry_rec.get("error") or "no error recorded") if retry_rec else ""
 
     spec_ref = (episodic.spec(target_id) or "")[:80] or "(spec not found)"
+    spec_path = f"/srv/lapis/planning/specs/{target_id}.md"
 
     query = (
         f"Two fixer dispatches for {target_id} terminated without opening a PR.\n"
         f"Original dispatch: {orig_id} — error: {orig_error}\n"
         f"Retry dispatch: {retry_id}"
         + (f" — error: {retry_error}" if retry_error else "")
-        + f"\nSpec: {spec_ref}"
+        + f"\nSpec: {spec_path} — {spec_ref}"
     )
 
     b = brief.synthesize(

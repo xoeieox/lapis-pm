@@ -410,6 +410,34 @@ class TestSecondLossBrief:
         # No retry child → dispatch_ids is just orig_id
         assert result == "fixer_lost:briefing:dispatches=gpu-solo"
 
+    def test_act_lost_brief_includes_spec_path(self):
+        """_act_lost_brief query includes the spec file path (spec §Deliverable 3)."""
+        original = _fixer_record(gpu_id="gpu-path-check", status="failed")
+
+        fake_brief = MagicMock()
+        fake_brief.comment_id = "brief-path"
+        fake_brief.pushed = False
+        fake_brief.body = "b"
+        fake_brief.target_id = "my-target"
+
+        captured_queries = []
+
+        def capture_synthesize(tid, trigger, query="", notify=None, **kw):
+            captured_queries.append(query)
+            return fake_brief
+
+        with (
+            patch("lapis_pm.pm_core.brief.synthesize", side_effect=capture_synthesize),
+            patch("lapis_pm.pm_core.set_outstanding_brief"),
+            patch("lapis_pm.pm_core.episodic.spec", return_value="spec body"),
+        ):
+            pm_core._act_lost_brief("my-target", original, None)
+
+        assert captured_queries, "synthesize not called"
+        assert "/srv/lapis/planning/specs/my-target.md" in captured_queries[0], (
+            f"spec path not in brief query: {captured_queries[0]!r}"
+        )
+
     def test_act_lost_brief_uses_normal_priority(self):
         """_act_lost_brief uses NORMAL (not HIGH) Pushover priority."""
         from agents_core.notify import Priority as NotifyPriority

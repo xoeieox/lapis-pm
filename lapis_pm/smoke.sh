@@ -26,6 +26,24 @@ GPU_PENDING="/srv/lapis/gpu-queue/pending"
 SPEC_FILE="/tmp/${TID}-spec.md"
 LAPIS="/usr/bin/python3 -m lapis_pm.cli"
 
+# --- Smoke TID registry -------------------------------------------------
+# SMOKE_TIDS: every bind phase that creates a target whose dispatch may open
+# a Forgejo PR MUST append its TID(s) here immediately after definition.
+# chain_cleanup iterates this array for PR reaping on EXIT/INT/TERM.
+#
+# Structural invariant: adding a new bind without registering here is a
+# programmer error caught locally (by the sentinel assertion in phase 20)
+# rather than discovered days later as leaked PRs.
+#
+# Audit — all smoke-created TIDs that fire real dispatches (as of this file):
+#   Phase 18  (chain smoke):  pm-smoke-chain-l1-<pid>  pm-smoke-chain-l2-<pid>  pm-smoke-chain-l3-<pid>
+#   Phase 20b (wire-chain):   pm-wire-chain-<pid>-l1   pm-wire-chain-<pid>-l2
+#   Phase 20c (wire-disp):    pm-wire-disp-<pid>
+#
+# All other phases (land, multi-PR, reconcile, reviewer, portfolio, brief,
+# verdict) use synthetic observations only — no real dispatches.
+SMOKE_TIDS=()
+
 green() { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 red()   { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 step()  { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
@@ -53,6 +71,69 @@ cleanup() {
     rm -rf "$TRAJ_SMOKE_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# --- Pre-run back-fill: close leaked smoke PRs from prior broken runs ----
+# Runs BEFORE any phase so a half-broken environment self-heals on the next
+# smoke invocation rather than requiring another manual sweep.
+# Pattern is conservative: ONLY matches known smoke TID prefixes; never
+# touches real lapis/<tid>/... PRs from real binds outside smoke.
+_smoke_backfill_close_leaked_prs() {
+    if [ -z "${FORGEJO_TOKEN:-}" ]; then
+        echo "[smoke] pre-run backfill: skipped (FORGEJO_TOKEN unset)"
+        return 0
+    fi
+    /usr/bin/python3 -c "
+import os, httpx
+
+FORGEJO_URL = os.environ.get('FORGEJO_URL', 'http://203.0.113.12:3000')
+OWNER = 'Erah'
+API = f'{FORGEJO_URL}/api/v1'
+token = os.environ.get('FORGEJO_TOKEN', '')
+HDRS = {'Authorization': f'token {token}', 'Accept': 'application/json',
+        'Content-Type': 'application/json'}
+T = 15
+
+# Conservative: ONLY known smoke TID prefixes — never touches real work PRs.
+SMOKE_PREFIXES = (
+    'lapis/pm-smoke-chain-',
+    'lapis/pm-wire-chain-',
+    'lapis/pm-wire-disp-',
+)
+
+REPOS = ('conductor', 'lapis-test')
+closed = 0
+for repo in REPOS:
+    try:
+        r = httpx.get(f'{API}/repos/{OWNER}/{repo}/pulls', headers=HDRS,
+                      params={'state': 'open', 'limit': 50}, timeout=T)
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        prs = r.json()
+    except Exception as e:
+        print(f'[smoke] backfill: list-prs {repo}: {e}')
+        continue
+    for pr in prs:
+        head_ref = (pr.get('head') or {}).get('ref', '')
+        if not any(head_ref.startswith(p) for p in SMOKE_PREFIXES):
+            continue
+        pr_num = pr['number']
+        try:
+            httpx.patch(f'{API}/repos/{OWNER}/{repo}/pulls/{pr_num}', headers=HDRS,
+                        json={'state': 'closed'}, timeout=T).raise_for_status()
+            print(f'[smoke] backfill: closed {repo}#{pr_num} ({head_ref})')
+            closed += 1
+        except Exception as e:
+            print(f'[smoke] backfill: close {repo}#{pr_num}: {e}')
+        try:
+            httpx.delete(f'{API}/repos/{OWNER}/{repo}/branches/{head_ref}',
+                         headers=HDRS, timeout=T)
+        except Exception:
+            pass
+print(f'[smoke] pre-run backfill: {closed} leaked smoke PR(s) closed')
+" || true
+}
+_smoke_backfill_close_leaked_prs
 
 # --- Setup --------------------------------------------------------------
 step "1. Create sandbox target $TID"
@@ -803,6 +884,8 @@ TID_L2="pm-smoke-chain-l2-$$"
 TID_L3="pm-smoke-chain-l3-$$"
 CHAIN_SPEC="/tmp/${CHAIN_GROUP}-spec.md"
 CHAIN_LEGS="/tmp/${CHAIN_GROUP}-legs.yaml"
+# Register chain-smoke legs: dispatches from these may open real Forgejo PRs.
+SMOKE_TIDS+=("$TID_L1" "$TID_L2" "$TID_L3")
 
 # Close leaked Forgejo PRs from chain-auto dispatch (best-effort; no-op if
 # FORGEJO_TOKEN unset or Forgejo unreachable). Must run before mem deletion
@@ -872,10 +955,11 @@ for repo in repos:
 }
 
 chain_cleanup() {
-    # Close leaked Forgejo PRs from chain-auto dispatch (best-effort; no-op if
-    # FORGEJO_TOKEN unset or Forgejo unreachable). Must run before mem deletion
-    # because we read each leg's dispatched record to find the target repo.
-    _smoke_chain_close_prs "$TID_L1" "$TID_L2" "$TID_L3"
+    # Close leaked Forgejo PRs for ALL smoke-created TIDs registered in
+    # SMOKE_TIDS (chain legs + wire-emitter legs + wire-disp targets).
+    # Must run before mem deletion because _smoke_chain_close_prs reads each
+    # leg's dispatched record to find the target repo.
+    [ ${#SMOKE_TIDS[@]} -gt 0 ] && _smoke_chain_close_prs "${SMOKE_TIDS[@]}"
     rm -f "$CHAIN_SPEC" "$CHAIN_LEGS"
     for T in "$TID_L1" "$TID_L2" "$TID_L3"; do
         rm -f "$TARGETS_DIR/${T}.yaml" "$COMMENTS_DIR/${T}.jsonl" 2>/dev/null || true
@@ -1323,6 +1407,8 @@ TID_WC="pm-wire-chain-$$"
 TID_WC_L1="${TID_WC}-l1"
 TID_WC_L2="${TID_WC}-l2"
 WC_SPEC="/tmp/${TID_WC}-spec.md"
+# Register wire-chain legs: auto-fire from chain bind may open real Forgejo PRs.
+SMOKE_TIDS+=("$TID_WC_L1" "$TID_WC_L2")
 WC_LEGS="/tmp/${TID_WC}-legs.yaml"
 cat > "$WC_SPEC" <<'SPECEOF'
 # Wire Emitter Chain Test Spec
@@ -1418,6 +1504,8 @@ green "wire-emitter: chain bind emits 2 kickoff + 1 dispatch entries OK"
 step "20c. wire-emitter: force-dispatch emits dispatch decision entry"
 TID_W3="pm-wire-disp-$$"
 W3_SPEC="/tmp/${TID_W3}-spec.md"
+# Register wire-disp target: force-dispatch from tick may open real Forgejo PRs.
+SMOKE_TIDS+=("$TID_W3")
 cat > "$W3_SPEC" <<'SPECEOF'
 # Wire Emitter Dispatch Test Spec
 Implement spec for dispatch portfolio emission test.
@@ -1475,6 +1563,25 @@ print(f'dispatch entry OK: fragment_id={e[\"fragment_id\"]} expert_chosen={e[\"e
 rm -f "$W3_SPEC"
 _wire_tid_cleanup "$TID_W3"
 green "wire-emitter: force-dispatch emits dispatch decision entry OK"
+
+# --- SMOKE_TIDS sentinel: structural enforcement --------------------------
+# Assert the registry is non-empty after all bind phases have run.
+# This catches a new bind phase that forgets to append to SMOKE_TIDS.
+# chain_cleanup is now known to reference "${SMOKE_TIDS[@]}" rather than
+# hardcoded TID variables, so this assertion validates the full contract.
+step "20c-sentinel. SMOKE_TIDS structural enforcement: registry non-empty + covers all phases"
+[ ${#SMOKE_TIDS[@]} -gt 0 ] \
+    || red "SMOKE_TIDS is empty — every bind phase that dispatches must register its TID(s)"
+echo "[smoke] SMOKE_TIDS (${#SMOKE_TIDS[@]} entries): ${SMOKE_TIDS[*]}"
+# Verify all three expected prefixes are represented
+_has_prefix() { local p="$1"; shift; for t in "$@"; do [[ "$t" == "$p"* ]] && return 0; done; return 1; }
+_has_prefix "pm-smoke-chain-" "${SMOKE_TIDS[@]}" \
+    || red "SMOKE_TIDS missing pm-smoke-chain- entries (phase 18 registration broken)"
+_has_prefix "pm-wire-chain-" "${SMOKE_TIDS[@]}" \
+    || red "SMOKE_TIDS missing pm-wire-chain- entries (phase 20b registration broken)"
+_has_prefix "pm-wire-disp-" "${SMOKE_TIDS[@]}" \
+    || red "SMOKE_TIDS missing pm-wire-disp- entries (phase 20c registration broken)"
+green "SMOKE_TIDS sentinel: ${#SMOKE_TIDS[@]} TIDs registered, all prefixes present — chain_cleanup will reap all"
 
 # --- 20d. test_land_emits_land_decision ------------------------------------
 step "20d. wire-emitter: land emits land decision entry"

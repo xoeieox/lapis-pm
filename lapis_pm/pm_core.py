@@ -100,6 +100,48 @@ def _consume_fixer_meta(spec_id: str) -> None:
         pass
 
 
+def _read_fixer_verdict(spec_id: str) -> dict | None:
+    """Read the {spec_id}-verdict.json sidecar copied from worktree by shaped_runner.
+
+    Returns the parsed dict if present and valid JSON, None otherwise.
+    Logs a WARN if the file exists but is unreadable or not a dict.
+    """
+    import sys
+    p = SHAPED_DIR / f"{spec_id}-verdict.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            print(f"WARN: verdict sidecar {spec_id} is not a dict: {type(data).__name__}",
+                  file=sys.stderr)
+            return None
+        return data
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARN: verdict sidecar {spec_id} unreadable: {exc}", file=sys.stderr)
+        return None
+
+
+def _consume_fixer_verdict(spec_id: str) -> None:
+    """Delete the verdict sidecar after pm_core has consumed it. Best-effort."""
+    p = SHAPED_DIR / f"{spec_id}-verdict.json"
+    try:
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _validate_already_satisfied_pr(repo: str, pr_num: int) -> bool:
+    """Return True if pr_num exists in repo and is merged+closed in Forgejo."""
+    if not repo or not _forgejo_get_pr:
+        return False
+    try:
+        pr_data = _forgejo_get_pr(repo, pr_num)
+        return bool(pr_data.get("merged") and pr_data.get("state") == "closed")
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # State helpers
 # ---------------------------------------------------------------------------
@@ -436,6 +478,108 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Already-satisfied verdict helpers
+# ---------------------------------------------------------------------------
+
+def _handle_already_satisfied_verdict(target_id: str, rec: dict, verdict_raw: dict) -> bool:
+    """Evaluate an already_satisfied verdict sidecar. Returns True if handled.
+
+    When True is returned, the caller should mark the dispatch processed and
+    continue (skip confabulation check and normal write_result). Two sub-cases:
+
+    - valid verdict + valid merged PR → write pm:already-satisfied observation
+    - valid verdict + invalid/missing PR → write pm:already-satisfied:invalid
+      observation (decide phase will brief the human)
+
+    Malformed verdicts (non-dict, unrecognised verdict type, missing pr_num)
+    return False so the caller falls through to the normal confabulation path.
+    """
+    import sys
+
+    verdict_type = verdict_raw.get("verdict")
+    if verdict_type != "already_satisfied":
+        print(f"WARN: unrecognised verdict type in sidecar: {verdict_type!r}", file=sys.stderr)
+        return False
+
+    pr_num = verdict_raw.get("satisfied_by_pr")
+    if not isinstance(pr_num, int) or pr_num <= 0:
+        print(f"WARN: malformed satisfied_by_pr in verdict sidecar: {pr_num!r}", file=sys.stderr)
+        return False
+
+    evidence = str(verdict_raw.get("evidence", ""))[:500]
+    repo = rec.get("repo", "")
+
+    if _validate_already_satisfied_pr(repo, pr_num):
+        episodic.write_observation(
+            target_id,
+            f"Fixer verdict: already_satisfied by PR #{pr_num}\nEvidence: {evidence}",
+            extra_tags=["pm:already-satisfied", f"pm:already-satisfied:pr={pr_num}"],
+        )
+        return True
+
+    # Forgejo validation failed — warn but still mark as handled so the fixer
+    # is not re-retried (it intentionally produced no PR).
+    print(
+        f"WARN: already_satisfied PR #{pr_num} not found or not merged in {repo!r}",
+        file=sys.stderr,
+    )
+    episodic.write_observation(
+        target_id,
+        f"Fixer claimed already_satisfied (PR #{pr_num}) but Forgejo validation failed "
+        f"— will brief human instead of auto-landing. Evidence: {evidence}",
+        extra_tags=["pm:already-satisfied:invalid", f"pm:already-satisfied:invalid:pr={pr_num}"],
+    )
+    return True
+
+
+def _already_satisfied_pending(target_id: str) -> tuple[int, str, str] | None:
+    """Return (pr_num, evidence, ts) if a valid already_satisfied verdict awaits action.
+
+    Conditions: pm:already-satisfied:pr=N observation exists, target not yet
+    landed, no pending dispatches.
+    """
+    if _mem().get(_landed_key(target_id)):
+        return None
+    if _has_pending_dispatch(target_id):
+        return None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith("pm:already-satisfied:pr=") and "invalid" not in t:
+                try:
+                    pr_num = int(t.split("=", 1)[1])
+                    content = c.content
+                    evidence = ""
+                    if "Evidence:" in content:
+                        evidence = content.split("Evidence:", 1)[1].strip()
+                    return (pr_num, evidence, c.ts)
+                except (ValueError, IndexError):
+                    pass
+    return None
+
+
+def _already_satisfied_invalid_pending(target_id: str) -> tuple[int, str] | None:
+    """Return (pr_num, content) if an invalid already_satisfied verdict needs a brief.
+
+    Returns None if already briefed (de-dup via pm:already-satisfied:invalid-briefed tag).
+    """
+    briefed = any(
+        "pm:already-satisfied:invalid-briefed" in c.tags
+        for c in episodic.all_comments(target_id)
+    )
+    if briefed:
+        return None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith("pm:already-satisfied:invalid:pr="):
+                try:
+                    pr_num = int(t.split("=", 1)[1])
+                    return (pr_num, c.content)
+                except (ValueError, IndexError):
+                    pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Auto-land helpers
 # ---------------------------------------------------------------------------
 
@@ -630,6 +774,100 @@ def _act_auto_land(target_id: str) -> str:
     clear_landed_state(target_id)
 
     return f"auto_land:pr={pr_num}:arc={path}"
+
+
+def _act_auto_land_already_satisfied(target_id: str) -> str:
+    """Auto-land via an already_satisfied verdict: arc doc + archive + unbind.
+
+    Mirrors _act_auto_land but uses the verdict's PR number (not a freshly
+    merged lapis/* PR) and appends the spec-required "already satisfied" note
+    to the arc doc's Origin section.
+    """
+    from . import land as land_module
+
+    result = _already_satisfied_pending(target_id)
+    if result is None:
+        return "noop"
+    pr_num, evidence, satisfied_ts = result
+    landed_at = _now_iso()
+
+    # Generate arc doc with the already-satisfied addendum to Origin.
+    already_sat_note = (
+        f"_Spec verified already satisfied by PR #{pr_num} at {satisfied_ts}; "
+        "landed without new dispatch._"
+    )
+    arc = land_module.generate_arc_doc(target_id, extra_origin_note=already_sat_note)
+    path = land_module.write_arc_doc(arc)
+
+    # Commit marker (same structure as regular auto-land for symmetry)
+    _mem().set(
+        _landed_key(target_id),
+        json.dumps({
+            "pr_num": pr_num,
+            "merged_at": satisfied_ts,
+            "landed_at": landed_at,
+            "arc_path": str(path),
+            "via": "already_satisfied",
+        }),
+        tags=["lapis-pm", "landed"],
+    )
+
+    # Audit comment (spec-required tag)
+    episodic.write(
+        target_id,
+        f"auto-landed via already_satisfied verdict: PR #{pr_num} was merged before "
+        f"dispatch ran. arc={path}",
+        tags=["pm:auto-land", "pm:auto-land:already-satisfied"],
+    )
+
+    # Chain advance (same as regular auto-land)
+    store = TargetStore()
+    _target_for_chain = store.get(target_id)
+    _chain_group = (
+        _target_for_chain.data.get("chain_group") or ""
+        if _target_for_chain else ""
+    )
+    try:
+        from . import chain as _chain
+        _chain.on_leg_landed(target_id, _chain_group)
+        _chain.check_chain_advance(target_id)
+    except Exception as _chain_err:
+        episodic.write_observation(
+            target_id,
+            f"chain-advance error (non-fatal): {_chain_err}",
+            extra_tags=["pm:chain-error"],
+        )
+
+    # Archive + unbind + clear mem state
+    store.archive(target_id)
+    target = store.get(target_id)
+    target.unbind_pm()
+    target.save()
+    clear_landed_state(target_id)
+
+    return f"auto_land:already_satisfied:pr={pr_num}:arc={path}"
+
+
+def _act_brief_already_satisfied_invalid(target_id: str) -> str:
+    """Post a brief for an already_satisfied verdict where the cited PR failed validation."""
+    result = _already_satisfied_invalid_pending(target_id)
+    if result is None:
+        return "noop"
+    pr_num, content = result
+
+    b = brief.synthesize(
+        target_id,
+        trigger=f"fixer claimed already_satisfied but PR #{pr_num} not found or not merged",
+        query=f"Fixer already-satisfied verdict: invalid PR #{pr_num}",
+        notify=NotifyPriority.NORMAL,
+    )
+    set_outstanding_brief(target_id, b.comment_id)
+    episodic.write_observation(
+        target_id,
+        f"Brief posted for invalid already_satisfied verdict (PR #{pr_num}): {b.comment_id}",
+        extra_tags=["pm:already-satisfied:invalid-briefed"],
+    )
+    return f"already_satisfied_invalid_brief:{b.comment_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -1496,6 +1734,26 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
             or any(text.lstrip().startswith(p) for p in _GPU_FAIL_PREFIXES)
         )
 
+        # Already-satisfied verdict check: fixer may write a machine-readable
+        # verdict sidecar instead of opening a PR (lapis-pm-fixer-already-done-verdict).
+        # Check before confabulation so a valid verdict is never marked confabulated.
+        _fixer_spec_id = rec.get("spec_id") if rec.get("agent_type") == "fixer" else None
+        if _fixer_spec_id and not is_failure:
+            _verdict_raw = _read_fixer_verdict(_fixer_spec_id)
+            _consume_fixer_verdict(_fixer_spec_id)
+            if _verdict_raw is not None:
+                _verdict_handled = _handle_already_satisfied_verdict(
+                    target_id, rec, _verdict_raw
+                )
+                if _verdict_handled:
+                    # Also consume meta sidecar (verdict takes priority)
+                    _consume_fixer_meta(_fixer_spec_id)
+                    rec["status"] = "processed"
+                    rec["completed_at"] = _now_iso()
+                    changed = True
+                    total_encoded += 1
+                    continue  # Skip confabulation + normal result encoding
+
         # Confabulation check: fixer agents that produced substantial prose
         # without using tools are stochastic failures and should be retried.
         # Meta sidecar is only written for fixers (capture_meta=true in registry.yaml).
@@ -2019,6 +2277,12 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
             )
             set_outstanding_brief(target_id, b.comment_id)
             decision_str = f"abandon_brief:{b.comment_id}"
+
+    elif _already_satisfied_pending(target_id) is not None:
+        decision_str = _act_auto_land_already_satisfied(target_id)
+
+    elif _already_satisfied_invalid_pending(target_id) is not None:
+        decision_str = _act_brief_already_satisfied_invalid(target_id)
 
     elif allow_auto_land and _is_auto_land_eligible(target_id):
         decision_str = _act_auto_land(target_id)

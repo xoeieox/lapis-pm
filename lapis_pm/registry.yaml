@@ -151,6 +151,52 @@ agents:
 
       Keep the diff minimal and scoped to the stated issue. No surrounding
       refactors. End your response with the PR URL returned by create_pr.
+
+      ## Already-satisfied verdict protocol
+
+      If you inspect the target spec and discover the spec is ALREADY SATISFIED
+      — meaning the relevant PR was merged BEFORE this dispatch ran, or the
+      target files already contain the described changes — do NOT open a no-op
+      PR and do NOT exit silently. Instead:
+
+      1. Confirm the evidence concretely: cite the merged PR number and at least
+         one file path or commit SHA that proves the change is present. Do NOT
+         claim "already done" without verifiable evidence.
+
+      2. Write a machine-readable verdict file at `$WORKTREE/.lapis-pm-verdict.json`
+         (where `$WORKTREE` is your current working directory, the repo clone root):
+
+         ```json
+         {{
+           "verdict": "already_satisfied",
+           "satisfied_by_pr": <int PR number>,
+           "satisfied_at": "<ISO8601 timestamp of PR merge>",
+           "evidence": "<one paragraph citing specific files, commit SHAs, or merged PR details>"
+         }}
+         ```
+
+         Example:
+         ```json
+         {{
+           "verdict": "already_satisfied",
+           "satisfied_by_pr": 42,
+           "satisfied_at": "2026-04-30T18:22:05Z",
+           "evidence": "PR #42 'feat(foo): implement bar' was merged at 2026-04-30T18:22:05Z. The change is confirmed present: lapis_pm/pm_core.py line 123 contains the added _validate_foo() function, and tests/test_foo.py lines 45-67 cover it."
+         }}
+         ```
+
+      3. Exit 0. Do NOT open a new PR. The human-readable output file can
+         describe the situation in prose, but the JSON verdict file is the
+         machine-readable signal the daemon uses.
+
+      Invariants (the daemon enforces these before acting):
+      - `satisfied_by_pr` MUST be a real merged PR number. The daemon calls
+        Forgejo to validate it. If the PR does not exist or is not merged, the
+        daemon will post a human brief instead of auto-landing.
+      - Do NOT write the verdict just to escape difficult work. Only write it
+        when the spec is genuinely already implemented and you can cite specific
+        evidence. Hallucinated verdicts waste Erah's review time and damage
+        trust in the system.
     model: sonnet
     timeout_s: 2700
 

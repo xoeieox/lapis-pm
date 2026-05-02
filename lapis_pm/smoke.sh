@@ -2191,9 +2191,171 @@ rm -f "${DIRECTIVE_FILE}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/outstanding-brief/${TID_BRIEF}" 2>/dev/null || true
 green "Phase 26 complete: closed-form-brief scenario passed"
 
+# =========================================================================
+# Fixer already-done verdict smoke tests (lapis-pm-fixer-already-done-verdict)
+# =========================================================================
+
+SHAPED_DIR_SMOKE="/srv/lapis/gpu-queue/shaped"
+mkdir -p "$SHAPED_DIR_SMOKE"
+
+# --- Step 27a: valid verdict observation → auto-land fires ---------------
+step "27a. Fixer already-done verdict: valid pm:already-satisfied obs → auto-land:already_satisfied fires"
+TID_VERDI="pm-smoke-verdi-$$"
+VERDI_SPEC="/tmp/${TID_VERDI}-spec.md"
+cat > "$VERDI_SPEC" <<EOF
+# Verdict smoke spec for $TID_VERDI
+
+What: smoke the already_satisfied auto-land path.
+EOF
+
+cat > "$TARGETS_DIR/${TID_VERDI}.yaml" <<EOF
+id: ${TID_VERDI}
+title: Verdict smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Verdict smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_VERDI" --spec-from "$VERDI_SPEC" --repo lapis-test --authority advisory
+
+# Write the pm:already-satisfied observation directly (simulates _encode_gpu_results
+# after validating the cited PR).  The smoke exercises the decide→act path
+# (_already_satisfied_pending → _act_auto_land_already_satisfied).  The
+# encode path (verdict sidecar reading + Forgejo validation) is covered by unit tests.
+/usr/bin/python3 -c "
+from agents_core.comments import CommentStore
+cs = CommentStore()
+cs.append(
+    '${TID_VERDI}',
+    'Fixer verdict: already_satisfied by PR #42\nEvidence: ops-kami-nightly-timer-v0 PR #42 was merged at 2026-04-30T08:00:00Z. Confirmed: lapis_pm/pm_core.py line 1 contains the expected header.',
+    'lapis-pm', 'agent',
+    tags=['pm:observation', 'pm:already-satisfied', 'pm:already-satisfied:pr=42'],
+)
+"
+
+# Tick — decide phase should fire auto_land:already_satisfied
+VERDI_TICK=$(/usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch, MagicMock
+
+# Stub Haiku arc-doc call (no Haiku endpoint in smoke)
+fake_arc_body = '# ${TID_VERDI} — Arc Doc\n\n## Origin\nSmoke origin.\n\n## Landing summary\nSmoke land.\n'
+def fake_call_claude(*a, **kw):
+    return fake_arc_body
+
+# Stub Pushover (no token in smoke)
+with (
+    patch('lapis_pm.land.call_claude_cli', side_effect=fake_call_claude),
+    patch('lapis_pm.pm_core._SHAPER'),
+):
+    from lapis_pm.cli import main as cli_main
+    sys.argv = ['lapis-pm', 'tick', '--target', '${TID_VERDI}']
+    cli_main()
+" 2>/dev/null || $LAPIS tick --target "$TID_VERDI")
+echo "$VERDI_TICK"
+echo "$VERDI_TICK" | grep -q "decision=auto_land:already_satisfied:" \
+    || red "verdict smoke 27a: auto_land:already_satisfied did not fire"
+[ -f "/srv/lapis/lapis-state/${TID_VERDI}.md" ] \
+    || red "verdict smoke 27a: arc doc not written for ${TID_VERDI}"
+/usr/local/bin/mem get "pm/landed/${TID_VERDI}" >/dev/null 2>&1 \
+    || red "verdict smoke 27a: pm/landed not set after already_satisfied auto-land"
+# Arc doc must contain the already-satisfied trailing sentence
+grep -q "already satisfied" "/srv/lapis/lapis-state/${TID_VERDI}.md" \
+    || red "verdict smoke 27a: arc doc missing 'already satisfied' note in Origin section"
+# Target should be unbound
+/usr/bin/python3 -c "
+from agents_core.targets import TargetStore
+t = TargetStore().get('${TID_VERDI}')
+assert t is not None, 'target not found'
+assert not t.pm_bound, 'target still pm_bound after already_satisfied auto-land'
+"
+rm -f "$TARGETS_DIR/${TID_VERDI}.yaml" "$COMMENTS_DIR/${TID_VERDI}.jsonl" "$VERDI_SPEC"
+rm -f "/srv/lapis/lapis-state/${TID_VERDI}.md"
+/usr/local/bin/mem delete "pm/cursor/${TID_VERDI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_VERDI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_VERDI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_VERDI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_VERDI}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/landed/${TID_VERDI}" 2>/dev/null || true
+green "verdict smoke 27a: valid already_satisfied → auto_land:already_satisfied OK"
+
+# --- Step 27b: malformed verdict sidecar → not auto-landed ---------------
+step "27b. Fixer already-done verdict: malformed verdict sidecar → ignored, no auto-land"
+TID_VERDI_BAD="pm-smoke-verdi-bad-$$"
+VERDI_BAD_SPEC="/tmp/${TID_VERDI_BAD}-spec.md"
+cat > "$VERDI_BAD_SPEC" <<EOF
+# Malformed verdict smoke spec
+EOF
+cat > "$TARGETS_DIR/${TID_VERDI_BAD}.yaml" <<EOF
+id: ${TID_VERDI_BAD}
+title: Malformed verdict smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Malformed verdict smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_VERDI_BAD" --spec-from "$VERDI_BAD_SPEC" --repo lapis-test --authority advisory
+
+# Inject pending fixer dispatch
+VERDI_BAD_GPU="claude_smoke_verdi_bad_$$"
+VERDI_BAD_SPEC_ID="spec-verdi-bad-$$"
+/usr/local/bin/mem set "pm/dispatched/${TID_VERDI_BAD}" \
+    "[{\"gpu_id\":\"${VERDI_BAD_GPU}\",\"spec_id\":\"${VERDI_BAD_SPEC_ID}\",\"agent_type\":\"fixer\",\"intent\":\"implement\",\"repo\":\"lapis-test\",\"ts\":\"$(date -Iseconds)\",\"status\":\"pending\",\"retry_count\":0}]" \
+    >/dev/null
+
+# Write fake completed output (short, no PR URL, no confab phrases)
+mkdir -p "$GPU_COMPLETED"
+cat > "$GPU_COMPLETED/${VERDI_BAD_GPU}-output.md" <<EOF
+DONE. Already merged.
+EOF
+
+# Write a malformed verdict sidecar (bad JSON)
+cat > "$SHAPED_DIR_SMOKE/${VERDI_BAD_SPEC_ID}-verdict.json" <<EOF
+{this is not valid json at all
+EOF
+
+# Tick — malformed verdict should be ignored with WARN; no auto_land:already_satisfied
+VERDI_BAD_TICK=$($LAPIS tick --target "$TID_VERDI_BAD" 2>&1)
+echo "$VERDI_BAD_TICK"
+! echo "$VERDI_BAD_TICK" | grep -q "decision=auto_land:already_satisfied:" \
+    || red "verdict smoke 27b: auto_land:already_satisfied fired despite malformed verdict"
+[ ! -f "/srv/lapis/lapis-state/${TID_VERDI_BAD}.md" ] \
+    || red "verdict smoke 27b: arc doc written despite malformed verdict"
+# Verdict sidecar should have been consumed
+[ ! -f "$SHAPED_DIR_SMOKE/${VERDI_BAD_SPEC_ID}-verdict.json" ] \
+    || red "verdict smoke 27b: malformed verdict sidecar not consumed"
+# Cleanup
+rm -f "$GPU_COMPLETED/${VERDI_BAD_GPU}-output.md"
+rm -f "$TARGETS_DIR/${TID_VERDI_BAD}.yaml" "$COMMENTS_DIR/${TID_VERDI_BAD}.jsonl" "$VERDI_BAD_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_VERDI_BAD}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_VERDI_BAD}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_VERDI_BAD}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_VERDI_BAD}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_VERDI_BAD}" 2>/dev/null || true
+green "verdict smoke 27b: malformed verdict sidecar ignored, no auto-land OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

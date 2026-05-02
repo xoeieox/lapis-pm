@@ -10,6 +10,7 @@ No TargetStore mutation in this slice. No chub update in this slice.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -92,8 +93,29 @@ def _format_all_episodes(comments: list, limit_chars: int = 400) -> str:
     return joined
 
 
-def generate_arc_doc(target_id: str) -> ArcDoc:
-    """Synthesize the arc doc body. Does NOT write to disk — caller decides."""
+def _append_origin_note(body: str, note: str) -> str:
+    """Append *note* as a paragraph inside the ## Origin section.
+
+    Finds the ## Origin block (everything up to the next ## header or EOF)
+    and appends the note before the following section. Falls back to appending
+    at the end if the section is not found.
+    """
+    pattern = re.compile(r"(## Origin\n(?:(?!##)[\s\S])*?)(?=\n## |\Z)", re.MULTILINE)
+    m = pattern.search(body)
+    if m:
+        origin_block = m.group(1)
+        new_block = origin_block.rstrip("\n") + f"\n\n{note}\n"
+        return body[: m.start()] + new_block + body[m.end() :]
+    return body.rstrip("\n") + f"\n\n## Origin\n\n{note}\n"
+
+
+def generate_arc_doc(target_id: str, extra_origin_note: str | None = None) -> ArcDoc:
+    """Synthesize the arc doc body. Does NOT write to disk — caller decides.
+
+    extra_origin_note: if provided, appended as a paragraph to the ## Origin
+    section. Used by the already_satisfied auto-land path to record that the
+    spec was verified pre-merged.
+    """
     spec_body = episodic.spec(target_id) or "(no spec bound)"
     comments = episodic.all_comments(target_id)
     episodes_block = _format_all_episodes(comments)
@@ -117,6 +139,9 @@ def generate_arc_doc(target_id: str) -> ArcDoc:
             "## Origin\nArc doc synthesis failed — Haiku call returned empty.\n\n"
             f"## Landing summary\nFallback dump of thread chronology:\n\n{episodes_block}\n"
         )
+
+    if extra_origin_note:
+        body = _append_origin_note(body, extra_origin_note)
 
     # Prepend a tiny YAML frontmatter so RoomRAG / Kami can tag arc docs cleanly.
     frontmatter = (

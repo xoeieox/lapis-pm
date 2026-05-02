@@ -530,6 +530,12 @@ def test_consume_brief_decisions_pending_to_applied(tmp_path):
     assert not pending_file.exists(), "pending file should be gone"
     applied = tmp_path / "applied" / f"{target_id}__{brief_id}.json"
     assert applied.exists(), "applied file should exist"
+    # Audit-trail invariant: applied file contains the augmented payload
+    # (original directive + result + applied_ts), not just the original directive.
+    applied_payload = json.loads(applied.read_text())
+    assert applied_payload["brief_id"] == brief_id
+    assert applied_payload["result"] == apply_result
+    assert "applied_ts" in applied_payload
 
 
 def test_consume_brief_decisions_failed_directive(tmp_path):
@@ -558,6 +564,10 @@ def test_consume_brief_decisions_failed_directive(tmp_path):
     assert not pending_file.exists()
     failed = tmp_path / "failed" / f"{target_id}__{brief_id}.json"
     assert failed.exists()
+    failed_payload = json.loads(failed.read_text())
+    assert failed_payload["brief_id"] == brief_id
+    assert failed_payload["error"] == "stale_brief"
+    assert "failed_ts" in failed_payload
 
 
 def test_consume_brief_decisions_crash_recovery(tmp_path):

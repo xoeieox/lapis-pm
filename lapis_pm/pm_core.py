@@ -1840,14 +1840,17 @@ def _consume_brief_decisions(target_id: str) -> str | None:
 
         ts = _now_iso()
         if result.get("ok"):
-            # Move to applied/ and append result line.
+            # Write augmented payload (directive + result + applied_ts) into
+            # applied/ then unlink processing/.  Earlier code wrote the augmented
+            # payload then os.rename'd processing_path over it, which silently
+            # clobbered the result/applied_ts fields.
             result_payload = json.dumps({**directive, "result": result, "applied_ts": ts},
                                         ensure_ascii=False)
             try:
                 applied_path.write_text(result_payload)
-                os.rename(processing_path, applied_path)
+                processing_path.unlink(missing_ok=True)
             except OSError:
-                # best-effort: leave in processing if rename fails
+                # best-effort: leave in processing if write/unlink fails
                 pass
             return f"brief_decision_applied:{brief_id}:{option_id}"
         else:
@@ -1856,7 +1859,7 @@ def _consume_brief_decisions(target_id: str) -> str | None:
                                         ensure_ascii=False)
             try:
                 failed_path.write_text(failed_payload)
-                os.rename(processing_path, failed_path)
+                processing_path.unlink(missing_ok=True)
             except OSError:
                 pass
             episodic.write_observation(

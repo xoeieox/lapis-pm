@@ -315,6 +315,7 @@ def test_tick_result_includes_reconciled_count():
     mock_target.paused = False
     mock_target.pm_repo = ""
     mock_target.pm_authority = "advisory"
+    mock_target.data = {}
 
     with patch("lapis_pm.pm_core._ClaudeQueue", return_value=queue), \
          patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]), \

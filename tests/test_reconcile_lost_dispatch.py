@@ -62,10 +62,15 @@ def _open_pr(created_at: str, number: int = 1) -> dict:
     }
 
 
-def _comment_with_tag(tag: str, ts: str = "2026-05-01T11:00:00-07:00") -> MagicMock:
+def _comment_with_tag(
+    tag: str,
+    ts: str = "2026-05-01T11:00:00-07:00",
+    content: str = "",
+) -> MagicMock:
     c = MagicMock()
     c.tags = [tag, "pm:observation"]
     c.ts = ts
+    c.content = content  # must be str; empty → _collect_merged_pr_created_ats falls back to c.ts
     return c
 
 

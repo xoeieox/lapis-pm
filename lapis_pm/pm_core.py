@@ -712,10 +712,11 @@ def _encode_merged_prs(target_id: str, repo: str) -> int:
             continue
         if pr_data.get("merged") and pr_data.get("state") == "closed":
             merged_at = pr_data.get("merged_at") or _now_iso()
+            created_at = pr_data.get("created_at") or ""
             head_sha = (pr_data.get("head") or {}).get("sha", "")
             episodic.write_observation(
                 target_id,
-                f"PR #{pr_num} merged at {merged_at}, head_sha={head_sha}",
+                f"PR #{pr_num} merged at {merged_at}, created_at={created_at}, head_sha={head_sha}",
                 extra_tags=[f"pm:pr-merged:{pr_num}", f"pm:pr={pr_num}"],
             )
             new_obs += 1
@@ -2123,6 +2124,22 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
 # Lost-dispatch detection and handling
 # ---------------------------------------------------------------------------
 
+def _collect_merged_pr_created_ats(target_id: str) -> list[str]:
+    """Return PR creation timestamps from pm:pr-merged episodic observations.
+
+    Parses 'created_at=<ts>' from observation content (written by
+    _encode_merged_prs since the lost-dispatch feature landed). Falls back to
+    the observation's own timestamp for older records that pre-date this field.
+    """
+    result: list[str] = []
+    for c in episodic.all_comments(target_id):
+        if not any(t.startswith("pm:pr-merged:") for t in c.tags):
+            continue
+        m = re.search(r"created_at=(\S+)", c.content)
+        result.append(m.group(1) if m else c.ts)
+    return result
+
+
 def _find_lost_fixer_dispatches(
     target_id: str,
     records: list[dict],
@@ -2147,12 +2164,9 @@ def _find_lost_fixer_dispatches(
     if not forgejo_ok:
         return [], []
 
-    # Timestamps of merged-PR observations (proxy for PR creation time)
-    merged_obs_ts: list[str] = [
-        c.ts
-        for c in episodic.all_comments(target_id)
-        if any(t.startswith("pm:pr-merged:") for t in c.tags)
-    ]
+    # Lazily loaded on first miss — avoids scanning episodic on ticks where no
+    # terminal fixer dispatch exists or all are covered by open_prs.
+    merged_pr_created_ats: list[str] | None = None
 
     needs_retry: list[dict] = []
     needs_brief: list[tuple[dict, dict | None]] = []
@@ -2170,7 +2184,9 @@ def _find_lost_fixer_dispatches(
         # Does a matching PR exist (created at or after this dispatch)?
         has_pr = any(pr.get("created_at", "") >= dispatch_ts for pr in open_prs)
         if not has_pr:
-            has_pr = any(obs_ts >= dispatch_ts for obs_ts in merged_obs_ts)
+            if merged_pr_created_ats is None:
+                merged_pr_created_ats = _collect_merged_pr_created_ats(target_id)
+            has_pr = any(ts >= dispatch_ts for ts in merged_pr_created_ats)
         if has_pr:
             continue  # PR exists; not lost
 

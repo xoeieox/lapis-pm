@@ -199,7 +199,7 @@ class TestNoopTaxonomy:
         """Chain leg with unsatisfied depends_on → noop:awaiting_chain_dependency:waiting_on=TID."""
         target = _mock_target(depends_on=["leg1-other-tid"])
         result = _tick_with_patches(target, {
-            "lapis_pm.chain._landed_tids": MagicMock(return_value=set()),
+            "lapis_pm.chain.landed_tids": MagicMock(return_value=set()),
         })
         assert result.decision == "noop:awaiting_chain_dependency:waiting_on=leg1-other-tid"
 
@@ -207,7 +207,7 @@ class TestNoopTaxonomy:
         """When all depends_on are satisfied → NOT noop:awaiting_chain_dependency."""
         target = _mock_target(depends_on=["leg1-other-tid"])
         result = _tick_with_patches(target, {
-            "lapis_pm.chain._landed_tids": MagicMock(return_value={"leg1-other-tid"}),
+            "lapis_pm.chain.landed_tids": MagicMock(return_value={"leg1-other-tid"}),
         })
         assert result.decision == "noop:no_change"
 
@@ -391,6 +391,76 @@ class TestActionTaxonomy:
             result = pm_core._act_retry("tid", rec)
         assert result == "action:fixer_dispatched:source=init:dispatch=task-init-001"
 
+    def test_act_auto_land(self):
+        """auto_land eligible target → action:auto_land:pr=N:arc=PATH."""
+        mock_arc = MagicMock()
+        mock_arc.comment_id = "cmt-land-001"
+        mock_target = MagicMock()
+        mock_target.data = {}
+        mock_store = MagicMock()
+        mock_store.get.return_value = mock_target
+        with (
+            patch("lapis_pm.pm_core._merged_pr_numbers_observed", return_value={42}),
+            patch("lapis_pm.pm_core._merged_at_for_pr", return_value="2026-05-02T00:00:00"),
+            patch("lapis_pm.pm_core._now_iso", return_value="2026-05-02T00:01:00"),
+            patch("lapis_pm.pm_core._mem") as mock_mem_fn,
+            patch("lapis_pm.pm_core.TargetStore", return_value=mock_store),
+            patch("lapis_pm.pm_core.episodic.write"),
+            patch("lapis_pm.pm_core.episodic.write_observation"),
+            patch("lapis_pm.pm_core.clear_landed_state"),
+        ):
+            mock_mem_fn.return_value.set = MagicMock()
+            land_mod = MagicMock()
+            land_mod.generate_arc_doc.return_value = MagicMock()
+            land_mod.write_arc_doc.return_value = "/srv/lapis/lapis-state/tid.md"
+            chain_mod = MagicMock()
+            with (
+                patch.dict("sys.modules", {
+                    "lapis_pm.land": land_mod,
+                    "lapis_pm.chain": chain_mod,
+                }),
+            ):
+                result = pm_core._act_auto_land("tid")
+        assert result == "action:auto_land:pr=42:arc=/srv/lapis/lapis-state/tid.md"
+
+    def test_act_directive_brief_via_tick(self):
+        """Directive present → action:directive_brief:cid=..."""
+        target = _mock_target(pm_repo="myrepo")
+        directive = MagicMock()
+        directive.author = "Erah"
+        directive.ts = "2026-05-02T00:00:00"
+        directive.content = "implement feature X"
+        directive.id = "dir-001"
+        mock_brief = MagicMock()
+        mock_brief.comment_id = "cmt-dir-001"
+        result = _tick_with_patches(target, {
+            "lapis_pm.pm_core._encode_user_comments": MagicMock(return_value=[directive]),
+            "lapis_pm.pm_core.brief.synthesize": MagicMock(return_value=mock_brief),
+            "lapis_pm.pm_core.set_outstanding_brief": MagicMock(),
+        })
+        assert result.decision == "action:directive_brief:cid=cmt-dir-001"
+
+    def test_act_abandon_brief_via_tick(self):
+        """Failed dispatch at retry limit → action:abandon_brief:cid=..."""
+        from lapis_pm import pm_core as _pm
+        target = _mock_target(pm_repo="myrepo")
+        failed_rec = {
+            "agent_type": "fixer",
+            "intent": "do stuff",
+            "retry_count": _pm.MAX_DISPATCH_RETRIES,  # at the limit
+            "status": "failed",
+        }
+        mock_brief = MagicMock()
+        mock_brief.comment_id = "cmt-abandon-001"
+        result = _tick_with_patches(target, {
+            "lapis_pm.pm_core._encode_gpu_results": MagicMock(
+                return_value=(0, [failed_rec])
+            ),
+            "lapis_pm.pm_core.brief.synthesize": MagicMock(return_value=mock_brief),
+            "lapis_pm.pm_core.set_outstanding_brief": MagicMock(),
+        })
+        assert result.decision == "action:abandon_brief:cid=cmt-abandon-001"
+
     def test_act_brief_review_exhausted(self):
         """Review budget exhausted → action:review_exhausted_brief:cid=..."""
         from lapis_pm import authority as _auth
@@ -434,11 +504,11 @@ class TestActionTaxonomy:
         assert result == "action:review_gate_paused:cid=cmt-gate-001"
 
     def test_act_review_gate_pause_already_briefed(self):
-        """Kill-switch already briefed → action:review_gate_pause:already_briefed."""
+        """Kill-switch already briefed → action:review_gate_paused:already_briefed."""
         with patch("lapis_pm.pm_core._mem") as mock_mem_fn:
             mock_mem_fn.return_value.get.return_value = {"content": "cmt-gate-001"}
             result = pm_core._act_review_gate_pause("tid", {})
-        assert result == "action:review_gate_pause:already_briefed"
+        assert result == "action:review_gate_paused:already_briefed"
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +538,7 @@ ACTION_VARIANTS = [
     "action:abandon_brief:cid=cmt-001",
     "action:review_exhausted_brief:cid=cmt-001",
     "action:review_gate_paused:cid=cmt-001",
-    "action:review_gate_pause:already_briefed",
+    "action:review_gate_paused:already_briefed",
 ]
 
 

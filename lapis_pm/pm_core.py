@@ -1332,7 +1332,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     # Only post the pause brief once (idempotent)
     rec = _mem().get(REVIEW_GATE_PAUSE_BRIEF_KEY)
     if rec:
-        return "action:review_gate_pause:already_briefed"
+        return "action:review_gate_paused:already_briefed"
 
     count = _review_gate_counter()
     episodic.write_observation(
@@ -2062,7 +2062,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         _deps = target.data.get("depends_on") or []
         if _deps:
             from . import chain as _chain_mod
-            _landed = _chain_mod._landed_tids()
+            _landed = _chain_mod.landed_tids()
             _unsatisfied = [d for d in _deps if d not in _landed]
             if _unsatisfied:
                 decision_str = f"noop:awaiting_chain_dependency:waiting_on={_unsatisfied[0]}"

@@ -74,6 +74,10 @@ _REVIEWER_MODES: dict[str, str] = {
     "hold": "fresh-reviewer",
 }
 
+# Forgejo health gate constants
+FORGEJO_CONSECUTIVE_FAILS_KEY = "pm/forgejo_consecutive_fails"
+FORGEJO_UNREACHABLE_THRESHOLD = 3  # consecutive failed probes before Pushover
+
 # Tick-local corroboration cache: (target_id, pr_number) -> corr_result dict.
 # Populated by _encode_gpu_results; consumed by _persist_review_state_cache in
 # the same tick to avoid re-scanning episodic for data already in hand.
@@ -394,6 +398,63 @@ def get_outstanding_brief(target_id: str) -> str | None:
 
 def _landed_key(target_id: str) -> str:
     return f"pm/landed/{target_id}"
+
+
+# ---------------------------------------------------------------------------
+# Forgejo health gate
+# ---------------------------------------------------------------------------
+
+def probe_forgejo_health() -> tuple[bool, str]:
+    """Probe Forgejo reachability with GET /api/v1/version (3-second timeout).
+
+    Returns (True, "") on success.
+    Returns (False, reason) on failure where reason is one of:
+      "connect_error", "timeout", "http=<code>"
+    """
+    try:
+        from agents_core.forgejo import FORGEJO_URL
+    except Exception:
+        return True, ""  # agents_core unavailable — assume reachable
+    try:
+        import httpx as _httpx
+        r = _httpx.get(f"{FORGEJO_URL}/api/v1/version", timeout=3.0)
+        if not (200 <= r.status_code < 300):
+            return False, f"http={r.status_code}"
+        return True, ""
+    except Exception as exc:
+        # Distinguish timeout from other connect failures
+        import httpx as _httpx2
+        if isinstance(exc, _httpx2.TimeoutException):
+            return False, "timeout"
+        return False, "connect_error"
+
+
+def _get_forgejo_consecutive_fails() -> int:
+    rec = _mem().get(FORGEJO_CONSECUTIVE_FAILS_KEY)
+    if not rec:
+        return 0
+    try:
+        return int(rec["content"])
+    except (ValueError, KeyError, TypeError):
+        return 0
+
+
+def _set_forgejo_consecutive_fails(n: int) -> None:
+    _mem().set(FORGEJO_CONSECUTIVE_FAILS_KEY, str(n), tags=["lapis-pm", "forgejo-health"])
+
+
+def _notify_forgejo_unreachable() -> None:
+    """Emit one HIGH-priority Pushover when Forgejo has been unreachable for ≥3 ticks."""
+    try:
+        from agents_core.notify import send_notification, Priority as _P
+        send_notification(
+            "Forgejo health probe has failed for 3 or more consecutive ticks. "
+            "Daemon is skipping all target processing until Forgejo recovers.",
+            title="lapis-pm: Forgejo unreachable for >3 ticks",
+            priority=_P.HIGH,
+        )
+    except Exception:
+        pass
 
 
 def _classified_pr_ids(target_id: str) -> set[int]:
@@ -2308,6 +2369,24 @@ def tick_all() -> list[TickResult]:
     land-eligible, the oldest-bound (earliest spec:bound comment) is chosen;
     others have auto-land suppressed and become eligible next tick.
     """
+    # Pre-perceive health probe — one probe per tick_all call, not per target.
+    reachable, probe_reason = probe_forgejo_health()
+    if not reachable:
+        print(f"[forgejo:unreachable] reason={probe_reason}", flush=True)
+        fails = _get_forgejo_consecutive_fails() + 1
+        _set_forgejo_consecutive_fails(fails)
+        if fails == FORGEJO_UNREACHABLE_THRESHOLD:
+            _notify_forgejo_unreachable()
+        store = TargetStore()
+        bound = [t for t in store.load_all() if t.pm_bound]
+        # Cursors are NOT advanced — next healthy tick re-perceives from the same point.
+        return [
+            TickResult(t.id, True, "forgejo_unreachable", 0, "skipped:forgejo_unreachable")
+            for t in bound
+        ]
+    # Probe succeeded — reset consecutive-fail counter.
+    _set_forgejo_consecutive_fails(0)
+
     store = TargetStore()
     bound = [t for t in store.load_all() if t.pm_bound]
 

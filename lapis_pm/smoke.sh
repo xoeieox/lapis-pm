@@ -2460,9 +2460,84 @@ rm -f "$TARGETS_DIR/${TID_VERDI_BAD}.yaml" "$COMMENTS_DIR/${TID_VERDI_BAD}.jsonl
 /usr/local/bin/mem delete "pm/classified-prs/${TID_VERDI_BAD}" 2>/dev/null || true
 green "verdict smoke 27b: malformed verdict sidecar ignored, no auto-land OK"
 
+# =========================================================================
+# Forgejo health gate smoke (lapis-pm-forgejo-health-gate)
+# =========================================================================
+step "28. Forgejo health gate: unreachable probe → all bound targets skipped, cursors not advanced"
+
+TID_HG="pm-smoke-hg-$$"
+HG_SPEC="/tmp/${TID_HG}-spec.md"
+cat > "$HG_SPEC" <<EOF
+# Health-gate smoke spec for $TID_HG
+What: verify Forgejo health gate skips ticks correctly.
+Why:  smoke coverage for lapis-pm-forgejo-health-gate.
+EOF
+
+cat > "$TARGETS_DIR/${TID_HG}.yaml" <<EOF
+id: ${TID_HG}
+title: Health-gate smoke
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Health-gate smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+$LAPIS bind "$TID_HG" --spec-from "$HG_SPEC" --repo lapis-test --authority advisory
+
+# Run tick_all() with probe monkey-patched to return unreachable
+HG_OUT=$(python3 - <<PYEOF28
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch
+from lapis_pm import pm_core
+
+with patch('lapis_pm.pm_core.probe_forgejo_health', return_value=(False, 'connect_error')), \
+     patch('lapis_pm.pm_core._notify_forgejo_unreachable'):
+    results = pm_core.tick_all()
+
+for r in results:
+    print(f'[{r.target_id}] skipped={r.skipped} reason={r.reason} encoded={r.encoded} decision={r.decision}')
+PYEOF28
+)
+echo "$HG_OUT"
+
+# Assert [forgejo:unreachable] was emitted
+echo "$HG_OUT" | grep -q "\[forgejo:unreachable\] reason=connect_error" \
+    || red "health gate: [forgejo:unreachable] line missing from tick_all output"
+
+# Assert target row has decision=skipped:forgejo_unreachable
+echo "$HG_OUT" | grep -q "decision=skipped:forgejo_unreachable" \
+    || red "health gate: decision=skipped:forgejo_unreachable missing"
+
+# Assert skipped=True in the per-target line
+echo "$HG_OUT" | grep -q "skipped=True" \
+    || red "health gate: skipped=True missing from per-target line"
+
+# Assert cursor was NOT advanced (key must be absent from mem)
+/usr/local/bin/mem get "pm/cursor/${TID_HG}" 2>/dev/null \
+    && red "health gate: cursor was advanced on unreachable tick (must not advance)" \
+    || true   # expected absence is success
+
+# Cleanup phase 28
+rm -f "$TARGETS_DIR/${TID_HG}.yaml" "$COMMENTS_DIR/${TID_HG}.jsonl" "$HG_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_HG}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_HG}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_HG}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/forgejo_consecutive_fails" 2>/dev/null || true
+green "Phase 28 complete: Forgejo health gate smoke OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate all OK"
 cat <<MSG
 
 Skipped automatically (need live state):
@@ -2470,6 +2545,7 @@ Skipped automatically (need live state):
   - auto-merge a clean PR (target authority=auto, diff <400 LOC, no held paths)
   - Pushover delivery confirmation — check phone after the directive step above
   - trajectory weekly/monthly rollup (requires Qwen endpoint — suppressed in smoke)
+  - Forgejo health gate Pushover delivery (requires ≥3 consecutive unreachable ticks in prod)
 
 Cleanup runs on exit. Target id was: $TID
 MSG

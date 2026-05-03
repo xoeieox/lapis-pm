@@ -26,17 +26,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from archetypes_core.corroboration import Citation
+
 
 # ---------------------------------------------------------------------------
 # Data shapes (CorroborationResult is evidence-packet-shaped from day 1)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Citation:
-    """SCP-shaped attribution: source path + relevant text snippet."""
-    source: str   # e.g. "repo:lapis-pm:lapis_pm/pm_core.py:42"
-    text: str     # the relevant text (truncated to 200 chars)
-
 
 @dataclass
 class CorroborationResult:
@@ -58,7 +53,7 @@ class CorroborationResult:
         return {
             "verdict": self.verdict,
             "claim": self.claim,
-            "citations": [{"source": c.source, "text": c.text} for c in self.citations],
+            "citations": [{"source_id": c.source_id, "excerpt": c.excerpt} for c in self.citations],
             "freshness_stamp": self.freshness_stamp,
             "scope_id": self.scope_id,
             "drift_class": self.drift_class,
@@ -356,8 +351,9 @@ class LapisPMReviewerAdapter:
                 if s.identifier == ident:
                     for h in s.repo_hits[:1]:
                         citations.append(Citation(
-                            source=f"repo:{repo}:{h['file']}:{h['line']}",
-                            text=h["text"],
+                            source_id=f"repo:{repo}:{h['file']}:{h['line']}",
+                            excerpt=h["text"],
+                            provenance_method="diff_grep",
                         ))
                     break
 

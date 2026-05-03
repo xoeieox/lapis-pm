@@ -960,6 +960,60 @@ rm -f "$TARGETS_DIR/${TID_REV}.yaml" "$COMMENTS_DIR/${TID_REV}.jsonl" "$REV_SPEC
 green "reviewer verdict: corroboration_result present + resume read-back OK (cross-node-corroboration-v0)"
 green "reviewer dispatch produces verdict=fixable episodic entry (not verdict=pending) OK"
 
+# --- Step 17b: reviewer dispatch carries branch refs in vars_ ---------------
+step "17b. Reviewer dispatch: existing_branch + base_branch plumbed into vars_ (lapis-pm-reviewer-full-context-v0)"
+python3 - "$TID_REV" <<'PYEOF_BRANCHES' || red "reviewer dispatch: existing_branch / base_branch not plumbed into vars_"
+import sys
+from unittest.mock import MagicMock, patch
+from lapis_pm import authority, pm_core
+
+target_id = sys.argv[1]
+
+pr = {
+    "number": 99,
+    "title": "smoke: branch-ref test",
+    "html_url": "https://forgejo/Erah/lapis-test/pulls/99",
+    "head": {"ref": "lapis/smoke-target/some-feature"},
+    "base": {"ref": "main"},
+    "mergeable": True,
+}
+cls = authority.PRClassification(
+    verdict="advisory", screen_verdict="unknown",
+    static_outcome=authority.StaticOutcome.static_pass,
+    reasons=[], issues=[], pr_number=99, repo="lapis-test",
+    title="smoke", html_url="", changed_paths=[], diff_loc=10, diff="",
+)
+
+captured = {}
+
+def capture_dispatch(agent_type, tid, user_prompt, vars_=None, **kw):
+    captured.update(vars_ or {})
+    r = MagicMock(); r.task_id = "smoke-task"; r.spec_id = "smoke-spec"; return r
+
+with (
+    patch.object(pm_core._SHAPER, "dispatch", side_effect=capture_dispatch),
+    patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd", return_value="/tmp/smoke"),
+    patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+    patch("lapis_pm.pm_core.episodic.write_dispatch"),
+    patch("lapis_pm.pm_core.append_dispatched"),
+    patch("lapis_pm.pm_core._increment_review_gate_counter", return_value=1),
+    patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+    patch("agents_core.forgejo.get_pr_diff", return_value="diff"),
+):
+    pm_core._act_dispatch_reviewer(target_id, pr, cls, mode="same", cycle=1)
+
+assert "existing_branch" in captured, \
+    f"existing_branch missing from vars_: {list(captured.keys())}"
+assert "base_branch" in captured, \
+    f"base_branch missing from vars_: {list(captured.keys())}"
+assert captured["existing_branch"] == "lapis/smoke-target/some-feature", \
+    f"existing_branch value wrong: {captured['existing_branch']}"
+assert captured["base_branch"] == "main", \
+    f"base_branch value wrong: {captured['base_branch']}"
+print(f"existing_branch={captured['existing_branch']} base_branch={captured['base_branch']} OK")
+PYEOF_BRANCHES
+green "reviewer dispatch: existing_branch + base_branch plumbed into vars_ OK (lapis-pm-reviewer-full-context-v0)"
+
 # --- Chain smoke phase (step 18) ----------------------------------------
 step "18. Chain: 3-leg bind → simulated land → auto-dispatch cascade → state.complete"
 

@@ -31,6 +31,7 @@ HELD_PATTERNS = [
 ]
 
 MAX_AUTO_LOC = 400
+DIFF_INLINE_CAP = 200_000
 DIFF_PATH_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 DIFF_HUNK_LINE_RE = re.compile(r"^[+-](?![+-])", re.MULTILINE)
 
@@ -88,8 +89,8 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
     Used only for auto-merge authority targets and as the kill-switch fallback.
     Returns parsed JSON or fallback dict.
     """
-    if len(diff_text) > 60000:
-        diff_text = diff_text[:60000] + "\n\n... (diff truncated)"
+    if len(diff_text) > DIFF_INLINE_CAP:
+        diff_text = diff_text[:DIFF_INLINE_CAP] + "\n\n... (diff truncated)"
     user = (
         f"PR #{pr_number} in {repo}.\n\n"
         f"Spec context:\n{spec_summary}\n\n"

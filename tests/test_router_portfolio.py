@@ -30,6 +30,7 @@ from lapis_pm.router_portfolio import (
     emit_ratify_correct,
     emit_ratify_override,
     emit_ratify_redirect,
+    find_latest_decision,
     read_session_entries,
     session_checkpoint_exists,
     write_session_summary,
@@ -506,3 +507,78 @@ class TestRouterPortfolioEntryShape:
         raw = entry.to_json()
         parsed = json.loads(raw)
         assert parsed["verdict"] == "proposed"
+
+
+# ---------------------------------------------------------------------------
+# find_latest_decision
+# ---------------------------------------------------------------------------
+
+def _seed_decision(mock_mem, target_id: str, freshness_stamp: str, event_id: str) -> str:
+    """Seed a decision entry into mock_mem._data; return the mem key."""
+    key = f"router/lapis-pm/decisions/{event_id}"
+    entry = {
+        "verdict": "proposed",
+        "claim": f"decision for {target_id}",
+        "citations": [],
+        "freshness_stamp": freshness_stamp,
+        "scope_id": "router/lapis-pm",
+        "target_id": target_id,
+        "fragment_id": "kickoff",
+        "expert_chosen": None,
+        "ratification_outcome": None,
+        "intent_summary": "test",
+        "drift_class": None,
+        "primitive_decomposition": None,
+    }
+    mock_mem._data[key] = {
+        "key": key,
+        "content": json.dumps(entry),
+        "tags": ["lapis-pm", "router-portfolio", f"target:{target_id}"],
+    }
+    return key
+
+
+class TestFindLatestDecision:
+    def test_returns_newest_by_freshness_stamp(self) -> None:
+        """Three decisions for t1; find_latest_decision returns the one with the latest stamp."""
+        mock_mem = _make_mock_mem()
+        _seed_decision(mock_mem, "t1", "2026-05-01T08:00:00Z", "old-event")
+        _seed_decision(mock_mem, "t1", "2026-05-03T12:00:00Z", "newest-event")
+        _seed_decision(mock_mem, "t1", "2026-05-02T10:00:00Z", "middle-event")
+
+        with patch("lapis_pm.router_portfolio._mem", return_value=mock_mem):
+            result = find_latest_decision("t1")
+
+        assert result is not None
+        assert result["freshness_stamp"] == "2026-05-03T12:00:00Z"
+        assert result["_mem_key"] == "router/lapis-pm/decisions/newest-event"
+
+    def test_returns_none_when_no_match(self) -> None:
+        """Decisions seeded for t2; querying t1 returns None."""
+        mock_mem = _make_mock_mem()
+        _seed_decision(mock_mem, "t2", "2026-05-01T08:00:00Z", "t2-event")
+
+        with patch("lapis_pm.router_portfolio._mem", return_value=mock_mem):
+            result = find_latest_decision("t1")
+
+        assert result is None
+
+    def test_ignores_non_decision_entries(self) -> None:
+        """A ratification-outcomes entry for t1 must not be returned."""
+        mock_mem = _make_mock_mem()
+        # Seed only a ratification-outcomes entry for t1 (not a decision)
+        ratify_key = "router/lapis-pm/ratification-outcomes/2026-05-01T10:00:00Z-aabbccdd"
+        mock_mem._data[ratify_key] = {
+            "key": ratify_key,
+            "content": json.dumps({
+                "verdict": "ratified",
+                "freshness_stamp": "2026-05-01T10:00:00Z",
+                "target_id": "t1",
+            }),
+            "tags": ["lapis-pm", "router-portfolio", "target:t1"],
+        }
+
+        with patch("lapis_pm.router_portfolio._mem", return_value=mock_mem):
+            result = find_latest_decision("t1")
+
+        assert result is None

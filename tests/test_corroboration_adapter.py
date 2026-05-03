@@ -247,7 +247,7 @@ class TestScoreFlagsRenamedReferent:
         assert result.drift_class == "renamed_referent"
         # Citation should reference the repo hit
         assert len(result.citations) == 1
-        assert result.citations[0].source.startswith("repo:lapis-pm:")
+        assert result.citations[0].source_id.startswith("repo:lapis-pm:")
 
 
 # ---------------------------------------------------------------------------

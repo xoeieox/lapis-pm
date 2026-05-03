@@ -9,6 +9,7 @@ description = "Lapis PM — per-thread project manager daemon + shaped-agent dis
 requires-python = ">=3.12"
 dependencies = [
     "agents-core",
+    "archetypes-core",
     "pyyaml",
 ]
 

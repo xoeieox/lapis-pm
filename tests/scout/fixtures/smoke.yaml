@@ -1,0 +1,69 @@
+spec_id: smoke
+spec_version: v0
+description: |
+  Smoke test scaffold for lapis-scout-v0.
+  Routes entity events to the correct handler.
+
+static_scaffold:
+  objective: "Route an entity event to the correct handler"
+  architecture_sketch: |
+    A dispatcher receives entity events, classifies them by type,
+    routes to handler A or B, and emits an acknowledgement.
+    Falls back to handler A on timeout.
+  necessary_steps:
+    - id: classify-event
+      description: "Determine the event type (type-A or type-B)"
+    - id: route-to-handler
+      description: "Forward the event to the appropriate handler"
+    - id: emit-ack
+      description: "Emit an acknowledgement to the originating source"
+  optional_steps:
+    - id: cache-lookup
+      description: "Check the cache before routing to avoid duplicate processing"
+    - id: dedup-check
+      description: "Skip duplicate events already seen in the last 60s"
+  available_tools:
+    - id: classify_event
+      description: "Classify an event by type, returns type-A or type-B"
+    - id: route
+      description: "Route the event to a handler by name"
+    - id: emit_ack
+      description: "Emit acknowledgement back to the originating entity"
+    - id: cache_get
+      description: "Look up an event hash in the dedup cache"
+  scenario:
+    conditions:
+      - "Event stream is continuous at ~100 events/min"
+      - "Handlers may become slow or unavailable"
+      - "Duplicate events can arrive within 60s windows"
+    time_progression:
+      t0: "system start; first events arriving; both handlers healthy"
+      t0+10s: "handler B overloaded; latency spikes to 800ms"
+    external_state:
+      handler_a:
+        latency_ms: 10
+        status: healthy
+        capacity: 500
+      handler_b:
+        latency_ms: 500
+        status: degraded
+        capacity: 20
+    utilization_pattern: "100 events/min steady, 5x burst during incidents"
+
+generation_directive: |
+  Simulate executing this architecture against the scenario. At each step,
+  reach for tools from available_tools by id. Narrate what happens.
+  Report breaks_observed, leverage_points, surprises, tools_used, tools_wished_for,
+  drift_signals (where you had to invent context the scaffold did not provide).
+  Output strict JSON matching the schema.
+
+matrix:
+  optional_steps_included:
+    - []
+    - [cache-lookup]
+  external_state_severity:
+    - healthy
+    - degraded
+  concurrent_load:
+    - 1
+  runs_per_cell: 3

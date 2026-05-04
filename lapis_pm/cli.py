@@ -40,6 +40,7 @@ from agents_core.targets import TargetStore
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
+from .scout.cli import cmd_scout
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
 PM_LIFECYCLE_STAGES = [
@@ -1060,6 +1061,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Month to generate (default: current month). With --period monthly.",
     )
     tr.set_defaults(func=cmd_trajectory_rollup)
+
+    # ------------------------------------------------------------------
+    # scout — pseudocode-simulate v0
+    # ------------------------------------------------------------------
+    sc = sub.add_parser(
+        "scout",
+        help="Lapis Scout v0: architectural fuzzing via pseudocode simulation.",
+    )
+    sc_sub = sc.add_subparsers(dest="scout_sub", required=True)
+
+    sc_sim = sc_sub.add_parser(
+        "simulate",
+        help="Run a scaffold against the parameter matrix and persist traces.",
+    )
+    sc_sim.add_argument(
+        "scaffold",
+        metavar="SCAFFOLD_PATH",
+        help="Path to the scaffold YAML file.",
+    )
+    sc_sim.add_argument(
+        "--cell",
+        default=None,
+        metavar="CELL_ID",
+        help="Run only this cell (e.g. opt=weight-by-recency,load=5,severity=degraded).",
+    )
+    sc_sim.add_argument(
+        "--runs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override runs_per_cell from the scaffold.",
+    )
+    sc_sim.set_defaults(func=cmd_scout)
+
+    sc_dig = sc_sub.add_parser(
+        "digest",
+        help="Digest persisted traces into a failure-mode map.",
+    )
+    sc_dig.add_argument(
+        "spec_id",
+        help="Spec ID to digest (must have traces under /srv/lapis/scout/traces/<spec_id>/).",
+    )
+    sc_dig.set_defaults(func=cmd_scout)
 
     return p
 

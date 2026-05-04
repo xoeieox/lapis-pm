@@ -2,7 +2,7 @@
 
 Storage layout:
   Input:  /srv/lapis/scout/traces/<spec-id>/<cell-id>/<run-id>.json
-  Output: /srv/lapis/scout/maps/<spec-id>.json   (LapisToolReturn-conformant)
+  Output: /srv/lapis/scout/maps/<spec-id>.yaml   (LapisToolReturn-conformant JSON)
 
 No LLM calls at v0.  Clustering uses exact-string + Jaccard token-overlap.
 """
@@ -278,6 +278,6 @@ def digest(
     )
 
     maps_root.mkdir(parents=True, exist_ok=True)
-    out_path = maps_root / f"{spec_id}.json"
+    out_path = maps_root / f"{spec_id}.yaml"
     out_path.write_text(ltr.to_json())
     return out_path

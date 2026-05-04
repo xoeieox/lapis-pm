@@ -12,12 +12,14 @@ Storage layout:
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from lapis_engine import Engine, LlamaAdapter
 
+from archetypes_core.corroboration import Citation
 from archetypes_core.provenance import InputRef, to_lapis_return
 
 from .director import ScoutDirector
@@ -26,8 +28,6 @@ from .scaffold import ScoutScaffold, load_scaffold
 from .schema import ScoutTracePayload
 
 SCOUT_TRACES_ROOT = Path("/srv/lapis/scout/traces")
-
-import json
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +186,28 @@ def run_single(
         InputRef(ref=f"cell:{cell_id}", content_hash=None, type="claim"),
     ]
 
+    # Citations: one per chub bundle + one per vault section declared in scaffold.context.
+    # At v0 the actual bundle/vault content is not loaded (content_hash=None, excerpt="").
+    # The citations record deterministic context-injection events per the spec.
+    citations: list[Citation] = []
+    ctx = scaffold.context
+    for chub_id in ctx.chubs:
+        citations.append(Citation(
+            source_id=chub_id,
+            excerpt="",
+            content_hash=None,
+            provenance_method="chub-injection",
+        ))
+    for vs in ctx.vault_sections:
+        for section in vs.sections or [""]:
+            src = f"{vs.path}#{section}" if section else vs.path
+            citations.append(Citation(
+                source_id=src,
+                excerpt="",
+                content_hash=None,
+                provenance_method="vault-section-reference",
+            ))
+
     ltr = to_lapis_return(
         payload=payload,
         agent_id="lapis-scout/sim",
@@ -194,7 +216,7 @@ def run_single(
         model=getattr(llm, "model", None),
         prompt_hash=ph,
         input_refs=input_refs,
-        citations=[],
+        citations=citations,
         upstream_calls=[],
         scope_id=None,
     )

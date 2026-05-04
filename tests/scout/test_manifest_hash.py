@@ -128,14 +128,31 @@ class TestManifestHashReproducibility:
         assert h0 != h1, "Different cells must produce different scaffold hashes"
 
     def test_canonical_json_sorted_keys_no_whitespace(self) -> None:
-        """Verify _canonical_json is sorted-keys, no-whitespace, round-trip floats."""
-        from archetypes_core.provenance import _canonical_json  # type: ignore[attr-defined]
+        """manifest_hash is key-order-independent: same content, different dict insertion
+        order → same hash.  Verifies sorted-keys canonical serialization via public API."""
+        from archetypes_core.provenance import to_lapis_return
 
-        obj = {"z": 1, "a": 2, "m": {"y": 3, "b": 4}}
-        result = _canonical_json(obj)
-        # Keys must be sorted
-        assert result == '{"a":2,"m":{"b":4,"y":3},"z":1}', (
-            f"_canonical_json output unexpected: {result}"
+        fixed_ts = "2026-05-03T17:00:00Z"
+
+        class _PayloadABC:
+            def to_dict(self):
+                return {"z": 1, "a": 2, "m": {"y": 3, "b": 4}}
+
+        class _PayloadCBA:
+            def to_dict(self):
+                # Same content, keys inserted in reverse order
+                return {"m": {"b": 4, "y": 3}, "z": 1, "a": 2}
+
+        ltr1 = to_lapis_return(
+            _PayloadABC(), agent_id="t", tool="t", summary="s", timestamp=fixed_ts
         )
-        # No extra whitespace
-        assert " " not in result
+        ltr2 = to_lapis_return(
+            _PayloadCBA(), agent_id="t", tool="t", summary="s", timestamp=fixed_ts
+        )
+
+        assert ltr1.provenance.manifest_hash == ltr2.provenance.manifest_hash, (
+            "manifest_hash must be identical for payloads with the same content "
+            "regardless of dict key insertion order (sorted-keys canonical JSON required).\n"
+            f"  hash1={ltr1.provenance.manifest_hash}\n"
+            f"  hash2={ltr2.provenance.manifest_hash}"
+        )

@@ -74,7 +74,7 @@ matrix:
 /srv/lapis/scout/
   sims/<spec-id>.yaml              # scaffold definitions
   traces/<spec-id>/<cell-id>/<run-id>.json  # raw traces (LapisToolReturn)
-  maps/<spec-id>.json              # digested map (LapisToolReturn)
+  maps/<spec-id>.yaml              # digested map (LapisToolReturn)
 ```
 
 **`/srv/lapis/scout/` is NOT RoomRAG-indexed** — Qwen-narrated content stays out of

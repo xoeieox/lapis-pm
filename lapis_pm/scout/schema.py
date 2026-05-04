@@ -34,6 +34,7 @@ class BreakModeAggregate:
     severity_distribution: dict[str, int] = field(default_factory=dict)
     associated_steps: list[str] = field(default_factory=list)
     cells_observed_in: list[str] = field(default_factory=list)
+    parroted_likely: bool = False                     # True iff Jaccard(signature, context_union) > 0.30
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +43,7 @@ class BreakModeAggregate:
             "severity_distribution": self.severity_distribution,
             "associated_steps": self.associated_steps,
             "cells_observed_in": self.cells_observed_in,
+            "parroted_likely": self.parroted_likely,
         }
 
 

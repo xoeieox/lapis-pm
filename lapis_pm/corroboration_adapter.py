@@ -18,13 +18,14 @@ Invariants (from spec §Invariants):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from archetypes_core.corroboration import Citation
 
@@ -221,6 +222,14 @@ class LapisPMReviewerAdapter:
 
     def __init__(self, repo_path: str | None = None):
         self._repo_path = repo_path
+        self._last_model: str | None = None
+        self._last_prompt_hash: str | None = None
+        self._last_score_at: datetime | None = None
+
+    @property
+    def scope_id(self) -> str:
+        """Stable identifier for this substrate (SubstrateAdapter contract)."""
+        return "repo:lapis-pm"
 
     def retrieve(
         self,
@@ -315,7 +324,8 @@ class LapisPMReviewerAdapter:
                 timeout=_LLM_TIMEOUT,
             )
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
+            resp_json = resp.json()
+            content = resp_json["choices"][0]["message"]["content"].strip()
             # Strip markdown fences if present
             if content.startswith("```"):
                 content = re.sub(r"^```(?:json)?\s*", "", content)
@@ -323,7 +333,15 @@ class LapisPMReviewerAdapter:
             # Some models wrap with <think>...</think>; strip thinking
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             result_data = json.loads(content)
+            # Capture provenance metadata from the successful LLM call
+            self._last_model = resp_json.get("model")
+            self._last_prompt_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            self._last_score_at = datetime.now(timezone.utc)
         except Exception as exc:
+            # Clear provenance — most-recent score() attempt did not succeed;
+            # a stale model from a prior call should not claim credit.
+            self._last_model = None
+            self._last_prompt_hash = None
             return CorroborationResult(
                 verdict="uncertain",
                 claim="(substrate unavailable)",
@@ -381,6 +399,32 @@ class LapisPMReviewerAdapter:
             drift_class=worst_dc,
             notes=result_data.get("summary"),
         )
+
+    def score_provenance(self) -> dict[str, Any]:
+        """Return adapter-level provenance metadata for the most-recent score() call.
+
+        Returns {"model", "prompt_hash", "upstream_calls"} — keys are populated only
+        if a successful score() has run since construction. Empty dict if no LLM
+        call has succeeded.
+
+        Recognized by archetypes_core.corroboration.corroborate_envelope() when
+        this adapter is passed in; the returned dict's keys flow into the envelope's
+        provenance (model, prompt_hash, upstream_calls).
+
+        Concurrency note (v0): _last_* state is a single-call-at-a-time abstraction.
+        If two score() calls on the same adapter instance interleave (threads or
+        asyncio), score_provenance() returns the metadata of whichever call wrote
+        last. This matches the schema doc's framing: provenance describes the
+        most-recent call. v1 may switch to a context-local store or per-call return
+        value if concurrent usage shows up.
+        """
+        if self._last_model is None and self._last_prompt_hash is None:
+            return {}
+        return {
+            "model": self._last_model,
+            "prompt_hash": self._last_prompt_hash,
+            "upstream_calls": [],  # leaf adapter — no nested LLM calls
+        }
 
 
 # ---------------------------------------------------------------------------

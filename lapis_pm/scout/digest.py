@@ -24,6 +24,8 @@ from .schema import BreakModeAggregate, ScoutMapPayload
 SCOUT_TRACES_ROOT = Path("/srv/lapis/scout/traces")
 SCOUT_MAPS_ROOT = Path("/srv/lapis/scout/maps")
 
+NOVELTY_PARROT_THRESHOLD = 0.30
+
 # ---------------------------------------------------------------------------
 # Text similarity
 # ---------------------------------------------------------------------------
@@ -71,6 +73,34 @@ def _cluster_breaks(all_breaks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Novelty filter — distinct from _cluster_breaks
+#
+# _cluster_breaks: Jaccard between *two signature strings* to group similar
+#                  break modes together.
+# _score_novelty:  Jaccard between each cluster's *signature* and the *union
+#                  of tokens injected via scaffold context* to flag parroting.
+# ---------------------------------------------------------------------------
+
+
+def _score_novelty(
+    break_modes: list[BreakModeAggregate],
+    context_token_union: frozenset[str],
+) -> None:
+    """Set parroted_likely=True on any cluster whose signature overlaps the
+    injected context token union by more than NOVELTY_PARROT_THRESHOLD (strict >).
+
+    Mutates break_modes in-place; does not reorder or drop entries.
+    """
+    for cluster in break_modes:
+        sig_tokens = _tokenize(cluster.signature)
+        if not sig_tokens or not context_token_union:
+            cluster.parroted_likely = False
+            continue
+        overlap = len(sig_tokens & context_token_union) / len(sig_tokens | context_token_union)
+        cluster.parroted_likely = overlap > NOVELTY_PARROT_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
 # Main digest function
 # ---------------------------------------------------------------------------
 
@@ -101,6 +131,10 @@ def digest(
         traces_root = SCOUT_TRACES_ROOT
     if maps_root is None:
         maps_root = SCOUT_MAPS_ROOT
+
+    # Load scaffold to build context token union for novelty filter.
+    scaffold_path = Path("/srv/lapis/scout/sims") / f"{spec_id}.yaml"
+    scaffold = load_scaffold(scaffold_path) if scaffold_path.exists() else None
 
     spec_traces_dir = traces_root / spec_id
     if not spec_traces_dir.exists():
@@ -207,6 +241,21 @@ def digest(
             associated_steps=steps,
             cells_observed_in=[],  # cell tracking reserved for v1
         ))
+
+    # ------------------------------------------------------------------
+    # Novelty filter — score each cluster against injected context tokens
+    # ------------------------------------------------------------------
+    if scaffold is not None:
+        ctx_tokens: frozenset[str] = frozenset()
+        for chub_id in scaffold.context.chubs:
+            ctx_tokens = ctx_tokens | _tokenize(chub_id)
+        for vs in scaffold.context.vault_sections:
+            ctx_tokens = ctx_tokens | _tokenize(vs.path)
+            for section in vs.sections:
+                ctx_tokens = ctx_tokens | _tokenize(section)
+        ctx_tokens = ctx_tokens | _tokenize(scaffold.static_scaffold.architecture_sketch)
+        ctx_tokens = ctx_tokens | _tokenize(scaffold.static_scaffold.objective)
+        _score_novelty(break_modes, ctx_tokens)
 
     # ------------------------------------------------------------------
     # Optional step promotion signal

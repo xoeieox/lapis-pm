@@ -111,12 +111,12 @@ class PseudocodeSystemEntity:
         # Context references (chub bundles + vault sections declared in scaffold)
         # At v0 the actual bundle/vault content is not loaded — the references
         # are rendered so Qwen knows what context is relevant to this simulation.
-        ctx = self.scaffold.context
-        if ctx.chubs or ctx.vault_sections:
+        scaffold_ctx = self.scaffold.context
+        if scaffold_ctx.chubs or scaffold_ctx.vault_sections:
             ctx_lines = ["# Context references"]
-            for chub_id in ctx.chubs:
+            for chub_id in scaffold_ctx.chubs:
                 ctx_lines.append(f"- chub: {chub_id}")
-            for vs in ctx.vault_sections:
+            for vs in scaffold_ctx.vault_sections:
                 sections_str = ", ".join(vs.sections) if vs.sections else "all"
                 ctx_lines.append(f"- vault: {vs.path} (sections: {sections_str})")
             parts.append("\n".join(ctx_lines))

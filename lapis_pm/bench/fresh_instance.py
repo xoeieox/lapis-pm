@@ -125,6 +125,17 @@ def spawn_stripped(prompt: str, timeout: int = 180, synapse: bool = False) -> di
         claude_dir = tmp_home_path / ".claude"
         claude_dir.mkdir()
 
+        # Mirror the real HOME's Claude credentials so the stripped
+        # instance can authenticate.  Without this every `claude -p`
+        # exits with "Not logged in · Please run /login" and the
+        # bench captures only the error string.  The temp HOME is
+        # torn down on subprocess exit so the mirror is short-lived.
+        real_creds = Path.home() / ".claude" / ".credentials.json"
+        if real_creds.is_file():
+            tmp_creds = claude_dir / ".credentials.json"
+            tmp_creds.write_bytes(real_creds.read_bytes())
+            tmp_creds.chmod(0o600)
+
         # Select the settings.json to write based on the synapse flag.
         active_settings = _synapse_settings() if synapse else _STUB_SETTINGS
         settings_path = claude_dir / "settings.json"

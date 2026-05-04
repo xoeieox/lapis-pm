@@ -34,6 +34,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
+from archetypes_core.corroboration import Citation
+from archetypes_core.provenance import InputRef, LapisToolReturn, UpstreamRef, to_lapis_return
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -83,6 +86,78 @@ class RouterPortfolioEntry:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False)
+
+    def to_envelope(
+        self,
+        *,
+        agent_id: str = "lapis-pm/router",
+        tool: str | None = None,
+        input_refs: list[InputRef] | None = None,
+        upstream_calls: list[UpstreamRef] | None = None,
+        timestamp: str | None = None,
+    ) -> LapisToolReturn:
+        """Wrap this portfolio entry as a v0-conformant LapisToolReturn.
+
+        The entry itself is the payload; provenance is composed from Router fields
+        per the Lapis Provenance Schema v0 mapping. Backward-compatible: this method
+        is opt-in; persistent storage and existing emit_* functions are unchanged.
+
+        Args:
+            agent_id: Routing identifier; defaults to "lapis-pm/router".
+            tool: Tool name within agent; defaults to self.fragment_id (or
+                "router_emit" if fragment_id is None).
+            input_refs: Optional caller-supplied input refs.
+            upstream_calls: Optional caller-supplied upstream call list.
+            timestamp: Optional explicit ISO-8601 UTC timestamp; defaults to now.
+                (Note: distinct from self.freshness_stamp, which describes the
+                recorded event's substrate freshness, not envelope return time.)
+
+        Returns:
+            LapisToolReturn with payload=self, summary=self.intent_summary or
+            a fallback, and provenance populated per the schema doc mapping.
+
+        Note on prompt_hash:
+            prompt_hash is always None for Router emissions. Router entries are
+            transcribed records of expert decisions, not single LLM calls, so
+            there is no canonical resolved prompt to hash. model set + prompt_hash
+            None is a recognized pattern for transcribed/aggregated provenance
+            records (Lapis Provenance Schema v0, §"Mapping from existing shapes").
+        """
+        # 1. Derive summary
+        if self.intent_summary:
+            summary = self.intent_summary
+        else:
+            summary = f"{self.verdict}: {self.fragment_id or 'router-event'}"
+
+        # 2. Derive tool
+        resolved_tool = tool or self.fragment_id or "router_emit"
+
+        # 3. Wrap citations: list[str] → list[Citation]
+        wrapped_citations = [
+            Citation(
+                source_id=s,
+                excerpt="",
+                content_hash=None,
+                provenance_method="router_referenced",
+            )
+            for s in self.citations
+        ]
+
+        # 4 & 5. Compose provenance and build envelope
+        return to_lapis_return(
+            payload=self,
+            agent_id=agent_id,
+            tool=resolved_tool,
+            summary=summary,
+            model=self.expert_chosen,
+            prompt_hash=None,  # transcribed-provenance pattern: no canonical resolved prompt
+            citations=wrapped_citations,
+            scope_id=self.scope_id,
+            primitive_decomposition=None,  # Router stores list[dict] in payload; envelope stays None at v0
+            input_refs=input_refs or [],
+            upstream_calls=upstream_calls or [],
+            timestamp=timestamp,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -61,14 +61,18 @@ def _cmd_run(argv: list[str]) -> int:
                         help="Output JSON capture path")
     parser.add_argument("--timeout", type=int, default=180, metavar="SECS",
                         help="Per-side timeout in seconds (default: 180)")
+    parser.add_argument("--synapse", action="store_true", default=False,
+                        help="Enable Synapse UserPromptSubmit hook in temp HOME "
+                             "(measures Synapse contribution; requires live service)")
     args = parser.parse_args(argv)
 
     print(f"Loading battery: {args.battery}")
     battery = load_battery(args.battery)
     n = len(battery["pairs"])
-    print(f"Running {n} pair(s) × 2 sides (timeout={args.timeout}s each) …")
+    synapse_label = " [SYNAPSE ON]" if args.synapse else ""
+    print(f"Running {n} pair(s) × 2 sides (timeout={args.timeout}s each){synapse_label} …")
 
-    capture = run_battery(battery, timeout=args.timeout)
+    capture = run_battery(battery, timeout=args.timeout, synapse=args.synapse)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

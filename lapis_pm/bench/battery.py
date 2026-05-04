@@ -55,7 +55,7 @@ def parse_battery(yaml_text: str, source: Path | None = None) -> dict:
     return data
 
 
-def run_battery(battery: dict, timeout: int = 180) -> dict:
+def run_battery(battery: dict, timeout: int = 180, synapse: bool = False) -> dict:
     """Run all pairs in *battery*, capturing stripped-instance responses.
 
     Each pair side (loud + quiet) is run through
@@ -65,6 +65,10 @@ def run_battery(battery: dict, timeout: int = 180) -> dict:
         battery: Validated battery dict (from :func:`load_battery` or
             :func:`parse_battery`).
         timeout: Per-side timeout in seconds forwarded to ``spawn_stripped``.
+        synapse: When True, the temp HOME's settings.json is populated with
+            ONLY the Synapse ``UserPromptSubmit`` hook entry (chub-inject
+            suppressed, MCP servers empty).  Requires the Synapse service to
+            be running.
 
     Returns:
         Capture dict::
@@ -73,6 +77,7 @@ def run_battery(battery: dict, timeout: int = 180) -> dict:
                 "schema_version": int,
                 "battery_name":   str,
                 "timestamp":      str,   # ISO 8601 UTC
+                "synapse":        bool,
                 "results": [
                     {
                         "pair_id": str,
@@ -84,13 +89,14 @@ def run_battery(battery: dict, timeout: int = 180) -> dict:
             }
 
         The ``stripped_state`` field inside each side entry lets a reviewer
-        reproduce the exact env the child process saw.
+        reproduce the exact env the child process saw.  When synapse=True,
+        each side also has a ``synapse_state`` key.
     """
     ts = datetime.now(timezone.utc).isoformat()
     results = []
     for pair in battery["pairs"]:
-        loud = spawn_stripped(pair["loud"]["topic"], timeout=timeout)
-        quiet = spawn_stripped(pair["quiet"]["topic"], timeout=timeout)
+        loud = spawn_stripped(pair["loud"]["topic"], timeout=timeout, synapse=synapse)
+        quiet = spawn_stripped(pair["quiet"]["topic"], timeout=timeout, synapse=synapse)
         results.append({
             "pair_id": pair["id"],
             "loud": loud,
@@ -100,6 +106,7 @@ def run_battery(battery: dict, timeout: int = 180) -> dict:
         "schema_version": CAPTURE_SCHEMA_VERSION,
         "battery_name": battery["name"],
         "timestamp": ts,
+        "synapse": synapse,
         "results": results,
     }
 

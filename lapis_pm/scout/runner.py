@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lapis_engine import Engine, LlamaAdapter
+import httpx as _httpx
+
+from lapis_engine import Engine, LlamaAdapter, Message
 
 from archetypes_core.corroboration import Citation
 from archetypes_core.provenance import InputRef, to_lapis_return
@@ -28,6 +30,32 @@ from .scaffold import ScoutScaffold, load_scaffold
 from .schema import ScoutTracePayload
 
 SCOUT_TRACES_ROOT = Path("/srv/lapis/scout/traces")
+
+
+# ---------------------------------------------------------------------------
+# JSON-mode adapter (Scout-local, not exported)
+# ---------------------------------------------------------------------------
+
+
+class _ScoutJsonAdapter(LlamaAdapter):
+    """LlamaAdapter subclass that forces JSON-object output mode.
+
+    Injects ``response_format: {"type": "json_object"}`` into every request
+    so Qwen returns structured JSON rather than prose narration.
+    """
+
+    def chat(self, system: str, messages: list[Message]) -> str:  # type: ignore[override]
+        payload = {
+            "messages": [{"role": "system", "content": system}]
+            + [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        client = self.client or _httpx
+        resp = client.post(self.url, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +169,7 @@ def run_single(
 ) -> tuple[Any, str]:  # (LapisToolReturn, run_id)
     """Run a single (cell, seed) and return (LapisToolReturn, run_id)."""
     if llm is None:
-        llm = LlamaAdapter(max_tokens=2048)
+        llm = _ScoutJsonAdapter(max_tokens=2048)
 
     cell_id = ScoutScaffold.cell_id(cell_params)
     run_id = (

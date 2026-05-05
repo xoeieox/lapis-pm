@@ -413,7 +413,7 @@ def test_cli_timeout_arg_forwarded(tmp_path):
     out = tmp_path / "out.json"
     recorded: list[int] = []
 
-    def fake_run(battery, timeout=180):
+    def fake_run(battery, timeout=180, synapse=False):
         recorded.append(timeout)
         return cap
 

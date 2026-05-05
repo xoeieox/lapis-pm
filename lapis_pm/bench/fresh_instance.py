@@ -41,7 +41,39 @@ _STUB_SETTINGS: dict = {
 }
 
 
-def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
+# Path to the operator-installed Synapse per-prompt hook.
+# Operator copies synapse/hooks/synapse-inject.py here per INSTALL.md.
+SYNAPSE_HOOK_PATH: str = os.environ.get(
+    "SYNAPSE_HOOK_PATH",
+    "/home/user/.claude/hooks/synapse-inject.py",
+)
+
+# Settings.json used when synapse=True: strips chub-inject + MCP servers but
+# enables the Synapse UserPromptSubmit hook (synchronous, no async:true).
+def _synapse_settings() -> dict:
+    return {
+        "version": 1,
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": SYNAPSE_HOOK_PATH,
+                            "statusMessage": (
+                                "synapse-inject (load-bearing for Synapse Phase 2"
+                                " — do not remove)"
+                            ),
+                        }
+                    ]
+                }
+            ]
+        },
+        "mcpServers": {},
+    }
+
+
+def spawn_stripped(prompt: str, timeout: int = 180, synapse: bool = False) -> dict:
     """Run a fresh, stripped Claude Code instance against *prompt*.
 
     Strips:
@@ -50,6 +82,15 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
       - chub-inject SessionStart hook: temp HOME's settings.json has no
         hooks key, so no user-level hooks are registered.
       - Subagents / MCP servers: settings.json has an empty mcpServers map.
+
+    When *synapse* is True:
+      - settings.json in the temp HOME is populated with ONLY the Synapse
+        UserPromptSubmit hook entry (chub-inject still suppressed, MCP servers
+        still empty).  The hook script path is SYNAPSE_HOOK_PATH (default
+        ``/home/user/.claude/hooks/synapse-inject.py``; override via
+        ``SYNAPSE_HOOK_PATH`` env var).
+      - The return dict gains a ``synapse_state`` key with the hook path and
+        settings that were used, so a reviewer can reproduce the run.
 
     The temp HOME is cleaned up after the subprocess exits.  The stripped
     state (settings.json contents, stub MEMORY.md text, temp HOME path) is
@@ -69,12 +110,13 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
                 "settings_json": dict,
                 "memory_md":     str,
             },
-            "timed_out": bool,
+            "timed_out":      bool,
+            # Only present when synapse=True:
+            "synapse_state":  {
+                "hook_path":     str,
+                "settings_json": dict,
+            },
         }
-
-    Phase 2 extension point: add a ``synapse: bool = False`` parameter and,
-    when True, populate the temp HOME with the Synapse retrieval config and
-    add a ``synapse_state`` key to the return dict.
     """
     with tempfile.TemporaryDirectory(prefix="lapis-bench-") as tmp_home:
         tmp_home_path = Path(tmp_home)
@@ -83,9 +125,21 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
         claude_dir = tmp_home_path / ".claude"
         claude_dir.mkdir()
 
-        # Write settings.json — no hooks, no agents
+        # Mirror the real HOME's Claude credentials so the stripped
+        # instance can authenticate.  Without this every `claude -p`
+        # exits with "Not logged in · Please run /login" and the
+        # bench captures only the error string.  The temp HOME is
+        # torn down on subprocess exit so the mirror is short-lived.
+        real_creds = Path.home() / ".claude" / ".credentials.json"
+        if real_creds.is_file():
+            tmp_creds = claude_dir / ".credentials.json"
+            tmp_creds.write_bytes(real_creds.read_bytes())
+            tmp_creds.chmod(0o600)
+
+        # Select the settings.json to write based on the synapse flag.
+        active_settings = _synapse_settings() if synapse else _STUB_SETTINGS
         settings_path = claude_dir / "settings.json"
-        settings_path.write_text(json.dumps(_STUB_SETTINGS, indent=2))
+        settings_path.write_text(json.dumps(active_settings, indent=2))
 
         # Write a stub MEMORY.md.  The path mirrors what chub-inject.py
         # would look for under a projects/ sub-dir; since the hook never
@@ -97,7 +151,7 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
         stub_memory_path.write_text(_STUB_MEMORY)
 
         stripped_state = {
-            "settings_json": _STUB_SETTINGS,
+            "settings_json": active_settings,
             "memory_md": _STUB_MEMORY,
         }
 
@@ -117,7 +171,7 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
                 env=env,
             )
             duration_s = time.monotonic() - start
-            return {
+            capture = {
                 "schema_version": CAPTURE_SCHEMA_VERSION,
                 "prompt": prompt,
                 "response": result.stdout,
@@ -128,9 +182,15 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
                 "stripped_state": stripped_state,
                 "timed_out": False,
             }
+            if synapse:
+                capture["synapse_state"] = {
+                    "hook_path": SYNAPSE_HOOK_PATH,
+                    "settings_json": active_settings,
+                }
+            return capture
         except subprocess.TimeoutExpired:
             duration_s = time.monotonic() - start
-            return {
+            capture = {
                 "schema_version": CAPTURE_SCHEMA_VERSION,
                 "prompt": prompt,
                 "response": "",
@@ -141,6 +201,12 @@ def spawn_stripped(prompt: str, timeout: int = 180) -> dict:
                 "stripped_state": stripped_state,
                 "timed_out": True,
             }
+            if synapse:
+                capture["synapse_state"] = {
+                    "hook_path": SYNAPSE_HOOK_PATH,
+                    "settings_json": active_settings,
+                }
+            return capture
 
 
 def _extract_model(stdout: str, stderr: str) -> str | None:

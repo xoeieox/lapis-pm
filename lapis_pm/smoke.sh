@@ -792,6 +792,14 @@ green "reconciler carve-out: fixer_retry completed → stays pending OK"
 # (lapis-pm-reviewer-verdict-encode-carveout)
 # =========================================================================
 
+# TODO(audit-gate-smoke): see lapis-pm-reviewer-same-mode-deltas-v1
+# The audit gate logic in _decide_for_pr (§4 of the spec) is not exercised here.
+# Smoke does not synthesize a returned reviewer verdict with prior_resolution, so
+# the cycle-2 audit-gate branch (prior-issue filter, verdict downgrade, telemetry)
+# cannot be driven from smoke without injecting a prior cycle-1 verdict + a cycle-2
+# verdict with prior_resolution. Unit tests in tests/test_review_gate.py
+# (class TestAuditGateDeltaClassification) cover this logic comprehensively.
+
 # --- Step 17: reviewer dispatch → verdict=fixable encoded (not verdict=pending) ---
 step "17. Reviewer carve-out: reviewer dispatch + synthesized output file → verdict=fixable encoded"
 TID_REV="pm-smoke-reviewer-$$"

@@ -27,12 +27,15 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from agents_core.targets import TargetStore
 from agents_core.mem import MemoryStore
@@ -1048,6 +1051,33 @@ def _last_review_verdict(target_id: str, pr_number: int) -> dict | None:
         return None
 
 
+def _review_verdict_for_cycle(target_id: str, pr_number: int, cycle: int) -> dict | None:
+    """Return the verdict dict for a specific reviewer cycle, or None if absent.
+
+    Mirrors _last_review_verdict's tag-and-content parsing but filters by cycle.
+    """
+    prefix = f"pm:reviewer:pr={pr_number}:cycle={cycle}:verdict="
+    target_comment = None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix):
+                verdict_val = t[len(prefix):]
+                if verdict_val != "pending":
+                    target_comment = c
+    if target_comment is None:
+        return None
+    content = target_comment.content
+    try:
+        json_part = content.split("\n", 1)[-1].strip()
+        return json.loads(json_part)
+    except (json.JSONDecodeError, IndexError):
+        for t in target_comment.tags:
+            if t.startswith(prefix):
+                verdict_val = t[len(prefix):]
+                return {"verdict": verdict_val, "issues": [], "confidence": 0.0}
+        return None
+
+
 def _fixer_retry_count(target_id: str, pr_number: int) -> int:
     """Count fixer_retry dispatches that actually advanced the PR for this PR.
 
@@ -1308,6 +1338,131 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
     verdict = verdict_info.get("verdict", "needs-human")
     issues = verdict_info.get("issues", [])
 
+    # ---------------------------------------------------------------------------
+    # §4 Audit gate — drop unsubstantiated still_present regurgitation
+    # Runs only when there are prior issues to audit (cycle ≥ 2, same mode).
+    # ---------------------------------------------------------------------------
+    prior_issues_for_gate: list = []
+    if mode == "same" and reviewer_count >= 2:
+        prior_verdict_data = _review_verdict_for_cycle(target_id, pr_number, reviewer_count - 1)
+        if prior_verdict_data is not None:
+            prior_issues_for_gate = prior_verdict_data.get("issues") or []
+
+    if prior_issues_for_gate:
+        prior_resolution_raw: list = verdict_info.get("prior_resolution") or []
+
+        # Validate resolution entries; drop malformed
+        valid_resolutions: list = []
+        for entry in prior_resolution_raw:
+            idx = entry.get("prior_index")
+            status = entry.get("status")
+            evidence = entry.get("evidence", "")
+            if not isinstance(idx, int) or not (0 <= idx < len(prior_issues_for_gate)):
+                logger.warning(
+                    "dropped malformed prior_resolution entry: prior_index=%r out of range "
+                    "(prior_issues len=%d)",
+                    idx, len(prior_issues_for_gate),
+                )
+                continue
+            if status not in ("addressed", "still_present", "not_applicable"):
+                logger.warning(
+                    "dropped malformed prior_resolution entry: unknown status=%r prior_index=%d",
+                    status, idx,
+                )
+                continue
+            if not evidence:
+                logger.warning(
+                    "dropped malformed prior_resolution entry: empty evidence "
+                    "prior_index=%d status=%r",
+                    idx, status,
+                )
+                continue
+            valid_resolutions.append({"prior_index": idx, "status": status, "evidence": evidence})
+
+        # Build still_present_set from validated resolutions
+        still_present_set: set = {
+            r["prior_index"] for r in valid_resolutions if r["status"] == "still_present"
+        }
+
+        # Also build a set of prior paths that are still_present (for defense-in-depth)
+        still_present_paths: set = {
+            prior_issues_for_gate[i].get("path", "")
+            for i in still_present_set
+        }
+
+        # Filter issues
+        filtered_issues: list = []
+        for iss in issues:
+            pi = iss.get("prior_index")
+            if pi is not None:
+                # Issue cites a prior index — keep only if still_present
+                if pi in still_present_set:
+                    filtered_issues.append(iss)
+                else:
+                    logger.warning(
+                        "dropped unsubstantiated regurgitated prior issue: prior_index=%d path=%r",
+                        pi, iss.get("path"),
+                    )
+            else:
+                # No prior_index — check path-only defense-in-depth
+                iss_path = iss.get("path", "")
+                prior_paths_all = {p.get("path", "") for p in prior_issues_for_gate}
+                if iss_path in prior_paths_all and iss_path not in still_present_paths:
+                    logger.warning(
+                        "dropped uncited prior-path issue: path=%r", iss_path,
+                    )
+                else:
+                    filtered_issues.append(iss)
+
+        old_verdict = verdict
+        issues = filtered_issues
+
+        # Verdict downgrade after filtering
+        if old_verdict == "fixable" and not issues:
+            verdict = "clean"
+            logger.info("verdict downgraded fixable→clean: no substantiated issues")
+        elif old_verdict == "needs-human" and not issues and prior_issues_for_gate:
+            # All priors addressed/not_applicable, no new issues
+            all_resolved = all(
+                r["status"] in ("addressed", "not_applicable") for r in valid_resolutions
+            )
+            if all_resolved and len(valid_resolutions) == len(prior_issues_for_gate):
+                verdict = "clean"
+                logger.info("verdict downgraded needs-human→clean: all priors resolved, no new issues")
+
+        # §5 Telemetry — per-resolution observations
+        for res_entry in valid_resolutions:
+            episodic.write_observation(
+                target_id,
+                f"reviewer cycle {reviewer_count} prior_resolution: "
+                f"index={res_entry['prior_index']} "
+                f"status={res_entry['status']} "
+                f"evidence={res_entry['evidence'][:120]}",
+                extra_tags=[
+                    "pm:reviewer-prior-resolution",
+                    f"pm:cycle={reviewer_count}",
+                    f"pm:status={res_entry['status']}",
+                ],
+            )
+
+        # §5 Telemetry — rollup observation
+        kept_count = len([i for i in issues if i.get("prior_index") in still_present_set])
+        dropped_count = sum(
+            1 for iss in verdict_info.get("issues", [])
+            if iss.get("prior_index") is not None and iss.get("prior_index") not in still_present_set
+        )
+        episodic.write_observation(
+            target_id,
+            f"audit-gate: cycle={reviewer_count} priors={len(prior_issues_for_gate)} "
+            f"still_present_kept={kept_count} "
+            f"dropped_unsubstantiated={dropped_count} "
+            f"verdict_downgrade={old_verdict}->{verdict}",
+            extra_tags=["pm:reviewer-audit-gate", f"pm:cycle={reviewer_count}"],
+        )
+    # ---------------------------------------------------------------------------
+    # End audit gate
+    # ---------------------------------------------------------------------------
+
     if verdict == "clean":
         # Reviewer approved — surface per authority level
         cls.screen_verdict = "clean"
@@ -1470,14 +1625,38 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     # Build prior_review context for same-reviewer mode
     prior_review_text = ""
     if mode == "same" and cycle > 1:
-        prior = _last_review_verdict(target_id, pr_number)
+        prior = _review_verdict_for_cycle(target_id, pr_number, cycle - 1)
         if prior:
-            issues_text = json.dumps(prior.get("issues", []), indent=2)
+            prior_issues = prior.get("issues", [])
+            indexed_issues = "\n".join(
+                f"  [{i}] {iss.get('severity', '?').upper()} {iss.get('path', '?')} — {iss.get('note', '')}"
+                for i, iss in enumerate(prior_issues)
+            ) if prior_issues else "  (none)"
             prior_review_text = (
                 f"\n## Prior review context (cycle {cycle - 1})\n\n"
+                f"The prior reviewer cycle returned this verdict on an EARLIER state of this branch:\n\n"
                 f"Verdict: {prior.get('verdict')}\n"
-                f"Issues:\n{issues_text}\n\n"
-                f"Review the updated diff in light of these prior concerns.\n"
+                f"Prior issues (indexed):\n{indexed_issues}\n\n"
+                f"The diff in the user prompt is the CURRENT state. Your task is to classify\n"
+                f"EACH prior issue against the current diff. Then return your own fresh\n"
+                f"verdict on the current diff.\n\n"
+                f"For each prior issue, you MUST emit a `prior_resolution` entry with:\n"
+                f'  - "prior_index": the index above\n'
+                f'  - "status": "addressed" | "still_present" | "not_applicable"\n'
+                f'  - "evidence": for "still_present", a current-diff line/path citation;\n'
+                f'                for "addressed", the line/path that fixes it;\n'
+                f'                for "not_applicable", a one-sentence reason\n'
+                f'                (empty string is NOT acceptable for any status)\n\n'
+                f"Then your `issues` array must contain ONLY:\n"
+                f'  - prior issues you classified as "still_present" (re-stated, with the\n'
+                f"    same path/severity, but `note` updated to reference the current-diff\n"
+                f"    evidence), AND\n"
+                f"  - any new issues you find in the current diff that were not in the\n"
+                f"    prior set.\n\n"
+                f'Issues you classified as "addressed" or "not_applicable" must NOT appear\n'
+                f"in `issues`. Reviewer cycles are explicit deltas, not stateless re-reads.\n\n"
+                f'When re-stating a prior issue in `issues`, include `prior_index: <i>`\n'
+                f"pointing to the prior set; new issues omit `prior_index`.\n"
             )
 
     existing_branch = (pr.get("head") or {}).get("ref") or f"lapis/{target_id}/pr{pr_number}"
@@ -1505,11 +1684,24 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     except Exception:
         diff_text = "(diff unavailable)"
 
+    if mode == "same" and cycle >= 2:
+        schema_extra = (
+            ', "prior_resolution": ['
+            '{"prior_index": <int>, "status": "addressed"|"still_present"|"not_applicable", '
+            '"evidence": "<non-empty string>"}]'
+            " (required when prior issues were provided); "
+            'issues that re-state a prior issue carry "prior_index": <int>; '
+            "new issues omit prior_index"
+        )
+    else:
+        schema_extra = ""
     user_prompt = (
         f"Review PR #{pr_number} in {repo}. This is reviewer cycle {cycle}.\n\n"
         f"```diff\n{diff_text}\n```\n\n"
-        f"Return JSON: {{\"verdict\": \"clean\" | \"fixable\" | \"needs-human\", "
-        f"\"issues\": [...], \"confidence\": 0.0-1.0}}"
+        f'Return JSON: {{"verdict": "clean" | "fixable" | "needs-human", '
+        f'"issues": [{{"severity": "high"|"med"|"low", "path": "...", "note": "..."'
+        f'{"," if schema_extra else ""}{"prior_index?: <int>" if schema_extra else ""}'
+        f'}}]{schema_extra}, "confidence": 0.0-1.0}}'
     )
 
     # Increment kill-switch counter before dispatch

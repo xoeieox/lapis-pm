@@ -18,6 +18,7 @@ Coverage (per spec deliverable 8):
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -505,7 +506,7 @@ class TestReviewerModeVars:
             patch("lapis_pm.pm_core.episodic.write_dispatch"),
             patch("lapis_pm.pm_core.append_dispatched"),
             patch("lapis_pm.pm_core._increment_review_gate_counter", return_value=2),
-            patch("lapis_pm.pm_core._last_review_verdict", return_value=prior_verdict),
+            patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=prior_verdict),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
             patch("agents_core.forgejo.get_pr_diff", return_value="diff"),
         ):
@@ -514,6 +515,9 @@ class TestReviewerModeVars:
 
         assert "prior_review" in captured_vars
         assert "fixable" in captured_vars["prior_review"]  # prior verdict injected
+        # Delta-classification framing is injected (§1)
+        assert "prior_resolution" in captured_vars["prior_review"]
+        assert "prior_index" in captured_vars["prior_review"]
 
     def test_same_reviewer_cycle1_has_empty_prior_review(self):
         """Same-reviewer mode cycle=1: prior_review is empty string."""
@@ -1158,3 +1162,478 @@ class TestRecoverReviewerVerdict:
             f"Unexpected parse-recovered tag in {written_tags}"
         verdict_tags = [t for t in written_tags if "verdict=needs-human" in t]
         assert verdict_tags, f"Expected verdict=needs-human tag in {written_tags}"
+
+# ---------------------------------------------------------------------------
+# §6 Audit gate — delta classification tests
+# ---------------------------------------------------------------------------
+
+# Shared prior issues (3 items for most tests)
+_PRIOR_ISSUES_3 = [
+    {"severity": "high", "path": "tests/test_x.py", "note": "test 9 unmocked"},
+    {"severity": "med",  "path": "src/validator.py", "note": "naming convention"},
+    {"severity": "low",  "path": "tests/test_y.py",  "note": "test quality"},
+]
+_PRIOR_VERDICT_3 = {"verdict": "fixable", "issues": _PRIOR_ISSUES_3, "confidence": 0.8}
+
+# Shared prior issues (2 items)
+_PRIOR_ISSUES_2 = [
+    {"severity": "high", "path": "tests/test_x.py", "note": "test 9 unmocked"},
+    {"severity": "med",  "path": "src/validator.py", "note": "naming convention"},
+]
+_PRIOR_VERDICT_2 = {"verdict": "fixable", "issues": _PRIOR_ISSUES_2, "confidence": 0.8}
+
+
+def _audit_gate_patches(
+    reviewer_count: int,
+    fixer_count: int,
+    current_verdict: dict,
+    prior_verdict: dict | None,
+    pm_authority: str = "advisory",
+) -> ExitStack:
+    """Return an ExitStack context manager with audit-gate _decide_for_pr patches active."""
+    patches = [
+        patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+        patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+        patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+        patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_count),
+        patch("lapis_pm.pm_core._fixer_retry_count", return_value=fixer_count),
+        patch("lapis_pm.pm_core._last_review_verdict", return_value=current_verdict),
+        patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=prior_verdict),
+        patch("lapis_pm.pm_core.episodic.write_observation"),
+    ]
+    stack = ExitStack()
+    for p in patches:
+        stack.enter_context(p)
+    return stack
+
+
+class TestAuditGateDeltaClassification:
+    """§6 Tests — reviewer same-mode delta classification audit gate."""
+
+    # -----------------------------------------------------------------------
+    # Test 1: Cycle 1 — audit gate is a no-op
+    # -----------------------------------------------------------------------
+    def test_cycle1_audit_gate_noop(self):
+        """mode=same, cycle=1 — reviewer_count=1 < 2, audit gate not engaged."""
+        verdict = {"verdict": "fixable", "issues": ISSUES, "confidence": 0.9}
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+            patch("lapis_pm.pm_core._review_verdict_for_cycle") as mock_rvfc,
+            patch("lapis_pm.pm_core.episodic.write_observation"),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        # Gate not triggered for cycle 1
+        mock_rvfc.assert_not_called()
+        assert d.kind == "dispatch_fixer_retry"
+        assert d.payload["issues"] == ISSUES
+
+    # -----------------------------------------------------------------------
+    # Test 2: Cycle 2 — all priors addressed → advisory_brief, issues == []
+    # -----------------------------------------------------------------------
+    def test_cycle2_all_addressed_downgrades_to_clean(self):
+        """Cycle 2: reviewer returns clean + all 3 priors addressed → advisory_brief."""
+        current_verdict = {
+            "verdict": "clean",
+            "issues": [],
+            "prior_resolution": [
+                {"prior_index": 0, "status": "addressed",
+                 "evidence": "tests/test_x.py:680 mock_record = MagicMock()"},
+                {"prior_index": 1, "status": "addressed",
+                 "evidence": "src/validator.py:45 renamed to validate_record"},
+                {"prior_index": 2, "status": "addressed",
+                 "evidence": "tests/test_y.py:100 added edge-case assertions"},
+            ],
+            "confidence": 0.95,
+        }
+        with _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_3,
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "advisory_brief"
+        assert d.payload["classification"].issues == []
+
+    # -----------------------------------------------------------------------
+    # Test 3: Cycle 2 — one still_present (with prior_index) → fixer retry
+    # (budget patched to 3 so cycle-2 advisory can still dispatch fixer retry)
+    # -----------------------------------------------------------------------
+    def test_cycle2_one_still_present_carried_to_fixer_retry(self):
+        """Cycle 2: one prior still_present → dispatch_fixer_retry with 1 issue.
+
+        Budget is patched to 3 (default advisory=2 would exhaust at cycle 2).
+        The test verifies audit-gate carries the still_present issue and that it
+        has prior_index=1.
+        """
+        carried_issue = {
+            "severity": "med", "path": "src/validator.py",
+            "note": "still uses wrong naming at src/validator.py:30",
+            "prior_index": 1,
+        }
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": [carried_issue],
+            "prior_resolution": [
+                {"prior_index": 0, "status": "addressed",
+                 "evidence": "tests/test_x.py:680 mock_record = MagicMock()"},
+                {"prior_index": 1, "status": "still_present",
+                 "evidence": "src/validator.py:30 still uses id-substring"},
+                {"prior_index": 2, "status": "addressed",
+                 "evidence": "tests/test_y.py:100 added assertions"},
+            ],
+            "confidence": 0.85,
+        }
+        stack = _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_3,
+        )
+        # Patch budget to 3 so cycle 2 can still dispatch a fixer retry
+        stack.enter_context(
+            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
+        )
+        with stack:
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "dispatch_fixer_retry"
+        assert len(d.payload["issues"]) == 1
+        assert d.payload["issues"][0]["prior_index"] == 1
+
+    # -----------------------------------------------------------------------
+    # Test 4: Cycle 2 — unsubstantiated still_present (empty evidence) → clean
+    # -----------------------------------------------------------------------
+    def test_cycle2_unsubstantiated_still_present_drops_all(self):
+        """Cycle 2: all 3 resolutions have empty evidence → dropped, verdict→clean."""
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": [
+                {"severity": "high", "path": "tests/test_x.py",
+                 "note": "still unmocked", "prior_index": 0},
+                {"severity": "med",  "path": "src/validator.py",
+                 "note": "still bad naming", "prior_index": 1},
+                {"severity": "low",  "path": "tests/test_y.py",
+                 "note": "still low quality", "prior_index": 2},
+            ],
+            "prior_resolution": [
+                {"prior_index": 0, "status": "still_present", "evidence": ""},
+                {"prior_index": 1, "status": "still_present", "evidence": ""},
+                {"prior_index": 2, "status": "still_present", "evidence": ""},
+            ],
+            "confidence": 0.7,
+        }
+        with _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_3,
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        # All resolutions malformed (empty evidence) → still_present_set empty
+        # → all prior_index issues dropped → verdict downgraded fixable→clean
+        assert d.kind == "advisory_brief"
+        assert d.payload["classification"].issues == []
+
+    # -----------------------------------------------------------------------
+    # Test 5: Cycle 2 — malformed prior_resolution entries dropped
+    # -----------------------------------------------------------------------
+    def test_cycle2_malformed_resolution_entries_dropped(self, caplog):
+        """Cycle 2: out-of-range prior_index + unknown status → both dropped."""
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": [
+                {"severity": "high", "path": "tests/test_x.py",
+                 "note": "still present", "prior_index": 0},
+            ],
+            "prior_resolution": [
+                # Out-of-range index
+                {"prior_index": 99, "status": "still_present",
+                 "evidence": "some/file.py:1"},
+                # Unknown status
+                {"prior_index": 0, "status": "unknown_status",
+                 "evidence": "tests/test_x.py:50"},
+            ],
+            "confidence": 0.7,
+        }
+        import logging
+        stack = _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_3,
+        )
+        stack.enter_context(caplog.at_level(logging.WARNING, logger="lapis_pm.pm_core"))
+        with stack:
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        # Both malformed → still_present_set empty → prior_index=0 issue dropped
+        # → verdict downgraded fixable→clean
+        assert d.kind == "advisory_brief"
+        assert "malformed" in caplog.text.lower()
+
+    # -----------------------------------------------------------------------
+    # Test 6: Cycle 2 — new issue (no prior_index) + still_present → both kept
+    # -----------------------------------------------------------------------
+    def test_cycle2_new_issue_and_still_present_both_kept(self):
+        """Cycle 2: 1 still_present + 1 new issue → 2 issues in live set."""
+        still_present_issue = {
+            "severity": "high", "path": "tests/test_x.py",
+            "note": "still unmocked at line 680", "prior_index": 0,
+        }
+        new_issue = {
+            "severity": "low", "path": "src/new_file.py",
+            "note": "newly introduced typo",
+            # No prior_index — this is a new issue
+        }
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": [still_present_issue, new_issue],
+            "prior_resolution": [
+                {"prior_index": 0, "status": "still_present",
+                 "evidence": "tests/test_x.py:680 still no MagicMock"},
+                {"prior_index": 1, "status": "addressed",
+                 "evidence": "src/validator.py:45 renamed correctly"},
+            ],
+            "confidence": 0.8,
+        }
+        stack = _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_2,
+        )
+        stack.enter_context(
+            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
+        )
+        with stack:
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "dispatch_fixer_retry"
+        assert len(d.payload["issues"]) == 2
+        # The new issue (no prior_index) is preserved
+        new_issues = [i for i in d.payload["issues"] if "prior_index" not in i]
+        assert len(new_issues) == 1
+        assert new_issues[0]["path"] == "src/new_file.py"
+        # The still_present issue is preserved
+        carried = [i for i in d.payload["issues"] if i.get("prior_index") == 0]
+        assert len(carried) == 1
+
+    # -----------------------------------------------------------------------
+    # Test 7: Fresh mode cycle 2 — audit gate not engaged
+    # -----------------------------------------------------------------------
+    def test_fresh_mode_cycle2_audit_gate_not_engaged(self):
+        """mode=fresh (hold authority), cycle=2 — audit gate skipped entirely."""
+        current_verdict = {
+            "verdict": "clean",
+            "issues": [],
+            # prior_resolution would be ignored in fresh mode
+            "prior_resolution": [
+                {"prior_index": 0, "status": "addressed", "evidence": "src/foo.py:1"},
+            ],
+            "confidence": 0.9,
+        }
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=current_verdict),
+            patch("lapis_pm.pm_core._review_verdict_for_cycle") as mock_rvfc,
+            patch("lapis_pm.pm_core.episodic.write_observation"),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "hold")
+        # Fresh mode → audit gate not triggered → _review_verdict_for_cycle not called
+        mock_rvfc.assert_not_called()
+        assert d.kind == "hold_brief"
+
+    # -----------------------------------------------------------------------
+    # Test 8: Telemetry writes
+    # -----------------------------------------------------------------------
+    def test_cycle2_telemetry_writes_per_resolution_and_rollup(self, tmp_path):
+        """Cycle 2: 2 valid resolutions → 2 prior-resolution observations + 1 rollup."""
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": [
+                {"severity": "high", "path": "tests/test_x.py",
+                 "note": "still unmocked", "prior_index": 0},
+            ],
+            "prior_resolution": [
+                {"prior_index": 0, "status": "still_present",
+                 "evidence": "tests/test_x.py:680 line unchanged"},
+                {"prior_index": 1, "status": "addressed",
+                 "evidence": "src/validator.py:45 renamed"},
+            ],
+            "confidence": 0.8,
+        }
+        written_obs: list[tuple[str, list[str]]] = []
+
+        def capture_write_obs(target_id, content, extra_tags=None):
+            written_obs.append((content, list(extra_tags or [])))
+
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=current_verdict),
+            patch("lapis_pm.pm_core._review_verdict_for_cycle",
+                  return_value=_PRIOR_VERDICT_2),
+            patch("lapis_pm.pm_core.episodic.write_observation",
+                  side_effect=capture_write_obs),
+        ):
+            pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+
+        resolution_obs = [
+            (c, t) for c, t in written_obs
+            if any("pm:reviewer-prior-resolution" in tag for tag in t)
+        ]
+        rollup_obs = [
+            (c, t) for c, t in written_obs
+            if any("pm:reviewer-audit-gate" in tag for tag in t)
+        ]
+        assert len(resolution_obs) == 2, (
+            f"Expected 2 prior-resolution observations, got {len(resolution_obs)}: {written_obs}"
+        )
+        assert len(rollup_obs) == 1, (
+            f"Expected 1 rollup observation, got {len(rollup_obs)}: {written_obs}"
+        )
+        # Rollup contains cycle info
+        rollup_content = rollup_obs[0][0]
+        assert "audit-gate:" in rollup_content
+        assert "cycle=2" in rollup_content
+
+    # -----------------------------------------------------------------------
+    # Test 9: Cycle 2 — prior cycle 1 was clean (issues=[]) → audit gate no-op
+    # -----------------------------------------------------------------------
+    def test_cycle2_clean_prior_audit_gate_noop(self):
+        """Cycle 2: prior cycle returned clean with issues=[] → no priors → gate is no-op."""
+        prior_clean = {"verdict": "clean", "issues": [], "confidence": 0.95}
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": ISSUES,
+            "confidence": 0.8,
+        }
+        stack = _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=prior_clean,
+        )
+        stack.enter_context(
+            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
+        )
+        with stack:
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        # No prior issues → audit gate is a no-op → issues pass through unchanged
+        assert d.kind == "dispatch_fixer_retry"
+        assert d.payload["issues"] == ISSUES
+
+    # -----------------------------------------------------------------------
+    # Test 10: Defense-in-depth path-duplicate without prior_index
+    # -----------------------------------------------------------------------
+    def test_cycle2_path_duplicate_without_prior_index_dropped(self, caplog):
+        """Cycle 2: issue matches prior path but omits prior_index + prior is addressed → drop."""
+        # Reviewer omits prior_index on an issue that matches a prior path
+        uncited_issue = {
+            "severity": "high", "path": "tests/test_x.py",
+            "note": "still missing mock",
+            # No prior_index — defense-in-depth path matching kicks in
+        }
+        current_verdict = {
+            "verdict": "fixable",
+            "issues": [uncited_issue],
+            "prior_resolution": [
+                # Prior for tests/test_x.py (index 0) is ADDRESSED
+                {"prior_index": 0, "status": "addressed",
+                 "evidence": "tests/test_x.py:680 mock_record = MagicMock()"},
+                {"prior_index": 1, "status": "addressed",
+                 "evidence": "src/validator.py:45 renamed"},
+                {"prior_index": 2, "status": "addressed",
+                 "evidence": "tests/test_y.py:100 assertions added"},
+            ],
+            "confidence": 0.7,
+        }
+        import logging
+        stack = _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_3,
+        )
+        stack.enter_context(caplog.at_level(logging.WARNING, logger="lapis_pm.pm_core"))
+        with stack:
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        # Path matches a prior but that prior is addressed → dropped via defense-in-depth
+        assert d.kind == "advisory_brief"
+        assert "uncited prior-path" in caplog.text
+
+    # -----------------------------------------------------------------------
+    # Test 11: Verdict downgrade needs-human→clean
+    # -----------------------------------------------------------------------
+    def test_cycle2_needs_human_all_priors_addressed_downgrades_to_clean(self):
+        """Cycle 2: needs-human + issues=[] + all priors addressed → downgrade to clean."""
+        current_verdict = {
+            "verdict": "needs-human",
+            "issues": [],
+            "prior_resolution": [
+                {"prior_index": 0, "status": "addressed",
+                 "evidence": "tests/test_x.py:680 mock_record = MagicMock()"},
+                {"prior_index": 1, "status": "addressed",
+                 "evidence": "src/validator.py:45 renamed"},
+            ],
+            "confidence": 0.85,
+        }
+        with _audit_gate_patches(
+            reviewer_count=2, fixer_count=1,
+            current_verdict=current_verdict,
+            prior_verdict=_PRIOR_VERDICT_2,
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        # All 2 priors addressed, no new issues → downgrade needs-human→clean
+        assert d.kind == "advisory_brief"
+        assert d.payload["classification"].issues == []
+
+
+# ---------------------------------------------------------------------------
+# _review_verdict_for_cycle helper
+# ---------------------------------------------------------------------------
+
+class TestReviewVerdictForCycle:
+
+    def test_returns_none_on_no_comments(self):
+        with patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]):
+            result = pm_core._review_verdict_for_cycle("tid", 42, 1)
+        assert result is None
+
+    def test_returns_verdict_for_specific_cycle(self):
+        c1 = _make_review_comment(42, 1, "fixable", ISSUES)
+        c2 = _make_review_comment(42, 2, "clean")
+        with patch("lapis_pm.pm_core.episodic.all_comments", return_value=[c1, c2]):
+            result1 = pm_core._review_verdict_for_cycle("tid", 42, 1)
+            result2 = pm_core._review_verdict_for_cycle("tid", 42, 2)
+        assert result1 is not None
+        assert result1["verdict"] == "fixable"
+        assert result1["issues"] == ISSUES
+        assert result2 is not None
+        assert result2["verdict"] == "clean"
+
+    def test_ignores_pending_cycle(self):
+        c1 = _make_review_comment(42, 1, "fixable", ISSUES)
+        pending = MagicMock()
+        pending.tags = ["pm:reviewer:pr=42:cycle=1:verdict=pending"]
+        pending.content = ""
+        with patch("lapis_pm.pm_core.episodic.all_comments", return_value=[pending, c1]):
+            result = pm_core._review_verdict_for_cycle("tid", 42, 1)
+        assert result["verdict"] == "fixable"
+
+    def test_different_pr_not_returned(self):
+        c = _make_review_comment(99, 1, "clean")
+        with patch("lapis_pm.pm_core.episodic.all_comments", return_value=[c]):
+            result = pm_core._review_verdict_for_cycle("tid", 42, 1)
+        assert result is None

@@ -199,9 +199,11 @@ def _derive_health_url() -> str:
     try:
         from lapis_engine.adapters import LLAMA_SERVER_URL  # type: ignore[import]
         base = LLAMA_SERVER_URL
-    except ImportError:
-        # Fallback only if lapis_engine is unavailable (should not happen in prod).
-        base = "http://203.0.113.12:8081/v1/chat/completions"
+    except ImportError as exc:
+        raise RuntimeError(
+            "lapis_engine is unavailable — cannot derive health URL. "
+            "Set the LAPIS_SCOUT_HEALTH_URL env var to override."
+        ) from exc
     # Strip known suffix if present; fall back to simple rstrip approach.
     SUFFIX = "/v1/chat/completions"
     if base.endswith(SUFFIX):
@@ -413,6 +415,7 @@ class Scheduler:
         scaffold = load_scaffold(state.scaffold_path)
         all_cells = [ScoutScaffold.cell_id(cp) for cp in scaffold.cell_params()]
         varying_cells = [c for c in all_cells if _cell_varies(state.spec_id, c, self._traces_root)]
+        self._rng.shuffle(varying_cells)
         additional: list[tuple[str, int]] = []
         for cell_id in varying_cells:
             for run_i in range(state.runs_per_cell):
@@ -846,7 +849,7 @@ def read_status(log_root: Path, as_json: bool = False) -> str:
     Returns human-readable text or JSON string depending on as_json.
 
     JSON key set (stable, documented for claude-view/Librarian consumption):
-        run_tag, manifest_path, started_at, elapsed_s,
+        run_tag, manifest_path, shuffle_seed, started_at, last_row_at,
         units_total, units_completed, units_errored,
         units_skipped_quarantine, units_skipped_health, units_skipped_contention,
         scaffolds: [{spec_id, completed, errored, skipped_quarantine}],

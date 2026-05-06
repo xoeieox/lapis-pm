@@ -109,6 +109,7 @@ def _make_scheduler(
 
 def test_health_gate_backoff_then_proceed(monkeypatch):
     """503 twice, then 200 — gate backs off (5s, 10s) then clears."""
+    monkeypatch.setenv("LAPIS_SCOUT_HEALTH_URL", "http://test-server/health")
     call_count = 0
 
     def fake_get(url, timeout):
@@ -141,8 +142,14 @@ def test_health_gate_backoff_then_proceed(monkeypatch):
 # Test 2: health gate aborts after wall-clock budget
 # ---------------------------------------------------------------------------
 
-def test_health_gate_aborts_after_wall_clock_budget(monkeypatch):
-    """Always 503; time advances past HEALTH_ABORT_SECONDS — gate returns 'health-abort'."""
+def test_health_gate_aborts_after_wall_clock_budget(tmp_path, monkeypatch):
+    """Always 503; time advances past HEALTH_ABORT_SECONDS — gate returns 'health-abort'.
+
+    Phase 1: HealthGate in isolation returns 'health-abort'.
+    Phase 2: run_night() writes a manifest row with spec_id=health-abort, exit_code=3.
+    """
+    monkeypatch.setenv("LAPIS_SCOUT_HEALTH_URL", "http://test-server/health")
+
     def fake_get(url, timeout):
         resp = MagicMock()
         resp.status_code = 503
@@ -154,9 +161,35 @@ def test_health_gate_aborts_after_wall_clock_budget(monkeypatch):
     monkeypatch.setattr(night_queue, "HEALTH_ABORT_SECONDS", 0.05)
     monkeypatch.setattr(time, "sleep", lambda s: None)
 
+    # Phase 1: HealthGate isolation
     gate = HealthGate()
     result = gate.wait_until_healthy()
     assert result == "health-abort"
+
+    # Phase 2: orchestrator writes health-abort manifest line with exit_code=3
+    sims_dir = tmp_path / "sims"
+    sims_dir.mkdir()
+    _make_scaffold_yaml(sims_dir, "spec_ha", cells=1, runs_per_cell=1)
+    log_root = tmp_path / "log"
+
+    night_result = run_night(
+        sims_dir=sims_dir,
+        once=True,
+        log_root=log_root,
+    )
+
+    assert night_result.aborted is True
+
+    manifest_path = log_root / "manifest.tsv"
+    assert manifest_path.exists(), "manifest.tsv not written by run_night()"
+    data_rows = [
+        line for line in manifest_path.read_text().splitlines()
+        if not line.startswith("#") and not line.startswith("started_at_local") and line.strip()
+    ]
+    abort_rows = [r for r in data_rows if r.split("\t")[1] == "health-abort"]
+    assert abort_rows, f"No health-abort row in manifest. Rows: {data_rows}"
+    abort_exit_code = int(abort_rows[0].split("\t")[5])
+    assert abort_exit_code == 3, f"Expected exit_code=3 on health-abort row, got {abort_exit_code}"
 
 
 # ---------------------------------------------------------------------------

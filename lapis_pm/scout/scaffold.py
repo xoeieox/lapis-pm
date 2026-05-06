@@ -74,6 +74,9 @@ class MatrixConfig:
 # ---------------------------------------------------------------------------
 
 
+_ALLOWED_PRIORITY_PROFILES = frozenset({"full-pass-once", "variance-resolution", "continuous-baseline"})
+
+
 @dataclass
 class ScoutScaffold:
     spec_id: str
@@ -83,6 +86,10 @@ class ScoutScaffold:
     generation_directive: str
     context: ContextConfig = field(default_factory=ContextConfig)
     matrix: MatrixConfig = field(default_factory=MatrixConfig)
+    # Scheduling profile for the night queue.
+    # Lives here (ScoutScaffold), NOT on StaticScaffold — adding it to
+    # StaticScaffold would invalidate scaffold_hash for every existing scaffold.
+    priority_profile: str = "full-pass-once"
 
     # ------------------------------------------------------------------
     # Parameter matrix helpers
@@ -215,6 +222,14 @@ def load_scaffold(path: str | Path) -> ScoutScaffold:
         runs_per_cell=int(raw_matrix.get("runs_per_cell", 1)),
     )
 
+    priority_profile = data.get("priority_profile", "full-pass-once")
+    if priority_profile not in _ALLOWED_PRIORITY_PROFILES:
+        allowed = ", ".join(sorted(_ALLOWED_PRIORITY_PROFILES))
+        raise ValueError(
+            f"Unknown priority_profile {priority_profile!r} in {path}. "
+            f"Allowed values: {allowed}"
+        )
+
     return ScoutScaffold(
         spec_id=data["spec_id"],
         spec_version=data.get("spec_version", "v0"),
@@ -223,4 +238,5 @@ def load_scaffold(path: str | Path) -> ScoutScaffold:
         generation_directive=data.get("generation_directive", ""),
         context=context,
         matrix=matrix,
+        priority_profile=priority_profile,
     )

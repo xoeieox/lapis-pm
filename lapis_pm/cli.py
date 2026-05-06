@@ -1105,6 +1105,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sc_dig.set_defaults(func=cmd_scout)
 
+    # ------------------------------------------------------------------
+    # scout night — night-queue orchestrator
+    # ------------------------------------------------------------------
+    sc_night = sc_sub.add_parser(
+        "night",
+        help="Night-queue orchestrator: health-gated, quarantine-aware, round-robin scheduler.",
+    )
+    sc_night_sub = sc_night.add_subparsers(dest="night_sub", required=True)
+
+    sc_nr = sc_night_sub.add_parser("run", help="Start a night run.")
+    sc_nr.add_argument(
+        "--until",
+        default=None,
+        metavar="HHMM",
+        help="Stop at this local time (e.g. 0900). Defaults to next 09:00.",
+    )
+    sc_nr.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Run each scaffold once then exit (overrides --until).",
+    )
+    sc_nr.add_argument(
+        "--sims-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory containing scaffold YAMLs (default: /srv/lapis/scout/sims).",
+    )
+    sc_nr.add_argument(
+        "--log-root",
+        default=None,
+        metavar="DIR",
+        help="Directory for manifest.tsv and quarantine.json.",
+    )
+    sc_nr.add_argument(
+        "--profile-override",
+        action="append",
+        default=[],
+        metavar="SPEC_ID:PROFILE",
+        help="Override a scaffold's priority profile (may be repeated).",
+    )
+    sc_nr.set_defaults(func=cmd_scout)
+
+    sc_ns = sc_night_sub.add_parser("status", help="Show night-run status.")
+    sc_ns.add_argument(
+        "--log-root",
+        default=None,
+        metavar="DIR",
+        help="Log root of the run to inspect (default: most recent).",
+    )
+    sc_ns.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit structured JSON (for claude-view/Librarian consumption).",
+    )
+    sc_ns.set_defaults(func=cmd_scout)
+
+    sc_nq = sc_night_sub.add_parser(
+        "quarantine-clear",
+        help="Clear a scaffold's quarantine entry (idempotent).",
+    )
+    sc_nq.add_argument("spec_id", help="Spec ID to un-quarantine.")
+    sc_nq.add_argument(
+        "--log-root",
+        default=None,
+        metavar="DIR",
+        help="Log root of the run (default: most recent).",
+    )
+    sc_nq.set_defaults(func=cmd_scout)
+
     return p
 
 

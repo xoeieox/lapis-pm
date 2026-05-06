@@ -80,6 +80,53 @@ matrix:
 **`/srv/lapis/scout/` is NOT RoomRAG-indexed** — Qwen-narrated content stays out of
 any RoomRAG-indexed tree per `feedback/qwen-narration-out-of-router-corpus`.
 
+## Night queue
+
+The night-queue orchestrator replaces `scripts/scout_night.sh` with a Python
+process that gates on llama-server health, quarantines bad scaffolds, and
+schedules cells in round-robin across scaffolds.
+
+```bash
+# Run until 09:00 local (default)
+lapis-pm scout night run
+
+# Run each scaffold once and exit (smoke / CI)
+lapis-pm scout night run --once --sims-dir /srv/lapis/scout/sims
+
+# Check status of the most recent night run
+lapis-pm scout night status
+lapis-pm scout night status --json   # structured output for claude-view
+
+# Clear a quarantined scaffold after amending its YAML
+lapis-pm scout night quarantine-clear <spec_id>
+```
+
+### Priority profiles
+
+Each scaffold YAML may declare `priority_profile` at the top level:
+
+| Value | Behaviour |
+|---|---|
+| `full-pass-once` (default) | Run each cell once, then done. |
+| `variance-resolution` | Warmup pass + re-run cells whose break signatures varied across runs. |
+| `continuous-baseline` | Cycle indefinitely until the run wall-clock expires. |
+
+Unknown values raise `ValueError` at load time. Existing scaffolds without the
+field default to `full-pass-once` and require no edits.
+
+### Failure modes closed
+
+1. **Health gate** — exponential back-off (5s base, 120s ceiling); 1-hour
+   wall-clock abort budget if llama-server stays down.
+2. **Quarantine** — 3 consecutive zero-parse runs → scaffold quarantined for
+   the night; clears via `quarantine-clear` after operator amendment.
+3. **Round-robin scheduling** — cells interleaved across scaffolds; 24-cell
+   scaffolds no longer starve behind 216-cell scaffolds.
+4. **SIGTERM** — handled between WorkUnits; in-flight simulate() runs to
+   completion before the orchestrator exits.
+5. **GPU contention** — reads GPUQueue read-only; yields when another process
+   holds the GPU, resumes when clear.
+
 ## Provenance conformance
 
 Every Scout output is a `LapisToolReturn` (payload + non-empty summary +

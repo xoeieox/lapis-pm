@@ -71,6 +71,7 @@ Rules:
 - Grounding rule: Every claim in 'Risk / spec deviation' MUST cite either (a) a `screen_issues` entry by its severity+path, or (b) a specific line or symbol from the diff section. If neither is available, output `none` for that section.
 - No-screen rule: If the user message states 'no inline screen ran for this PR', the 'Risk / spec deviation' section outputs `none` unless the diff section contains concrete evidence of a problem (held path, deleted test, scope creep beyond spec). Do not infer schema violations, missing dependencies, or convention breaks from a truncated diff.
 - No-absence-from-truncation rule: You cannot conclude something is missing or absent from a truncated diff. If the diff section ends with `(diff truncated)`, do not make absence-claims (e.g. 'missing dependency X', 'no test for Y'); consult the spec_summary for declared dependencies/structure instead, and only claim absence when the spec affirmatively says X should exist and the diff section is complete.
+- Reviewer-anchor rule: When the user message contains a 'Reviewer verdict:' block and that verdict reads 'verdict=clean', the 'Risk / spec deviation' section MUST output `none` UNLESS the diff section shows a held path under {Lapis,room,registry}.yaml or a deleted/skipped test. Do not infer truncation, missing implementation, or schema violations when Opus has already returned clean. The reviewer has the full diff; the composer does not.
 - Never invent state — if you don't know something, omit it.
 """
 
@@ -170,6 +171,7 @@ def synthesize(
     *,
     notify: NotifyPriority | None = NotifyPriority.NORMAL,
     options_extra_tags: list[str] | None = None,
+    reviewer_verdict_text: str | None = None,
 ) -> Brief:
     """Produce a brief, write it as a comment, optionally push to Pushover.
 
@@ -209,11 +211,16 @@ def synthesize(
     )
     trigger_block = f"Trigger: {trigger}\nInline screen: {inline_screen}\n"
 
+    verdict_block = ""
+    if reviewer_verdict_text:
+        verdict_block = f"Reviewer verdict:\n{reviewer_verdict_text}\n"
+
     user = (
         f"Thread: {target_id}\n"
         f"{trigger_block}\n"
         f"Spec:\n{spec_summary}\n\n"
         f"Recent PM episodes (most relevant first):\n{episodes_block}\n"
+        f"{verdict_block}"
         f"{diff_block}"
         f"{issues_block}"
     )

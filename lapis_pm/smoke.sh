@@ -3217,9 +3217,108 @@ assert get_outstanding_brief('${TID_VERIFY}') is None, \
 " || red "set_outstanding_brief_verified round-trip FAILED"
 green "set_outstanding_brief_verified round-trip passes"
 
+# --- Phase 32: advisory-clean brief anchor — Reviewer verdict: block -----
+step "32. advisory-clean brief anchor: synthesize receives Reviewer verdict: block when verdict present"
+/usr/bin/python3 - <<'PYEOF32'
+import sys, json
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import MagicMock, patch
+
+from lapis_pm import brief
+from lapis_pm import authority
+
+# Build a minimal PRClassification with no issues (advisory-clean path)
+cls = authority.PRClassification(
+    verdict="advisory",
+    screen_verdict="clean",
+    static_outcome=authority.StaticOutcome.static_pass,
+    reasons=[],
+    issues=[],
+    pr_number=63,
+    repo="lapis-pm",
+    title="Smoke anchor test PR",
+    html_url="http://forgejo/pr/63",
+    changed_paths=["foo.py"],
+    diff_loc=5,
+    diff="diff --git a/foo.py b/foo.py\n+pass\n",
+)
+
+verdict_info = {
+    "verdict": "clean",
+    "confidence": 0.93,
+    "issues": [],
+}
+
+captured = {}
+mock_brief_result = MagicMock()
+mock_brief_result.comment_id = "smoke-anchor-cid"
+mock_brief_result.pushed = False
+
+def fake_synthesize(*args, **kwargs):
+    captured.update(kwargs)
+    return mock_brief_result
+
+with (
+    patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_info),
+    patch("lapis_pm.pm_core.brief.synthesize", side_effect=fake_synthesize),
+    patch("lapis_pm.pm_core._mark_pr_classified"),
+    patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
+    patch("lapis_pm.pm_core._post_write_sweep_brief"),
+    patch("lapis_pm.pm_core.episodic.write_hold"),
+):
+    from lapis_pm import pm_core
+    pm_core._act_brief(
+        "smoke-anchor-tid",
+        trigger="advisory",
+        hold=False,
+        payload={"classification": cls},
+    )
+
+rvt = captured.get("reviewer_verdict_text")
+assert rvt is not None, f"reviewer_verdict_text was None; captured={captured}"
+assert "verdict=clean" in rvt, f"'verdict=clean' missing from reviewer_verdict_text: {rvt!r}"
+assert "confidence=0.93" in rvt, f"'confidence=0.93' missing from reviewer_verdict_text: {rvt!r}"
+print(f"advisory-clean anchor: reviewer_verdict_text={rvt!r} ok")
+
+# Verify the Reviewer verdict: block appears in the synthesize prompt
+captured_prompt = {}
+
+def fake_llm(prompt, system, model, timeout):
+    captured_prompt["prompt"] = prompt
+    return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
+
+fake_comment = MagicMock()
+fake_comment.id = "smoke-anchor-prompt-cid"
+fake_comment.tags = ["pm:brief"]
+
+with (
+    patch("lapis_pm.brief.call_claude_cli", side_effect=fake_llm),
+    patch("lapis_pm.brief.send_notification", return_value=False),
+    patch("lapis_pm.brief.episodic.recall", return_value=[]),
+    patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+    patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+    patch("lapis_pm.brief.episodic.write_brief_options"),
+):
+    brief.synthesize(
+        target_id="smoke-anchor-tid",
+        trigger="advisory-clean",
+        reviewer_verdict_text=rvt,
+        notify=None,
+    )
+
+assert "Reviewer verdict:" in captured_prompt["prompt"], (
+    f"'Reviewer verdict:' block missing from synthesize prompt; got:\n{captured_prompt['prompt']}"
+)
+assert rvt in captured_prompt["prompt"], (
+    f"verdict text not found in prompt; got:\n{captured_prompt['prompt']}"
+)
+print("advisory-clean anchor: 'Reviewer verdict:' block present in synthesize prompt ok")
+PYEOF32
+green "Phase 32 complete: advisory-clean brief anchor (reviewer_verdict_text) OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

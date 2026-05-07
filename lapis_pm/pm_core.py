@@ -1616,6 +1616,19 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             effective_trigger = "advisory-screen-issue"
         else:
             effective_trigger = "advisory-clean"
+    reviewer_verdict_text: str | None = None
+    if effective_trigger == "advisory-clean":
+        verdict_info = _last_review_verdict(target_id, cls.pr_number)
+        if verdict_info:
+            v = verdict_info.get("verdict", "?")
+            conf = verdict_info.get("confidence", "?")
+            n_issues = len(verdict_info.get("issues") or [])
+            corr = verdict_info.get("corroboration_result") or {}
+            corr_v = corr.get("verdict")
+            parts = [f"Opus reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
+            if corr_v:
+                parts.append(f"corroboration={corr_v}")
+            reviewer_verdict_text = "; ".join(parts)
     b = brief.synthesize(
         target_id,
         trigger=effective_trigger,
@@ -1624,6 +1637,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         screen_issues=cls.issues or None,
         pr_number=cls.pr_number if not hold else None,
         notify=NotifyPriority.NORMAL if hold else None,
+        reviewer_verdict_text=reviewer_verdict_text,
     )
     _mark_pr_classified(target_id, cls.pr_number)
     set_outstanding_brief_verified(target_id, b.comment_id)

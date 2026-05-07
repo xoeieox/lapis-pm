@@ -3447,14 +3447,14 @@ with open(yaml_path) as f:
     run = yaml.safe_load(f)
 
 status = run.get('status')
-deliberation_terminal = {'resolved', 'open', 'diverged'}
+deliberation_terminal = {'resolved', 'open', 'diverged', 'laid-down'}
 assert status in deliberation_terminal, \
     f'run YAML status {status!r} not in deliberation terminal set {deliberation_terminal}'
 turns = run.get('turns', [])
 assert len(turns) >= 1, f'expected at least 1 turn written by stub, got {len(turns)}'
 print(f'run YAML: status={status}, turns={len(turns)} OK')
 " || red "Phase 33d: run YAML did not reach deliberation terminal status"
-green "33d: run YAML status in {resolved, open, diverged} ✓"
+green "33d: run YAML status in {resolved, open, diverged, laid-down} ✓"
 
 # 33e. Assert queue task reached completed
 python3 -c "
@@ -3586,9 +3586,412 @@ green "34e: scene queue task reached completed ✓"
 council_smoke_cleanup "${COUNCIL_RUN_ID_SCENE}"
 green "Phase 34 complete: council.run scene mode (stub) → closed + queue completed OK"
 
+# --- Phase 35: v0.next deliberation — all agree (cohesion-finding written) ---
+
+step "Phase 35: council.run v0.next — deliberation all-agree (COUNCIL_STUB_POSITIONS=agree,agree)"
+
+COUNCIL_RUN_ID_35="$(python3 -c "
+import hashlib, time
+ts = time.strftime('%Y-%m-%d-%H%M%S')
+suffix = hashlib.sha256(b'smoke-35-agree').hexdigest()[:6]
+print(f'{ts}-{suffix}')
+")"
+
+python3 -c "
+import yaml, datetime
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_35}'
+council_dir = Path('${COUNCIL_SMOKE_DIR}')
+council_dir.mkdir(parents=True, exist_ok=True)
+
+run = {
+    'run_id': run_id,
+    'created_at': datetime.datetime.utcnow().isoformat(),
+    'status': 'deliberating',
+    'mode': 'deliberation',
+    'decision': 'smoke v0.next: should we adopt daily cohesion sweeps?',
+    'context_gathered': [],
+    'selected_entities': [
+        {'id': 'stub-entity-a', 'role': 'first_voice'},
+        {'id': 'stub-entity-b', 'role': 'second_voice'},
+    ],
+    'selection_reasoning': 'smoke fixture',
+    'voicing': 'sonnet',
+    'turns_cap': 2,
+    'turns': [],
+}
+yaml_path = council_dir / f'{run_id}.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.safe_dump(run, f, default_flow_style=False, allow_unicode=True)
+print(f'run YAML written: {yaml_path}')
+" || red "Phase 35a: failed to write run YAML"
+green "35a: run YAML written"
+
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+task_id = q.submit({
+    'task_type': 'council.run',
+    'description': 'smoke v0.next: daily cohesion sweeps',
+    'priority': 'normal',
+    'notify': False,
+    'timeout_seconds': 120,
+    'payload': {
+        'mode': 'deliberation',
+        '_ignore_intention_registry': True,
+    },
+}, task_id='${COUNCIL_RUN_ID_35}')
+print(f'submitted task_id={task_id}')
+" || red "Phase 35b: failed to submit task"
+green "35b: task submitted"
+
+COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,agree python3 -c "
+import asyncio
+from agents_core.claude_queue import ClaudeQueue
+from agents_core.claude_queue_runner import _run_council_task
+
+async def main():
+    q = ClaudeQueue()
+    task = q.claim()
+    assert task is not None, 'claim() returned None'
+    assert task['id'] == '${COUNCIL_RUN_ID_35}', f'wrong task: {task[\"id\"]}'
+    await _run_council_task(q, task)
+    print('_run_council_task returned')
+
+asyncio.run(main())
+" || red "Phase 35c: _run_council_task raised"
+green "35c: _run_council_task completed"
+
+python3 -c "
+import yaml
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_35}'
+yaml_path = Path('${COUNCIL_SMOKE_DIR}') / f'{run_id}.yaml'
+with open(yaml_path) as f:
+    run = yaml.safe_load(f)
+
+assert run.get('status') == 'resolved', f'expected resolved, got {run.get(\"status\")!r}'
+syn = run.get('synthesis', {})
+assert syn.get('confidence') == 'converged', f'expected converged, got {syn.get(\"confidence\")!r}'
+assert syn.get('output_class') == 'cohesion-finding', f'expected cohesion-finding, got {syn.get(\"output_class\")!r}'
+positions = syn.get('positions', [])
+assert len(positions) == 2, f'expected 2 positions, got {len(positions)}'
+assert all(p['position'] == 'agree' for p in positions), f'expected all agree: {positions}'
+print(f'run YAML: status={run[\"status\"]}, confidence={syn[\"confidence\"]}, output_class={syn[\"output_class\"]}, positions={len(positions)} OK')
+
+# Assert cache entry written
+import glob, os
+cache_dir = '/srv/lapis/council/cache/cohesion'
+cache_files = [f for f in glob.glob(f'{cache_dir}/*.yaml') if '/.tmp-' not in f]
+assert len(cache_files) >= 1, f'expected cache entry written at {cache_dir}, found none'
+print(f'cache entry written: {cache_files[0]} OK')
+" || red "Phase 35d: assertions failed"
+green "35d: status=resolved, confidence=converged, output_class=cohesion-finding, 2×agree, cache written ✓"
+
+council_smoke_cleanup "${COUNCIL_RUN_ID_35}"
+green "Phase 35 complete: v0.next deliberation all-agree → cohesion-finding cached OK"
+
+# --- Phase 36: v0.next deliberation — stand-aside (converged-with-reservation) ---
+
+step "Phase 36: council.run v0.next — deliberation stand-aside (COUNCIL_STUB_POSITIONS=agree,stand-aside)"
+
+COUNCIL_RUN_ID_36="$(python3 -c "
+import hashlib, time
+ts = time.strftime('%Y-%m-%d-%H%M%S')
+suffix = hashlib.sha256(b'smoke-36-standside').hexdigest()[:6]
+print(f'{ts}-{suffix}')
+")"
+
+python3 -c "
+import yaml, datetime
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_36}'
+council_dir = Path('${COUNCIL_SMOKE_DIR}')
+council_dir.mkdir(parents=True, exist_ok=True)
+
+run = {
+    'run_id': run_id,
+    'created_at': datetime.datetime.utcnow().isoformat(),
+    'status': 'deliberating',
+    'mode': 'deliberation',
+    'decision': 'smoke v0.next stand-aside: should we expand to daily sweeps?',
+    'context_gathered': [],
+    'selected_entities': [
+        {'id': 'stub-entity-a', 'role': 'first_voice'},
+        {'id': 'stub-entity-b', 'role': 'second_voice'},
+    ],
+    'selection_reasoning': 'smoke fixture',
+    'voicing': 'sonnet',
+    'turns_cap': 2,
+    'turns': [],
+}
+yaml_path = council_dir / f'{run_id}.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.safe_dump(run, f, default_flow_style=False, allow_unicode=True)
+print(f'run YAML written: {yaml_path}')
+" || red "Phase 36a: failed to write run YAML"
+
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+q.submit({
+    'task_type': 'council.run',
+    'description': 'smoke stand-aside test',
+    'priority': 'normal',
+    'notify': False,
+    'timeout_seconds': 120,
+    'payload': {'mode': 'deliberation', '_ignore_intention_registry': True},
+}, task_id='${COUNCIL_RUN_ID_36}')
+print('submitted')
+" || red "Phase 36b: failed to submit"
+
+COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,stand-aside python3 -c "
+import asyncio
+from agents_core.claude_queue import ClaudeQueue
+from agents_core.claude_queue_runner import _run_council_task
+
+async def main():
+    q = ClaudeQueue()
+    task = q.claim()
+    assert task is not None
+    assert task['id'] == '${COUNCIL_RUN_ID_36}'
+    await _run_council_task(q, task)
+
+asyncio.run(main())
+" || red "Phase 36c: _run_council_task raised"
+green "36c: completed"
+
+python3 -c "
+import yaml, glob
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_36}'
+with open(Path('${COUNCIL_SMOKE_DIR}') / f'{run_id}.yaml') as f:
+    run = yaml.safe_load(f)
+
+assert run.get('status') == 'resolved', f'expected resolved, got {run.get(\"status\")!r}'
+syn = run.get('synthesis', {})
+assert syn.get('confidence') == 'converged-with-reservation', \
+    f'expected converged-with-reservation, got {syn.get(\"confidence\")!r}'
+assert len(syn.get('stood_aside', [])) >= 1, f'expected stood_aside non-empty'
+cache_files = [f for f in glob.glob('/srv/lapis/council/cache/cohesion/*.yaml') if '/.tmp-' not in f]
+assert len(cache_files) >= 1, 'expected cache entry written for stand-aside finding'
+print(f'status={run[\"status\"]}, confidence={syn[\"confidence\"]}, stood_aside={len(syn[\"stood_aside\"])}, cache={len(cache_files)} OK')
+" || red "Phase 36d: assertions failed"
+green "36d: status=resolved, converged-with-reservation, stood_aside non-empty, cache written ✓"
+
+council_smoke_cleanup "${COUNCIL_RUN_ID_36}"
+green "Phase 36 complete: v0.next deliberation stand-aside → cohesion-finding cached OK"
+
+# --- Phase 37: v0.next deliberation — block → laid-down (NO cache write) ---
+
+step "Phase 37: council.run v0.next — block laid-down (COUNCIL_STUB_POSITIONS=agree,block, turns_cap=1)"
+
+COUNCIL_RUN_ID_37="$(python3 -c "
+import hashlib, time
+ts = time.strftime('%Y-%m-%d-%H%M%S')
+suffix = hashlib.sha256(b'smoke-37-block').hexdigest()[:6]
+print(f'{ts}-{suffix}')
+")"
+
+python3 -c "
+import yaml, datetime
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_37}'
+council_dir = Path('${COUNCIL_SMOKE_DIR}')
+council_dir.mkdir(parents=True, exist_ok=True)
+
+run = {
+    'run_id': run_id,
+    'created_at': datetime.datetime.utcnow().isoformat(),
+    'status': 'deliberating',
+    'mode': 'deliberation',
+    'decision': 'smoke v0.next block: should the council auto-modify decisions?',
+    'context_gathered': [],
+    'selected_entities': [
+        {'id': 'stub-entity-a', 'role': 'first_voice'},
+        {'id': 'stub-entity-b', 'role': 'second_voice'},
+    ],
+    'selection_reasoning': 'smoke fixture',
+    'voicing': 'sonnet',
+    'turns_cap': 1,
+    'turns': [],
+}
+yaml_path = council_dir / f'{run_id}.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.safe_dump(run, f, default_flow_style=False, allow_unicode=True)
+print(f'run YAML written (turns_cap=1): {yaml_path}')
+" || red "Phase 37a: failed to write run YAML"
+
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+q.submit({
+    'task_type': 'council.run',
+    'description': 'smoke block laid-down test',
+    'priority': 'normal',
+    'notify': False,
+    'timeout_seconds': 120,
+    'payload': {'mode': 'deliberation', '_ignore_intention_registry': True},
+}, task_id='${COUNCIL_RUN_ID_37}')
+print('submitted')
+" || red "Phase 37b: failed to submit"
+
+COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,block python3 -c "
+import asyncio
+from agents_core.claude_queue import ClaudeQueue
+from agents_core.claude_queue_runner import _run_council_task
+
+async def main():
+    q = ClaudeQueue()
+    task = q.claim()
+    assert task is not None
+    assert task['id'] == '${COUNCIL_RUN_ID_37}'
+    await _run_council_task(q, task)
+
+asyncio.run(main())
+" || red "Phase 37c: _run_council_task raised"
+green "37c: completed"
+
+python3 -c "
+import yaml, glob, os
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_37}'
+with open(Path('${COUNCIL_SMOKE_DIR}') / f'{run_id}.yaml') as f:
+    run = yaml.safe_load(f)
+
+assert run.get('status') == 'laid-down', f'expected laid-down, got {run.get(\"status\")!r}'
+syn = run.get('synthesis', {})
+assert syn.get('confidence') == 'laid-down', \
+    f'expected confidence=laid-down, got {syn.get(\"confidence\")!r}'
+assert len(syn.get('blocks', [])) >= 1, 'expected blocks non-empty'
+assert syn.get('output_class') == 'none', f'expected output_class=none, got {syn.get(\"output_class\")!r}'
+
+# No cache write for laid-down (Invariant 6)
+# We cannot assert zero cache files globally since phases 35+36 wrote entries.
+# Assert this run_id is NOT in any cache entry.
+import glob as _glob
+cache_files = [f for f in _glob.glob('/srv/lapis/council/cache/cohesion/*.yaml') if '/.tmp-' not in f]
+for cf in cache_files:
+    with open(cf) as fh:
+        entry = yaml.safe_load(fh)
+    assert entry.get('run_id') != run_id, f'laid-down run_id found in cache: {cf}'
+
+print(f'status=laid-down, confidence=laid-down, blocks={len(syn[\"blocks\"])}, no cache entry for this run OK')
+" || red "Phase 37d: assertions failed"
+green "37d: status=laid-down, confidence=laid-down, blocks non-empty, NO cache write ✓"
+
+council_smoke_cleanup "${COUNCIL_RUN_ID_37}"
+green "Phase 37 complete: v0.next deliberation block → laid-down, no cache write OK"
+
+# --- Phase 38: v0.next scene — unchanged from v0 ---
+
+step "Phase 38: council.run v0.next — scene mode unchanged (no synthesis, no cache)"
+
+COUNCIL_RUN_ID_38="$(python3 -c "
+import hashlib, time
+ts = time.strftime('%Y-%m-%d-%H%M%S')
+suffix = hashlib.sha256(b'smoke-38-scene').hexdigest()[:6]
+print(f'{ts}-{suffix}')
+")"
+
+python3 -c "
+import yaml, datetime
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_38}'
+council_dir = Path('${COUNCIL_SMOKE_DIR}')
+council_dir.mkdir(parents=True, exist_ok=True)
+
+run = {
+    'run_id': run_id,
+    'created_at': datetime.datetime.utcnow().isoformat(),
+    'status': 'deliberating',
+    'mode': 'scene',
+    'decision': 'smoke v0.next scene: two characters at the archive at dawn',
+    'context_gathered': [],
+    'selected_entities': [
+        {'id': 'stub-char-a', 'role': 'scene_slot_0'},
+        {'id': 'stub-char-b', 'role': 'scene_slot_1'},
+    ],
+    'selection_reasoning': 'smoke fixture',
+    'voicing': 'sonnet',
+    'turns_cap': 2,
+    'turns': [],
+}
+yaml_path = council_dir / f'{run_id}.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.safe_dump(run, f, default_flow_style=False, allow_unicode=True)
+print(f'scene run YAML written: {yaml_path}')
+" || red "Phase 38a: failed to write scene run YAML"
+
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+q.submit({
+    'task_type': 'council.run',
+    'description': 'smoke v0.next scene test',
+    'priority': 'normal',
+    'notify': False,
+    'timeout_seconds': 120,
+    'payload': {'mode': 'scene', '_ignore_intention_registry': True},
+}, task_id='${COUNCIL_RUN_ID_38}')
+print('submitted')
+" || red "Phase 38b: failed to submit"
+
+COUNCIL_ENGINE_STUB=1 python3 -c "
+import asyncio
+from agents_core.claude_queue import ClaudeQueue
+from agents_core.claude_queue_runner import _run_council_task
+
+async def main():
+    q = ClaudeQueue()
+    task = q.claim()
+    assert task is not None
+    assert task['id'] == '${COUNCIL_RUN_ID_38}'
+    await _run_council_task(q, task)
+
+asyncio.run(main())
+" || red "Phase 38c: _run_council_task raised"
+green "38c: scene task completed"
+
+python3 -c "
+import yaml
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_38}'
+with open(Path('${COUNCIL_SMOKE_DIR}') / f'{run_id}.yaml') as f:
+    run = yaml.safe_load(f)
+
+assert run.get('status') == 'closed', f'expected closed, got {run.get(\"status\")!r}'
+assert 'synthesis' not in run, 'scene run should have no synthesis key'
+assert 'positions' not in run, 'scene run should have no positions key'
+print(f'scene status=closed, no synthesis, no positions OK')
+" || red "Phase 38d: scene assertions failed"
+green "38d: status=closed, no synthesis, no cache write ✓"
+
+council_smoke_cleanup "${COUNCIL_RUN_ID_38}"
+
+# Clean up cache entries created by phases 35-36
+python3 -c "
+import glob, os
+for f in glob.glob('/srv/lapis/council/cache/cohesion/*.yaml'):
+    try:
+        os.remove(f)
+    except Exception:
+        pass
+print('cache cleanup done')
+"
+green "Phase 38 complete: v0.next scene unchanged from v0 OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

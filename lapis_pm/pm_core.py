@@ -332,6 +332,19 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     if target is None:
         raise ValueError(f"target not found: {target_id}")
     spec_sum = episodic.spec_summary(target_id)
+    existing_branch = f"lapis/{target_id}/forced"
+    base_branch = "main"
+    if agent_type == "fixer_retry" and target.pm_repo:
+        try:
+            from agents_core.forgejo import get_open_prs as _get_open_prs
+            for pr in _get_open_prs(target.pm_repo):
+                pr_ref = (pr.get("head") or {}).get("ref", "")
+                if pr_ref.startswith(f"lapis/{target_id}/"):
+                    existing_branch = pr_ref
+                    base_branch = (pr.get("base") or {}).get("ref", "main")
+                    break
+        except Exception:
+            pass
     vars_ = {
         "target_id": target_id,
         "spec_summary": spec_sum,
@@ -339,6 +352,8 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "question": intent,
         "pr_number": "",
         "slug": "forced",
+        "existing_branch": existing_branch,
+        "base_branch": base_branch,
     }
     res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
     append_dispatched(target_id, {

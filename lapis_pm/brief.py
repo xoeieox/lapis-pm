@@ -169,6 +169,7 @@ def synthesize(
     pr_number: int | None = None,
     *,
     notify: NotifyPriority | None = NotifyPriority.NORMAL,
+    options_extra_tags: list[str] | None = None,
 ) -> Brief:
     """Produce a brief, write it as a comment, optionally push to Pushover.
 
@@ -234,7 +235,8 @@ def synthesize(
     # Emit sibling pm:brief-options comment for closed-form triggers.
     # The brief body is unchanged; this is purely additive.
     if trigger in _CLOSED_FORM_TRIGGERS:
-        _write_options_sibling(target_id, comment.id, trigger, pr_number)
+        _write_options_sibling(target_id, comment.id, trigger, pr_number,
+                               extra_tags=options_extra_tags)
 
     deep_link = f"{DASHBOARD_BASE}/thread/{target_id}"
     pushed = False
@@ -255,6 +257,7 @@ def _write_options_sibling(
     brief_id: str,
     trigger: str,
     pr_number: int | None,
+    extra_tags: list[str] | None = None,
 ) -> None:
     """Write the pm:brief-options sibling comment for a closed-form trigger."""
     import copy
@@ -272,7 +275,8 @@ def _write_options_sibling(
         "trigger": trigger,
         "options": options,
     }
-    episodic.write_brief_options(target_id, json.dumps(payload, ensure_ascii=False))
+    episodic.write_brief_options(target_id, json.dumps(payload, ensure_ascii=False),
+                                 extra_tags=extra_tags)
 
 
 # ---------------------------------------------------------------------------

@@ -3398,11 +3398,12 @@ green "33a: run YAML written (status=deliberating)"
 # 33b. Submit council.run task to ClaudeQueue with matching task_id
 python3 -c "
 from agents_core.claude_queue import ClaudeQueue
+from agents_core.gpu import Priority
 q = ClaudeQueue()
 task_id = q.submit({
     'task_type': 'council.run',
     'description': 'smoke: should we adopt a daily cohesion sweep?',
-    'priority': 'normal',
+    'priority': Priority.NORMAL,
     'notify': False,
     'timeout_seconds': 60,
     'payload': {
@@ -3517,11 +3518,12 @@ green "34a: scene run YAML written (status=deliberating)"
 # 34b. Submit council.run task with mode=scene
 python3 -c "
 from agents_core.claude_queue import ClaudeQueue
+from agents_core.gpu import Priority
 q = ClaudeQueue()
 task_id = q.submit({
     'task_type': 'council.run',
     'description': 'smoke scene: two characters meet at the archive',
-    'priority': 'normal',
+    'priority': Priority.NORMAL,
     'notify': False,
     'timeout_seconds': 60,
     'payload': {

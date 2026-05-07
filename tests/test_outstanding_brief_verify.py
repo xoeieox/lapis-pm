@@ -10,9 +10,7 @@ also patching _mem to return a MemoryStore backed by a fresh temp file.
 
 from __future__ import annotations
 
-import sys
 import tempfile
-from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 

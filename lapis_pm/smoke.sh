@@ -3331,9 +3331,264 @@ print("advisory-clean anchor: 'Reviewer verdict:' block present in synthesize pr
 PYEOF32
 green "Phase 32 complete: advisory-clean brief anchor (reviewer_verdict_text) OK"
 
+# --- Phase 33: council.run smoke — deliberation mode --------------------
+#
+# Exercises the full council.run queue handler path without a real LLM call:
+#   write run YAML → submit queue task → claim → _run_council_task runs
+#   `python -m agents_core.council run <run_id>` with COUNCIL_ENGINE_STUB=1
+#   → assert run YAML reaches a deliberation terminal status → queue task
+#   reaches completed → cleanup.
+#
+# Requirements: agents_core.council package installed (agents-core PR #32).
+
+COUNCIL_SMOKE_DIR="/srv/lapis/council"
+COUNCIL_SMOKE_LOG_DIR="/srv/lapis/council/logs"
+COUNCIL_SMOKE_QUEUE_DIR="/srv/lapis/claude-queue"
+
+council_smoke_cleanup() {
+    local run_id="$1"
+    rm -f "${COUNCIL_SMOKE_DIR}/${run_id}.yaml" 2>/dev/null || true
+    rm -f "${COUNCIL_SMOKE_LOG_DIR}/${run_id}.log" 2>/dev/null || true
+    for d in pending active completed failed cancelled; do
+        rm -f "${COUNCIL_SMOKE_QUEUE_DIR}/${d}/${run_id}.yaml" 2>/dev/null || true
+    done
+}
+
+step "Phase 33: council.run smoke — deliberation mode (COUNCIL_ENGINE_STUB=1)"
+
+COUNCIL_RUN_ID_DELIB="$(python3 -c "
+import hashlib, time
+ts = time.strftime('%Y-%m-%d-%H%M%S')
+suffix = hashlib.sha256(b'smoke-delib').hexdigest()[:6]
+print(f'{ts}-{suffix}')
+")"
+
+# 31a. Write the initial run YAML (as cmd_submit would before queue.submit)
+python3 -c "
+import yaml, datetime
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_DELIB}'
+council_dir = Path('${COUNCIL_SMOKE_DIR}')
+council_dir.mkdir(parents=True, exist_ok=True)
+
+run = {
+    'run_id': run_id,
+    'created_at': datetime.datetime.utcnow().isoformat(),
+    'status': 'deliberating',
+    'mode': 'deliberation',
+    'decision': 'smoke: should we adopt a daily cohesion sweep?',
+    'context_gathered': [],
+    'selected_entities': [
+        {'id': 'stub-entity-a', 'card_path': '/stub/a.yaml', 'role': 'participant'},
+        {'id': 'stub-entity-b', 'card_path': '/stub/b.yaml', 'role': 'participant'},
+    ],
+    'selection_reasoning': 'smoke fixture',
+    'voicing': 'sonnet',
+    'turns_cap': 2,
+    'turns': [],
+}
+yaml_path = council_dir / f'{run_id}.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.safe_dump(run, f, default_flow_style=False, allow_unicode=True)
+print(f'run YAML written: {yaml_path}')
+" || red "Phase 33a: failed to write deliberation run YAML"
+green "33a: run YAML written (status=deliberating)"
+
+# 33b. Submit council.run task to ClaudeQueue with matching task_id
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+task_id = q.submit({
+    'task_type': 'council.run',
+    'description': 'smoke: should we adopt a daily cohesion sweep?',
+    'priority': 'normal',
+    'notify': False,
+    'timeout_seconds': 60,
+    'payload': {
+        'mode': 'deliberation',
+        '_ignore_intention_registry': True,
+    },
+}, task_id='${COUNCIL_RUN_ID_DELIB}')
+print(f'submitted task_id={task_id}')
+assert task_id == '${COUNCIL_RUN_ID_DELIB}', f'task_id mismatch: {task_id}'
+" || red "Phase 33b: failed to submit council.run task"
+green "33b: council.run task submitted to queue"
+
+# 33c. Claim + run via _run_council_task (asyncio, COUNCIL_ENGINE_STUB=1)
+#      This exercises the full handler dispatch path without a real Claude call.
+COUNCIL_ENGINE_STUB=1 python3 -c "
+import asyncio, os
+from agents_core.claude_queue import ClaudeQueue
+from agents_core.claude_queue_runner import _run_council_task
+
+async def main():
+    q = ClaudeQueue()
+    task = q.claim()
+    assert task is not None, 'claim() returned None — task not in pending dir'
+    assert task['id'] == '${COUNCIL_RUN_ID_DELIB}', f'wrong task claimed: {task[\"id\"]}'
+    assert task.get('task_type') == 'council.run', f'wrong task_type: {task.get(\"task_type\")}'
+    print(f'claimed task {task[\"id\"]} task_type={task[\"task_type\"]}')
+    await _run_council_task(q, task)
+    print('_run_council_task returned')
+
+asyncio.run(main())
+" || red "Phase 33c: _run_council_task raised an exception"
+green "33c: _run_council_task completed without exception"
+
+# 33d. Assert run YAML has a deliberation terminal status
+python3 -c "
+import yaml
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_DELIB}'
+yaml_path = Path('${COUNCIL_SMOKE_DIR}') / f'{run_id}.yaml'
+with open(yaml_path) as f:
+    run = yaml.safe_load(f)
+
+status = run.get('status')
+deliberation_terminal = {'resolved', 'open', 'diverged'}
+assert status in deliberation_terminal, \
+    f'run YAML status {status!r} not in deliberation terminal set {deliberation_terminal}'
+turns = run.get('turns', [])
+assert len(turns) >= 1, f'expected at least 1 turn written by stub, got {len(turns)}'
+print(f'run YAML: status={status}, turns={len(turns)} OK')
+" || red "Phase 33d: run YAML did not reach deliberation terminal status"
+green "33d: run YAML status in {resolved, open, diverged} ✓"
+
+# 33e. Assert queue task reached completed
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+completed = q.get_completed()
+ids = [t['id'] for t in completed]
+assert '${COUNCIL_RUN_ID_DELIB}' in ids, \
+    f'task not in completed; completed ids={ids}'
+print(f'task ${COUNCIL_RUN_ID_DELIB} is in completed OK')
+" || red "Phase 33e: council task not found in completed queue"
+green "33e: queue task reached completed ✓"
+
+council_smoke_cleanup "${COUNCIL_RUN_ID_DELIB}"
+green "Phase 33 complete: council.run deliberation mode (stub) → resolved/open/diverged + queue completed OK"
+
+# --- Phase 34: council.run smoke — scene mode ----------------------------
+
+step "Phase 34: council.run smoke — scene mode (COUNCIL_ENGINE_STUB=1)"
+
+COUNCIL_RUN_ID_SCENE="$(python3 -c "
+import hashlib, time
+ts = time.strftime('%Y-%m-%d-%H%M%S')
+suffix = hashlib.sha256(b'smoke-scene').hexdigest()[:6]
+print(f'{ts}-{suffix}')
+")"
+
+# 32a. Write initial run YAML for scene mode
+python3 -c "
+import yaml, datetime
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_SCENE}'
+council_dir = Path('${COUNCIL_SMOKE_DIR}')
+council_dir.mkdir(parents=True, exist_ok=True)
+
+run = {
+    'run_id': run_id,
+    'created_at': datetime.datetime.utcnow().isoformat(),
+    'status': 'deliberating',
+    'mode': 'scene',
+    'decision': 'smoke scene: two characters meet at the archive',
+    'context_gathered': [],
+    'selected_entities': [
+        {'id': 'stub-char-a', 'card_path': '/stub/a.yaml', 'role': 'participant'},
+        {'id': 'stub-char-b', 'card_path': '/stub/b.yaml', 'role': 'participant'},
+    ],
+    'selection_reasoning': 'smoke fixture',
+    'voicing': 'sonnet',
+    'turns_cap': 2,
+    'turns': [],
+}
+yaml_path = council_dir / f'{run_id}.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.safe_dump(run, f, default_flow_style=False, allow_unicode=True)
+print(f'scene run YAML written: {yaml_path}')
+" || red "Phase 34a: failed to write scene run YAML"
+green "34a: scene run YAML written (status=deliberating)"
+
+# 34b. Submit council.run task with mode=scene
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+task_id = q.submit({
+    'task_type': 'council.run',
+    'description': 'smoke scene: two characters meet at the archive',
+    'priority': 'normal',
+    'notify': False,
+    'timeout_seconds': 60,
+    'payload': {
+        'mode': 'scene',
+        '_ignore_intention_registry': True,
+    },
+}, task_id='${COUNCIL_RUN_ID_SCENE}')
+print(f'submitted task_id={task_id}')
+assert task_id == '${COUNCIL_RUN_ID_SCENE}', f'task_id mismatch: {task_id}'
+" || red "Phase 34b: failed to submit scene council.run task"
+green "34b: scene council.run task submitted to queue"
+
+# 34c. Claim + run via _run_council_task (COUNCIL_ENGINE_STUB=1)
+COUNCIL_ENGINE_STUB=1 python3 -c "
+import asyncio
+from agents_core.claude_queue import ClaudeQueue
+from agents_core.claude_queue_runner import _run_council_task
+
+async def main():
+    q = ClaudeQueue()
+    task = q.claim()
+    assert task is not None, 'claim() returned None'
+    assert task['id'] == '${COUNCIL_RUN_ID_SCENE}', f'wrong task claimed: {task[\"id\"]}'
+    print(f'claimed scene task {task[\"id\"]}')
+    await _run_council_task(q, task)
+    print('_run_council_task returned')
+
+asyncio.run(main())
+" || red "Phase 34c: _run_council_task (scene) raised an exception"
+green "34c: _run_council_task (scene) completed without exception"
+
+# 34d. Assert run YAML has scene terminal status = closed
+python3 -c "
+import yaml
+from pathlib import Path
+
+run_id = '${COUNCIL_RUN_ID_SCENE}'
+yaml_path = Path('${COUNCIL_SMOKE_DIR}') / f'{run_id}.yaml'
+with open(yaml_path) as f:
+    run = yaml.safe_load(f)
+
+status = run.get('status')
+assert status == 'closed', f'scene run YAML status {status!r} != \"closed\"'
+turns = run.get('turns', [])
+assert len(turns) >= 1, f'expected at least 1 turn written by stub, got {len(turns)}'
+print(f'scene run YAML: status={status}, turns={len(turns)} OK')
+" || red "Phase 34d: scene run YAML did not reach status=closed"
+green "34d: scene run YAML status=closed ✓"
+
+# 34e. Assert queue task reached completed
+python3 -c "
+from agents_core.claude_queue import ClaudeQueue
+q = ClaudeQueue()
+completed = q.get_completed()
+ids = [t['id'] for t in completed]
+assert '${COUNCIL_RUN_ID_SCENE}' in ids, \
+    f'scene task not in completed; completed ids={ids}'
+print(f'task ${COUNCIL_RUN_ID_SCENE} is in completed OK')
+" || red "Phase 34e: scene council task not found in completed queue"
+green "34e: scene queue task reached completed ✓"
+
+council_smoke_cleanup "${COUNCIL_RUN_ID_SCENE}"
+green "Phase 34 complete: council.run scene mode (stub) → closed + queue completed OK"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

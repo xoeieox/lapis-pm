@@ -3056,9 +3056,25 @@ print('Phase 30: ratify CLI roundtrip PASSED')
 ratify_cleanup
 green "Phase 30 complete: ratify CLI roundtrip (bind → ratify confirm → outcomes entry with citation) OK"
 
+# --- Step Nb: set_outstanding_brief_verified round-trip ------------------
+TID_VERIFY="pm-smoke-brief-verify-$$"
+
+step "Nb. set_outstanding_brief_verified round-trip"
+python3 -c "
+from lapis_pm.pm_core import set_outstanding_brief_verified, clear_outstanding_brief
+from lapis_pm.pm_core import get_outstanding_brief
+set_outstanding_brief_verified('${TID_VERIFY}', 'cid-fixture-abc')
+assert get_outstanding_brief('${TID_VERIFY}') == 'cid-fixture-abc', \
+    'outstanding-brief key missing or wrong after set_outstanding_brief_verified'
+clear_outstanding_brief('${TID_VERIFY}')
+assert get_outstanding_brief('${TID_VERIFY}') is None, \
+    'outstanding-brief key still present after clear_outstanding_brief'
+" || red "set_outstanding_brief_verified round-trip FAILED"
+green "set_outstanding_brief_verified round-trip passes"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, outstanding-brief-verify all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

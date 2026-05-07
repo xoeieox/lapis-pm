@@ -410,6 +410,68 @@ def get_outstanding_brief(target_id: str) -> str | None:
     return rec["content"] if rec else None
 
 
+class OutstandingBriefWriteError(RuntimeError):
+    """set_outstanding_brief failed to persist after retry."""
+
+
+def set_outstanding_brief_verified(target_id: str, comment_id: str) -> None:
+    """Set the outstanding-brief mem key with a read-back verify.
+
+    Writes the key, immediately reads it back, and on mismatch:
+    1. Logs a structured WARN line to stderr (so journalctl picks it
+       up — see `[router-portfolio:emit-failed]` precedent at
+       pm_core.py:384) with target_id, comment_id, and the observed
+       value (or 'missing').
+    2. Retries the write exactly once.
+    3. Re-reads. If still missing or mismatched after retry, raises
+       OutstandingBriefWriteError so the caller surfaces the failure
+       rather than logging a phantom action.
+
+    The action-string returned by _act_brief is the operator's contract
+    for "the brief is now resolvable" — silent persistence failure breaks
+    that contract.
+    """
+    import sys
+    set_outstanding_brief(target_id, comment_id)
+    for attempt in range(1, 3):
+        observed = get_outstanding_brief(target_id)
+        if observed == comment_id:
+            return
+        observed_repr = observed if observed is not None else "missing"
+        print(
+            f"[outstanding-brief:write-mismatch] tid={target_id} cid={comment_id}"
+            f" observed={observed_repr} attempt={attempt}",
+            file=sys.stderr,
+        )
+        if attempt == 1:
+            set_outstanding_brief(target_id, comment_id)
+    raise OutstandingBriefWriteError(
+        f"set_outstanding_brief failed to persist after retry: "
+        f"tid={target_id} cid={comment_id}"
+    )
+
+
+def _post_write_sweep_brief(target_id: str, comment_id: str) -> None:
+    """Read the brief key once more after _mark_pr_classified ran.
+
+    This catches the external-deleter hypothesis the verify-and-retry
+    cannot defend against: if some sibling process (sweeper, concurrent
+    PM session, mem CLI invocation) deletes the key in the window
+    between verify and the next status read, this sweep is the only
+    on-tick surface that records the disappearance.
+
+    Logs to stderr only; never raises. Sweep is observability, not
+    guarantee — the verify-and-retry IS the guarantee.
+    """
+    import sys
+    observed = get_outstanding_brief(target_id)
+    if observed != comment_id:
+        print(
+            f"[outstanding-brief:disappeared-post-write] tid={target_id} cid={comment_id}",
+            file=sys.stderr,
+        )
+
+
 def _landed_key(target_id: str) -> str:
     return f"pm/landed/{target_id}"
 
@@ -1563,8 +1625,9 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         pr_number=cls.pr_number if not hold else None,
         notify=NotifyPriority.NORMAL if hold else None,
     )
-    set_outstanding_brief(target_id, b.comment_id)
     _mark_pr_classified(target_id, cls.pr_number)
+    set_outstanding_brief_verified(target_id, b.comment_id)
+    _post_write_sweep_brief(target_id, b.comment_id)
     if hold:
         kind = "hold"
     elif cls.issues:

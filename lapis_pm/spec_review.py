@@ -173,17 +173,35 @@ def _load_invariant_context(repo: str) -> str:
 
 
 def _find_reviewer_output(task_id: str) -> Path | None:
-    """Check completed/failed dirs for the spec_reviewer output file."""
-    for completed, failed in [
-        (_CLAUDE_QUEUE_COMPLETED, _CLAUDE_QUEUE_FAILED),
-        (_GPU_QUEUE_COMPLETED, _GPU_QUEUE_FAILED),
-    ]:
+    """Check completed dirs for the spec_reviewer output file.
+
+    claude_queue_runner writes output only to completed/ (OUTPUT_DIR).
+    GPU queue follows the same convention.
+    """
+    for completed in (_CLAUDE_QUEUE_COMPLETED, _GPU_QUEUE_COMPLETED):
         p = completed / f"{task_id}-output.md"
         if p.exists():
             return p
-        p = failed / f"{task_id}-output.md"
-        if p.exists():
-            return p
+    return None
+
+
+def _extract_outermost_json_object(text: str) -> str | None:
+    """Return the first complete {...} substring using bracket counting.
+
+    Handles nested objects (e.g. an issues array with {} elements).
+    Returns None if no balanced object is found.
+    """
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start : i + 1]
     return None
 
 
@@ -191,19 +209,24 @@ def _read_verdict_from_output(output_path: Path) -> dict:
     """Parse the verdict JSON from the spec_reviewer output file.
 
     The spec_reviewer template returns JSON only. Extracts the first JSON
-    object found in the file content.
+    object found in the file content, stripping markdown fences if present.
     """
     content = output_path.read_text(encoding="utf-8")
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*\n?", "", stripped)
+        stripped = re.sub(r"\n?```\s*$", "", stripped)
     # Try direct JSON parse first
     try:
-        return json.loads(content.strip())
+        return json.loads(stripped)
     except json.JSONDecodeError:
         pass
-    # Fall back: find JSON object in content (reviewer may emit surrounding text)
-    m = re.search(r"\{[^{}]*\"verdict\"[^{}]*\}", content, re.DOTALL)
-    if m:
+    # Fall back: bracket-counting scan for outermost {...} (handles nested objects)
+    obj_str = _extract_outermost_json_object(content)
+    if obj_str:
         try:
-            return json.loads(m.group(0))
+            return json.loads(obj_str)
         except json.JSONDecodeError:
             pass
     # Return error shape on parse failure
@@ -271,7 +294,15 @@ def _dispatch_council(
     invariant_context: str,
     voicing: str,
 ) -> str:
-    """Submit the council deliberation. Returns run_id."""
+    """Submit the council deliberation. Returns run_id.
+
+    SPEC_REVIEW_COUNCIL_STUB=1: skip cmd_submit entirely, return a fake run_id.
+    The poll loop will never find a YAML for the fake id, so the timeout fires
+    naturally. Used in Phase 42 smoke to maintain hermetic (no real LLM calls).
+    """
+    if os.getenv("SPEC_REVIEW_COUNCIL_STUB") == "1":
+        return f"stub-council-{uuid.uuid4().hex[:8]}"
+
     decision_text = (
         f"Review this spec for ecosystem fit and meaning: target {parsed_target_id}.\n"
         f"The technical-soundness question is being handled in parallel by an Opus pass.\n"
@@ -281,16 +312,14 @@ def _dispatch_council(
         f"=== INVARIANT CONTEXT ===\n{invariant_context}\n\n"
         f"=== SPEC ===\n{spec_text}"
     )
-    from agents_core.council.cli import cmd_submit
+    from agents_core.council.cli import cmd_submit, DEFAULT_TURNS
     args = argparse.Namespace(
         decision=decision_text,
         voicing=voicing,
         mode="deliberation",
         n=None,
-        turns=None,
+        turns=DEFAULT_TURNS,
         with_entity=None,
-        narrator=False,
-        narrator_voice=None,
         no_queue=False,
         notify=False,
     )

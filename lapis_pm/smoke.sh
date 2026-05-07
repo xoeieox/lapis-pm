@@ -4065,19 +4065,18 @@ green "Phase 41: frontmatter parse error → exit 2 + error message ✓"
 
 # --- Phase 42: timeout side-marker ---------------------------------------
 #
-# SPEC_REVIEWER_STUB=1 (clean) + no COUNCIL_ENGINE_STUB + --timeout 5.
-# The poll loop times out on the council side; spec_reviewer stub completes.
+# SPEC_REVIEWER_STUB=1 (clean) + SPEC_REVIEW_COUNCIL_STUB=1 + --timeout 5.
+# SPEC_REVIEW_COUNCIL_STUB=1 short-circuits _dispatch_council: returns a fake
+# run_id without calling cmd_submit (no real selector LLM call). The poll loop
+# checks /srv/lapis/council/<fake-run_id>.yaml, which never exists, so the 5-second
+# timeout fires naturally. Smoke stays hermetic — no real LLM calls.
 # Assert exit 0, Recommendation: incomplete, council Status: timeout,
 # opus verdict: clean.
-#
-# Note: cmd_submit makes a real selector LLM call (10-30s) before queue
-# submit. With --timeout 5, by the time the poll loop starts the timeout
-# has already elapsed. The brief is still produced correctly with council
-# side marked as timeout.
 
-step "Phase 42: spec-review timeout side-marker (SPEC_REVIEWER_STUB=1 clean, council real but timeout)"
+step "Phase 42: spec-review timeout side-marker (SPEC_REVIEWER_STUB=1 clean, SPEC_REVIEW_COUNCIL_STUB=1, --timeout 5)"
 
 SPEC_REVIEW_OUT_42="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=clean \
+    SPEC_REVIEW_COUNCIL_STUB=1 \
     timeout 300 python3 -m lapis_pm.cli spec-review \
     --timeout 5 \
     "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {

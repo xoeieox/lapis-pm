@@ -103,9 +103,10 @@ def write_brief(target_id: str, content: str, extra_tags: list[str] | None = Non
     return write(target_id, content, tags)
 
 
-def write_brief_options(target_id: str, content: str) -> Comment:
+def write_brief_options(target_id: str, content: str, extra_tags: list[str] | None = None) -> Comment:
     """Write a pm:brief-options sibling comment (JSON document)."""
-    return write(target_id, content, [TAG_BRIEF_OPTIONS])
+    tags = [TAG_BRIEF_OPTIONS] + list(extra_tags or [])
+    return write(target_id, content, tags)
 
 
 def write_hold(target_id: str, content: str, extra_tags: list[str] | None = None) -> Comment:

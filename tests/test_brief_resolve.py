@@ -45,10 +45,10 @@ def _fake_write_brief_factory(cid: str):
 
 
 def _fake_write_brief_options_factory(captured: list):
-    def _fake(target_id, content):
+    def _fake(target_id, content, extra_tags=None):
         c = MagicMock()
         c.id = "brief-options-cid"
-        c.tags = ["pm:brief-options"]
+        c.tags = ["pm:brief-options"] + list(extra_tags or [])
         c.content = content
         captured.append((target_id, content))
         return c

@@ -2427,6 +2427,9 @@ def _find_lost_fixer_dispatches(
     # Lazily loaded on first miss — avoids scanning episodic on ticks where no
     # terminal fixer dispatch exists or all are covered by open_prs.
     merged_pr_created_ats: list[str] | None = None
+    # New: lazy caches for merge-state and head-SHA-advance gates (Change 1).
+    seen_prs: set[int] | None = None
+    merged_prs_for_target: set[int] | None = None
 
     needs_retry: list[dict] = []
     needs_brief: list[tuple[dict, dict | None]] = []
@@ -2447,6 +2450,40 @@ def _find_lost_fixer_dispatches(
             if merged_pr_created_ats is None:
                 merged_pr_created_ats = _collect_merged_pr_created_ats(target_id)
             has_pr = any(ts >= dispatch_ts for ts in merged_pr_created_ats)
+
+        # Gate 1 (new): a merged PR's merged_at >= dispatch_ts, restricted to
+        # _seen_pr_ids(target_id).  Covers the foyer-shaped case where the fixer
+        # pushed onto an *existing* branch rather than opening a new PR.
+        if not has_pr:
+            if seen_prs is None:
+                seen_prs = _seen_pr_ids(target_id)
+            if merged_prs_for_target is None:
+                merged_prs_for_target = _merged_pr_numbers_observed(target_id)
+            for n in merged_prs_for_target & seen_prs:
+                if _merged_at_for_pr(target_id, n) >= dispatch_ts:
+                    has_pr = True
+                    break
+
+        # Gate 2 (new): a head-SHA-advance observation (pm:pr=<n>:sha=<sha>) at
+        # ts >= dispatch_ts, restricted to _seen_pr_ids(target_id).  Covers the
+        # case where the fixer pushed a commit and the PR is still open.
+        if not has_pr:
+            if seen_prs is None:
+                seen_prs = _seen_pr_ids(target_id)
+            for c in episodic.all_comments(target_id):
+                if c.ts >= dispatch_ts:
+                    for t in c.tags:
+                        if t.startswith("pm:pr=") and ":sha=" in t:
+                            try:
+                                n = int(t[len("pm:pr="):].split(":sha=")[0])
+                                if n in seen_prs:
+                                    has_pr = True
+                                    break
+                            except (ValueError, IndexError):
+                                pass
+                if has_pr:
+                    break
+
         if has_pr:
             continue  # PR exists; not lost
 
@@ -2531,11 +2568,51 @@ def _act_lost_brief(
     Brief body includes both dispatch IDs, error strings, and spec reference.
     Options: retry-again, amend-spec-and-retry, unbind.
     Logs decision=fixer_lost:briefing:dispatches=<id1>,<id2>.
+
+    Idempotency guard: if a pm:brief-options comment tagged
+    pm:lost-original-gpu=<orig_gpu_id> already exists for this dispatch,
+    and the outstanding-brief mem key still matches, the brief is not
+    re-composed.  Returns noop:lost-brief-suppressed:gpu=<id> in that case.
     """
     orig_id = original_rec.get("gpu_id", "unknown")
     orig_error = original_rec.get("error") or "no error recorded"
     retry_id = retry_rec.get("gpu_id", "none") if retry_rec else "none"
     retry_error = (retry_rec.get("error") or "no error recorded") if retry_rec else ""
+
+    # --- Idempotency guard (Change 2) ---
+    gpu_tag = f"pm:lost-original-gpu={orig_id}"
+    existing_brief_id: str | None = None
+    for c in episodic.all_comments(target_id):
+        if "pm:brief-options" not in c.tags:
+            continue
+        if gpu_tag not in c.tags:
+            continue
+        try:
+            data = json.loads(c.content)
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if data.get("trigger") == "lost-dispatch":
+            existing_brief_id = data.get("brief_id")
+            break
+
+    if existing_brief_id is not None:
+        current_outstanding = get_outstanding_brief(target_id)
+        if current_outstanding == existing_brief_id:
+            # Brief is outstanding and matches — suppress entirely (noop).
+            return f"noop:lost-brief-suppressed:gpu={orig_id}"
+        else:
+            # Mem key is stale (lapis-pm-outstanding-brief-write-verify-v0
+            # addresses this path separately).  Still suppress composition but
+            # write a single observation so the mismatch is visible in episodic.
+            episodic.write_observation(
+                target_id,
+                f"Lost-brief suppressed (mem-stale): orig_gpu={orig_id} "
+                f"existing_brief={existing_brief_id} "
+                f"mem_key={current_outstanding!r}",
+                extra_tags=["pm:lost-brief-suppressed", gpu_tag],
+            )
+            return f"noop:lost-brief-suppressed:gpu={orig_id}"
+    # --- End idempotency guard ---
 
     spec_ref = (episodic.spec(target_id) or "")[:80] or "(spec not found)"
     spec_path = f"/srv/lapis/planning/specs/{target_id}.md"
@@ -2553,6 +2630,7 @@ def _act_lost_brief(
         trigger="lost-dispatch",
         query=query,
         notify=NotifyPriority.NORMAL,
+        options_extra_tags=[gpu_tag],
     )
     set_outstanding_brief(target_id, b.comment_id)
 

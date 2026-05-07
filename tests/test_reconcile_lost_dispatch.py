@@ -600,3 +600,368 @@ class TestTickLostDispatchDecide:
             result = pm_core.tick("my-target")
 
         assert not result.decision.startswith("fixer_lost:")
+
+
+# ---------------------------------------------------------------------------
+# New scenarios for daemon-merge-aware-lost-dispatch-v0
+# ---------------------------------------------------------------------------
+
+# Helper: build a comment mock with ts, tags, and content fields.
+def _comment(tags: list[str], ts: str, content: str = "") -> MagicMock:
+    c = MagicMock()
+    c.tags = tags
+    c.ts = ts
+    c.content = content
+    return c
+
+
+class TestMergeAwareGates:
+    """Change 1: _find_lost_fixer_dispatches merge-state + SHA-advance gates."""
+
+    # -----------------------------------------------------------------------
+    # Scenario 1 (foyer-shaped): PR merged after dispatch → NOT lost (gate 1)
+    # -----------------------------------------------------------------------
+    def test_foyer_shaped_merged_pr_not_lost(self):
+        """Fixer dispatched against existing branch; PR merged after dispatch → not lost.
+
+        Gate 1: pm:pr-merged:<n> observation with merged_at >= dispatch_ts
+        and n ∈ _seen_pr_ids(target_id).
+        """
+        dispatch_ts = "2026-05-06T16:55:57-07:00"
+        merge_ts = "2026-05-06T17:09:47-07:00"  # after dispatch
+        rec = _fixer_record(
+            gpu_id="gpu-foyer-orig",
+            ts=dispatch_ts,
+            status="processed",
+        )
+
+        # pm:pr=1 tag establishes PR #1 in _seen_pr_ids
+        sha_obs = _comment(
+            tags=["pm:observation", "pm:pr=1", "pm:pr=1:sha=abc123"],
+            ts="2026-05-06T15:38:00-07:00",  # before dispatch
+            content="PR #1 head SHA: abc123",
+        )
+        # pm:pr-merged:1 observation with merged at <merge_ts>,
+        merged_obs = _comment(
+            tags=["pm:observation", "pm:pr-merged:1"],
+            ts=merge_ts,
+            content=f"PR #1 merged at {merge_ts}, created_at=2026-05-06T15:38:27-07:00",
+        )
+
+        with patch("lapis_pm.episodic.all_comments", return_value=[sha_obs, merged_obs]):
+            retry, brief_list = pm_core._find_lost_fixer_dispatches(
+                "foyer-v0", [rec], open_prs=[], forgejo_ok=True
+            )
+
+        assert retry == [], "foyer-shaped dispatch must NOT be classified lost"
+        assert brief_list == []
+
+    # -----------------------------------------------------------------------
+    # Scenario 2 (head-SHA-advance): SHA advances after dispatch → NOT lost (gate 2)
+    # -----------------------------------------------------------------------
+    def test_sha_advance_not_lost(self):
+        """Fixer pushes commit to existing branch; PR not yet merged; SHA advances → not lost.
+
+        Gate 2: pm:pr=<n>:sha=<sha> observation with ts >= dispatch_ts
+        and n ∈ _seen_pr_ids(target_id).
+        """
+        dispatch_ts = "2026-05-06T16:55:57-07:00"
+        sha_advance_ts = "2026-05-06T17:00:00-07:00"  # after dispatch
+        rec = _fixer_record(
+            gpu_id="gpu-sha-orig",
+            ts=dispatch_ts,
+            status="processed",
+        )
+
+        # SHA advance AFTER dispatch (this is what gate 2 catches)
+        sha_obs = _comment(
+            tags=["pm:observation", "pm:pr=1", "pm:pr=1:sha=afad37c"],
+            ts=sha_advance_ts,
+            content="PR #1 head SHA: afad37c",
+        )
+
+        with patch("lapis_pm.episodic.all_comments", return_value=[sha_obs]):
+            retry, brief_list = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+
+        assert retry == [], "SHA-advance dispatch must NOT be classified lost"
+        assert brief_list == []
+
+    # -----------------------------------------------------------------------
+    # Scenario 3 (regression): no PR, no SHA advance, no merge → still lost
+    # -----------------------------------------------------------------------
+    def test_genuinely_lost_still_classified(self):
+        """Fixer with no PR, no SHA advance, no merged sibling → classified as lost.
+
+        Regression guard: the new gates must not suppress genuine losses.
+        """
+        rec = _fixer_record(
+            gpu_id="gpu-genuinely-lost",
+            ts="2026-05-01T10:00:00-07:00",
+            status="failed",
+        )
+        # No episodic comments → no PR, no SHA advance, no merge
+        with patch("lapis_pm.episodic.all_comments", return_value=[]):
+            retry, brief_list = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+
+        assert len(retry) == 1, "Genuinely-lost dispatch must still appear in needs_retry"
+        assert retry[0]["gpu_id"] == "gpu-genuinely-lost"
+        assert brief_list == []
+
+    # -----------------------------------------------------------------------
+    # Scenario 5 (reviewer-driven fixer_retry): original suppressed via gate 2
+    # -----------------------------------------------------------------------
+    def test_reviewer_driven_retry_interaction(self):
+        """Original fixer (processed) + retry child (processed); child pushed SHA → not lost.
+
+        The child is skipped (has parent_gpu_id).
+        The original is suppressed via gate 2 because the child's push is
+        encoded as a sha-advance observation for the same PR.
+        """
+        dispatch_ts = "2026-05-06T16:55:00-07:00"
+        child_push_ts = "2026-05-06T17:00:00-07:00"
+
+        original = _fixer_record(
+            gpu_id="gpu-orig-retry",
+            ts=dispatch_ts,
+            status="processed",
+        )
+        child = _fixer_record(
+            gpu_id="gpu-child-retry",
+            ts=child_push_ts,
+            status="processed",
+            parent_gpu_id="gpu-orig-retry",
+        )
+
+        # SHA advance written after child's work (ts > dispatch_ts)
+        sha_obs = _comment(
+            tags=["pm:observation", "pm:pr=1", "pm:pr=1:sha=deadbeef"],
+            ts=child_push_ts,
+            content="PR #1 head SHA: deadbeef",
+        )
+
+        with patch("lapis_pm.episodic.all_comments", return_value=[sha_obs]):
+            retry, brief_list = pm_core._find_lost_fixer_dispatches(
+                "my-target", [original, child], open_prs=[], forgejo_ok=True
+            )
+
+        assert retry == [], "Reviewer-driven fixer_retry: original must not be classified lost"
+        assert brief_list == []
+
+    # -----------------------------------------------------------------------
+    # Scenario 6 (multi-PR leg isolation): leg A merged before dispatch of leg B → leg B still lost
+    # -----------------------------------------------------------------------
+    def test_multi_pr_leg_isolation(self):
+        """Multi-PR target: leg A merged before dispatch_ts; leg B still open.
+
+        A lost dispatch against leg B (dispatched AFTER leg A's merge) must
+        NOT be suppressed by leg A's pm:pr-merged observation, because
+        leg A's merged_at < dispatch_ts.
+        """
+        leg_a_merge_ts = "2026-05-06T16:00:00-07:00"
+        dispatch_ts = "2026-05-06T17:00:00-07:00"  # after leg A's merge
+
+        rec = _fixer_record(
+            gpu_id="gpu-leg-b-orig",
+            ts=dispatch_ts,
+            status="failed",
+        )
+
+        # PR #1 (leg A): seen in episodic via sha tag, and merged before dispatch
+        pr1_sha_obs = _comment(
+            tags=["pm:observation", "pm:pr=1", "pm:pr=1:sha=legahead"],
+            ts="2026-05-06T15:00:00-07:00",
+            content="PR #1 head SHA: legahead",
+        )
+        pr1_merged_obs = _comment(
+            tags=["pm:observation", "pm:pr-merged:1"],
+            ts=leg_a_merge_ts,
+            content=(
+                f"PR #1 merged at {leg_a_merge_ts}, "
+                "created_at=2026-05-06T14:00:00-07:00"
+            ),
+        )
+        # PR #2 (leg B): seen but still open (no merged obs, no sha advance after dispatch)
+        pr2_sha_obs = _comment(
+            tags=["pm:observation", "pm:pr=2", "pm:pr=2:sha=legbhead"],
+            ts="2026-05-06T15:30:00-07:00",  # BEFORE dispatch
+            content="PR #2 head SHA: legbhead",
+        )
+
+        with patch("lapis_pm.episodic.all_comments",
+                   return_value=[pr1_sha_obs, pr1_merged_obs, pr2_sha_obs]):
+            retry, brief_list = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+
+        assert len(retry) == 1, (
+            "Leg-B dispatch must still be classified lost — "
+            "leg A's merge is before dispatch_ts and must not suppress"
+        )
+        assert retry[0]["gpu_id"] == "gpu-leg-b-orig"
+
+
+class TestActLostBriefIdempotency:
+    """Change 2: _act_lost_brief idempotency on (target, original_gpu_id)."""
+
+    def _make_options_comment(self, brief_id: str, orig_gpu_id: str) -> MagicMock:
+        """Build a mock pm:brief-options comment as _act_lost_brief would write it."""
+        payload = {
+            "brief_id": brief_id,
+            "trigger": "lost-dispatch",
+            "options": [{"id": "A", "label": "Retry again",
+                         "action": {"kind": "force_dispatch_retry"}}],
+        }
+        return _comment(
+            tags=["pm:brief-options", f"pm:lost-original-gpu={orig_gpu_id}"],
+            ts="2026-05-06T18:18:00-07:00",
+            content=json.dumps(payload),
+        )
+
+    # -----------------------------------------------------------------------
+    # Scenario 4a: second call with matching mem key → noop (no new brief)
+    # -----------------------------------------------------------------------
+    def test_idempotency_second_call_is_noop(self):
+        """_act_lost_brief called twice on same (target, orig_gpu_id) → second returns noop.
+
+        The second call must NOT call brief.synthesize.
+        """
+        orig = _fixer_record(gpu_id="gpu-idem-001", status="failed")
+        existing_brief_id = "brief-idem-001"
+
+        options_comment = self._make_options_comment(existing_brief_id, "gpu-idem-001")
+
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[options_comment]),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=existing_brief_id),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+        ):
+            result = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert result == "noop:lost-brief-suppressed:gpu=gpu-idem-001"
+        mock_synth.assert_not_called()
+
+    # -----------------------------------------------------------------------
+    # Scenario 4b: second call with stale mem key → noop + suppressed observation
+    # -----------------------------------------------------------------------
+    def test_idempotency_stale_mem_writes_suppression_observation(self):
+        """_act_lost_brief: prior brief exists but mem key is stale → noop + observation.
+
+        The second call must NOT call brief.synthesize but MUST write a
+        pm:lost-brief-suppressed observation noting the mismatch.
+        """
+        orig = _fixer_record(gpu_id="gpu-stale-001", status="failed")
+        existing_brief_id = "brief-stale-001"
+        stale_mem_value = "brief-old-value"  # mem key points elsewhere
+
+        options_comment = self._make_options_comment(existing_brief_id, "gpu-stale-001")
+        written_obs = []
+
+        def capture_obs(tid, content, extra_tags=None):
+            written_obs.append((content, extra_tags or []))
+            return MagicMock()
+
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[options_comment]),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
+        ):
+            result = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert result == "noop:lost-brief-suppressed:gpu=gpu-stale-001"
+        mock_synth.assert_not_called()
+
+        # Exactly one suppression observation written
+        assert len(written_obs) == 1, "Expected exactly one suppression observation"
+        obs_content, obs_tags = written_obs[0]
+        assert "pm:lost-brief-suppressed" in obs_tags
+        assert "pm:lost-original-gpu=gpu-stale-001" in obs_tags
+        assert "gpu-stale-001" in obs_content
+        assert "brief-stale-001" in obs_content
+
+    # -----------------------------------------------------------------------
+    # Scenario 4c: first call (no prior brief) → composes brief + tags options comment
+    # -----------------------------------------------------------------------
+    def test_first_call_composes_brief_with_gpu_tag(self):
+        """_act_lost_brief first call: no prior brief → calls brief.synthesize
+        with options_extra_tags=[pm:lost-original-gpu=<id>].
+        """
+        orig = _fixer_record(gpu_id="gpu-first-001", status="failed")
+
+        fake_brief = MagicMock()
+        fake_brief.comment_id = "brief-first-001"
+        fake_brief.pushed = False
+        fake_brief.body = "brief body"
+        fake_brief.target_id = "my-target"
+
+        captured_kwargs = {}
+
+        def capture_synth(tid, trigger, query="", notify=None, **kw):
+            captured_kwargs.update(kw)
+            return fake_brief
+
+        with (
+            # No prior pm:brief-options comments
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.pm_core.brief.synthesize", side_effect=capture_synth),
+            patch("lapis_pm.pm_core.set_outstanding_brief"),
+            patch("lapis_pm.pm_core.episodic.spec", return_value="spec body"),
+        ):
+            result = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert result == "fixer_lost:briefing:dispatches=gpu-first-001"
+        assert captured_kwargs.get("options_extra_tags") == ["pm:lost-original-gpu=gpu-first-001"]
+
+    # -----------------------------------------------------------------------
+    # Scenario 4d: two sequential calls; first composes, second is noop
+    # -----------------------------------------------------------------------
+    def test_two_calls_produce_exactly_one_brief(self):
+        """Calling _act_lost_brief twice on same GPU: exactly one brief composition,
+        second call is noop — simulates the full storm scenario.
+        """
+        orig = _fixer_record(gpu_id="gpu-twocall-001", status="failed")
+        brief_id = "brief-twocall-001"
+
+        fake_brief = MagicMock()
+        fake_brief.comment_id = brief_id
+        fake_brief.pushed = False
+        fake_brief.body = "brief body"
+        fake_brief.target_id = "my-target"
+
+        # Build the options comment that the first call would have written
+        options_comment = self._make_options_comment(brief_id, "gpu-twocall-001")
+
+        synth_call_count = [0]
+
+        def synth_first_call(tid, trigger, query="", notify=None, **kw):
+            synth_call_count[0] += 1
+            return fake_brief
+
+        # First call: no prior brief → synthesize
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.pm_core.brief.synthesize", side_effect=synth_first_call),
+            patch("lapis_pm.pm_core.set_outstanding_brief"),
+            patch("lapis_pm.pm_core.episodic.spec", return_value="spec"),
+        ):
+            r1 = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert r1.startswith("fixer_lost:briefing:"), f"First call should emit brief, got {r1}"
+        assert synth_call_count[0] == 1
+
+        # Second call: prior brief exists, mem key matches → noop
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[options_comment]),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=brief_id),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth2,
+        ):
+            r2 = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert r2 == f"noop:lost-brief-suppressed:gpu=gpu-twocall-001"
+        mock_synth2.assert_not_called()
+        # Total synthesize calls is still 1
+        assert synth_call_count[0] == 1

@@ -3056,6 +3056,151 @@ print('Phase 30: ratify CLI roundtrip PASSED')
 ratify_cleanup
 green "Phase 30 complete: ratify CLI roundtrip (bind → ratify confirm → outcomes entry with citation) OK"
 
+# --- Step 31: merge-aware lost-dispatch (foyer-shaped scenario) ----------
+# Simulates the foyer-v0 storm: fixer dispatched after PR was created,
+# merged after dispatch.  tick() must produce NO lost-dispatch action.
+step "31. merge-aware lost-dispatch: foyer-shaped merged-PR suppresses lost-classification"
+
+TID_FOYER="pm-smoke-foyer-$$"
+FOYER_SPEC="/tmp/${TID_FOYER}-spec.md"
+cat > "$FOYER_SPEC" <<EOF
+# Foyer-shaped smoke spec for $TID_FOYER
+Smoke target for daemon-merge-aware-lost-dispatch-v0.
+EOF
+
+cat > "$TARGETS_DIR/${TID_FOYER}.yaml" <<EOF
+id: ${TID_FOYER}
+title: Foyer-shaped merge-aware smoke
+status: active
+category: active-work
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+
+$LAPIS bind "$TID_FOYER" --spec-from "$FOYER_SPEC" --repo lapis-test --authority advisory
+
+python3 - "${TID_FOYER}" <<'PYEOF31'
+import sys, json
+sys.path.insert(0, '/srv/git/agents-core-working')
+from unittest.mock import patch, MagicMock
+
+target_id = sys.argv[1]
+
+# Timestamps: PR created before dispatch; merged after dispatch.
+pr_created_at = "2026-05-06T15:38:27-07:00"
+dispatch_ts   = "2026-05-06T16:55:57-07:00"
+merge_ts      = "2026-05-06T17:09:47-07:00"
+
+# Dispatch record: fixer processed (pushed commit), no new PR opened.
+orig_record = {
+    "gpu_id": "smoke-foyer-gpu-orig",
+    "spec_id": "spec-smoke-foyer",
+    "agent_type": "fixer",
+    "intent": "push review amendment onto existing branch",
+    "repo": "lapis-test",
+    "ts": dispatch_ts,
+    "status": "processed",
+    "retry_count": 0,
+    "lost_retry_count": 0,
+}
+
+from agents_core.targets import Target
+mock_target = MagicMock(spec=Target)
+mock_target.pm_bound = True
+mock_target.paused = False
+mock_target.pm_repo = "lapis-test"
+mock_target.pm_authority = "advisory"
+mock_target.data = {}
+
+# Build episodic comments:
+# - pm:pr=1 + pm:pr=1:sha=<sha> (establishes PR #1 in _seen_pr_ids; before dispatch)
+# - pm:pr-merged:1 with merged_at = merge_ts (after dispatch)
+def _comment(tags, ts, content=""):
+    c = MagicMock()
+    c.tags = tags
+    c.ts = ts
+    c.content = content
+    return c
+
+sha_obs = _comment(
+    tags=["pm:observation", "pm:pr=1", "pm:pr=1:sha=abc123"],
+    ts=pr_created_at,
+    content="PR #1 head SHA: abc123",
+)
+merged_obs = _comment(
+    tags=["pm:observation", "pm:pr-merged:1"],
+    ts=merge_ts,
+    content=(
+        f"PR #1 merged at {merge_ts}, "
+        f"created_at={pr_created_at}"
+    ),
+)
+
+from lapis_pm import pm_core
+
+base_patches = [
+    patch("lapis_pm.pm_core.TargetStore"),
+    patch("lapis_pm.pm_core.load_dispatched", return_value=[orig_record]),
+    patch("lapis_pm.pm_core._perceive_prs", return_value=([], True)),
+    patch("lapis_pm.pm_core._reconcile_dispatched_with_queue", return_value=0),
+    patch("lapis_pm.pm_core.get_cursor", return_value=None),
+    patch("lapis_pm.pm_core.set_cursor"),
+    patch("lapis_pm.pm_core.get_pause_state", return_value=None),
+    patch("lapis_pm.pm_core.set_pause_state"),
+    patch("lapis_pm.episodic.since", return_value=[]),
+    patch("lapis_pm.pm_core._encode_new_prs", return_value=[]),
+    patch("lapis_pm.pm_core._encode_pr_sha_updates", return_value=0),
+    patch("lapis_pm.pm_core._encode_gpu_results", return_value=(0, [])),
+    patch("lapis_pm.pm_core._encode_merged_prs", return_value=0),
+    patch("lapis_pm.pm_core._encode_user_comments", return_value=[]),
+    patch("lapis_pm.pm_core._consume_brief_decisions", return_value=None),
+    patch("lapis_pm.pm_core._is_auto_land_eligible", return_value=False),
+    patch("lapis_pm.pm_core._persist_review_state_cache"),
+    patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+    patch("lapis_pm.pm_core.episodic.spec", return_value="spec body"),
+    patch("lapis_pm.episodic.all_comments", return_value=[sha_obs, merged_obs]),
+    patch("lapis_pm.episodic.write_observation"),
+    patch("lapis_pm.pm_core.save_dispatched"),
+]
+
+import contextlib
+with contextlib.ExitStack() as stack:
+    mocks = [stack.enter_context(p) for p in base_patches]
+    # Wire up TargetStore mock
+    store_mock = mocks[0]
+    store_mock.return_value.get.return_value = mock_target
+
+    result = pm_core.tick(target_id)
+
+decision = result.decision
+print(f"tick decision: {decision}")
+
+assert not decision.startswith("fixer_lost:"), (
+    f"foyer-shaped merged dispatch must NOT produce a lost-dispatch action; got: {decision}"
+)
+assert "lost" not in decision or "noop" in decision, (
+    f"unexpected lost-dispatch in decision: {decision}"
+)
+print("PASSED: foyer-shaped merged-PR suppresses lost-classification")
+PYEOF31
+green "Phase 31 complete: merge-aware lost-dispatch foyer-shaped scenario OK"
+
+# Cleanup phase 31
+rm -f "$TARGETS_DIR/${TID_FOYER}.yaml" "$COMMENTS_DIR/${TID_FOYER}.jsonl" "$FOYER_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_FOYER}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_FOYER}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_FOYER}" 2>/dev/null || true
+
+
 # --- Step Nb: set_outstanding_brief_verified round-trip ------------------
 TID_VERIFY="pm-smoke-brief-verify-$$"
 
@@ -3074,7 +3219,7 @@ green "set_outstanding_brief_verified round-trip passes"
 
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, outstanding-brief-verify all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

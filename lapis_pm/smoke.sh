@@ -69,6 +69,19 @@ cleanup() {
     /usr/local/bin/mem delete "pm/classified-prs/${TID}" 2>/dev/null || true
     # Trajectory smoke cleanup
     rm -rf "$TRAJ_SMOKE_DIR" 2>/dev/null || true
+    # Defense-in-depth: sweep any pm-smoke-*-$$ / pm-wire-*-$$ artifacts a
+    # phase may have left behind (e.g. cleanup-after-assert that exited).
+    # Pattern is PID-suffixed so we only touch this run's leftovers.
+    for f in "$TARGETS_DIR"/pm-smoke-*-$$.yaml "$TARGETS_DIR"/pm-wire-*-$$.yaml \
+             "$TARGETS_DIR"/pm-smoke-*-$$-l[0-9].yaml "$TARGETS_DIR"/pm-wire-*-$$-l[0-9].yaml; do
+        [ -e "$f" ] || continue
+        leaked_tid=$(basename "$f" .yaml)
+        rm -f "$f" "$COMMENTS_DIR/${leaked_tid}.jsonl"
+        for k in pm/cursor pm/dispatched pm/pause-state pm/outstanding-brief \
+                 pm/classified-prs pm/landed pm/review-state; do
+            /usr/local/bin/mem delete "${k}/${leaked_tid}" 2>/dev/null || true
+        done
+    done
 }
 trap cleanup EXIT
 
@@ -530,21 +543,23 @@ mock_cls = authority.PRClassification(
     title='Smoke PR', html_url='http://x', changed_paths=[], diff_loc=0, diff='',
 )
 
-with patch('lapis_pm.pm_core._perceive_prs', return_value=[pr]), \
-     patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls):
+with patch('lapis_pm.pm_core._perceive_prs', return_value=([pr], True)), \
+     patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls), \
+     patch('lapis_pm.pm_core._review_gate_paused', return_value=False):
     result = pm_core.tick('${TID_RIF}')
 print(f'[{result.target_id}] skipped={result.skipped} reason={result.reason} encoded={result.encoded} decision={result.decision}')
 ")
 echo "$TICK_RIF"
-echo "$TICK_RIF" | grep -q "decision=noop:reviewer_in_flight:pr=7:cycle=" \
-    || red "reviewer_in_flight tick did not emit noop:reviewer_in_flight (got: $TICK_RIF)"
-# Cleanup
+# Cleanup runs BEFORE the assertion so an assert failure doesn't leak the
+# bound target back to the daemon (it would then tick noop:no_change forever).
 rm -f "$TARGETS_DIR/${TID_RIF}.yaml" "$COMMENTS_DIR/${TID_RIF}.jsonl"
 /usr/local/bin/mem delete "pm/cursor/${TID_RIF}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/dispatched/${TID_RIF}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/pause-state/${TID_RIF}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/outstanding-brief/${TID_RIF}" 2>/dev/null || true
 /usr/local/bin/mem delete "pm/classified-prs/${TID_RIF}" 2>/dev/null || true
+echo "$TICK_RIF" | grep -q "decision=noop:reviewer_in_flight:pr=7:cycle=" \
+    || red "reviewer_in_flight tick did not emit noop:reviewer_in_flight (got: $TICK_RIF)"
 green "noop:reviewer_in_flight taxonomy assertion passes"
 
 # --- Auto-detect: bind --create infers pr_count from spec headers ---------
@@ -2153,7 +2168,7 @@ stages:
   - name: smoke-stage
     status: active
 EOF
-$LAPIS bind "$TID_SHA" --spec-from "$SHA_SPEC" --repo lapis-pm --authority auto-merge
+$LAPIS bind "$TID_SHA" --spec-from "$SHA_SPEC" --repo lapis-pm --authority auto
 
 # Pre-populate classified-prs with PR #42.
 /usr/local/bin/mem set "pm/classified-prs/${TID_SHA}" "[42]" --tags "lapis-pm,classified-prs" >/dev/null
@@ -2426,7 +2441,7 @@ with (
     from lapis_pm import pm_core
     result = pm_core._consume_brief_decisions(target_id)
 
-assert result == f'brief_decision_applied:{brief_id}:A', \
+assert result == f'action:brief_decision_applied:{brief_id}:A', \
     f'expected decision_str, got: {result!r}'
 
 applied = f'/srv/lapis/directives/brief-decisions/applied/{target_id}__{brief_id}.json'

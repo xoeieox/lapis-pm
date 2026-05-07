@@ -76,6 +76,16 @@ def _normalize_authority(auth: str | None) -> str:
     return auth
 
 
+def _humanize_chain_group(group: str) -> str:
+    """Humanize a chain-group id for display. e.g. 'lapis-cockpit-loom-v0' -> 'Lapis cockpit loom v0'."""
+    if not group:
+        return ""
+    words = group.replace("-", " ").replace("_", " ").split()
+    if not words:
+        return group
+    return words[0].capitalize() + (" " + " ".join(words[1:]) if len(words) > 1 else "")
+
+
 def cmd_bind(args) -> int:
     # Route to chain bind if --legs-from is present
     if getattr(args, "legs_from", None):
@@ -162,6 +172,45 @@ def cmd_bind(args) -> int:
     elif args.create:
         detected = pm_core._detect_pr_count_from_spec(spec_body)
         target.data["pr_count"] = detected
+
+    # Destination flags: validate + write if set. Omitting flags preserves existing value.
+    dest_slug = getattr(args, "destination_slug", None)
+    dest_name = getattr(args, "destination_name", None)
+    dest_when = getattr(args, "destination_when", None)
+
+    if dest_when is not None and dest_slug is None:
+        print("ERROR: --destination-when requires --destination-slug", file=sys.stderr)
+        return 2
+    slug_set = dest_slug is not None
+    name_set = dest_name is not None
+    if slug_set != name_set:
+        print(
+            "ERROR: --destination-slug and --destination-name must both be set or both be omitted",
+            file=sys.stderr,
+        )
+        return 2
+    if slug_set:
+        if not chain_mod._BRANCH_SLUG_RE.match(dest_slug):
+            print(
+                f"ERROR: --destination-slug must be kebab-case (lowercase alphanumeric, "
+                f"hyphens allowed in the middle, no leading/trailing hyphens) "
+                f"— got: {dest_slug}",
+                file=sys.stderr,
+            )
+            return 2
+        if not dest_name.strip():
+            print("ERROR: --destination-name must be non-empty", file=sys.stderr)
+            return 2
+        target.data["destination"] = {
+            "slug": dest_slug,
+            "name": dest_name,
+            "when": dest_when,
+        }
+
+    # loom_visibility: write if set, preserve existing value if omitted.
+    loom_vis = getattr(args, "loom_visibility", None)
+    if loom_vis is not None:
+        target.data["loom_visibility"] = loom_vis
 
     target.bind_pm(repo=args.repo, authority=args.authority)
     target.save()
@@ -256,6 +305,18 @@ def cmd_bind_chain(args) -> int:
         print("ERROR: empty spec body", file=sys.stderr)
         return 2
 
+    # Destination flags are not allowed in chain mode.
+    if any(
+        getattr(args, f, None) is not None
+        for f in ("destination_slug", "destination_name", "destination_when")
+    ):
+        print(
+            "ERROR: destination flags are not allowed in chain mode — "
+            "chain group id becomes the destination automatically",
+            file=sys.stderr,
+        )
+        return 2
+
     store = TargetStore()
     force = bool(getattr(args, "force", False))
     create = bool(getattr(args, "create", False))
@@ -339,6 +400,20 @@ def cmd_bind_chain(args) -> int:
             if leg_depends_on:
                 target.data["depends_on"] = leg_depends_on
             target.data["initial_dispatch"] = injected_dispatch
+
+            # Destination defaulting: guard is load-bearing (preserves explicit destination
+            # set by a prior single-target bind through chain rebind via --force).
+            if "destination" not in target.data:
+                target.data["destination"] = {
+                    "slug": chain_group,
+                    "name": _humanize_chain_group(chain_group),
+                    "when": None,
+                }
+
+            # loom_visibility: write if flag set, preserve existing if omitted.
+            chain_loom_vis = getattr(args, "loom_visibility", None)
+            if chain_loom_vis is not None:
+                target.data["loom_visibility"] = chain_loom_vis
 
             target.bind_pm(repo=leg["repo"], authority=leg["authority"])
             target.save()
@@ -603,6 +678,8 @@ def _target_to_json_dict(t) -> dict:
         "tags": t.data.get("tags", []),
         "urgency": t.urgency,
         "category": t.category,
+        "destination": t.data.get("destination"),
+        "loom_visibility": t.data.get("loom_visibility"),
     }
 
 
@@ -922,6 +999,16 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--pr-count", dest="pr_count", type=int, default=None, metavar="N",
                    help="Number of PRs that must merge before auto-land fires (>= 1). "
                         "With --create and no --pr-count: auto-detected from '### PR N' headers.")
+    b.add_argument("--destination-slug", default=None, dest="destination_slug", metavar="SLUG",
+                   help="Destination slug (kebab-case). Optional. Single-target bind only.")
+    b.add_argument("--destination-name", default=None, dest="destination_name", metavar="NAME",
+                   help="Destination display name. Required if --destination-slug is set.")
+    b.add_argument("--destination-when", default=None, dest="destination_when", metavar="WHEN",
+                   help="Optional schedule label (e.g. 'tomorrow', 'this week').")
+    b.add_argument("--loom-visibility", default=None, dest="loom_visibility",
+                   choices=["pinned", "default", "hidden"],
+                   help="Per-target Loom visibility. 'pinned' always shows in Loom; 'default' "
+                        "shows when active in window (implicit when field absent); 'hidden' never shows.")
     b.set_defaults(func=cmd_bind)
 
     u = sub.add_parser("unbind", help="Remove PM binding from a target.")

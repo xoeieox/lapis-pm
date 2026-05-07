@@ -37,6 +37,8 @@ SCHEMA_KEYS = {
     "tags",
     "urgency",
     "category",
+    "destination",
+    "loom_visibility",
 }
 
 

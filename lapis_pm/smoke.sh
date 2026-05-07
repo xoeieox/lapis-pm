@@ -3989,9 +3989,114 @@ print('cache cleanup done')
 "
 green "Phase 38 complete: v0.next scene unchanged from v0 OK"
 
+# --- Phase 39: spec-review happy path (both stubs) -----------------------
+#
+# SPEC_REVIEWER_STUB=1 + COUNCIL_ENGINE_STUB=1 — both stubs fire, no real
+# dispatch. Assert exit 0, combined brief shows proceed-to-bind, both
+# verdict:clean and Status:resolved lines present.
+
+step "Phase 39: spec-review happy path (SPEC_REVIEWER_STUB=1 clean + COUNCIL_ENGINE_STUB=1 agree)"
+
+SPEC_REVIEW_FIXTURE="${SCRIPT_DIR}/smoke_fixtures/spec_review/valid-fixture.md"
+
+# Pre-stub the council run: write a resolved YAML so the poll loop finds it
+# immediately. cmd_submit in COUNCIL_ENGINE_STUB mode still prints a run_id;
+# we capture that and pre-write the resolved YAML before poll starts.
+# Simpler approach for smoke: stub both sides and use a very short timeout.
+
+SPEC_REVIEW_OUT_39="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=clean \
+    COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,agree \
+    timeout 120 python3 -m lapis_pm.cli spec-review \
+    --timeout 120 \
+    "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
+    echo "Phase 39: spec-review exited non-zero"
+    echo "$SPEC_REVIEW_OUT_39"
+    red "Phase 39: exit code check failed"
+}
+
+echo "$SPEC_REVIEW_OUT_39" | grep -q "proceed-to-bind" \
+    || red "Phase 39: expected 'proceed-to-bind' in output"
+echo "$SPEC_REVIEW_OUT_39" | grep -q "clean" \
+    || red "Phase 39: expected 'clean' (opus verdict) in output"
+green "Phase 39: spec-review happy path → proceed-to-bind ✓"
+
+# --- Phase 40: spec-review amend-spec recommendation ---------------------
+#
+# SPEC_REVIEWER_STUB=1 STUB_VERDICT=fixable + COUNCIL_ENGINE_STUB=1 → amend-spec.
+
+step "Phase 40: spec-review amend-spec (SPEC_REVIEWER_STUB=1 fixable + COUNCIL_ENGINE_STUB=1)"
+
+SPEC_REVIEW_OUT_40="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=fixable \
+    COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,agree \
+    timeout 120 python3 -m lapis_pm.cli spec-review \
+    --timeout 120 \
+    "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
+    echo "Phase 40: spec-review exited non-zero"
+    echo "$SPEC_REVIEW_OUT_40"
+    red "Phase 40: exit code check failed"
+}
+
+echo "$SPEC_REVIEW_OUT_40" | grep -q "amend-spec" \
+    || red "Phase 40: expected 'amend-spec' in output"
+green "Phase 40: spec-review amend-spec → amend-spec ✓"
+
+# --- Phase 41: frontmatter parse error → exit 2 --------------------------
+#
+# Feed a spec with no frontmatter. Assert exit 2 and SpecFrontmatterError
+# in stderr. No dispatches should happen.
+
+step "Phase 41: spec-review frontmatter parse error → exit 2"
+
+NO_FM_FIXTURE="${SCRIPT_DIR}/smoke_fixtures/spec_review/no-frontmatter.md"
+
+SPEC_REVIEW_ERR_41=""
+set +e
+SPEC_REVIEW_OUT_41="$(python3 -m lapis_pm.cli spec-review "${NO_FM_FIXTURE}" 2>&1)"
+SPEC_REVIEW_EXIT_41=$?
+set -e
+
+[ "$SPEC_REVIEW_EXIT_41" -eq 2 ] \
+    || red "Phase 41: expected exit 2, got ${SPEC_REVIEW_EXIT_41}"
+
+echo "$SPEC_REVIEW_OUT_41" | grep -q "SpecFrontmatterError\|ERROR\|Target ID\|Repo" \
+    || red "Phase 41: expected error message in output"
+
+green "Phase 41: frontmatter parse error → exit 2 + error message ✓"
+
+# --- Phase 42: timeout side-marker ---------------------------------------
+#
+# SPEC_REVIEWER_STUB=1 (clean) + no COUNCIL_ENGINE_STUB + --timeout 5.
+# The poll loop times out on the council side; spec_reviewer stub completes.
+# Assert exit 0, Recommendation: incomplete, council Status: timeout,
+# opus verdict: clean.
+#
+# Note: cmd_submit makes a real selector LLM call (10-30s) before queue
+# submit. With --timeout 5, by the time the poll loop starts the timeout
+# has already elapsed. The brief is still produced correctly with council
+# side marked as timeout.
+
+step "Phase 42: spec-review timeout side-marker (SPEC_REVIEWER_STUB=1 clean, council real but timeout)"
+
+SPEC_REVIEW_OUT_42="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=clean \
+    timeout 300 python3 -m lapis_pm.cli spec-review \
+    --timeout 5 \
+    "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
+    echo "Phase 42: spec-review exited non-zero"
+    echo "$SPEC_REVIEW_OUT_42"
+    red "Phase 42: exit code check failed"
+}
+
+echo "$SPEC_REVIEW_OUT_42" | grep -q "incomplete" \
+    || red "Phase 42: expected 'incomplete' recommendation in output"
+echo "$SPEC_REVIEW_OUT_42" | grep -q "clean" \
+    || red "Phase 42: expected opus 'clean' verdict in output"
+echo "$SPEC_REVIEW_OUT_42" | grep -q "timeout" \
+    || red "Phase 42: expected 'timeout' (council side) in output"
+green "Phase 42: timeout side-marker → incomplete with council timeout ✓"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

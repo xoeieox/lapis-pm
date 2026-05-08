@@ -558,3 +558,54 @@ def test_sigterm_completes_in_flight_then_exits(tmp_path, monkeypatch):
 
     # Reset stop flag for subsequent tests
     night_queue._stop_requested = False
+
+
+# ---------------------------------------------------------------------------
+# Test 13: drained scheduler exits before until_epoch
+# ---------------------------------------------------------------------------
+
+def test_drained_scheduler_exits_before_until_epoch(tmp_path, monkeypatch, caplog):
+    """All scaffolds done → run_night exits before until_epoch instead of busy-sleeping.
+
+    Regression: previously, when --until was set and --once was not, the loop's
+    exit conditions only fired for `once or until_epoch is None`, so a fully
+    drained scheduler would sit in `time.sleep(1)` until the time budget ran
+    out (silent ~hours-long idle tail).
+    """
+    sims_dir = tmp_path / "sims"
+    sims_dir.mkdir()
+    _make_scaffold_yaml(sims_dir, "spec_drain", cells=2, runs_per_cell=1, load_values=[1, 2])
+
+    log_root = tmp_path / "log"
+
+    simulate_calls: list[list[str]] = []
+
+    def fake_simulate(path, *, runs_per_cell, cells, **kw):
+        simulate_calls.append(list(cells))
+        return []
+
+    monkeypatch.setattr("httpx.get", lambda url, timeout: MagicMock(status_code=200))
+    monkeypatch.setattr("lapis_pm.scout.runner.simulate", fake_simulate)
+
+    until_epoch = int(time.time()) + 3600
+
+    started = time.time()
+    with caplog.at_level("INFO", logger="lapis_pm.scout.night_queue"):
+        result = run_night(
+            sims_dir=sims_dir,
+            until_epoch=until_epoch,
+            once=False,
+            log_root=log_root,
+        )
+    elapsed = time.time() - started
+
+    assert len(simulate_calls) == 2, f"expected 2 cells run, got {len(simulate_calls)}"
+    assert result.aborted is False
+    assert elapsed < 30, (
+        f"run_night idled for {elapsed:.1f}s after scheduler drained — "
+        "should have exited promptly"
+    )
+    assert any(
+        "exiting before until_epoch" in rec.message
+        for rec in caplog.records
+    ), f"missing drained-exit log line; got: {[r.message for r in caplog.records]}"

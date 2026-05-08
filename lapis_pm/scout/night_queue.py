@@ -714,11 +714,11 @@ def run_night(
         if until_epoch is not None and time.time() >= until_epoch:
             log.info("Reached until_epoch — night run complete.")
             break
-        if once and scheduler.all_done():
-            log.info("--once: all scaffolds done — night run complete.")
-            break
-        if not once and until_epoch is None and scheduler.all_done():
-            # No time limit, no --once, all done → exit
+        if scheduler.all_done():
+            if once:
+                log.info("--once: all scaffolds done — night run complete.")
+            elif until_epoch is not None:
+                log.info("All scaffolds done — exiting before until_epoch.")
             break
 
         unit = scheduler.next_unit(now=int(time.time()))

@@ -921,6 +921,35 @@ def cmd_review_gate(args) -> int:
     return 2
 
 
+def cmd_spec_review(args) -> int:
+    """Handle `lapis-pm spec-review` subcommand."""
+    from pathlib import Path
+    from .spec_review import (
+        SpecFrontmatterError,
+        InvariantContextError,
+        format_brief,
+        run_spec_review,
+    )
+
+    spec_path = Path(args.spec_path)
+    try:
+        brief = run_spec_review(
+            spec_path=spec_path,
+            council_voicing=args.council_voicing,
+            timeout_s=args.timeout,
+            repo_override=args.repo_override,
+        )
+    except (SpecFrontmatterError, InvariantContextError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"ERROR: dispatch failure — {e}", file=sys.stderr)
+        return 2
+
+    print(format_brief(brief))
+    return 0
+
+
 def cmd_trajectory_rollup(args) -> int:
     """Handle `lapis-pm trajectory-rollup` subcommand."""
     import logging
@@ -1262,6 +1291,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log root of the run (default: most recent).",
     )
     sc_nq.set_defaults(func=cmd_scout)
+
+    sr = sub.add_parser(
+        "spec-review",
+        help="Pre-bind parallel Opus + Council review of a spec document.",
+    )
+    sr.add_argument("spec_path", help="Path to the spec markdown file.")
+    sr.add_argument(
+        "--council-voicing",
+        default="local",
+        choices=["local", "haiku", "sonnet", "opus"],
+        dest="council_voicing",
+        help="Voicing for Mirror Council deliberation (default: local).",
+    )
+    sr.add_argument(
+        "--timeout",
+        type=int,
+        default=900,
+        help="Total timeout in seconds (default: 900).",
+    )
+    sr.add_argument(
+        "--repo",
+        default=None,
+        dest="repo_override",
+        help="Override repo parsed from spec frontmatter.",
+    )
+    sr.set_defaults(func=cmd_spec_review)
 
     return p
 

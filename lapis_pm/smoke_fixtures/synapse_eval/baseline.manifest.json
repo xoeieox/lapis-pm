@@ -1,0 +1,7 @@
+{
+  "chub_bundle_hashes": ["sha256:smoke-bundle-abc123"],
+  "mem_snapshot_at": "2026-05-11T00:00:00Z",
+  "query_count": 2,
+  "fixture_purpose": "smoke-test-only",
+  "note": "Minimal fixture for eval-gate CI path; not representative of production retrieval quality."
+}

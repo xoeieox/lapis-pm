@@ -57,6 +57,11 @@ except Exception:
 from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
 from . import episodic, brief, authority
 
+try:
+    from . import eval_gate as _eval_gate
+except Exception:
+    _eval_gate = None  # type: ignore
+
 # Module-level singleton — constructed at import time so a malformed
 # registry.yaml crashes the daemon immediately, not at first dispatch.
 _SHAPER = Shaper(Path(__file__).parent / "registry.yaml")
@@ -2782,6 +2787,102 @@ def _consume_brief_decisions(target_id: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Eval-gate helpers (synapse-eval-gate-v1)
+# ---------------------------------------------------------------------------
+
+def _act_eval_gate_brief(
+    target_id: str, result, repo: str
+) -> str:
+    """Emit an advisory brief for a regressed or unverified eval-gate result.
+
+    Calls brief.synthesize() with the documented parameter mapping:
+      trigger  = "synapse_eval_regressed" | "synapse_eval_unverified"
+      query    = "PR #N retrieval-quality check"
+      diff_snippet = result.summary_text   (delta table)
+      screen_issues = []
+      pr_number = result.pr_number
+      notify    = None    (advisory only; no Pushover per invariant)
+
+    Marks the result actioned in the cache and sets the outstanding brief.
+    Does NOT mark the PR classified so the reviewer/fixer can proceed on the
+    next tick.
+    """
+    trigger = (
+        "synapse_eval_regressed"
+        if result.status == "regressed"
+        else "synapse_eval_unverified"
+    )
+    b = brief.synthesize(
+        target_id,
+        trigger=trigger,
+        query=f"PR #{result.pr_number} retrieval-quality check",
+        diff_snippet=result.summary_text,
+        screen_issues=[],
+        pr_number=result.pr_number,
+        notify=None,
+    )
+    if _eval_gate:
+        _eval_gate.mark_eval_actioned(result.head_sha)
+    episodic.write_observation(
+        target_id,
+        f"Eval-gate brief emitted: PR #{result.pr_number} "
+        f"sha={result.head_sha[:8]} status={result.status} cid={b.comment_id}",
+        extra_tags=[
+            f"pm:synapse-eval:pr={result.pr_number}",
+            f"pm:synapse-eval:sha={result.head_sha[:8]}",
+            f"pm:synapse-eval:status={result.status}",
+        ],
+    )
+    set_outstanding_brief_verified(target_id, b.comment_id)
+    _post_write_sweep_brief(target_id, b.comment_id)
+    return (
+        f"action:eval_gate_brief:pr={result.pr_number}"
+        f":status={result.status}:cid={b.comment_id}"
+    )
+
+
+def _act_regenerate_synapse_baseline(target_id: str) -> str:
+    """Regenerate the synapse eval baseline at origin/main HEAD.
+
+    Blocking operation with REGEN_TIMEOUT_S ceiling (240s).  Tears down
+    worktree + ephemeral process unconditionally.  On success, writes
+    /data/synapse/eval/baselines/main.json and logs a journal observation.
+    On failure, leaves the prior baseline in place.
+
+    Rate-limited: at most one retry per 30 minutes after a failure (tracked
+    via pm/synapse-eval/regen-last-attempt in mem.db).
+    """
+    if not _eval_gate:
+        return "noop:eval_gate_unavailable"
+
+    episodic.write_observation(
+        target_id,
+        "Baseline regeneration started (synapse-eval-gate-v1)",
+        extra_tags=["pm:synapse-eval:regen-started"],
+    )
+    result = _eval_gate.regenerate_baseline()
+    if result is not None:
+        _eval_gate.record_regen_attempt(success=True)
+        sha = result.get("sha", "?")[:12]
+        episodic.write_observation(
+            target_id,
+            f"Baseline regeneration succeeded: sha={sha} "
+            f"metrics={list(result.get('metrics', {}).keys())}",
+            extra_tags=["pm:synapse-eval:regen-succeeded", f"pm:synapse-eval:sha={sha}"],
+        )
+        return f"action:regenerate_synapse_baseline:succeeded:sha={sha}"
+    else:
+        _eval_gate.record_regen_attempt(success=False)
+        episodic.write_observation(
+            target_id,
+            "Baseline regeneration failed — prior baseline preserved; "
+            "will retry after rate-limit window (30 min)",
+            extra_tags=["pm:synapse-eval:regen-failed", "pm:error"],
+        )
+        return "action:regenerate_synapse_baseline:failed"
+
+
+# ---------------------------------------------------------------------------
 # Tick
 # ---------------------------------------------------------------------------
 
@@ -2896,35 +2997,72 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
             # Pick the lowest-numbered PR (FIFO) so the same one drives action
             # until resolved.
             pr = min(actionable_prs, key=lambda p: p.get("number", 1 << 30))
-            decision = _decide_for_pr(target_id, repo, pr, pm_authority)
-            if decision.kind == "merge":
-                decision_str = _act_merge(target_id, decision.payload)
-            elif decision.kind == "hold_brief":
-                decision_str = _act_brief(target_id, trigger="held PR", hold=True,
-                                          payload=decision.payload)
-            elif decision.kind == "advisory_brief":
-                decision_str = _act_brief(target_id, trigger="advisory PR", hold=False,
-                                          payload=decision.payload)
-            elif decision.kind == "dispatch_reviewer":
-                p = decision.payload
-                decision_str = _act_dispatch_reviewer(
-                    target_id, p["pr"], p["cls"], p["mode"], p["cycle"],
-                )
-            elif decision.kind == "dispatch_fixer_retry":
-                decision_str = _act_dispatch_fixer_retry(target_id, decision.payload)
-            elif decision.kind == "review_exhausted_brief":
-                decision_str = _act_brief_review_exhausted(target_id, decision.payload)
-            elif decision.kind == "review_gate_pause":
-                decision_str = _act_review_gate_pause(target_id, decision.payload)
-            elif decision.kind == "noop_reviewer_in_flight":
-                p = decision.payload
-                decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"
-            elif decision.kind == "noop_fixer_in_flight":
-                p = decision.payload
-                decision_str = f"noop:fixer_in_flight:dispatch={p['dispatch_id']}"
-            else:
-                # noop_no_change or unknown — single-action discipline: do nothing
-                decision_str = "noop:no_change"
+            pr_number_sel = pr.get("number", 0)
+
+            # Eval-gate: for synapse PRs, run quality check before reviewer dispatch.
+            # Skip if reviewer is already pending (avoid race with in-flight review).
+            _eval_gate_handled = False
+            if _eval_gate and repo == "synapse":
+                if not _has_pending_reviewer_for_pr(target_id, pr_number_sel):
+                    try:
+                        _eg_result = _eval_gate.evaluate_pr(target_id, pr, repo)
+                    except Exception as _eg_exc:
+                        logger.warning("eval_gate.evaluate_pr raised: %s", _eg_exc)
+                        _eg_result = None
+                    if _eg_result is not None:
+                        _already_actioned = _eval_gate.is_eval_actioned(_eg_result.head_sha)
+                        if not _already_actioned:
+                            if _eg_result.status == "clean":
+                                # Percept tag only; fall through to normal dispatch
+                                episodic.write_observation(
+                                    target_id,
+                                    f"Eval-gate: PR #{pr_number_sel} "
+                                    f"sha={_eg_result.head_sha[:8]} status=clean",
+                                    extra_tags=[
+                                        f"pm:synapse-eval:pr={pr_number_sel}",
+                                        f"pm:synapse-eval:sha={_eg_result.head_sha[:8]}",
+                                        "pm:synapse-eval:status=clean",
+                                    ],
+                                )
+                                _eval_gate.mark_eval_actioned(_eg_result.head_sha)
+                                # Fall through to _decide_for_pr below
+                            elif _eg_result.status in ("regressed", "unverified"):
+                                # Advisory brief — consumes single-action slot
+                                decision_str = _act_eval_gate_brief(
+                                    target_id, _eg_result, repo
+                                )
+                                _eval_gate_handled = True
+
+            if not _eval_gate_handled:
+                decision = _decide_for_pr(target_id, repo, pr, pm_authority)
+                if decision.kind == "merge":
+                    decision_str = _act_merge(target_id, decision.payload)
+                elif decision.kind == "hold_brief":
+                    decision_str = _act_brief(target_id, trigger="held PR", hold=True,
+                                              payload=decision.payload)
+                elif decision.kind == "advisory_brief":
+                    decision_str = _act_brief(target_id, trigger="advisory PR", hold=False,
+                                              payload=decision.payload)
+                elif decision.kind == "dispatch_reviewer":
+                    p = decision.payload
+                    decision_str = _act_dispatch_reviewer(
+                        target_id, p["pr"], p["cls"], p["mode"], p["cycle"],
+                    )
+                elif decision.kind == "dispatch_fixer_retry":
+                    decision_str = _act_dispatch_fixer_retry(target_id, decision.payload)
+                elif decision.kind == "review_exhausted_brief":
+                    decision_str = _act_brief_review_exhausted(target_id, decision.payload)
+                elif decision.kind == "review_gate_pause":
+                    decision_str = _act_review_gate_pause(target_id, decision.payload)
+                elif decision.kind == "noop_reviewer_in_flight":
+                    p = decision.payload
+                    decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"
+                elif decision.kind == "noop_fixer_in_flight":
+                    p = decision.payload
+                    decision_str = f"noop:fixer_in_flight:dispatch={p['dispatch_id']}"
+                else:
+                    # noop_no_change or unknown — single-action discipline: do nothing
+                    decision_str = "noop:no_change"
 
     elif failed_dispatches:
         rec = failed_dispatches[-1]
@@ -2954,6 +3092,14 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         # Lost dispatch: retry also produced no PR → surface to human.
         _orig, _retry_rec = _lost_needs_brief[0]
         decision_str = _act_lost_brief(target_id, _orig, _retry_rec)
+
+    elif (
+        _eval_gate
+        and _eval_gate.should_regenerate_baseline(repo)
+    ):
+        # Baseline regeneration: fires post-merge when baseline is stale/missing.
+        # Mirrors auto-land shape — consumes the single-action slot.
+        decision_str = _act_regenerate_synapse_baseline(target_id)
 
     elif allow_auto_land and _is_auto_land_eligible(target_id):
         decision_str = _act_auto_land(target_id)

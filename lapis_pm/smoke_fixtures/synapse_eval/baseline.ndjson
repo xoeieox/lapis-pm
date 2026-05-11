@@ -1,0 +1,2 @@
+{"query_id": "smoke-q1", "query": "how does retrieval work", "expected_chub_ids": ["chub-abc123", "chub-def456"], "expected_mem_keys": ["mem-key-001"]}
+{"query_id": "smoke-q2", "query": "character embedding lookup", "expected_chub_ids": ["chub-ghi789"], "expected_mem_keys": ["mem-key-002", "mem-key-003"]}

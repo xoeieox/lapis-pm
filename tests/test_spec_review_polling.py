@@ -133,6 +133,99 @@ def test_timeout_marks_pending_reviewer():
 
 
 # ---------------------------------------------------------------------------
+# Progress log lines — §4 and §5
+# ---------------------------------------------------------------------------
+
+def test_poll_timeout_log_emitted(capsys):
+    """Both sides timeout → [spec-review:timeout] opus_done=False council_done=False."""
+    tid = f"poll-timeout-log-{int(time.time())}"
+    run_id = f"council-timeout-log-{int(time.time())}"
+    try:
+        # No output files written — both sides hit timeout
+        opus_raw, council_raw = _poll_until_terminal(
+            spec_reviewer_task_id=tid,
+            council_run_id=run_id,
+            timeout_s=60,
+            start_time=time.time() - 10000,
+        )
+        assert opus_raw["status"] == "timeout"
+        assert council_raw["status"] == "timeout"
+        captured = capsys.readouterr()
+        assert "[spec-review:timeout] elapsed=" in captured.err
+        assert "opus_done=False" in captured.err
+        assert "council_done=False" in captured.err
+        assert "opus-complete" not in captured.err
+        assert "council-complete" not in captured.err
+    finally:
+        out = _CLAUDE_QUEUE_COMPLETED / f"{tid}-output.md"
+        if out.exists():
+            out.unlink()
+        council_yaml = _COUNCIL_DIR / f"{run_id}.yaml"
+        if council_yaml.exists():
+            council_yaml.unlink()
+
+
+def test_opus_complete_log_emitted(capsys):
+    """Reviewer output found, council times out → opus-complete + timeout logs."""
+    tid = f"opus-complete-log-{int(time.time())}"
+    run_id = f"council-opus-timeout-{int(time.time())}"
+    out_path = None
+    try:
+        out_path = _write_reviewer_output(tid, "clean")
+        opus_raw, council_raw = _poll_until_terminal(
+            spec_reviewer_task_id=tid,
+            council_run_id=run_id,
+            timeout_s=60,
+            start_time=time.time() - 10000,
+        )
+        assert opus_raw["verdict"] == "clean"
+        assert council_raw["status"] == "timeout"
+        captured = capsys.readouterr()
+        assert f"[spec-review:opus-complete] task_id={tid}" in captured.err
+        assert "elapsed=" in captured.err
+        assert "verdict=clean" in captured.err
+        assert "[spec-review:timeout]" in captured.err
+        assert "opus_done=True" in captured.err
+        assert "council_done=False" in captured.err
+    finally:
+        if out_path and out_path.exists():
+            out_path.unlink()
+        council_yaml = _COUNCIL_DIR / f"{run_id}.yaml"
+        if council_yaml.exists():
+            council_yaml.unlink()
+
+
+def test_council_complete_log_emitted(capsys):
+    """Council yaml found (status=failed), reviewer times out → council-complete + timeout."""
+    tid = f"council-complete-log-{int(time.time())}"
+    run_id = f"council-complete-yaml-{int(time.time())}"
+    council_path = None
+    try:
+        council_path = _write_council_yaml(run_id, "failed")
+        opus_raw, council_raw = _poll_until_terminal(
+            spec_reviewer_task_id=tid,
+            council_run_id=run_id,
+            timeout_s=60,
+            start_time=time.time() - 10000,
+        )
+        assert opus_raw["status"] == "timeout"
+        assert council_raw["status"] == "failed"
+        captured = capsys.readouterr()
+        assert f"[spec-review:council-complete] run_id={run_id}" in captured.err
+        assert "elapsed=" in captured.err
+        assert "status=failed" in captured.err
+        assert "[spec-review:timeout]" in captured.err
+        assert "opus_done=False" in captured.err
+        assert "council_done=True" in captured.err
+    finally:
+        if council_path and council_path.exists():
+            council_path.unlink()
+        out = _CLAUDE_QUEUE_COMPLETED / f"{tid}-output.md"
+        if out.exists():
+            out.unlink()
+
+
+# ---------------------------------------------------------------------------
 # No cancellation signal: task continues after poll returns
 # ---------------------------------------------------------------------------
 

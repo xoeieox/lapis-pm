@@ -219,7 +219,7 @@ agents:
 
       No prose outside the JSON.
     model: opus
-    timeout_s: 600
+    timeout_s: 1800
 
   fixer:
     chub_bundles: []

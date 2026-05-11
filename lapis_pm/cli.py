@@ -950,6 +950,116 @@ def cmd_spec_review(args) -> int:
     return 0
 
 
+def cmd_eval_gate(args) -> int:
+    """Handle `lapis-pm eval-gate` subcommand."""
+    from . import eval_gate as eg
+
+    sub = args.eval_gate_sub
+
+    if sub == "status":
+        # Show last eval run for each open Synapse PR
+        try:
+            from agents_core.forgejo import get_open_prs
+            open_prs = get_open_prs("synapse") or []
+        except Exception as exc:
+            print(f"WARNING: could not fetch open synapse PRs: {exc}", file=sys.stderr)
+            open_prs = []
+
+        statuses = eg.eval_gate_status(open_prs, repo="synapse")
+        if args.json:
+            print(json.dumps(statuses, ensure_ascii=False, indent=2))
+        else:
+            if not statuses:
+                print("No open Synapse PRs.")
+            for s in statuses:
+                actioned = " [actioned]" if s["actioned"] else ""
+                regressed = ""
+                if s["regressed_metrics"]:
+                    regressed = f" regressed={s['regressed_metrics']}"
+                print(
+                    f"PR #{s['pr_number']} sha={s['head_sha']} "
+                    f"status={s['status']}{regressed}{actioned}"
+                )
+        return 0
+
+    if sub == "run":
+        pr_number = args.pr
+        # Force re-eval by removing cache entry
+        from agents_core.forgejo import get_open_prs
+        try:
+            open_prs = get_open_prs("synapse") or []
+        except Exception as exc:
+            print(f"ERROR: cannot fetch open Synapse PRs: {exc}", file=sys.stderr)
+            return 1
+
+        pr = next((p for p in open_prs if p.get("number") == pr_number), None)
+        if pr is None:
+            print(f"ERROR: PR #{pr_number} not found in open Synapse PRs", file=sys.stderr)
+            return 1
+
+        head_sha = (pr.get("head") or {}).get("sha", "")
+        if head_sha:
+            cache_file = eg.RUNS_DIR / f"{head_sha}.json"
+            if cache_file.exists():
+                cache_file.unlink()
+                print(f"Cache cleared for sha={head_sha[:8]}")
+
+        result = eg.evaluate_pr("eval-gate-cli", pr, "synapse")
+        if result is None:
+            print("Eval gate returned no result (path-filter miss, fixture missing, or eval error).")
+            return 1
+
+        if args.json:
+            from dataclasses import asdict
+            print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        else:
+            print(f"PR #{result.pr_number} sha={result.head_sha[:8]}")
+            print(f"Status: {result.status}")
+            print(f"Regressed: {result.regressed}")
+            if result.regressed_metrics:
+                print(f"Regressed metrics: {result.regressed_metrics}")
+            print()
+            print(result.summary_text)
+        return 0
+
+    if sub == "baseline":
+        baseline_sub = args.baseline_sub
+
+        if baseline_sub == "show":
+            baseline = eg.load_baseline()
+            if baseline is None:
+                print("No baseline found at", eg.BASELINE_PATH)
+                return 1
+            if args.json:
+                print(json.dumps(baseline, ensure_ascii=False, indent=2))
+            else:
+                sha = baseline.get("sha", "?")[:12]
+                gen = baseline.get("generated_at", "?")
+                metrics = baseline.get("metrics", {})
+                print(f"Baseline sha={sha} generated_at={gen}")
+                for m, v in metrics.items():
+                    print(f"  {m}: {v}")
+            return 0
+
+        if baseline_sub == "regenerate":
+            print("Regenerating baseline (this may take up to 240s)...")
+            result = eg.regenerate_baseline()
+            if result is None:
+                print("ERROR: baseline regeneration failed. Check logs.", file=sys.stderr)
+                return 1
+            sha = result.get("sha", "?")[:12]
+            print(f"Baseline regenerated: sha={sha}")
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
+        print(f"ERROR: unknown baseline subcommand: {baseline_sub}", file=sys.stderr)
+        return 2
+
+    print(f"ERROR: unknown eval-gate subcommand: {sub}", file=sys.stderr)
+    return 2
+
+
 def cmd_trajectory_rollup(args) -> int:
     """Handle `lapis-pm trajectory-rollup` subcommand."""
     import logging
@@ -1291,6 +1401,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log root of the run (default: most recent).",
     )
     sc_nq.set_defaults(func=cmd_scout)
+
+    # ------------------------------------------------------------------
+    # eval-gate — synapse retrieval-quality gate
+    # ------------------------------------------------------------------
+    eg = sub.add_parser(
+        "eval-gate",
+        help="Synapse eval-gate: retrieval-quality check on PR branches.",
+    )
+    eg_sub = eg.add_subparsers(dest="eval_gate_sub", required=True)
+
+    eg_status = eg_sub.add_parser("status", help="Show last eval run for each open Synapse PR.")
+    eg_status.add_argument("--json", action="store_true", default=False,
+                           help="Emit structured JSON output.")
+    eg_status.set_defaults(func=cmd_eval_gate)
+
+    eg_run = eg_sub.add_parser("run", help="Force a re-eval for a specific PR (bypasses cache).")
+    eg_run.add_argument("--pr", type=int, required=True, metavar="N", help="PR number to evaluate.")
+    eg_run.add_argument("--json", action="store_true", default=False,
+                        help="Emit structured JSON output.")
+    eg_run.set_defaults(func=cmd_eval_gate)
+
+    eg_baseline = eg_sub.add_parser("baseline", help="Manage the eval baseline.")
+    eg_baseline_sub = eg_baseline.add_subparsers(dest="baseline_sub", required=True)
+
+    eg_bl_regen = eg_baseline_sub.add_parser(
+        "regenerate", help="Regenerate baseline against current origin/main."
+    )
+    eg_bl_regen.add_argument("--json", action="store_true", default=False,
+                             help="Emit JSON on success.")
+    eg_bl_regen.set_defaults(func=cmd_eval_gate)
+
+    eg_bl_show = eg_baseline_sub.add_parser("show", help="Print current baseline JSON.")
+    eg_bl_show.add_argument("--json", action="store_true", default=False,
+                            help="Emit raw JSON (default: human-readable).")
+    eg_bl_show.set_defaults(func=cmd_eval_gate)
 
     sr = sub.add_parser(
         "spec-review",

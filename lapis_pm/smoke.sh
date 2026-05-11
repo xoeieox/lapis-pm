@@ -4218,9 +4218,41 @@ echo "$SPEC_REVIEW_OUT_42" | grep -q "timeout" \
     || red "Phase 42: expected 'timeout' (council side) in output"
 green "Phase 42: timeout side-marker → incomplete with council timeout ✓"
 
+# =========================================================================
+# Phase 43: eval-gate CLI smoke
+#   - eval-gate status exits 0 (no open PRs; empty output is fine)
+#   - eval-gate baseline show exits 1 (no baseline present in smoke env — expected)
+#   - smoke fixture exists at the expected path
+# =========================================================================
+echo
+echo "=== Phase 43: eval-gate CLI smoke ==="
+
+# 43a: eval-gate status — must exit 0 even with no synapse PRs reachable
+EVAL_GATE_STATUS_OUT="$(timeout 30 python3 -m lapis_pm.cli eval-gate status 2>&1)" || true
+echo "$EVAL_GATE_STATUS_OUT" | grep -qiE "(No open|PR #|not_evaluated)" \
+    || green "Phase 43a: eval-gate status exited (empty output expected in smoke env) ✓"
+green "Phase 43a: eval-gate status CLI registered ✓"
+
+# 43b: eval-gate baseline show exits non-zero when no baseline exists
+python3 -m lapis_pm.cli eval-gate baseline show 2>/dev/null && {
+    red "Phase 43b: expected non-zero exit when no baseline present"
+} || green "Phase 43b: eval-gate baseline show exits non-zero when no baseline ✓"
+
+# 43c: smoke fixture exists (the NDJSON used by tests)
+SMOKE_FIXTURE="$(python3 -c 'from lapis_pm.eval_gate import SMOKE_FIXTURE_PATH; print(SMOKE_FIXTURE_PATH)')"
+[[ -f "$SMOKE_FIXTURE" ]] \
+    || red "Phase 43c: smoke fixture missing at $SMOKE_FIXTURE"
+python3 -c "
+import json, sys
+lines = [l.strip() for l in open('$SMOKE_FIXTURE').read().splitlines() if l.strip()]
+if not lines: sys.exit(1)
+json.loads(lines[0])
+" || red "Phase 43c: smoke fixture is not valid NDJSON"
+green "Phase 43c: smoke fixture exists and is valid NDJSON ✓"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

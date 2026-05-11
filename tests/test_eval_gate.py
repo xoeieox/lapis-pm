@@ -363,10 +363,15 @@ class TestBriefEmissionByStatus:
     ) -> dict:
         """Simulate the tick's eval-gate wiring for a single PR.
 
+        Drives brief emission through _act_eval_gate_brief (the real pm_core function)
+        so that changes to pm_core's wiring are caught by these tests.
+
         Returns {"brief_emitted": bool, "percept_tag_written": bool, "fell_through": bool}.
         """
         from lapis_pm import eval_gate as eg
         from lapis_pm.eval_gate import EvalResult
+        import lapis_pm.pm_core as pm_core_mod
+        from lapis_pm.pm_core import _act_eval_gate_brief
 
         sha = "sha_4c_001"
         result = EvalResult(
@@ -386,9 +391,8 @@ class TestBriefEmissionByStatus:
 
         brief_calls = []
         percept_calls = []
-        actioned_calls = []
 
-        def fake_synthesize(**kwargs):
+        def fake_synthesize(*args, **kwargs):
             brief_calls.append(kwargs)
             m = MagicMock()
             m.comment_id = "cid-4c"
@@ -397,22 +401,23 @@ class TestBriefEmissionByStatus:
         def fake_write_observation(*args, **kwargs):
             percept_calls.append((args, kwargs))
 
-        def fake_mark_actioned(head_sha):
-            actioned_calls.append(head_sha)
-
-        # Simulate the tick-wiring decision logic
+        # Simulate the tick-wiring decision logic, driving brief emission via
+        # the real _act_eval_gate_brief to catch future wiring changes.
         fell_through = False
+        mock_eval_gate_obj = MagicMock()
         with (
             patch.object(eg, "evaluate_pr", return_value=result),
             patch.object(eg, "is_eval_actioned", return_value=already_actioned),
-            patch.object(eg, "mark_eval_actioned", side_effect=fake_mark_actioned),
+            patch.object(eg, "mark_eval_actioned"),
+            patch.object(pm_core_mod, "_eval_gate", mock_eval_gate_obj),
+            patch.object(pm_core_mod, "set_outstanding_brief_verified"),
+            patch.object(pm_core_mod, "_post_write_sweep_brief"),
         ):
             from lapis_pm import brief as brief_mod, episodic as ep_mod
             with (
                 patch.object(brief_mod, "synthesize", side_effect=fake_synthesize),
                 patch.object(ep_mod, "write_observation", side_effect=fake_write_observation),
             ):
-                # Replicate the tick wiring logic
                 if not reviewer_pending:
                     r = eg.evaluate_pr("tid", {"number": 11, "head": {"sha": sha}}, "synapse")
                     if r is not None and not eg.is_eval_actioned(r.head_sha):
@@ -424,21 +429,8 @@ class TestBriefEmissionByStatus:
                             eg.mark_eval_actioned(r.head_sha)
                             fell_through = True
                         elif r.status in ("regressed", "unverified"):
-                            trigger = (
-                                "synapse_eval_regressed"
-                                if r.status == "regressed"
-                                else "synapse_eval_unverified"
-                            )
-                            brief_mod.synthesize(
-                                target_id="tid",
-                                trigger=trigger,
-                                query=f"PR #{r.pr_number} retrieval-quality check",
-                                diff_snippet=r.summary_text,
-                                screen_issues=[],
-                                pr_number=r.pr_number,
-                                notify=None,
-                            )
-                            eg.mark_eval_actioned(r.head_sha)
+                            # Drive through the real pm_core function for test fidelity.
+                            _act_eval_gate_brief("tid", r, "synapse")
                     elif r is not None and eg.is_eval_actioned(r.head_sha):
                         fell_through = True
                 else:
@@ -596,7 +588,7 @@ class TestSmokeIntegration:
 
         brief_calls = []
 
-        def fake_synthesize(**kwargs):
+        def fake_synthesize(*args, **kwargs):
             brief_calls.append(kwargs)
             m = MagicMock()
             m.comment_id = "smoke-brief-cid"
@@ -607,35 +599,34 @@ class TestSmokeIntegration:
         def fake_write_observation(tid, content, extra_tags=None):
             observation_calls.append({"tid": tid, "content": content, "tags": extra_tags})
 
+        import lapis_pm.pm_core as pm_core_mod
+        from lapis_pm.pm_core import _act_eval_gate_brief
+
+        mock_eval_gate_obj = MagicMock()
         with (
             patch.object(eg, "RUNS_DIR", runs_dir),
             patch.object(eg, "evaluate_pr", return_value=regressed_result),
             patch.object(eg, "is_eval_actioned", return_value=False),
-            patch.object(eg, "mark_eval_actioned") as mock_mark,
+            patch.object(eg, "mark_eval_actioned"),
+            patch.object(pm_core_mod, "_eval_gate", mock_eval_gate_obj),
+            patch.object(pm_core_mod, "set_outstanding_brief_verified"),
+            patch.object(pm_core_mod, "_post_write_sweep_brief"),
         ):
             from lapis_pm import brief as brief_mod, episodic as ep_mod
             with (
                 patch.object(brief_mod, "synthesize", side_effect=fake_synthesize),
                 patch.object(ep_mod, "write_observation", side_effect=fake_write_observation),
             ):
-                # Simulate the tick wiring
+                # Simulate the tick wiring - drive brief emission through the real
+                # _act_eval_gate_brief function for test fidelity.
                 r = eg.evaluate_pr("smoke-tid", {"number": pr_number, "head": {"sha": sha}}, "synapse")
                 assert r is not None
                 assert not eg.is_eval_actioned(sha)
 
-                # status == "regressed" -> emit brief
-                brief_mod.synthesize(
-                    target_id="smoke-tid",
-                    trigger="synapse_eval_regressed",
-                    query=f"PR #{pr_number} retrieval-quality check",
-                    diff_snippet=r.summary_text,
-                    screen_issues=[],
-                    pr_number=pr_number,
-                    notify=None,
-                )
-                eg.mark_eval_actioned(sha)
+                # status == "regressed" -> emit brief via real pm_core path
+                _act_eval_gate_brief("smoke-tid", r, "synapse")
 
-        # Verify brief was emitted
+        # Verify brief was emitted with the documented parameters
         assert len(brief_calls) == 1
         call_kw = brief_calls[0]
         assert call_kw["trigger"] == "synapse_eval_regressed"
@@ -643,8 +634,8 @@ class TestSmokeIntegration:
         assert call_kw["notify"] is None
         assert call_kw["pr_number"] == pr_number
 
-        # Verify mark_eval_actioned was called
-        mock_mark.assert_called_once_with(sha)
+        # Verify mark_eval_actioned was called via _eval_gate
+        mock_eval_gate_obj.mark_eval_actioned.assert_called_once_with(sha)
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +678,14 @@ class TestBriefBodyShape:
         assert "stale_sha_001"[:12] in text
 
     def test_synthesize_called_with_documented_mapping(self):
-        """brief.synthesize receives the documented parameter mapping from §Deliverables 5."""
+        """brief.synthesize receives the documented parameter mapping from §Deliverables 5.
+
+        Drives through _act_eval_gate_brief (the real pm_core function) so that
+        changes to the parameter mapping in pm_core are caught by this test.
+        """
         from lapis_pm.eval_gate import EvalResult
+        import lapis_pm.pm_core as pm_core_mod
+        from lapis_pm.pm_core import _act_eval_gate_brief
 
         sha = "sha_test_8"
         pr_number = 33
@@ -704,25 +701,24 @@ class TestBriefBodyShape:
             status="regressed",
         )
 
-        from lapis_pm import brief as brief_mod
+        from lapis_pm import brief as brief_mod, episodic as ep_mod
         captured_kwargs = {}
 
-        def fake_synthesize(**kwargs):
+        def fake_synthesize(*args, **kwargs):
             captured_kwargs.update(kwargs)
             m = MagicMock()
             m.comment_id = "cid-8"
             return m
 
-        with patch.object(brief_mod, "synthesize", side_effect=fake_synthesize):
-            brief_mod.synthesize(
-                target_id="tid-8",
-                trigger="synapse_eval_regressed",
-                query=f"PR #{result.pr_number} retrieval-quality check",
-                diff_snippet=result.summary_text,
-                screen_issues=[],
-                pr_number=result.pr_number,
-                notify=None,
-            )
+        mock_eval_gate_obj = MagicMock()
+        with (
+            patch.object(brief_mod, "synthesize", side_effect=fake_synthesize),
+            patch.object(ep_mod, "write_observation"),
+            patch.object(pm_core_mod, "_eval_gate", mock_eval_gate_obj),
+            patch.object(pm_core_mod, "set_outstanding_brief_verified"),
+            patch.object(pm_core_mod, "_post_write_sweep_brief"),
+        ):
+            _act_eval_gate_brief("tid-8", result, "synapse")
 
         assert captured_kwargs["trigger"] == "synapse_eval_regressed"
         assert captured_kwargs["query"] == f"PR #{pr_number} retrieval-quality check"
@@ -732,9 +728,14 @@ class TestBriefBodyShape:
         assert captured_kwargs["notify"] is None
 
     def test_unverified_brief_uses_correct_trigger(self):
-        """Status=unverified should use trigger="synapse_eval_unverified"."""
+        """Status=unverified should use trigger="synapse_eval_unverified".
+
+        Drives through _act_eval_gate_brief for test fidelity.
+        """
         from lapis_pm.eval_gate import EvalResult
-        from lapis_pm import brief as brief_mod
+        from lapis_pm import brief as brief_mod, episodic as ep_mod
+        import lapis_pm.pm_core as pm_core_mod
+        from lapis_pm.pm_core import _act_eval_gate_brief
 
         result = EvalResult(
             pr_number=44, head_sha="sha44", baseline_sha="bsha",
@@ -748,22 +749,21 @@ class TestBriefBodyShape:
 
         captured_kwargs = {}
 
-        def fake_synthesize(**kwargs):
+        def fake_synthesize(*args, **kwargs):
             captured_kwargs.update(kwargs)
             m = MagicMock()
             m.comment_id = "cid-unverified"
             return m
 
-        with patch.object(brief_mod, "synthesize", side_effect=fake_synthesize):
-            brief_mod.synthesize(
-                target_id="tid-44",
-                trigger="synapse_eval_unverified",
-                query=f"PR #{result.pr_number} retrieval-quality check",
-                diff_snippet=result.summary_text,
-                screen_issues=[],
-                pr_number=result.pr_number,
-                notify=None,
-            )
+        mock_eval_gate_obj = MagicMock()
+        with (
+            patch.object(brief_mod, "synthesize", side_effect=fake_synthesize),
+            patch.object(ep_mod, "write_observation"),
+            patch.object(pm_core_mod, "_eval_gate", mock_eval_gate_obj),
+            patch.object(pm_core_mod, "set_outstanding_brief_verified"),
+            patch.object(pm_core_mod, "_post_write_sweep_brief"),
+        ):
+            _act_eval_gate_brief("tid-44", result, "synapse")
 
         assert captured_kwargs["trigger"] == "synapse_eval_unverified"
         assert captured_kwargs["screen_issues"] == []

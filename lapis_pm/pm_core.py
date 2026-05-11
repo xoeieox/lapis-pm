@@ -2875,7 +2875,7 @@ def _act_regenerate_synapse_baseline(target_id: str) -> str:
         _eval_gate.record_regen_attempt(success=False)
         episodic.write_observation(
             target_id,
-            "Baseline regeneration failed — prior baseline preserved; "
+            "Baseline regeneration failed - prior baseline preserved; "
             "will retry after rate-limit window (30 min)",
             extra_tags=["pm:synapse-eval:regen-failed", "pm:error"],
         )
@@ -2949,7 +2949,11 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
 
     # Check Forgejo for newly merged PRs and write pm:pr-merged observations.
     # This is bookkeeping (encoding), not action — safe to do before decide.
-    encoded += _encode_merged_prs(target_id, repo)
+    # Capture the count so the decide phase knows whether a merge just happened
+    # (used by the baseline-regeneration trigger, which requires condition (a)
+    # "a Synapse PR was just encoded as merged" per spec §Deliverables 2).
+    _merged_this_tick = _encode_merged_prs(target_id, repo)
+    encoded += _merged_this_tick
 
     # Classify lost fixer dispatches (terminal job, no PR produced).
     # Must run after encode so freshly-flipped records are visible.
@@ -3095,9 +3099,12 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
 
     elif (
         _eval_gate
+        and _merged_this_tick > 0
         and _eval_gate.should_regenerate_baseline(repo)
     ):
         # Baseline regeneration: fires post-merge when baseline is stale/missing.
+        # Spec §Deliverables 2: requires BOTH (a) a Synapse PR just encoded as
+        # merged this tick AND (b) the baseline is stale or missing.
         # Mirrors auto-land shape — consumes the single-action slot.
         decision_str = _act_regenerate_synapse_baseline(target_id)
 

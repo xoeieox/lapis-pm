@@ -105,14 +105,14 @@ class EvalResult:
     head_sha: str
     baseline_sha: str
     baseline_stale: bool
-    metrics: dict
-    baseline_metrics: dict
-    deltas: dict
+    metrics: dict[str, float]
+    baseline_metrics: dict[str, float]
+    deltas: dict[str, float]
     regressed: bool
-    regressed_metrics: list
+    regressed_metrics: list[str]
     summary_text: str
     run_path: str
-    status: str = "clean"   # "clean" | "regressed" | "unverified"
+    status: Literal["clean", "regressed", "unverified"] = "clean"
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ def _build_summary_text(
     parts = [table]
     if baseline_stale:
         note = (
-            f"\nWARNING: baseline SHA {baseline_sha[:12]} is stale — "
+            f"\nWARNING: baseline SHA {baseline_sha[:12]} is stale - "
             f"current origin/main is {current_main_sha[:12] if current_main_sha else '(unknown)'}. "
             "Rebaseline recommended: `lapis-pm eval-gate baseline regenerate`"
         )
@@ -587,6 +587,17 @@ def evaluate_pr(
     synapse_repo = SYNAPSE_REPO_PATH
 
     deadline = time.monotonic() + PR_EVAL_TIMEOUT_S
+
+    # Fetch so the head SHA from Forgejo exists in the local clone.
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(synapse_repo),
+        )
+    except Exception as exc:
+        logger.warning("eval_gate: git fetch before worktree failed for PR #%d: %s", pr_number, exc)
+
     try:
         r = subprocess.run(
             ["git", "worktree", "add", "--detach", worktree_dir, head_sha],
@@ -695,6 +706,17 @@ def regenerate_baseline(
     worktree_dir = f"/tmp/synapse-eval-baseline-{short_sha}"
 
     deadline = time.monotonic() + REGEN_TIMEOUT_S
+
+    # Fetch so origin/main is current in the local clone.
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(synapse_repo),
+        )
+    except Exception as exc:
+        logger.warning("eval_gate: git fetch before baseline worktree failed: %s", exc)
+
     try:
         r = subprocess.run(
             ["git", "worktree", "add", "--detach", worktree_dir, main_sha],

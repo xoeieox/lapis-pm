@@ -320,6 +320,8 @@ def _dispatch_council(
         n=None,
         turns=DEFAULT_TURNS,
         with_entity=None,
+        narrator=False,
+        narrator_voice=None,
         no_queue=False,
         notify=False,
     )

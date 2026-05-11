@@ -391,7 +391,7 @@ def apply_decision(target_id: str, brief_id: str, option_id: str) -> dict:
         return {"ok": False, "error": f"action_failed:{kind}:{exc}"}
 
     # Clear the outstanding brief.
-    _pm.clear_outstanding_brief(target_id)
+    _pm.clear_outstanding_brief(target_id, reason="principal_decision")
 
     # Write audit key for idempotency + trajectory.
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")

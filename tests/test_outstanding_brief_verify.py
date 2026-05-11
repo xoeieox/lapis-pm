@@ -133,3 +133,84 @@ def test_post_write_sweep_logs_on_disappearance(capsys):
     assert captured.err.count("[outstanding-brief:disappeared-post-write]") == 1
     assert f"tid={TID}" in captured.err
     assert f"cid={CID}" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Case 5: clear_outstanding_brief logs reason and cid when key is present
+# ---------------------------------------------------------------------------
+
+
+def test_clear_outstanding_brief_logs_reason_and_cid(capsys):
+    """set key, clear with reason, assert stderr has clearing + cid + reason."""
+    store = _tmp_store()
+
+    with patch("lapis_pm.pm_core._mem", return_value=store):
+        set_outstanding_brief_verified(TID, CID)
+        clear_outstanding_brief(TID, reason="test_reason")
+        assert get_outstanding_brief(TID) is None
+
+    captured = capsys.readouterr()
+    assert "[outstanding-brief:clearing]" in captured.err
+    assert f"cid={CID}" in captured.err
+    assert "reason=test_reason" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Case 6: clear_outstanding_brief on absent key logs already-absent, no raise
+# ---------------------------------------------------------------------------
+
+
+def test_clear_outstanding_brief_absent_key_logs_already_absent(capsys):
+    """Clearing a non-existent key emits already-absent line and does not raise."""
+    store = _tmp_store()
+
+    with patch("lapis_pm.pm_core._mem", return_value=store):
+        clear_outstanding_brief(TID, reason="test_absent")  # must not raise
+
+    captured = capsys.readouterr()
+    assert "[outstanding-brief:clearing:already-absent]" in captured.err
+    assert f"tid={TID}" in captured.err
+    assert "reason=test_absent" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Case 7: clear_outstanding_brief default reason is "unspecified"
+# ---------------------------------------------------------------------------
+
+
+def test_clear_outstanding_brief_default_reason(capsys):
+    """Omitting reason param results in reason=unspecified in the log."""
+    store = _tmp_store()
+
+    with patch("lapis_pm.pm_core._mem", return_value=store):
+        clear_outstanding_brief(TID)
+
+    captured = capsys.readouterr()
+    assert "reason=unspecified" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Case 8: clear_outstanding_brief survives a read error and still deletes
+# ---------------------------------------------------------------------------
+
+
+def test_clear_outstanding_brief_survives_read_error(capsys):
+    """Read error is logged and swallowed; delete still runs."""
+    from unittest.mock import patch as _patch
+
+    import lapis_pm.pm_core as _core
+
+    store = _tmp_store()
+
+    with patch("lapis_pm.pm_core._mem", return_value=store):
+        set_outstanding_brief_verified(TID, CID)
+
+        with _patch.object(_core, "get_outstanding_brief", side_effect=RuntimeError("simulated")):
+            clear_outstanding_brief(TID, reason="r1")  # must not raise
+
+        captured = capsys.readouterr()
+        assert "[outstanding-brief:clearing:read-error]" in captured.err
+        assert "reason=r1" in captured.err
+
+        # Outside the get patch — delete should have run
+        assert get_outstanding_brief(TID) is None

@@ -421,7 +421,31 @@ def set_outstanding_brief(target_id: str, comment_id: str):
     _mem().set(_brief_key(target_id), comment_id, tags=["lapis-pm", "outstanding-brief"])
 
 
-def clear_outstanding_brief(target_id: str):
+def clear_outstanding_brief(target_id: str, reason: str = "unspecified") -> None:
+    import sys
+    # Read the current value for the audit line. A read failure must not
+    # block the delete — that would regress idempotency.
+    try:
+        observed = get_outstanding_brief(target_id)
+    except Exception as exc:
+        print(
+            f"[outstanding-brief:clearing:read-error] tid={target_id} "
+            f"reason={reason} err={exc!r}",
+            file=sys.stderr,
+        )
+        observed = None
+    if observed is not None:
+        print(
+            f"[outstanding-brief:clearing] tid={target_id} cid={observed} "
+            f"reason={reason}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[outstanding-brief:clearing:already-absent] tid={target_id} "
+            f"reason={reason}",
+            file=sys.stderr,
+        )
     _mem().delete(_brief_key(target_id))
 
 
@@ -616,7 +640,7 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
 
     if get_outstanding_brief(target_id) is not None:
         summary["outstanding_brief"] = 1
-    clear_outstanding_brief(target_id)
+    clear_outstanding_brief(target_id, reason="auto_land")
 
     summary["classified_prs"] = len(_classified_pr_ids(target_id))
     clear_classified_prs(target_id)
@@ -1973,7 +1997,7 @@ def _encode_user_comments(target_id: str, comments: list) -> list:
     directives = [c for c in comments if episodic.TAG_HUMAN_DIRECTIVE in c.tags]
     acks = [c for c in comments if episodic.TAG_HUMAN_ACK in c.tags]
     if acks:
-        clear_outstanding_brief(target_id)
+        clear_outstanding_brief(target_id, reason="user_ack")
         episodic.write_observation(
             target_id, f"Brief acknowledged by user ({len(acks)} ack(s)).",
         )

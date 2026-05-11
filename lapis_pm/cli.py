@@ -1307,8 +1307,8 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument(
         "--timeout",
         type=int,
-        default=900,
-        help="Total timeout in seconds (default: 900).",
+        default=1800,
+        help="Total timeout in seconds (default: 1800).",
     )
     sr.add_argument(
         "--repo",

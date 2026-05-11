@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -369,6 +370,12 @@ def _poll_until_terminal(
                     "confidence": raw.get("confidence", 0.0),
                     "run_id": spec_reviewer_task_id,
                 }
+                elapsed_s = int(time.time() - start_time)
+                print(
+                    f"[spec-review:opus-complete] task_id={spec_reviewer_task_id} "
+                    f"elapsed={elapsed_s}s verdict={opus_result['verdict']}",
+                    file=sys.stderr,
+                )
             elif timed_out:
                 opus_result = {
                     "status": "timeout",
@@ -399,6 +406,12 @@ def _poll_until_terminal(
                             "positions": synthesis.get("positions", []),
                             "run_id": council_run_id,
                         }
+                        elapsed_s = int(time.time() - start_time)
+                        print(
+                            f"[spec-review:council-complete] run_id={council_run_id} "
+                            f"elapsed={elapsed_s}s status={status}",
+                            file=sys.stderr,
+                        )
                 except Exception:
                     pass
 
@@ -414,6 +427,15 @@ def _poll_until_terminal(
 
         # Both terminal?
         if opus_result is not None and council_result is not None:
+            if timed_out:
+                opus_done = opus_result.get("status") != "timeout"
+                council_done = council_result.get("status") != "timeout"
+                elapsed_s = int(time.time() - start_time)
+                print(
+                    f"[spec-review:timeout] elapsed={elapsed_s}s "
+                    f"opus_done={opus_done} council_done={council_done}",
+                    file=sys.stderr,
+                )
             return opus_result, council_result
 
         if timed_out:
@@ -633,7 +655,7 @@ def format_brief(brief: SpecReviewBrief) -> str:
 def run_spec_review(
     spec_path: Path,
     council_voicing: str = "local",
-    timeout_s: int = 900,
+    timeout_s: int = 1800,
     repo_override: str | None = None,
 ) -> SpecReviewBrief:
     """Run parallel Opus + Council review of a spec document. Synchronous."""

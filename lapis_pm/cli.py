@@ -40,6 +40,7 @@ from agents_core.targets import TargetStore
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
+from .backcaster.cli import cmd_backcaster
 from .scout.cli import cmd_scout
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
@@ -1462,6 +1463,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override repo parsed from spec frontmatter.",
     )
     sr.set_defaults(func=cmd_spec_review)
+
+    # ------------------------------------------------------------------
+    # backcaster — inverse goal-state decomposition
+    # ------------------------------------------------------------------
+    bc = sub.add_parser(
+        "backcaster",
+        help="Backcaster v0: decompose a goal-state into required components.",
+    )
+    bc.add_argument(
+        "goal_file",
+        metavar="GOAL_FILE",
+        help="Path to the goal-state markdown file.",
+    )
+    bc.add_argument(
+        "--axes",
+        default=None,
+        metavar="ax1,ax2,...",
+        help=(
+            "Comma-separated axes to decompose (default: all 6). "
+            "Values: psychological,material,infrastructural,governance,social-norm,economic"
+        ),
+    )
+    bc.add_argument(
+        "--corpus",
+        default=None,
+        metavar="PATH",
+        help="Path to corpus directory for Synapse retrieval (default: library/civic-theory).",
+    )
+    bc.add_argument(
+        "--scenarios",
+        default=None,
+        metavar="RUN_IDS",
+        help="Comma-separated civic-sim run IDs (v0 no-op stub).",
+    )
+    bc.add_argument(
+        "--model",
+        default="qwen",
+        choices=["qwen", "sonnet", "opus"],
+        help="LLM model to use (default: qwen).",
+    )
+    bc.add_argument(
+        "--out",
+        default=None,
+        metavar="DIR",
+        help="Override run output directory (default: /srv/lapis/backcaster/runs/<timestamp>-<slug>/).",
+    )
+    bc.set_defaults(func=cmd_backcaster)
 
     return p
 

@@ -4250,9 +4250,52 @@ json.loads(lines[0])
 " || red "Phase 43c: smoke fixture is not valid NDJSON"
 green "Phase 43c: smoke fixture exists and is valid NDJSON ✓"
 
+# --- Phase 44: Backcaster stub smoke ------------------------------------
+
+step "Phase 44: backcaster stub smoke (BACKCASTER_STUB=1, all 7 artifacts)"
+
+BC_GOAL_FILE="${REPO_ROOT}/lapis_pm/backcaster/fixtures/stub-goal.md"
+BC_OUT_DIR="/tmp/bc-smoke-$$"
+mkdir -p "$BC_OUT_DIR"
+
+BACKCASTER_STUB=1 python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+from lapis_pm.cli import main; import sys
+sys.argv = ['lapis-pm', 'backcaster', '${BC_GOAL_FILE}', '--out', '${BC_OUT_DIR}']
+sys.exit(main())
+" 2>&1 || red "Phase 44: backcaster exited non-zero"
+
+for artifact in goal.md decomposition.yaml gaps.yaml components.yaml roadmap.md histogram.yaml run.yaml; do
+    [ -f "$BC_OUT_DIR/$artifact" ] || red "Phase 44: missing artifact $artifact"
+done
+
+# Verify histogram has all 7 category keys
+python3 -c "
+import yaml, sys
+h = yaml.safe_load(open('${BC_OUT_DIR}/histogram.yaml'))
+cats = ['software','policy','community-formation','research','infrastructure','cultural-shift','financial']
+missing = [c for c in cats if c not in h]
+if missing:
+    print('histogram missing categories:', missing, file=sys.stderr)
+    sys.exit(1)
+" || red "Phase 44: histogram missing categories"
+
+# Verify run.yaml has epistemic_caution + concentration_warning
+python3 -c "
+import yaml, sys
+r = yaml.safe_load(open('${BC_OUT_DIR}/run.yaml'))
+for field in ['epistemic_caution','concentration_warning','degraded_paths','derive_fallback_count']:
+    if field not in r:
+        print(f'run.yaml missing field: {field}', file=sys.stderr)
+        sys.exit(1)
+" || red "Phase 44: run.yaml missing required fields"
+
+rm -rf "$BC_OUT_DIR"
+green "Phase 44: backcaster stub smoke ✓"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ class SpecReviewBrief:
     spec_path: Path
     target_id: str
     repo: str
-    opus_verdict: Literal["clean", "fixable", "needs-human", "timeout", "error"]
+    opus_verdict: Literal["clean", "fixable", "needs-human", "timeout", "error", "parse_failed"]
     opus_issues: list[dict]
     opus_confidence: float
     opus_run_id: str
@@ -92,8 +92,9 @@ class SpecReviewBrief:
     council_run_id: str
     elapsed_s: float
     combined_recommendation: Literal[
-        "proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete"
+        "proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
     ]
+    parse_error: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -185,52 +186,103 @@ def _find_reviewer_output(task_id: str) -> Path | None:
     return None
 
 
-def _extract_outermost_json_object(text: str) -> str | None:
-    """Return the first complete {...} substring using bracket counting.
+def _iter_fenced_json_bodies(text: str) -> Iterator[str]:
+    """Yield each ```(json)? fence body found in text, in document order."""
+    for m in re.finditer(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL):
+        yield m.group(1)
 
-    Handles nested objects (e.g. an issues array with {} elements).
-    Returns None if no balanced object is found.
+
+def _iter_balanced_json_candidates(text: str) -> list[str]:
+    """Return balanced {...} substrings from text, sorted largest-first.
+
+    Pre-strips fenced blocks so this function only sees non-fenced content
+    (Strategy 1 already tried fenced bodies; this handles prose-embedded JSON).
+    State machine skips braces inside single-backtick spans and JSON string literals.
     """
+    # Pre-strip fenced blocks
+    de_fenced = re.sub(r"```(?:json)?\s*\n.*?\n```", "", text, flags=re.DOTALL)
+
+    candidates: list[str] = []
     depth = 0
-    start = None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start : i + 1]
-    return None
+    start: int | None = None
+    in_backtick = False
+    in_string = False
+    i = 0
+    while i < len(de_fenced):
+        ch = de_fenced[i]
+        if ch == "`" and not in_string:
+            in_backtick = not in_backtick
+        elif ch == '"' and not in_backtick:
+            # Count preceding backslashes to detect escaped quote
+            num_bs = 0
+            j = i - 1
+            while j >= 0 and de_fenced[j] == "\\":
+                num_bs += 1
+                j -= 1
+            if num_bs % 2 == 0:  # unescaped quote
+                in_string = not in_string
+        elif not in_backtick and not in_string:
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}" and depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidates.append(de_fenced[start : i + 1])
+                    start = None
+        i += 1
+
+    candidates.sort(key=len, reverse=True)
+    return candidates
 
 
 def _read_verdict_from_output(output_path: Path) -> dict:
     """Parse the verdict JSON from the spec_reviewer output file.
 
-    The spec_reviewer template returns JSON only. Extracts the first JSON
-    object found in the file content, stripping markdown fences if present.
+    Multi-strategy pipeline — handles Opus narrate-then-emit patterns:
+    1. Extract from ```(json)? fenced blocks (handles "narration + fence" pattern).
+    2. Direct json.loads on stripped content (handles strict JSON-only output).
+    3. Bracket-count with backtick/string-literal awareness, try largest-first
+       (handles fence-less JSON embedded in prose).
+    4. Return parse_failed envelope (richer diagnostics than bare "error").
     """
     content = output_path.read_text(encoding="utf-8")
-    # Strip markdown code fences (```json ... ``` or ``` ... ```)
     stripped = content.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*\n?", "", stripped)
-        stripped = re.sub(r"\n?```\s*$", "", stripped)
-    # Try direct JSON parse first
+
+    # Strategy 1: fenced extraction
+    for fence_body in _iter_fenced_json_bodies(stripped):
+        try:
+            return json.loads(fence_body)
+        except json.JSONDecodeError:
+            continue
+
+    # Strategy 2: direct JSON parse on stripped content
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
-    # Fall back: bracket-counting scan for outermost {...} (handles nested objects)
-    obj_str = _extract_outermost_json_object(content)
-    if obj_str:
+
+    # Strategy 3: bracket-count, skipping backtick spans and string literals,
+    #             try each balanced {...} candidate from largest to smallest
+    for candidate in _iter_balanced_json_candidates(content):
         try:
-            return json.loads(obj_str)
+            return json.loads(candidate)
         except json.JSONDecodeError:
-            pass
-    # Return error shape on parse failure
-    return {"verdict": "error", "issues": [], "confidence": 0.0}
+            continue
+
+    # All strategies failed: richer parse_failed envelope so operators can
+    # distinguish "delivery path lost data" from "underlying agent failed"
+    return {
+        "verdict": "parse_failed",
+        "issues": [],
+        "confidence": 0.0,
+        "parse_error": {
+            "file_size": len(content),
+            "head": content[:200],
+            "tail": content[-200:],
+        },
+    }
 
 
 def _dispatch_spec_reviewer(
@@ -368,6 +420,7 @@ def _poll_until_terminal(
                     "issues": raw.get("issues", []),
                     "confidence": raw.get("confidence", 0.0),
                     "run_id": spec_reviewer_task_id,
+                    "parse_error": raw.get("parse_error"),
                 }
             elif timed_out:
                 opus_result = {
@@ -459,8 +512,13 @@ def _combined_recommendation(
     opus_issues: list[dict],
     council_status: str,
     council_positions: list[dict],
-) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete"]:
+) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed"]:
     """Deterministic combined recommendation — no LLM call."""
+    # parse_failed: parser could not extract a verdict from the output file;
+    # distinct from "incomplete" (which means the agent task itself failed)
+    if opus_verdict == "parse_failed":
+        return "parse_failed"
+
     # incomplete: either side timeout or error
     if opus_verdict in {"timeout", "error"} or council_status in {"timeout", "error"}:
         return "incomplete"
@@ -529,6 +587,7 @@ def _build_brief(
         council_run_id=council_run_id,
         elapsed_s=elapsed_s,
         combined_recommendation=recommendation,
+        parse_error=opus_raw.get("parse_error"),
     )
 
 
@@ -580,6 +639,11 @@ def format_brief(brief: SpecReviewBrief) -> str:
             "One or both passes did not complete. "
             "Re-run spec-review, or proceed with caution after reviewing whatever completed."
         ),
+        "parse_failed": (
+            "The spec_reviewer agent likely succeeded but the parser could not extract "
+            "a JSON verdict. See the Parse Error block below for diagnostics. "
+            "After the runner fix lands (`spec-review-output-truncation-runner`), re-run spec-review."
+        ),
     }
     next_step = step_map.get(brief.combined_recommendation, "")
     # Reservation note for converged-with-reservation
@@ -598,6 +662,19 @@ def format_brief(brief: SpecReviewBrief) -> str:
                 f" Note: {names} stood aside (converged-with-reservation). "
                 "Their reservation is noted in §Mirror Council above."
             )
+
+    parse_error_block = ""
+    if brief.parse_error:
+        pe = brief.parse_error
+        parse_error_block = f"""
+## Parse error
+- **File size:** {pe.get('file_size', 0)} bytes
+- **Head (first 200 chars):** {pe.get('head', '')}
+- **Tail (last 200 chars):** {pe.get('tail', '')}
+- **Note:** the spec_reviewer agent likely succeeded; the orchestration \
+could not extract a JSON verdict from the output. See chain-sibling \
+`spec-review-output-truncation-runner` for the delivery-path fix.
+"""
 
     return f"""# Spec Review: {brief.target_id}
 
@@ -623,7 +700,7 @@ def format_brief(brief: SpecReviewBrief) -> str:
 
 ## Suggested next step
 {next_step}
-"""
+{parse_error_block}"""
 
 
 # ---------------------------------------------------------------------------

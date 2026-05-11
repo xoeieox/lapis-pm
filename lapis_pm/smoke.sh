@@ -146,9 +146,132 @@ for repo in REPOS:
 print(f'[smoke] pre-run backfill: {closed} leaked smoke PR(s) closed')
 " || true
 }
-_smoke_backfill_close_leaked_prs
 
-# --- Setup --------------------------------------------------------------
+# --- Pre-run back-fill: sweep leaked smoke substrate from prior broken runs ---
+# Iterates pm-smoke-*.yaml / pm-wire-*.yaml in TARGETS_DIR and removes any TID
+# that does not belong to the current run: target YAML, comments JSONL, per-TID
+# pm/* mem keys, shaped-task spool files, and chain-event keys.
+# Structural template: mirrors the in-run sweep at cleanup() above, but inverts
+# the PID filter (sweeps every OTHER run, skips the current run).
+_smoke_backfill_close_leaked_substrate() {
+    declare -A seen_groups
+    local swept=0 cleared=0
+    for f in "$TARGETS_DIR"/pm-smoke-*.yaml "$TARGETS_DIR"/pm-wire-*.yaml; do
+        [ -e "$f" ] || continue
+        local leaked_tid
+        leaked_tid=$(basename "$f" .yaml)
+        # Liveness guard: skip TIDs that belong to the current run.
+        # The l[0-9]* suffix (not l[0-9]) handles chain legs numbered l10+.
+        # Do NOT parse a PID from the TID and test kill -0 — recycled PIDs
+        # would wrongly skip old leaked TIDs.
+        case "$leaked_tid" in
+            *-$$|*-$$-l[0-9]*) continue ;;
+        esac
+        # Remove target YAML and comments JSONL.
+        rm -f "$f" "${COMMENTS_DIR}/${leaked_tid}.jsonl" 2>/dev/null || true
+        # Delete standard PM substrate mem keys.
+        for k in pm/cursor pm/dispatched pm/pause-state pm/outstanding-brief \
+                 pm/classified-prs pm/landed pm/review-state; do
+            /usr/local/bin/mem delete "${k}/${leaked_tid}" 2>/dev/null || true
+        done
+        # Sweep shaped-task spool best-effort.
+        rm -rf /srv/lapis/gpu-queue/shaped/${leaked_tid}-*.json 2>/dev/null || true
+        # Chain-event sweep: if TID is a chain leg, derive the parent group
+        # and sweep all chain/<group>/event/* keys tagged to that group.
+        local group_id=""
+        case "$leaked_tid" in
+            pm-smoke-chain-l[0-9]*-*)
+                # pm-smoke-chain-l1-267394 → pm-smoke-chain-267394
+                group_id=$(echo "$leaked_tid" | sed 's/pm-smoke-chain-l[0-9]*-/pm-smoke-chain-/')
+                ;;
+            pm-wire-chain-*-l[0-9]*)
+                # pm-wire-chain-2878744-l1 → pm-wire-chain-2878744
+                group_id=$(echo "$leaked_tid" | sed 's/-l[0-9]*$//')
+                ;;
+        esac
+        if [ -n "$group_id" ] && [ -z "${seen_groups[$group_id]+x}" ]; then
+            seen_groups["$group_id"]=1
+            while IFS= read -r key; do
+                /usr/local/bin/mem delete "$key" 2>/dev/null || true
+            done < <(/usr/local/bin/mem list --tag "chain-group:${group_id}" --limit 1000 2>/dev/null \
+                     | awk '/^  chain\//{print $1}')
+            cleared=$((cleared + 1))
+        fi
+        swept=$((swept + 1))
+    done
+    echo "[smoke] substrate backfill: ${swept} leaked smoke target(s) swept, ${cleared} chain group(s) cleared"
+}
+
+# --- Substrate backfill sentinel test (before Phase 1) -------------------
+# Places three pre-existing sentinel artifacts — one per substrate-leak class —
+# invokes both startup backfills, then asserts all leaked artifacts are gone
+# and the current-run sentinel was correctly skipped.
+step "0. Substrate backfill sentinel: three leak classes + liveness guard"
+
+# Class 1: simple leg-less TID
+touch "${TARGETS_DIR}/pm-smoke-9999999.yaml"
+touch "${COMMENTS_DIR}/pm-smoke-9999999.jsonl"
+/usr/local/bin/mem set "pm/cursor/pm-smoke-9999999" "<sentinel>" >/dev/null 2>&1 || true
+
+# Class 2: chain-leg shape (pm-smoke-chain-l[0-9]*-<group>)
+touch "${TARGETS_DIR}/pm-smoke-chain-l1-9999998.yaml"
+touch "${COMMENTS_DIR}/pm-smoke-chain-l1-9999998.jsonl"
+/usr/local/bin/mem set "chain/pm-smoke-chain-9999998/event/s1" "<sentinel>" \
+    --tags "chain,chain-group:pm-smoke-chain-9999998" >/dev/null 2>&1 || true
+/usr/local/bin/mem set "chain/pm-smoke-chain-9999998/event/s2" "<sentinel>" \
+    --tags "chain,chain-group:pm-smoke-chain-9999998" >/dev/null 2>&1 || true
+
+# Class 3: wire-chain shape (pm-wire-chain-<group>-l[0-9]*)
+touch "${TARGETS_DIR}/pm-wire-chain-9999997-l2.yaml"
+touch "${COMMENTS_DIR}/pm-wire-chain-9999997-l2.jsonl"
+/usr/local/bin/mem set "chain/pm-wire-chain-9999997/event/s1" "<sentinel>" \
+    --tags "chain,chain-group:pm-wire-chain-9999997" >/dev/null 2>&1 || true
+
+# Current-run liveness guard: this file must survive the backfill.
+touch "${TARGETS_DIR}/pm-smoke-$$.yaml"
+
+# Run both startup backfills; capture substrate output for exact-match assert.
+_smoke_backfill_close_leaked_prs
+_SUBSTRATE_OUT=$(_smoke_backfill_close_leaked_substrate)
+echo "$_SUBSTRATE_OUT"
+
+# Assert: all 3 leaked YAMLs swept.
+[ ! -f "${TARGETS_DIR}/pm-smoke-9999999.yaml" ] \
+    || red "substrate backfill sentinel: pm-smoke-9999999.yaml not swept"
+[ ! -f "${TARGETS_DIR}/pm-smoke-chain-l1-9999998.yaml" ] \
+    || red "substrate backfill sentinel: pm-smoke-chain-l1-9999998.yaml not swept"
+[ ! -f "${TARGETS_DIR}/pm-wire-chain-9999997-l2.yaml" ] \
+    || red "substrate backfill sentinel: pm-wire-chain-9999997-l2.yaml not swept"
+
+# Assert: all 3 JSONLs swept.
+[ ! -f "${COMMENTS_DIR}/pm-smoke-9999999.jsonl" ] \
+    || red "substrate backfill sentinel: pm-smoke-9999999.jsonl not swept"
+[ ! -f "${COMMENTS_DIR}/pm-smoke-chain-l1-9999998.jsonl" ] \
+    || red "substrate backfill sentinel: pm-smoke-chain-l1-9999998.jsonl not swept"
+[ ! -f "${COMMENTS_DIR}/pm-wire-chain-9999997-l2.jsonl" ] \
+    || red "substrate backfill sentinel: pm-wire-chain-9999997-l2.jsonl not swept"
+
+# Assert: all 4 sentinel mem keys deleted.
+! /usr/local/bin/mem get "pm/cursor/pm-smoke-9999999" >/dev/null 2>&1 \
+    || red "substrate backfill sentinel: pm/cursor/pm-smoke-9999999 still exists"
+! /usr/local/bin/mem get "chain/pm-smoke-chain-9999998/event/s1" >/dev/null 2>&1 \
+    || red "substrate backfill sentinel: chain/pm-smoke-chain-9999998/event/s1 still exists"
+! /usr/local/bin/mem get "chain/pm-smoke-chain-9999998/event/s2" >/dev/null 2>&1 \
+    || red "substrate backfill sentinel: chain/pm-smoke-chain-9999998/event/s2 still exists"
+! /usr/local/bin/mem get "chain/pm-wire-chain-9999997/event/s1" >/dev/null 2>&1 \
+    || red "substrate backfill sentinel: chain/pm-wire-chain-9999997/event/s1 still exists"
+
+# Assert: current-run sentinel survived (liveness guard worked).
+[ -f "${TARGETS_DIR}/pm-smoke-$$.yaml" ] \
+    || red "substrate backfill sentinel: liveness guard broken — pm-smoke-$$.yaml was swept"
+
+# Assert: exact summary line (not 'or higher' — wrong count must fail).
+[ "$_SUBSTRATE_OUT" = "[smoke] substrate backfill: 3 leaked smoke target(s) swept, 2 chain group(s) cleared" ] \
+    || red "substrate backfill sentinel: wrong summary line (got: '$_SUBSTRATE_OUT')"
+
+green "substrate backfill sentinel: 3 leaked classes swept, liveness guard OK, summary exact OK"
+
+# --- Setup (Phase 1) ---------------------------------------------------
 step "1. Create sandbox target $TID"
 cat > "$SPEC_FILE" <<EOF
 # Smoke spec for $TID

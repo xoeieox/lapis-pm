@@ -258,7 +258,7 @@ def _dispatch_spec_reviewer(
             output_path=str(output_path),
         )
 
-    from agents_core.shaper import _SHAPER
+    from lapis_pm.pm_core import _SHAPER
     vars_: dict = {
         "target_id": synth_target_id,
         "spec_summary": f"spec-review pass for {parsed_target_id}",

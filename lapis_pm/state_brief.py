@@ -23,8 +23,9 @@ Dry-run gate:
   still includes all five bucket headings. Used by smoke.sh.
 
 Pushover:
-  Fires NORMAL priority iff pm/outstanding-brief/* keys exist in mem.
-  Fires on every run while keys persist (intentional nag semantics).
+  Not fired from state briefs. Outstanding briefs are notified at creation
+  time via brief.synthesize(). Scheduled brief generation is informational
+  only — visible in claude-view, no phone interrupt.
 """
 
 from __future__ import annotations
@@ -57,8 +58,8 @@ def _mem():
     return MemoryStore()
 
 
-def _read_buckets(start_ts: datetime) -> tuple[dict[str, list[str]], list[str]]:
-    """Read all data sources and return (buckets, outstanding_keys).
+def _read_buckets(start_ts: datetime) -> dict[str, list[str]]:
+    """Read all data sources and return buckets dict.
 
     All reads are deterministic; performed before any LLM call.
     Uses list_all(tag="lapis-pm", since=...) + client-side prefix filter.
@@ -66,7 +67,6 @@ def _read_buckets(start_ts: datetime) -> tuple[dict[str, list[str]], list[str]]:
 
     Returns:
         buckets: dict mapping bucket name → list of item strings
-        outstanding_keys: list of pm/outstanding-brief/* key strings
     """
     mem = _mem()
     since_str = start_ts.isoformat()
@@ -125,25 +125,22 @@ def _read_buckets(start_ts: datetime) -> tuple[dict[str, list[str]], list[str]]:
             captured_items.append(f"{label}: {val[:120]}" if val else label)
 
     # --- Awaiting your call: pm/outstanding-brief/* keys ---
-    outstanding_keys: list[str] = []
     awaiting_items: list[str] = []
     for entry in all_keys:
         k = entry.get("key", "")
         if k.startswith("pm/outstanding-brief/"):
-            outstanding_keys.append(k)
             brief_id = k.removeprefix("pm/outstanding-brief/")
             rec = mem.get(k)
             val = rec.get("value", "") if rec else ""
             awaiting_items.append(f"{brief_id}: {val[:120]}" if val else brief_id)
 
-    buckets = {
+    return {
         B_BUILT: built_items,
         B_RATIFICATIONS: ratification_items,
         B_IN_FLIGHT: in_flight_items,
         B_CAPTURED: captured_items,
         B_AWAITING: awaiting_items,
     }
-    return buckets, outstanding_keys
 
 
 def _arc_docs_since(start_ts: datetime) -> list[str]:
@@ -262,30 +259,6 @@ def _write_brief(path: Path, header: str, body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pushover
-# ---------------------------------------------------------------------------
-
-def _maybe_pushover(outstanding_keys: list[str], period: str, brief_path: Path) -> None:
-    """Fire NORMAL Pushover iff outstanding-brief keys exist.
-
-    Fires on every run while keys persist — intentional nag semantics.
-    A future follow-on can add a last-pushed-at key per brief-id to suppress
-    re-nags within N hours if the nag frequency proves excessive.
-    """
-    if not outstanding_keys:
-        return
-    brief_ids = [k.removeprefix("pm/outstanding-brief/") for k in outstanding_keys]
-    msg = f"[lapis-pm] {period} brief: {len(brief_ids)} outstanding decision(s): " + ", ".join(brief_ids[:5])
-    if len(brief_ids) > 5:
-        msg += f" (+{len(brief_ids) - 5} more)"
-    try:
-        from agents_core.notify import send_notification, Priority as NotifyPriority
-        send_notification(msg, title="Lapis PM — Awaiting Your Call", priority=NotifyPriority.NORMAL)
-    except Exception:
-        pass  # never block brief generation on notification failure
-
-
-# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -318,7 +291,7 @@ def generate_brief(
     start_label = start_ts.astimezone(PACIFIC).strftime("%Y-%m-%d %H:%M PT")
 
     # 1. Read data — all deterministic, before LLM call
-    buckets, outstanding_keys = _read_buckets(start_ts)
+    buckets = _read_buckets(start_ts)
 
     # 2. Call LLM (or dry-run placeholder)
     body = _generate_prose(period, buckets, start_label)
@@ -335,8 +308,5 @@ def generate_brief(
     out_path = _output_path(period, now)
     _write_brief(out_path, header, body)
     _update_symlink(period, out_path)
-
-    # 4. Pushover iff outstanding briefs exist
-    _maybe_pushover(outstanding_keys, period, out_path)
 
     return out_path

@@ -6,7 +6,7 @@ For each precondition, asks:
   - What's miswired?
 
 Retrieval sources:
-  1. Synapse service at http://localhost:8401/serve (fail-soft)
+  1. Synapse service at http://203.0.113.12:8401/serve (fail-soft)
   2. mem.db architecture/* + project/* keys (fail-soft)
 
 Returns a list of Gap objects with citation-anchored statements.

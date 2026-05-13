@@ -108,7 +108,7 @@ def _retrieve_synapse(precondition: Precondition, session_id: str) -> tuple[list
     """
     try:
         import httpx
-        synapse_url = os.environ.get("SYNAPSE_URL", "http://localhost:8401")
+        synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
         resp = httpx.post(
             f"{synapse_url}/serve",
             json={"session_id": session_id, "prompt": precondition.statement},
@@ -140,8 +140,8 @@ def _retrieve_mem(goal_domain_keys: list[str]) -> tuple[list[BackcasterCitation]
     Returns (citations, context_text). Fail-soft: returns ([], "") on error.
     """
     try:
-        from agents_core.mem import MemDB
-        mem = MemDB()
+        from agents_core.mem import MemoryStore
+        mem = MemoryStore()
         results = []
         for prefix in ("architecture/", "project/"):
             try:
@@ -209,7 +209,7 @@ def analyze_gaps(
     mem_ok = True
 
     # Quick probe
-    synapse_url = os.environ.get("SYNAPSE_URL", "http://localhost:8401")
+    synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
     try:
         import httpx
         httpx.get(f"{synapse_url}/healthz", timeout=3)
@@ -219,8 +219,8 @@ def analyze_gaps(
         log.warning("gap_analyze: Synapse unreachable - running in LLM-only mode")
 
     try:
-        from agents_core.mem import MemDB
-        MemDB()
+        from agents_core.mem import MemoryStore
+        MemoryStore()
     except Exception:  # noqa: BLE001
         mem_ok = False
         degraded_paths.append("mem")

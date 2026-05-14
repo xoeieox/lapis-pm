@@ -119,8 +119,8 @@ def _retrieve_synapse(precondition: Precondition, session_id: str) -> tuple[list
         citations = []
         context_parts = []
         for hit in hits[:3]:  # cap at 3 context passages
-            ref = hit.get("ref") or hit.get("path") or hit.get("id") or ""
-            excerpt = hit.get("excerpt") or hit.get("text") or ""
+            ref = hit.get("id") or hit.get("ref") or hit.get("path") or ""
+            excerpt = hit.get("content") or hit.get("excerpt") or hit.get("text") or ""
             if ref:
                 citations.append(BackcasterCitation(type="corpus", ref=ref))
             if excerpt:
@@ -131,31 +131,24 @@ def _retrieve_synapse(precondition: Precondition, session_id: str) -> tuple[list
         return [], ""
 
 
-def _retrieve_mem(goal_domain_keys: list[str]) -> tuple[list[BackcasterCitation], str]:
-    """Query mem.db for architecture/* and project/* keys.
+def _retrieve_mem(query: str) -> tuple[list[BackcasterCitation], str]:
+    """Query mem.db via FTS for context relevant to query.
 
     Returns (citations, context_text). Fail-soft: returns ([], "") on error.
     """
     try:
         from agents_core.mem import MemoryStore
         mem = MemoryStore()
-        results = []
-        for prefix in ("architecture/", "project/"):
-            try:
-                items = mem.list_by_prefix(prefix, limit=5)
-                results.extend(items)
-            except Exception:  # noqa: BLE001
-                pass
-
+        items = mem.search(query, limit=5)
         citations = []
         context_parts = []
-        for item in results[:5]:
+        for item in items:
             key = item.get("key", "")
-            value = item.get("value", "")
+            content = item.get("content", "")
             if key:
                 citations.append(BackcasterCitation(type="mem", ref=key))
-            if value:
-                context_parts.append(f"[mem:{key}]: {str(value)[:200]}")
+            if content:
+                context_parts.append(f"[mem:{key}]: {str(content)[:200]}")
         return citations, "\n\n".join(context_parts)
     except Exception as exc:  # noqa: BLE001
         log.debug("gap_analyze: mem.db unreachable (%s)", exc)
@@ -233,7 +226,7 @@ def analyze_gaps(
         if synapse_ok:
             corpus_citations, corpus_context = _retrieve_synapse(prec, session_id)
         if mem_ok:
-            mem_citations, mem_context = _retrieve_mem([])
+            mem_citations, mem_context = _retrieve_mem(prec.statement)
 
         all_citations = corpus_citations + mem_citations
 

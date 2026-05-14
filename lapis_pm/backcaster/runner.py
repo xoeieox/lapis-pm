@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -135,6 +136,8 @@ def run_backcaster(
         slug = _derive_slug(goal_path)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
         run_dir = BACKCASTER_RUNS_ROOT / f"{ts}-{slug}"
+        if run_dir.exists():
+            run_dir = BACKCASTER_RUNS_ROOT / f"{ts}-{slug}-{secrets.token_hex(2)}"
 
     run_dir.mkdir(parents=True, exist_ok=True)
     run_id = run_dir.name

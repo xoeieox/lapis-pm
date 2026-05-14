@@ -317,3 +317,63 @@ def test_slug_exactly_32_chars():
     p = Path("abcdefghij-abcdefghij-abcdefghij.md")  # 32 chars with dashes
     slug = _derive_slug(p)
     assert len(slug) <= 32
+
+
+# ---------------------------------------------------------------------------
+# Test: run-id collision → 4-char hex suffix appended
+# ---------------------------------------------------------------------------
+
+def test_run_id_collision_appends_hex_suffix(tmp_path):
+    """When run_dir already exists, a second call produces a distinct directory
+    with a -{4hex} suffix.
+
+    Strategy: run once to create the first run_dir, then run again within the
+    same minute so the same base path is attempted and the collision branch fires.
+    """
+    import unittest.mock as mock
+    import re as _re
+    import lapis_pm.backcaster.runner as runner_mod
+
+    goal = tmp_path / "my-goal.md"
+    goal.write_text("test goal\n")
+
+    fake_runs_root = tmp_path / "runs"
+    fake_runs_root.mkdir()
+
+    # Fix the timestamp so both calls see the same ts (same minute = collision).
+    fixed_ts = "2026-05-14-1200"
+
+    with mock.patch.object(runner_mod, "BACKCASTER_RUNS_ROOT", fake_runs_root):
+        with mock.patch("lapis_pm.backcaster.runner.datetime") as mock_dt:
+            # Return a real datetime for the full call so YAML serialization works,
+            # but fix strftime to return the pinned timestamp.
+            from datetime import datetime, timezone
+            real_now = datetime(2026, 5, 14, 12, 0, 0, tzinfo=timezone.utc)
+            real_now_obj = type("_DT", (), {
+                "strftime": lambda self, fmt: fixed_ts,
+                "isoformat": lambda self: real_now.isoformat(),
+            })()
+            mock_dt.now.return_value = real_now_obj
+
+            # First call - creates the base run_dir
+            first_dir = runner_mod.run_backcaster(goal, stub=True)
+
+        # first_dir should now exist (run_backcaster created it)
+        assert first_dir.exists()
+
+        with mock.patch("lapis_pm.backcaster.runner.datetime") as mock_dt2:
+            real_now_obj2 = type("_DT", (), {
+                "strftime": lambda self, fmt: fixed_ts,
+                "isoformat": lambda self: real_now.isoformat(),
+            })()
+            mock_dt2.now.return_value = real_now_obj2
+
+            # Second call - same ts, same slug → collision → suffix appended
+            second_dir = runner_mod.run_backcaster(goal, stub=True)
+
+    assert second_dir != first_dir, "Expected a new distinct run_dir on collision"
+
+    name = second_dir.name
+    assert _re.search(r"-[0-9a-f]{4}$", name), (
+        f"Expected run_dir name to end with -{{4hex}}, got: {name}"
+    )

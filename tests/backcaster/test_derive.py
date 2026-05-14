@@ -32,7 +32,7 @@ def test_derive_fallback_on_both_attempts_fail(tmp_path):
     gaps = [_make_gap("p-01")]
 
     # Both calls return invalid JSON
-    with mock.patch("lapis_pm.backcaster.derive.call_operator", return_value="not json"):
+    with mock.patch("lapis_pm.backcaster.llm_routing.call_operator", return_value="not json"):
         components, _, fallback_count = derive_components(gaps, stub=False)
 
     assert fallback_count == 1
@@ -53,7 +53,7 @@ def test_derive_fallback_on_invalid_category(tmp_path):
                                               "effort_estimate": "small", "reversibility": "high",
                                               "dependencies": []}]})
 
-    with mock.patch("lapis_pm.backcaster.derive.call_operator", return_value=bad_output):
+    with mock.patch("lapis_pm.backcaster.llm_routing.call_operator", return_value=bad_output):
         components, _, fallback_count = derive_components(gaps, stub=False)
 
     assert fallback_count == 1
@@ -84,7 +84,7 @@ def test_derive_retry_succeeds_second_attempt():
             return "not valid json"  # first call fails parse
         return good_output  # second call succeeds
 
-    with mock.patch("lapis_pm.backcaster.derive.call_operator", side_effect=mock_call):
+    with mock.patch("lapis_pm.backcaster.llm_routing.call_operator", side_effect=mock_call):
         components, _, fallback_count = derive_components(gaps, stub=False)
 
     assert fallback_count == 0
@@ -121,7 +121,7 @@ def test_derive_fallback_count_two_gaps(tmp_path):
                 return "not json"  # always fail for these two
         return good_output
 
-    with mock.patch("lapis_pm.backcaster.derive.call_operator", side_effect=mock_call):
+    with mock.patch("lapis_pm.backcaster.llm_routing.call_operator", side_effect=mock_call):
         components, _, fallback_count = derive_components(gaps, stub=False)
 
     assert fallback_count == 2, f"Expected fallback_count=2, got {fallback_count}"

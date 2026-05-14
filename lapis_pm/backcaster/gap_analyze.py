@@ -23,11 +23,8 @@ from typing import Any
 
 from .schema import BackcasterCitation, Gap, Precondition
 
-# Module-level import so tests can patch lapis_pm.backcaster.gap_analyze.call_operator
-try:
-    from agents_core.llm import call_operator
-except ImportError:
-    call_operator = None  # type: ignore
+# Module-level import so tests can patch lapis_pm.backcaster.llm_routing.call_model_sync
+from .llm_routing import call_model_sync
 
 log = logging.getLogger(__name__)
 
@@ -255,35 +252,15 @@ def analyze_gaps(
         prompt_hashes.append(prompt_hash)
 
         raw = None
-        _llm = call_operator
-        if _llm is None:
-            log.warning("gap_analyze: call_operator unavailable for %s", prec.id)
-        else:
-            try:
-                raw = _llm(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
-            except NotImplementedError as exc:
-                raise RuntimeError(
-                    f"gap_analyze: model={model!r} requires ClaudeQueue sync surface not yet "
-                    f"implemented. Use --model qwen for v0. Detail: {exc}"
-                ) from exc
-            except Exception as exc:  # noqa: BLE001
-                log.warning("gap_analyze: LLM call failed for %s (%s)", prec.id, exc)
-        if raw is None and _llm is not None:
-            gaps.append(Gap(
-                precondition_id=prec.id,
-                what_exists="",
-                what_missing="LLM call failed",
-                what_miswired="nothing identified",
-                citations=[],
-                unsourced=True,
-            ))
-            continue
-
+        try:
+            raw = call_model_sync(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("gap_analyze: LLM call failed for %s (%s)", prec.id, exc)
         if raw is None:
             gaps.append(Gap(
                 precondition_id=prec.id,
                 what_exists="",
-                what_missing="LLM returned no output",
+                what_missing="LLM call failed",
                 what_miswired="nothing identified",
                 citations=[],
                 unsourced=True,

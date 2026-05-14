@@ -17,11 +17,8 @@ from typing import Any
 
 from .schema import AXES, Precondition
 
-# Module-level import so tests can patch lapis_pm.backcaster.decompose.call_operator
-try:
-    from agents_core.llm import call_operator
-except ImportError:
-    call_operator = None  # type: ignore
+# Module-level import so tests can patch lapis_pm.backcaster.llm_routing.call_model_sync
+from .llm_routing import call_model_sync
 
 log = logging.getLogger(__name__)
 
@@ -156,17 +153,8 @@ def decompose(
     )
     prompt_hash = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
 
-    _llm = call_operator
-    if _llm is None:
-        log.warning("decompose: call_operator unavailable; returning empty preconditions")
-        return [], prompt_hash
     try:
-        raw = _llm(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
-    except NotImplementedError as exc:
-        raise RuntimeError(
-            f"decompose: model={model!r} requires ClaudeQueue sync surface not yet "
-            f"implemented. Use --model qwen for v0. Detail: {exc}"
-        ) from exc
+        raw = call_model_sync(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
     except Exception as exc:  # noqa: BLE001
         log.warning("decompose: LLM call failed (%s); returning empty preconditions", exc)
         return [], prompt_hash

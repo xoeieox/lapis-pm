@@ -42,7 +42,7 @@ def test_non_stub_probe_no_degraded_paths(monkeypatch):
     monkeypatch.delenv("BACKCASTER_STUB", raising=False)
     monkeypatch.delenv("SYNAPSE_URL", raising=False)
 
-    # Build a minimal JSON gap response so call_operator returns something parseable
+    # Build a minimal JSON gap response so call_model_sync returns something parseable
     gap_json = json.dumps({
         "what_exists": "something",
         "what_missing": "nothing",
@@ -53,7 +53,7 @@ def test_non_stub_probe_no_degraded_paths(monkeypatch):
         patch("httpx.get", return_value=_healthz_response()) as mock_get,
         patch("httpx.post", return_value=_synapse_hits_response()) as mock_post,
         patch("agents_core.mem.MemoryStore") as mock_memstore,
-        patch("lapis_pm.backcaster.gap_analyze.call_operator", return_value=gap_json),
+        patch("lapis_pm.backcaster.llm_routing.call_operator", return_value=gap_json),
     ):
         # MemoryStore() instantiation must succeed (mock returns a MagicMock instance)
         mock_memstore.return_value = MagicMock()

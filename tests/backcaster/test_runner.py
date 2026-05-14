@@ -226,7 +226,7 @@ def test_gap_analyze_synapse_unreachable_non_stub(tmp_path):
 
         # Patch call_operator to avoid real LLM call
         import unittest.mock as mock
-        with mock.patch("lapis_pm.backcaster.gap_analyze.call_operator" if False else "agents_core.llm.call_operator") as _:
+        with mock.patch("lapis_pm.backcaster.llm_routing.call_operator" if False else "agents_core.llm.call_operator") as _:
             pass
 
         # With LLM unavailable too, should still produce a gap (fail-soft)

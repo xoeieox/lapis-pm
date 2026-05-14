@@ -23,11 +23,8 @@ from pydantic import ValidationError
 
 from .schema import CATEGORIES, FINANCIAL_SUBTYPES, Component, Gap
 
-# Module-level import so tests can patch lapis_pm.backcaster.derive.call_operator
-try:
-    from agents_core.llm import call_operator
-except ImportError:  # agents_core unavailable in isolated test env
-    call_operator = None  # type: ignore
+# Module-level import so tests can patch lapis_pm.backcaster.llm_routing.call_model_sync
+from .llm_routing import call_model_sync
 
 log = logging.getLogger(__name__)
 
@@ -264,19 +261,10 @@ def derive_components(
         prompt_hashes.append(prompt_hash)
 
         raw = None
-        _llm = call_operator
-        if _llm is None:
-            log.warning("derive: call_operator unavailable for gap %s", pid)
-        else:
-            try:
-                raw = _llm(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
-            except NotImplementedError as exc:
-                raise RuntimeError(
-                    f"derive: model={model!r} requires ClaudeQueue sync surface not yet "
-                    f"implemented. Use --model qwen for v0. Detail: {exc}"
-                ) from exc
-            except Exception as exc:  # noqa: BLE001
-                log.warning("derive: LLM call failed for gap %s (%s)", pid, exc)
+        try:
+            raw = call_model_sync(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("derive: LLM call failed for gap %s (%s)", pid, exc)
 
         parsed = False
         if raw is not None:
@@ -302,18 +290,12 @@ def derive_components(
             prompt_hashes.append(retry_hash)
 
             retry_raw = None
-            if _llm is not None:
-                try:
-                    retry_raw = _llm(
-                        model, prompt=retry_prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120
-                    )
-                except NotImplementedError as exc:
-                    raise RuntimeError(
-                        f"derive: model={model!r} requires ClaudeQueue sync surface not yet "
-                        f"implemented. Use --model qwen for v0. Detail: {exc}"
-                    ) from exc
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("derive: retry LLM call failed for %s (%s)", pid, exc)
+            try:
+                retry_raw = call_model_sync(
+                    model, prompt=retry_prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("derive: retry LLM call failed for %s (%s)", pid, exc)
 
             if retry_raw is not None:
                 try:

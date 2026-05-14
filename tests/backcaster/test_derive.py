@@ -93,6 +93,45 @@ def test_derive_retry_succeeds_second_attempt():
     assert components[0].fallback is False
 
 
+def test_derive_integer_deps_triggers_retry():
+    """Integer deps on attempt 1 trigger retry; valid empty deps on attempt 2 succeed."""
+    from lapis_pm.backcaster.derive import derive_components
+
+    gaps = [_make_gap("p-01")]
+
+    bad_output = json.dumps({
+        "components": [{
+            "description": "A component",
+            "category": "policy",
+            "effort_estimate": "small",
+            "reversibility": "high",
+            "dependencies": [0],  # integer — invalid per Pydantic list[str]
+        }]
+    })
+    good_output = json.dumps({
+        "components": [{
+            "description": "A component",
+            "category": "policy",
+            "effort_estimate": "small",
+            "reversibility": "high",
+            "dependencies": [],
+        }]
+    })
+
+    call_count = [0]
+
+    def mock_call(*args, **kwargs):
+        call_count[0] += 1
+        return bad_output if call_count[0] == 1 else good_output
+
+    with mock.patch("lapis_pm.backcaster.derive.call_model_sync", side_effect=mock_call):
+        components, _, fallback_count = derive_components(gaps, model="qwen", stub=False)
+
+    assert fallback_count == 0
+    assert len(components) == 1
+    assert components[0].dependencies == []
+
+
 def test_derive_fallback_count_two_gaps(tmp_path):
     """2 out of 10 gaps produce malformed output → derive_fallback_count == 2."""
     from lapis_pm.backcaster.derive import derive_components

@@ -70,7 +70,9 @@ For `financial` components, you MUST also include a `subtype` field:
 Components also carry:
   effort_estimate: small | medium | large
   reversibility:   high | medium | low
-  dependencies:    [] or list of other component ids
+  dependencies:    [] or list of string IDs referencing earlier components,
+                   e.g. ["comp-governance-01-01", "comp-software-02-01"]
+                   NEVER use integers — always string IDs.
 
 Return ONLY a JSON object:
 {
@@ -284,7 +286,9 @@ def derive_components(
                 "Return ONLY valid JSON matching the schema. "
                 "category MUST be one of: software, policy, community-formation, "
                 "research, infrastructure, cultural-shift, financial. "
-                "financial MUST include subtype (extractive, distributive, neutral)."
+                "financial MUST include subtype (extractive, distributive, neutral). "
+                "dependencies MUST be a list of strings (component IDs) or an empty list — "
+                "never integers."
             )
             retry_hash = "sha256:" + hashlib.sha256(retry_prompt.encode()).hexdigest()
             prompt_hashes.append(retry_hash)

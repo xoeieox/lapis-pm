@@ -744,6 +744,8 @@ def cmd_land(args) -> int:
         tags=["lapis-pm", "landed"],
     )
 
+    pm_core._post_land_deploy_hook(target.pm_repo)
+
     # Chain advance: auto-fire dependent legs before archiving this target.
     # Wrap both calls — if either raises, we still want to archive/unbind so
     # the target doesn't get stuck in a half-landed state.

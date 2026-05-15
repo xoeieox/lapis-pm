@@ -172,7 +172,7 @@ _smoke_backfill_close_leaked_substrate() {
         # Delete standard PM substrate mem keys.
         for k in pm/cursor pm/dispatched pm/pause-state pm/outstanding-brief \
                  pm/classified-prs pm/landed pm/review-state; do
-            /usr/local/bin/mem delete "${k}/${leaked_tid}" 2>/dev/null || true
+            /usr/local/bin/mem delete "${k}/${leaked_tid}" >/dev/null 2>&1 || true
         done
         # Sweep shaped-task spool best-effort.
         rm -rf /srv/lapis/gpu-queue/shaped/${leaked_tid}-*.json 2>/dev/null || true
@@ -192,7 +192,7 @@ _smoke_backfill_close_leaked_substrate() {
         if [ -n "$group_id" ] && [ -z "${seen_groups[$group_id]+x}" ]; then
             seen_groups["$group_id"]=1
             while IFS= read -r key; do
-                /usr/local/bin/mem delete "$key" 2>/dev/null || true
+                /usr/local/bin/mem delete "$key" >/dev/null 2>&1 || true
             done < <(/usr/local/bin/mem list --tag "chain-group:${group_id}" --limit 1000 2>/dev/null \
                      | awk '/^  chain\//{print $1}')
             cleared=$((cleared + 1))
@@ -452,10 +452,18 @@ _cleanup_land_target() {
 }
 
 # --- Auto-land: positive case --------------------------------------------
+# LAPIS_PM_DEPLOY_HOOK_DISABLE=1 is scoped to phases 9-11 only to suppress
+# real systemctl calls during smoke without disabling the hook globally.
+# Non-land phases are intentionally left unset so accidental invocations
+# in those phases would still fail loudly.
+export LAPIS_PM_DEPLOY_HOOK_DISABLE=1
+
 step "9. Auto-land positive: merged PR + no pending dispatches → auto-land fires"
 TID_LAND="pm-smoke-land-$$"
 _setup_land_target "$TID_LAND"
-TICK_OUT=$($LAPIS tick --target "$TID_LAND")
+_DEPLOY_HOOK_STDERR=$(mktemp)
+TICK_OUT=$($LAPIS tick --target "$TID_LAND" 2>"$_DEPLOY_HOOK_STDERR")
+cat "$_DEPLOY_HOOK_STDERR" >&2  # show stderr on terminal for debugging
 echo "$TICK_OUT"
 echo "$TICK_OUT" | grep -q "decision=action:auto_land:" || red "auto-land did not fire in positive case"
 [ -f "/srv/lapis/lapis-state/${TID_LAND}.md" ] || red "arc doc not written for ${TID_LAND}"
@@ -469,6 +477,9 @@ assert not t.pm_bound, 'target still pm_bound after auto-land'
 assert t.data.get('status') == 'archived', f'status not archived: {t.data.get(\"status\")}'
 "
 grep -q '"pm:auto-land"' "$COMMENTS_DIR/${TID_LAND}.jsonl" || red "pm:auto-land audit comment missing"
+# Deploy hook must log the disabled message (proves hook fired and env var took effect)
+grep -q '\[post-land-deploy:disabled\]' "$_DEPLOY_HOOK_STDERR" || red "deploy hook disabled msg not in stderr"
+rm -f "$_DEPLOY_HOOK_STDERR"
 _cleanup_land_target "$TID_LAND"
 green "auto-land positive case OK"
 
@@ -498,6 +509,8 @@ echo "$TICK_OUT3" | grep -q "skipped=True" || red "tick should be skipped while 
 [ ! -f "/srv/lapis/lapis-state/${TID_LAND3}.md" ] || red "arc doc should NOT exist when paused"
 _cleanup_land_target "$TID_LAND3"
 green "auto-land paused guard OK"
+
+unset LAPIS_PM_DEPLOY_HOOK_DISABLE
 
 # --- Auto-land: idempotency ----------------------------------------------
 step "12. Auto-land idempotency: second tick does not re-land"

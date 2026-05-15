@@ -30,6 +30,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -101,6 +103,60 @@ FORGEJO_UNREACHABLE_THRESHOLD = 3  # consecutive failed probes before Pushover
 # Populated by _encode_gpu_results; consumed by _persist_review_state_cache in
 # the same tick to avoid re-scanning episodic for data already in hand.
 _tick_corr_cache: dict[tuple[str, int], dict] = {}
+
+# ---------------------------------------------------------------------------
+# Post-land deploy hook
+# ---------------------------------------------------------------------------
+
+_POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
+    "agents-core": ("claude-queue-runner.service", "gpu-queue-runner.service"),
+}
+
+# Checked once at module load so tests can patch the env before import.
+_DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
+
+
+def _post_land_deploy_hook(repo: str | None) -> None:
+    """Restart long-running services that import code from `repo`.
+
+    Best-effort. Failures (sudo unavailable, unit missing, restart timeout)
+    are logged to stderr. Never raises — landing must complete even if the
+    restart fails.
+
+    Idempotent at the systemd level: `systemctl restart` of an
+    already-running unit is a clean SIGTERM + restart; the runner drains
+    in-flight tasks per its existing shutdown handler (claude_queue_runner.py
+    lines 520-541), bounded by `TimeoutStopSec=900`.
+    """
+    if _DEPLOY_HOOK_DISABLED:
+        print(
+            "[post-land-deploy:disabled] skipping restart "
+            "(LAPIS_PM_DEPLOY_HOOK_DISABLE=1)",
+            file=sys.stderr,
+        )
+        return
+    if not repo:
+        return
+    units = _POST_LAND_RESTART.get(repo)
+    if not units:
+        return
+    for unit in units:
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "systemctl", "restart", unit],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                print(
+                    f"[post-land-deploy] restart {unit} failed "
+                    f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                    file=sys.stderr,
+                )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(
+                f"[post-land-deploy] restart {unit} errored: {e}",
+                file=sys.stderr,
+            )
 
 
 def _read_fixer_meta(spec_id: str) -> dict | None:
@@ -934,6 +990,9 @@ def _act_auto_land(target_id: str) -> str:
         tags=["lapis-pm", "landed"],
     )
 
+    _deploy_target = TargetStore().get(target_id)
+    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None)
+
     # 3. Audit comment in the target JSONL (spec-required format)
     episodic.write(
         target_id,
@@ -1004,6 +1063,9 @@ def _act_auto_land_already_satisfied(target_id: str) -> str:
         }),
         tags=["lapis-pm", "landed"],
     )
+
+    _deploy_target = TargetStore().get(target_id)
+    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None)
 
     # Audit comment (spec-required tag)
     episodic.write(

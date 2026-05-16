@@ -4306,9 +4306,55 @@ for field in ['epistemic_caution','concentration_warning','degraded_paths','deri
 rm -rf "$BC_OUT_DIR"
 green "Phase 44: backcaster stub smoke ✓"
 
+# --- Phase 45: decisions-export ------------------------------------------
+step "Phase 45: decisions-export"
+
+DE_FIXTURE_KEY="decision/smoke-decisions-export-v0-fixture"
+DE_OUT="/tmp/decisions-export-smoke-$$.md"
+
+# Set fixture
+/usr/local/bin/mem set "$DE_FIXTURE_KEY" "fixture body for decisions-export smoke" --tags "smoke,decisions-export-test"
+green "Phase 45: fixture set"
+
+# Run decisions-export and assert exit 0 + output contains fixture
+python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+from lapis_pm.cli import main; import sys
+sys.argv = ['lapis-pm', 'decisions-export', '--since', '1d', '--tag', 'smoke', '--out', '${DE_OUT}']
+sys.exit(main())
+" || red "Phase 45: decisions-export exited non-zero"
+
+[ -f "$DE_OUT" ] || red "Phase 45: output file not created"
+grep -q "$DE_FIXTURE_KEY" "$DE_OUT" || red "Phase 45: fixture key not found in output"
+grep -q "fixture body for decisions-export smoke" "$DE_OUT" || red "Phase 45: fixture body not found in output"
+green "Phase 45: --out write + content check ✓"
+
+# Assert exit 2 + stderr on conflicting --include / --exclude
+ERR_OUT=$( python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+from lapis_pm.cli import main; import sys
+sys.argv = ['lapis-pm', 'decisions-export', '--include', 'decision', '--exclude', 'decision']
+sys.exit(main())
+" 2>&1 || true )
+echo "$ERR_OUT" | grep -q "no types selected" || red "Phase 45: expected 'no types selected' in stderr"
+
+python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+from lapis_pm.cli import main; import sys
+sys.argv = ['lapis-pm', 'decisions-export', '--include', 'decision', '--exclude', 'decision']
+rc = main()
+sys.exit(0 if rc == 2 else 1)
+" || red "Phase 45: expected exit code 2 for empty type set"
+green "Phase 45: exit-2 validation ✓"
+
+# Cleanup
+/usr/local/bin/mem delete "$DE_FIXTURE_KEY" 2>/dev/null || true
+rm -f "$DE_OUT"
+green "Phase 45: decisions-export smoke ✓"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

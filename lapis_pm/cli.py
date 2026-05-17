@@ -907,6 +907,17 @@ def cmd_brief(args) -> int:
     return 0
 
 
+def cmd_decisions_export(args) -> int:
+    from lapis_pm.decisions_export import run
+    return run(
+        since_spec=args.since,
+        include=args.include,
+        exclude=args.exclude,
+        tag=args.tag,
+        out=args.out,
+    )
+
+
 def cmd_review_gate(args) -> int:
     sub = args.review_gate_sub
     if sub == "status":
@@ -1512,6 +1523,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override run output directory (default: /srv/lapis/backcaster/runs/<timestamp>-<slug>/).",
     )
     bc.set_defaults(func=cmd_backcaster)
+
+    # ------------------------------------------------------------------
+    # decisions-export — export recent mem entries as a markdown artifact
+    # ------------------------------------------------------------------
+    de = sub.add_parser(
+        "decisions-export",
+        help="Export recent decision/feedback/pattern mem entries as a single markdown artifact",
+    )
+    de.add_argument("--since", default="7d", help="Window spec: `Nd` or `YYYY-MM-DD` (default: 7d)")
+    de.add_argument(
+        "--include", default="decision,feedback,pattern",
+        help="Comma-separated types to include (default: decision,feedback,pattern)",
+    )
+    de.add_argument("--exclude", default="", help="Comma-separated types to exclude (subtracted from --include)")
+    de.add_argument("--tag", default="", help="Optional tag filter (entries must contain this tag)")
+    de.add_argument("--out", default=None, help="Write to file (default: stdout)")
+    de.set_defaults(func=cmd_decisions_export)
 
     return p
 

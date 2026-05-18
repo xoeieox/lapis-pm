@@ -112,16 +112,49 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
     "agents-core": ("claude-queue-runner.service", "gpu-queue-runner.service"),
 }
 
+_POST_LAND_PULL: dict[str, list[str]] = {
+    "lapis-pm":    ["/srv/lapis/lapis-pm"],
+    "agents-core": ["/srv/git/agents-core-working"],
+}
+
 # Checked once at module load so tests can patch the env before import.
 _DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
 
 
+def _post_land_git_pull(repo: str | None) -> None:
+    """Git-pull each working clone mapped to `repo`.
+
+    Best-effort. Never raises. Failures are logged to stderr. No-ops on
+    None or unmapped repos. Uses --ff-only so a diverged clone fails
+    loudly rather than silently creating a merge commit.
+    """
+    if repo is None:
+        return
+    paths = _POST_LAND_PULL.get(repo)
+    if not paths:
+        return
+    for path in paths:
+        try:
+            result = subprocess.run(
+                ["git", "-C", path, "pull", "--ff-only", "origin", "main"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                print(
+                    f"[post-land-pull] pull {path} failed rc={result.returncode}: "
+                    f"{result.stderr[:200]}",
+                    file=sys.stderr,
+                )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"[post-land-pull] pull {path} errored: {e}", file=sys.stderr)
+
+
 def _post_land_deploy_hook(repo: str | None) -> None:
-    """Restart long-running services that import code from `repo`.
+    """Pull working clones then restart long-running services for `repo`.
 
     Best-effort. Failures (sudo unavailable, unit missing, restart timeout)
     are logged to stderr. Never raises — landing must complete even if the
-    restart fails.
+    pull or restart fails.
 
     Idempotent at the systemd level: `systemctl restart` of an
     already-running unit is a clean SIGTERM + restart; the runner drains
@@ -135,6 +168,7 @@ def _post_land_deploy_hook(repo: str | None) -> None:
             file=sys.stderr,
         )
         return
+    _post_land_git_pull(repo)
     if not repo:
         return
     units = _POST_LAND_RESTART.get(repo)

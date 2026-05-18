@@ -58,11 +58,12 @@ def _store() -> CommentStore:
 # --- Spec accessor ---------------------------------------------------------
 
 def spec(target_id: str) -> str | None:
-    """Return the spec body from the `spec:bound` comment, or None."""
+    """Return the spec body from the most recent `spec:bound` comment, or None."""
+    result = None
     for c in _store().list(target_id):
         if TAG_SPEC in c.tags:
-            return c.content
-    return None
+            result = c.content
+    return result
 
 
 def spec_summary(target_id: str, max_chars: int | None = None) -> str:
@@ -125,7 +126,8 @@ def write_retry(target_id: str, content: str, extra_tags: list[str] | None = Non
 
 
 def write_spec(target_id: str, body: str) -> Comment:
-    """One-shot at bind time. Caller should ensure no prior spec:bound exists."""
+    """Append a spec:bound comment. Callers may call multiple times (amendment flow);
+    episodic.spec() returns the last entry, so the most recent write wins."""
     return _store().append(
         target_id, body,
         author="lapis-pm-bind", author_type="system", tags=[TAG_SPEC],

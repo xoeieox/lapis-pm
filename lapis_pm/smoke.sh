@@ -2513,7 +2513,7 @@ def fake_write_brief(tid, body, extra_tags=None):
     return c
 
 captured_options = []
-def fake_write_brief_options(tid, content):
+def fake_write_brief_options(tid, content, **kwargs):
     c = MagicMock()
     c.id = 'smoke-brief-options-id-26'
     captured_options.append((tid, content))

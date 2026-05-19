@@ -4352,9 +4352,200 @@ green "Phase 45: exit-2 validation ✓"
 rm -f "$DE_OUT"
 green "Phase 45: decisions-export smoke ✓"
 
+# --- Phase 46: local-reviewer-witness ----------------------------------------
+step "Phase 46: local-reviewer-witness smoke"
+
+# (a) Inject a synthetic reviewer verdict with a local_reviewer_witness field
+# via _encode_gpu_results mock path, assert the field appears in the comment.
+python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+import json, sys, os
+sys.path.insert(0, '${REPO_ROOT}')
+sys.path.insert(0, '/srv/git/agents-core-working')
+
+from unittest.mock import patch, MagicMock
+from datetime import datetime, timezone
+from lapis_pm import pm_core
+from lapis_pm.local_reviewer_witness import LocalReviewerWitnessResult
+
+target_id = '${TID}'
+
+record = {
+    'gpu_id': 'gpu-smoke-wit-001',
+    'spec_id': 'spec-smoke-wit',
+    'agent_type': 'reviewer',
+    'intent': 'smoke witness test',
+    'repo': 'lapis-pm',
+    'pr_number': 9901,
+    'cycle': 1,
+    'status': 'pending',
+    'retry_count': 0,
+}
+output = json.dumps({'verdict': 'clean', 'issues': [], 'confidence': 0.95})
+
+corr_result = {
+    'verdict': 'uncertain', 'claim': '', 'citations': [],
+    'freshness_stamp': datetime.now(timezone.utc).isoformat(),
+    'scope_id': 'repo:lapis-pm', 'drift_class': None, 'notes': '',
+}
+
+# (a) agree case — no divergence observation
+wit_agree = LocalReviewerWitnessResult(
+    verdict='clean', issues=[], confidence=0.92,
+    agreement='agree', latency_ms=2374, json_valid=True,
+    model='qwen3.6-35b-a3b.gguf', prompt_hash='sha256:abc123',
+    dispatched_at='2026-05-19T22:15:00Z', error=None,
+)
+
+written_contents = []
+written_obs_tags = []
+
+def capture_write_result(tid, content, extra_tags=None):
+    written_contents.append(content)
+    c = MagicMock(); c.id = 'smoke-wit'
+    return c
+
+def capture_write_obs(tid, content, extra_tags=None):
+    written_obs_tags.append(extra_tags or [])
+    c = MagicMock(); c.id = 'smoke-obs'
+    return c
+
+mock_path = MagicMock()
+mock_path.read_text.return_value = output
+mock_path.parent = object()
+
+with (
+    patch('lapis_pm.pm_core.load_dispatched', return_value=[record]),
+    patch('lapis_pm.pm_core.save_dispatched'),
+    patch('lapis_pm.pm_core._gpu_output_path', return_value=mock_path),
+    patch('lapis_pm.pm_core._read_fixer_meta', return_value=None),
+    patch('lapis_pm.pm_core._consume_fixer_meta'),
+    patch('lapis_pm.pm_core.episodic.write_result', side_effect=capture_write_result),
+    patch('lapis_pm.pm_core.episodic.write_observation', side_effect=capture_write_obs),
+    patch('lapis_pm.pm_core.FAILED_DIR', object()),
+    patch('lapis_pm.pm_core._diff_text_for_corr', return_value='fake diff'),
+    patch('lapis_pm.pm_core._run_corroboration_pass_sync', return_value=corr_result),
+    patch('lapis_pm.local_reviewer_witness.run_local_reviewer_witness', return_value=wit_agree),
+):
+    encoded, failed = pm_core._encode_gpu_results(target_id)
+
+assert encoded == 1, f'expected encoded=1, got {encoded}'
+reviewer_entries = [c for c in written_contents if 'Reviewer verdict for PR #9901:' in c]
+assert reviewer_entries, 'no reviewer verdict entry found'
+verdict_data = json.loads(reviewer_entries[0].split('\n', 1)[-1].strip())
+assert 'local_reviewer_witness' in verdict_data, f'local_reviewer_witness missing: {list(verdict_data.keys())}'
+assert verdict_data['local_reviewer_witness']['agreement'] == 'agree'
+print('(a) witness field present and agree: OK')
+
+# No divergence obs for agree
+div_obs = [o for o in written_obs_tags if any('pm:reviewer-divergence' in t for t in o)]
+assert not div_obs, f'unexpected divergence obs for agree: {div_obs}'
+print('(a) no divergence obs on agree: OK')
+" || red "Phase 46(a): local-reviewer-witness agree-path failed"
+
+# (b) major-diverge case — divergence observation must be written
+python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+import json, sys
+sys.path.insert(0, '${REPO_ROOT}')
+sys.path.insert(0, '/srv/git/agents-core-working')
+
+from unittest.mock import patch, MagicMock
+from datetime import datetime, timezone
+from lapis_pm import pm_core
+from lapis_pm.local_reviewer_witness import LocalReviewerWitnessResult
+
+target_id = '${TID}'
+
+record = {
+    'gpu_id': 'gpu-smoke-wit-002',
+    'spec_id': 'spec-smoke-wit',
+    'agent_type': 'reviewer',
+    'intent': 'smoke witness diverge test',
+    'repo': 'lapis-pm',
+    'pr_number': 9902,
+    'cycle': 1,
+    'status': 'pending',
+    'retry_count': 0,
+}
+output = json.dumps({'verdict': 'clean', 'issues': [], 'confidence': 0.95})
+
+corr_result = {
+    'verdict': 'uncertain', 'claim': '', 'citations': [],
+    'freshness_stamp': datetime.now(timezone.utc).isoformat(),
+    'scope_id': 'repo:lapis-pm', 'drift_class': None, 'notes': '',
+}
+
+# local says needs-human (major diverge from Claude clean)
+wit_major = LocalReviewerWitnessResult(
+    verdict='needs-human',
+    issues=[{'severity': 'high', 'path': 'foo.py', 'note': 'scope question'}],
+    confidence=0.70,
+    agreement='diverge_major', latency_ms=2000, json_valid=True,
+    model='qwen3.6-35b-a3b.gguf', prompt_hash='sha256:abc',
+    dispatched_at='2026-05-19T22:15:00Z', error=None,
+)
+
+written_contents = []
+written_obs_list = []
+
+def capture_write_result(tid, content, extra_tags=None):
+    written_contents.append(content)
+    c = MagicMock(); c.id = 'smoke-wit-div'
+    return c
+
+def capture_write_obs(tid, content, extra_tags=None):
+    written_obs_list.append((tid, content, extra_tags or []))
+    c = MagicMock(); c.id = 'smoke-obs-div'
+    return c
+
+mock_path = MagicMock()
+mock_path.read_text.return_value = output
+mock_path.parent = object()
+
+with (
+    patch('lapis_pm.pm_core.load_dispatched', return_value=[record]),
+    patch('lapis_pm.pm_core.save_dispatched'),
+    patch('lapis_pm.pm_core._gpu_output_path', return_value=mock_path),
+    patch('lapis_pm.pm_core._read_fixer_meta', return_value=None),
+    patch('lapis_pm.pm_core._consume_fixer_meta'),
+    patch('lapis_pm.pm_core.episodic.write_result', side_effect=capture_write_result),
+    patch('lapis_pm.pm_core.episodic.write_observation', side_effect=capture_write_obs),
+    patch('lapis_pm.pm_core.FAILED_DIR', object()),
+    patch('lapis_pm.pm_core._diff_text_for_corr', return_value='fake diff'),
+    patch('lapis_pm.pm_core._run_corroboration_pass_sync', return_value=corr_result),
+    patch('lapis_pm.local_reviewer_witness.run_local_reviewer_witness', return_value=wit_major),
+):
+    encoded, failed = pm_core._encode_gpu_results(target_id)
+
+assert encoded == 1
+div_obs = [o for o in written_obs_list if any('pm:reviewer-divergence' in t for t in o[2])]
+assert div_obs, f'expected pm:reviewer-divergence obs, got: {written_obs_list}'
+tags = div_obs[0][2]
+assert 'pm:reviewer-divergence' in tags, f'tag missing: {tags}'
+assert 'pm:reviewer-divergence:pr=9902:type=major' in tags, f'pr tag missing: {tags}'
+print('(b) divergence obs written for major diverge: OK')
+
+reviewer_entries = [c for c in written_contents if 'Reviewer verdict for PR #9902:' in c]
+verdict_data = json.loads(reviewer_entries[0].split('\n', 1)[-1].strip())
+assert verdict_data['local_reviewer_witness']['agreement'] == 'diverge_major'
+print('(b) witness field shows diverge_major: OK')
+" || red "Phase 46(b): local-reviewer-witness major-diverge-path failed"
+
+# (c) stats subcommand exits 0 (no real data in smoke env — just assert no crash)
+python3 -c "
+import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
+from lapis_pm.cli import main; import sys
+sys.argv = ['lapis-pm', 'local-witness', 'stats']
+rc = main()
+sys.exit(0 if rc == 0 else 1)
+" || red "Phase 46(c): local-witness stats CLI exited non-zero"
+
+green "Phase 46: local-reviewer-witness smoke ✓"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export, local-reviewer-witness all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

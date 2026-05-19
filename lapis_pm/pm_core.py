@@ -2353,6 +2353,42 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                         f"corroboration pass skipped for PR #{pr_num}: {type(_corr_exc).__name__}",
                         extra_tags=["pm:corroboration-skipped"],
                     )  # best-effort; never fail verdict encoding
+                # Local-reviewer witness pass — additive, never mutates mainline fields.
+                try:
+                    from lapis_pm.local_reviewer_witness import (
+                        run_local_reviewer_witness as _run_local_reviewer_witness,
+                        _format_divergence_note as _fmt_div_note,
+                    )
+                    _wit_diff = _diff_text_for_corr(rec.get("repo", ""), pr_num)
+                    _wit_spec = episodic.spec_summary(target_id) or ""
+                    _claude_verdict_dict = json.loads(stored_json)
+                    _wit_result = _run_local_reviewer_witness(
+                        diff_text=_wit_diff,
+                        repo=rec.get("repo", ""),
+                        pr_number=pr_num if isinstance(pr_num, int) else int(pr_num),
+                        spec_summary=_wit_spec,
+                        claude_verdict=_claude_verdict_dict,
+                    )
+                    _stored_dict2 = json.loads(stored_json)
+                    _stored_dict2["local_reviewer_witness"] = _wit_result.to_dict()
+                    stored_json = json.dumps(_stored_dict2)
+                    if _wit_result.agreement == "diverge_major":
+                        _div_content = _fmt_div_note(_claude_verdict_dict, _wit_result)
+                        episodic.write_observation(
+                            target_id,
+                            _div_content,
+                            extra_tags=[
+                                "pm:reviewer-divergence",
+                                f"pm:reviewer-divergence:pr={pr_num}:type=major",
+                                f"pm:pr={pr_num}",
+                            ],
+                        )
+                except Exception as _wit_exc:
+                    episodic.write_observation(
+                        target_id,
+                        f"local witness pass skipped for PR #{pr_num}: {type(_wit_exc).__name__}",
+                        extra_tags=["pm:local-witness-skipped"],
+                    )  # best-effort; never fail verdict encoding
                 result_tags = tags + [
                     f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
                     f"pm:pr={pr_num}",

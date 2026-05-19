@@ -210,6 +210,12 @@ class _IdentifierSubstrate:
 _LLM_URL = "http://203.0.113.12:8081/v1/chat/completions"
 _LLM_TIMEOUT = 45  # seconds; Haiku-scale call, should be fast
 
+# Node 2 — MacBook Pro M4 Max / Gemma-3-27b (MLX, port 8080)
+# Architecturally distinct from StarHouse Qwen; used for parallel corroboration.
+_NODE2_URL = "http://100.124.203.15:8080/v1/chat/completions"
+_NODE2_MODEL = "/Users/user/Tools/mlx-models/gemma-3-27b-it-4bit"
+_NODE2_TIMEOUT = 120  # MLX on M4 Max is slower than StarHouse llama.cpp; large prompts approach 60s
+
 
 class LapisPMReviewerAdapter:
     """SubstrateAdapter for Lapis-PM reviewer corroboration.
@@ -254,6 +260,10 @@ class LapisPMReviewerAdapter:
         diff_text: str,
         substrates: list[_IdentifierSubstrate],
         repo: str,
+        *,
+        node_url: str | None = None,
+        node_model: str | None = None,
+        node_timeout: int | None = None,
     ) -> CorroborationResult:
         """Single LLM call to check identifier claims against substrate.
 
@@ -314,15 +324,16 @@ class LapisPMReviewerAdapter:
 
         try:
             import httpx
-            resp = httpx.post(
-                _LLM_URL,
-                json={
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 512,
-                },
-                timeout=_LLM_TIMEOUT,
-            )
+            _url = node_url or _LLM_URL
+            _timeout = node_timeout or _LLM_TIMEOUT
+            _body: dict = {
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 512,
+            }
+            if node_model:
+                _body["model"] = node_model
+            resp = httpx.post(_url, json=_body, timeout=_timeout)
             resp.raise_for_status()
             resp_json = resp.json()
             content = resp_json["choices"][0]["message"]["content"].strip()
@@ -438,22 +449,79 @@ def run_corroboration_pass(
 ) -> dict:
     """Run the corroboration follow-up pass on a PR diff.
 
-    Returns a dict suitable for attaching as `corroboration_result` to
-    the reviewer verdict JSON. Never raises — returns uncertain-shaped
-    dict on any error (Compost invariant: all outputs are nutrients).
+    Dispatches to StarHouse (primary) and MacBook/Node2 (witness) in parallel.
+    Returns a dict suitable for attaching as `corroboration_result` to the
+    reviewer verdict JSON. Never raises — returns uncertain-shaped dict on any
+    error (Compost invariant: all outputs are nutrients).
+
+    Added fields beyond v0 shape:
+      node2_corroboration: CorroborationResult dict from MacBook/Gemma, or None
+      cross_node_divergence: "agree" | "diverge" | "node2_unavailable"
     """
-    adapter = LapisPMReviewerAdapter(repo_path=repo_path)
+    import concurrent.futures
+
+    # Two separate adapter instances to avoid provenance-tracking races.
+    adapter_n1 = LapisPMReviewerAdapter(repo_path=repo_path)
+    adapter_n2 = LapisPMReviewerAdapter(repo_path=repo_path)
+
+    _uncertain = CorroborationResult(
+        verdict="uncertain",
+        claim="(corroboration pass failed)",
+        citations=[],
+        freshness_stamp=datetime.now(timezone.utc).isoformat(),
+        scope_id=f"repo:{repo}",
+        drift_class=None,
+        notes="",
+    )
+
     try:
-        substrates = adapter.retrieve(diff_text, repo, repo_path)
-        result = adapter.score(diff_text, substrates, repo)
-        return result.to_dict()
+        substrates = adapter_n1.retrieve(diff_text, repo, repo_path)
     except Exception as exc:
-        return CorroborationResult(
-            verdict="uncertain",
-            claim="(corroboration pass failed)",
-            citations=[],
-            freshness_stamp=datetime.now(timezone.utc).isoformat(),
-            scope_id=f"repo:{repo}",
-            drift_class=None,
-            notes=f"Adapter error: {type(exc).__name__}: {exc}",
-        ).to_dict()
+        r = _uncertain
+        r.notes = f"Retrieve error: {type(exc).__name__}: {exc}"
+        return r.to_dict()
+
+    def _score_n1() -> CorroborationResult:
+        try:
+            return adapter_n1.score(diff_text, substrates, repo)
+        except Exception as exc:
+            r = _uncertain
+            r.notes = f"Node1 error: {type(exc).__name__}: {exc}"
+            return r
+
+    def _score_n2() -> CorroborationResult:
+        try:
+            return adapter_n2.score(
+                diff_text, substrates, repo,
+                node_url=_NODE2_URL,
+                node_model=_NODE2_MODEL,
+                node_timeout=_NODE2_TIMEOUT,
+            )
+        except Exception as exc:
+            r = _uncertain
+            r.notes = f"Node2 error: {type(exc).__name__}: {exc}"
+            return r
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_n1 = pool.submit(_score_n1)
+        fut_n2 = pool.submit(_score_n2)
+        result_n1 = fut_n1.result()
+        result_n2 = fut_n2.result()
+
+    combined = result_n1.to_dict()
+    n2_dict = result_n2.to_dict()
+    combined["node2_corroboration"] = n2_dict
+
+    n2_unavailable = (
+        result_n2.verdict == "uncertain"
+        and result_n2.notes
+        and ("unavailable" in result_n2.notes or "Node2 error" in result_n2.notes)
+    )
+    if n2_unavailable:
+        combined["cross_node_divergence"] = "node2_unavailable"
+    elif result_n1.verdict == result_n2.verdict:
+        combined["cross_node_divergence"] = "agree"
+    else:
+        combined["cross_node_divergence"] = "diverge"
+
+    return combined

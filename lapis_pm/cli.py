@@ -918,6 +918,180 @@ def cmd_decisions_export(args) -> int:
     )
 
 
+def cmd_local_witness(args) -> int:
+    """Handle `lapis-pm local-witness stats` subcommand."""
+    sub = getattr(args, "local_witness_sub", None)
+    if sub != "stats":
+        print(f"ERROR: unknown local-witness subcommand: {sub}", file=sys.stderr)
+        return 2
+
+    import json as _json
+    from lapis_pm import episodic as _episodic
+    from agents_core.mem import Mem
+
+    repo_filter = getattr(args, "repo", None)
+    since_filter = getattr(args, "since", None)
+
+    since_dt = None
+    if since_filter:
+        from datetime import datetime as _dt
+        try:
+            since_dt = _dt.strptime(since_filter, "%Y-%m-%d")
+        except ValueError:
+            print(f"ERROR: --since must be YYYY-MM-DD, got: {since_filter}", file=sys.stderr)
+            return 2
+
+    # Collect all targets that have reviewer comments
+    mem = Mem()
+    all_targets: list[str] = []
+    try:
+        dispatched_keys = mem.search("pm/dispatched")
+        for k in dispatched_keys:
+            tid = k.split("pm/dispatched/", 1)[-1]
+            if tid and tid not in all_targets:
+                all_targets.append(tid)
+    except Exception:
+        pass
+
+    # Fall back to scanning episodic store if mem lookup is sparse
+    # (The store path is the canonical substrate)
+    from lapis_pm.episodic import _store as _ep_store
+    try:
+        store = _ep_store()
+        for tid in store.list_targets():
+            if tid not in all_targets:
+                all_targets.append(tid)
+    except Exception:
+        pass
+
+    # Agreement matrix accumulator
+    agree_counts = {"agree": 0, "diverge_minor": 0, "diverge_major": 0, "local_failed": 0}
+    # Confusion matrix: (claude_verdict, local_verdict) -> count
+    confusion: dict[tuple[str, str], int] = {}
+    latencies: list[int] = []
+    json_valid_count = 0
+    total = 0
+
+    for tid in all_targets:
+        try:
+            for comment in _episodic.all_comments(tid):
+                # Only look at reviewer verdict comments
+                is_reviewer = any(
+                    t.startswith("pm:reviewer:pr=") and ":cycle=" in t and ":verdict=" in t
+                    for t in comment.tags
+                )
+                if not is_reviewer:
+                    continue
+                content = comment.content or ""
+                json_part = content.split("\n", 1)[-1].strip()
+                try:
+                    body = _json.loads(json_part)
+                except Exception:
+                    continue
+                if "local_reviewer_witness" not in body:
+                    continue
+
+                # Apply date filter
+                if since_dt:
+                    # Comments have a timestamp field via the store
+                    ts = getattr(comment, "created_at", None) or getattr(comment, "timestamp", None)
+                    if ts:
+                        from datetime import datetime as _dt2
+                        try:
+                            if isinstance(ts, str):
+                                cdt = _dt2.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+                            else:
+                                cdt = ts.replace(tzinfo=None) if hasattr(ts, 'replace') else ts
+                            if cdt < since_dt:
+                                continue
+                        except Exception:
+                            pass
+
+                # Apply repo filter
+                if repo_filter:
+                    has_repo_tag = any(f"pm:repo={repo_filter}" in t for t in comment.tags)
+                    if not has_repo_tag:
+                        continue
+
+                wit = body["local_reviewer_witness"]
+                agreement = wit.get("agreement", "local_failed")
+                if agreement in agree_counts:
+                    agree_counts[agreement] += 1
+
+                cv = body.get("verdict", "?")
+                lv = wit.get("verdict") or "?"
+                key = (cv, lv)
+                confusion[key] = confusion.get(key, 0) + 1
+
+                lat = wit.get("latency_ms")
+                if isinstance(lat, int):
+                    latencies.append(lat)
+
+                if wit.get("json_valid"):
+                    json_valid_count += 1
+
+                total += 1
+        except Exception:
+            continue
+
+    if total == 0:
+        print("No local_reviewer_witness observations found.")
+        if since_filter:
+            print(f"  (filter: --since {since_filter})")
+        if repo_filter:
+            print(f"  (filter: --repo {repo_filter})")
+        return 0
+
+    print(f"Local-reviewer witness stats  (N={total})")
+    print()
+    print("Agreement breakdown:")
+    for k, v in agree_counts.items():
+        pct = 100 * v / total if total else 0
+        print(f"  {k:<18} {v:>4}  ({pct:.1f}%)")
+    print()
+
+    verdicts_order = ["clean", "fixable", "needs-human", "?"]
+    print("Confusion matrix (claude_verdict × local_verdict):")
+    header_cols = [lv for _, lv in confusion.keys()]
+    all_lv = sorted(set(header_cols), key=lambda x: verdicts_order.index(x) if x in verdicts_order else 99)
+    all_cv = sorted(set(cv for cv, _ in confusion.keys()), key=lambda x: verdicts_order.index(x) if x in verdicts_order else 99)
+    col_w = max(len(v) for v in all_lv + ["local →"]) + 2
+    cv_w = max(len(v) for v in all_cv + ["claude ↓"]) + 2
+    header = f"{'claude ↓ / local →':<{cv_w}}" + "".join(f"{lv:>{col_w}}" for lv in all_lv)
+    print("  " + header)
+    for cv in all_cv:
+        row = f"  {cv:<{cv_w}}"
+        for lv in all_lv:
+            cnt = confusion.get((cv, lv), 0)
+            row += f"{cnt:>{col_w}}"
+        print(row)
+    print()
+
+    # Precision / recall on fixable
+    tp_fixable = confusion.get(("fixable", "fixable"), 0)
+    fp_fixable = sum(confusion.get((cv, "fixable"), 0) for cv in all_cv if cv != "fixable")
+    fn_fixable = sum(confusion.get(("fixable", lv), 0) for lv in all_lv if lv != "fixable")
+    prec = tp_fixable / (tp_fixable + fp_fixable) if (tp_fixable + fp_fixable) > 0 else float("nan")
+    rec = tp_fixable / (tp_fixable + fn_fixable) if (tp_fixable + fn_fixable) > 0 else float("nan")
+    print(f"Fixable precision: {prec:.2f}   recall: {rec:.2f}")
+    print()
+
+    # Latency percentiles
+    if latencies:
+        latencies_sorted = sorted(latencies)
+        n_lat = len(latencies_sorted)
+        def pct(p: float) -> int:
+            idx = max(0, int(n_lat * p / 100) - 1)
+            return latencies_sorted[idx]
+        print(f"Latency (ms)  p50={pct(50)}  p90={pct(90)}  p99={pct(99)}")
+    else:
+        print("Latency data: none recorded")
+
+    # JSON validity
+    print(f"JSON validity: {json_valid_count}/{total} ({100*json_valid_count/total:.1f}%)")
+    return 0
+
+
 def cmd_review_gate(args) -> int:
     sub = args.review_gate_sub
     if sub == "status":
@@ -1540,6 +1714,20 @@ def build_parser() -> argparse.ArgumentParser:
     de.add_argument("--tag", default="", help="Optional tag filter (entries must contain this tag)")
     de.add_argument("--out", default=None, help="Write to file (default: stdout)")
     de.set_defaults(func=cmd_decisions_export)
+
+    lw = sub.add_parser(
+        "local-witness",
+        help="Local-reviewer witness tools (agreement stats, divergence history).",
+    )
+    lw_sub = lw.add_subparsers(dest="local_witness_sub")
+    lw_sub.required = True
+    lw_stats = lw_sub.add_parser(
+        "stats",
+        help="Print agreement matrix + latency percentiles for local-reviewer-witness observations.",
+    )
+    lw_stats.add_argument("--repo", default=None, help="Filter to a specific repo (default: all)")
+    lw_stats.add_argument("--since", default=None, help="Filter to observations since YYYY-MM-DD")
+    lw.set_defaults(func=cmd_local_witness)
 
     return p
 

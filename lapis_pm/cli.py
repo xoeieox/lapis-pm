@@ -775,6 +775,17 @@ def cmd_land(args) -> int:
         f"Archived + unbound {args.target_id}"
         + (f"; cleared: {cleared_summary}" if cleared_summary else "; mem state already clean")
     )
+
+    # Opportunistic compaction of old landed targets (non-fatal).
+    try:
+        compaction_results = pm_core.compact_eligible_targets()
+        newly_compacted = [tid for tid, outcome in compaction_results if outcome == "compacted"]
+        if newly_compacted:
+            print(f"Opportunistic compaction: {len(newly_compacted)} old targets compacted.")
+    except Exception as _ce:
+        import warnings
+        warnings.warn(f"compact_eligible_targets failed (non-fatal): {_ce}", stacklevel=2)
+
     return 0
 
 
@@ -916,6 +927,100 @@ def cmd_decisions_export(args) -> int:
         tag=args.tag,
         out=args.out,
     )
+
+
+def cmd_compact(args) -> int:
+    """Handle `lapis-pm compact [--days N] [--dry-run]`."""
+    import json as _json
+    from datetime import datetime as _dt, timezone, timedelta
+
+    days = args.days
+    if days < 1:
+        print("ERROR: --days must be >= 1", file=sys.stderr)
+        return 2
+
+    dry_run = args.dry_run
+    mem = pm_core._mem()
+    cutoff = _dt.now(timezone.utc) - timedelta(days=days)
+
+    landed_entries = mem.list_by_prefix("pm/landed/", limit=500)
+
+    eligible: list[tuple[str, list]] = []  # (target_id, dispatched_records)
+    skipped_already = 0
+    skipped_no_key = 0
+
+    for entry in landed_entries:
+        key = entry["key"]
+        target_id = key[len("pm/landed/"):]
+
+        try:
+            landed_rec = _json.loads(entry["content"])
+        except Exception:
+            continue
+
+        age_ts_str = landed_rec.get("landed_at") or landed_rec.get("ts")
+        if not age_ts_str:
+            continue
+
+        try:
+            age_dt = _dt.fromisoformat(age_ts_str)
+            if age_dt.tzinfo is None:
+                age_dt = age_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        if age_dt > cutoff:
+            continue
+
+        dispatched_rec = mem.get(pm_core._dispatched_key(target_id))
+        if not dispatched_rec:
+            skipped_no_key += 1
+            continue
+
+        try:
+            dispatched = _json.loads(dispatched_rec["content"])
+        except Exception:
+            dispatched = []
+
+        if dispatched and dispatched[0].get("compacted"):
+            skipped_already += 1
+            continue
+
+        eligible.append((target_id, dispatched))
+
+    if dry_run:
+        print(f"Would compact {len(eligible)} targets ({days}+ days since landing):")
+        for tid, records in eligible:
+            size_bytes = len(_json.dumps(records).encode())
+            print(f"  {tid}: {len(records)} records, ~{size_bytes / 1024:.1f} KB")
+        return 0
+
+    # Live run - compact each eligible target.
+    compacted_tids = []
+    for tid, _records in eligible:
+        pm_core.compact_dispatched(tid)
+        compacted_tids.append(tid)
+
+    skip_note = ""
+    if skipped_already or skipped_no_key:
+        parts = []
+        if skipped_already:
+            parts.append(f"{skipped_already} already compacted")
+        if skipped_no_key:
+            parts.append(f"{skipped_no_key} no dispatched key")
+        skip_note = f" (skipped {', '.join(parts)})"
+    print(f"Compacted {len(compacted_tids)} targets{skip_note}.")
+
+    for tid in compacted_tids:
+        stub_rec = mem.get(pm_core._dispatched_key(tid))
+        try:
+            stub = _json.loads(stub_rec["content"]) if stub_rec else [{}]
+        except Exception:
+            stub = [{}]
+        count = stub[0].get("dispatch_count", "?") if stub else "?"
+        print(f"  {tid}: {count} records \u2192 stub")
+
+    return 0
 
 
 def cmd_local_witness(args) -> int:
@@ -1728,6 +1833,23 @@ def build_parser() -> argparse.ArgumentParser:
     lw_stats.add_argument("--repo", default=None, help="Filter to a specific repo (default: all)")
     lw_stats.add_argument("--since", default=None, help="Filter to observations since YYYY-MM-DD")
     lw.set_defaults(func=cmd_local_witness)
+
+    # ------------------------------------------------------------------
+    # compact — compact dispatched records for old landed targets
+    # ------------------------------------------------------------------
+    cmp = sub.add_parser(
+        "compact",
+        help="Compact dispatched records for old landed targets.",
+    )
+    cmp.add_argument(
+        "--days", type=int, default=30,
+        help="Eligibility threshold: targets landed >= N days ago (default: 30, min: 1)",
+    )
+    cmp.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Print eligible targets and their current dispatch record size without writing.",
+    )
+    cmp.set_defaults(func=cmd_compact)
 
     return p
 

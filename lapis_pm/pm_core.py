@@ -417,6 +417,108 @@ def append_dispatched(target_id: str, record: dict):
     save_dispatched(target_id, records)
 
 
+def compact_dispatched(target_id: str) -> None:
+    """Replace the full dispatch record list for target_id with a compact stub.
+
+    Stub shape (single-element list to preserve the list[dict] contract):
+      [{"compacted": True, "compacted_at": "<iso>", "dispatch_count": N,
+        "agent_types": [...], "first_dispatch": "<ts>",
+        "last_completed": "<ts>"}]   # last_completed omitted if no record has it
+
+    Idempotent: if the first element already has "compacted": True, returns
+    immediately without writing. Does not touch pm/landed/<tid>.
+    """
+    records = load_dispatched(target_id)
+    if not records:
+        return
+    if records[0].get("compacted"):
+        return
+
+    agent_types = [r.get("agent_type", "") for r in records]
+    first_dispatch = records[0].get("ts", "")
+
+    last_completed: str | None = None
+    for r in records:
+        ca = r.get("completed_at")
+        if ca:
+            if last_completed is None or ca > last_completed:
+                last_completed = ca
+
+    stub: dict = {
+        "compacted": True,
+        "compacted_at": _now_iso(),
+        "dispatch_count": len(records),
+        "agent_types": agent_types,
+        "first_dispatch": first_dispatch,
+    }
+    if last_completed is not None:
+        stub["last_completed"] = last_completed
+
+    save_dispatched(target_id, [stub])
+
+
+def compact_eligible_targets(min_age_days: int = 30) -> list[tuple[str, str]]:
+    """Find all targets eligible for compaction and compact their dispatched records.
+
+    Eligibility: pm/landed/<tid> exists AND landed_at (or ts for manual-land)
+    is older than min_age_days days AND pm/dispatched/<tid> exists AND is not
+    already compacted.
+
+    Returns list of (target_id, outcome) pairs where outcome is one of:
+      "compacted" | "already_compacted" | "no_dispatched_key"
+    """
+    from datetime import timezone, timedelta
+
+    mem = _mem()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=min_age_days)
+
+    landed_entries = mem.list_by_prefix("pm/landed/", limit=500)
+    results: list[tuple[str, str]] = []
+
+    for entry in landed_entries:
+        key = entry["key"]
+        target_id = key[len("pm/landed/"):]
+
+        try:
+            landed_rec = json.loads(entry["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        age_ts_str = landed_rec.get("landed_at") or landed_rec.get("ts")
+        if not age_ts_str:
+            continue  # unparseable age - skip rather than compact prematurely
+
+        try:
+            age_dt = datetime.fromisoformat(age_ts_str)
+            if age_dt.tzinfo is None:
+                from datetime import timezone as _tz
+                age_dt = age_dt.replace(tzinfo=_tz.utc)
+        except (ValueError, AttributeError):
+            continue  # unparseable age - skip
+
+        if age_dt > cutoff:
+            continue  # too recent
+
+        dispatched_rec = mem.get(_dispatched_key(target_id))
+        if not dispatched_rec:
+            results.append((target_id, "no_dispatched_key"))
+            continue
+
+        try:
+            dispatched = json.loads(dispatched_rec["content"])
+        except (json.JSONDecodeError, TypeError):
+            dispatched = []
+
+        if dispatched and dispatched[0].get("compacted"):
+            results.append((target_id, "already_compacted"))
+            continue
+
+        compact_dispatched(target_id)
+        results.append((target_id, "compacted"))
+
+    return results
+
+
 def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     """Dispatch a shaped agent, record it, and emit a router-portfolio event.
 
@@ -1059,6 +1161,12 @@ def _act_auto_land(target_id: str) -> str:
     target.save()
     clear_landed_state(target_id)
 
+    # Opportunistic compaction of old landed targets (non-fatal).
+    try:
+        compact_eligible_targets()
+    except Exception as _ce:
+        logger.warning("compact_eligible_targets failed (non-fatal): %s", _ce)
+
     return f"action:auto_land:pr={pr_num}:arc={path}"
 
 
@@ -1133,6 +1241,12 @@ def _act_auto_land_already_satisfied(target_id: str) -> str:
     target.unbind_pm()
     target.save()
     clear_landed_state(target_id)
+
+    # Opportunistic compaction of old landed targets (non-fatal).
+    try:
+        compact_eligible_targets()
+    except Exception as _ce:
+        logger.warning("compact_eligible_targets failed (non-fatal): %s", _ce)
 
     return f"auto_land:already_satisfied:pr={pr_num}:arc={path}"
 

@@ -3456,7 +3456,7 @@ def tick_all() -> list[TickResult]:
         count = _review_gate_counter()
         logger.info(
             "[review-gate-paused] counter=%d/%d: dispatching inline-Sonnet fallback for "
-            "advisory PRs. Resume with `lapis-pm review-gate resume --reason \"..\"`.",
+            "advisory PRs. Resume with `lapis-pm review-gate resume --reason \"...\"`.",
             count,
             REVIEW_GATE_THRESHOLD,
         )

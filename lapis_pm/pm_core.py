@@ -1303,15 +1303,29 @@ def _set_review_gate_paused(paused: bool) -> None:
                tags=["lapis-pm", "review-gate"])
 
 
-def review_gate_resume() -> int:
-    """Reset kill-switch counter. Returns previous count.
+def review_gate_resume(reason: str) -> int:
+    """Reset kill-switch counter with documented reason. Returns previous count.
 
-    Called by `lapis-pm review-gate resume`.
+    The reason is written to mem under `decision/review-gate-resume/<iso8601-ts>`
+    as a tagged audit entry. Empty or whitespace-only reasons raise ValueError —
+    the caller (CLI or future agent) is responsible for eliciting a substantive
+    reason before invoking.
     """
+    if not reason or not reason.strip():
+        raise ValueError("review_gate_resume requires a non-empty reason")
     count = _review_gate_counter()
     _mem().set(REVIEW_GATE_COUNTER_KEY, "0", tags=["lapis-pm", "review-gate"])
     _set_review_gate_paused(False)
     _mem().delete(REVIEW_GATE_PAUSE_BRIEF_KEY)
+    # Decision audit-trail
+    from datetime import timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _mem().set(
+        f"decision/review-gate-resume/{ts}",
+        f"Review-gate resumed at counter={count}/{REVIEW_GATE_THRESHOLD}. "
+        f"Reason: {reason.strip()}",
+        tags=["lapis-pm", "review-gate", "resume-audit"],
+    )
     return count
 
 
@@ -2179,7 +2193,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
         target_id,
         f"Review-gate loop soft-paused after {count} Opus reviewer calls in the past 7d. "
         f"Falling back to inline-Sonnet behavior for new PRs. "
-        f"Resume with `lapis-pm review-gate resume`.",
+        f"Resume with `lapis-pm review-gate resume --reason \"...\"` (reason is required).",
         extra_tags=["pm:review-gate-paused"],
     )
     b = brief.synthesize(
@@ -3436,6 +3450,16 @@ def tick_all() -> list[TickResult]:
         return skipped
     # Probe succeeded — reset consecutive-fail counter.
     _set_forgejo_consecutive_fails(0)
+
+    # Emit one log line per tick when review-gate is paused (persistent visibility signal).
+    if _review_gate_paused():
+        count = _review_gate_counter()
+        logger.info(
+            "[review-gate-paused] counter=%d/%d: dispatching inline-Sonnet fallback for "
+            "advisory PRs. Resume with `lapis-pm review-gate resume --reason \"...\"`.",
+            count,
+            REVIEW_GATE_THRESHOLD,
+        )
 
     store = TargetStore()
     bound = [t for t in store.load_all() if t.pm_bound]

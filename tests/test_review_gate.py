@@ -619,7 +619,7 @@ class TestKillSwitch:
         mem.get.side_effect = [{"content": "25"}, None]
 
         with patch("lapis_pm.pm_core._mem", return_value=mem):
-            prev = pm_core.review_gate_resume()
+            prev = pm_core.review_gate_resume("test resume reason")
 
         assert prev == 25
         set_calls = [c for c in mem.set.call_args_list
@@ -714,9 +714,9 @@ class TestReviewGateCli:
         """lapis-pm review-gate resume resets counter."""
         from lapis_pm.cli import main
         with patch("lapis_pm.cli.pm_core.review_gate_resume", return_value=25) as mock_resume:
-            ret = main(["review-gate", "resume"])
+            ret = main(["review-gate", "resume", "--reason", "test reason"])
         assert ret == 0
-        mock_resume.assert_called_once()
+        mock_resume.assert_called_once_with(reason="test reason")
 
 
 # ---------------------------------------------------------------------------

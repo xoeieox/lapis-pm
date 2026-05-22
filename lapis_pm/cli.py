@@ -603,6 +603,15 @@ def cmd_tick(args) -> int:
 
 
 def cmd_status(args) -> int:
+    # Global review-gate kill-switch section (separate from per-target loop state).
+    rg = pm_core.review_gate_status()
+    print("=== review-gate ===")
+    print(f"  counter:       {rg['counter']} / {rg['threshold']}")
+    print(f"  paused:        {rg['paused']}")
+    if rg["paused"]:
+        print('  → Resume with: lapis-pm review-gate resume --reason "..."')
+    print()
+
     store = TargetStore()
     if args.target_id:
         t = store.get(args.target_id)
@@ -1204,11 +1213,16 @@ def cmd_review_gate(args) -> int:
         print(f"review-gate counter:   {state['counter']} / {state['threshold']}")
         print(f"review-gate paused:    {state['paused']}")
         if state["paused"]:
-            print("  → Resume with: lapis-pm review-gate resume")
+            print('  → Resume with: lapis-pm review-gate resume --reason "..."')
         return 0
     if sub == "resume":
-        prev = pm_core.review_gate_resume()
+        try:
+            prev = pm_core.review_gate_resume(reason=args.reason)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         print(f"Review-gate counter reset (was {prev}). Opus reviewer active again.")
+        print(f"Reason recorded: {args.reason}")
         return 0
     print(f"ERROR: unknown review-gate subcommand: {sub}", file=sys.stderr)
     return 2
@@ -1534,7 +1548,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Manage the Opus reviewer kill-switch.")
     rg_sub = rg.add_subparsers(dest="review_gate_sub", required=True)
     rg_sub.add_parser("status", help="Print current counter + threshold.")
-    rg_sub.add_parser("resume", help="Reset counter; re-enable Opus reviewer.")
+    rg_resume = rg_sub.add_parser("resume", help="Reset counter; re-enable Opus reviewer.")
+    rg_resume.add_argument(
+        "--reason",
+        required=True,
+        help="Why is the gate being resumed? Captured in mem audit trail.",
+    )
     rg.set_defaults(func=cmd_review_gate)
 
     tr = sub.add_parser(

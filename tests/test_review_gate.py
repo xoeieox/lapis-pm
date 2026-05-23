@@ -1637,3 +1637,40 @@ class TestReviewVerdictForCycle:
         with patch("lapis_pm.pm_core.episodic.all_comments", return_value=[c]):
             result = pm_core._review_verdict_for_cycle("tid", 42, 1)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Registry model selection (lapis-pm-advisory-sonnet-reviewer-v0)
+# ---------------------------------------------------------------------------
+
+class TestRegistryReviewerModels:
+    """Verify registry.yaml reviewer agent model assignments.
+
+    Advisory authority → reviewer (model=sonnet).
+    Hold authority → reviewer_fresh (model=opus).
+    Spec-review → spec_reviewer (model=opus).
+    """
+
+    def test_advisory_reviewer_agent_uses_sonnet(self):
+        """Advisory authority selects reviewer agent, which must be model=sonnet."""
+        agent = pm_core._SHAPER.get_agent("reviewer")
+        assert agent.model == "sonnet", (
+            f"reviewer agent model is '{agent.model}'; expected 'sonnet' "
+            "(lapis-pm-advisory-sonnet-reviewer-v0)"
+        )
+
+    def test_hold_reviewer_fresh_agent_uses_opus(self):
+        """Hold authority selects reviewer_fresh agent, which must remain model=opus."""
+        agent = pm_core._SHAPER.get_agent("reviewer_fresh")
+        assert agent.model == "opus", (
+            f"reviewer_fresh agent model is '{agent.model}'; expected 'opus' "
+            "(hold authority unchanged)"
+        )
+
+    def test_spec_reviewer_agent_uses_opus(self):
+        """Spec-review gate uses spec_reviewer agent, which must remain model=opus."""
+        agent = pm_core._SHAPER.get_agent("spec_reviewer")
+        assert agent.model == "opus", (
+            f"spec_reviewer agent model is '{agent.model}'; expected 'opus' "
+            "(spec-review gate unchanged)"
+        )

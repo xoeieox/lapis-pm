@@ -95,7 +95,7 @@ agents:
         "confidence": 0.0-1.0
       }}
       No prose outside the JSON.
-    model: opus
+    model: sonnet
     timeout_s: 600
 
   reviewer_fresh:

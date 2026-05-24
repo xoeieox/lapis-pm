@@ -78,13 +78,10 @@ class _DispatchResult:
 
 @dataclass
 class SpecReviewBrief:
+    # Required fields
     spec_path: Path
     target_id: str
     repo: str
-    opus_verdict: Literal["clean", "fixable", "needs-human", "timeout", "error", "parse_failed"]
-    opus_issues: list[dict]
-    opus_confidence: float
-    opus_run_id: str
     council_status: Literal["resolved", "open", "laid-down", "failed", "timeout", "error", "closed"]
     council_landing: str
     council_open_questions: list[str]
@@ -95,7 +92,13 @@ class SpecReviewBrief:
     combined_recommendation: Literal[
         "proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
     ]
+    # Optional fields — opus kept for backward compat; facets_deliberation is new
+    opus_verdict: str = "error"
+    opus_issues: list[dict] = field(default_factory=list)
+    opus_confidence: float = 0.0
+    opus_run_id: str = ""
     parse_error: dict | None = None
+    facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,126 @@ def _parse_spec_frontmatter(spec_path: Path) -> tuple[str, str]:
         )
 
     return tid_m.group(1), repo_m.group(1)
+
+
+def _parse_spec_authority(spec_path: Path) -> str:
+    """Extract Authority from spec frontmatter (first 50 lines).
+
+    Pattern: **Authority:** <auto-merge|advisory|hold> (followed by whitespace or end)
+    Raises SpecFrontmatterError if not found.
+    """
+    try:
+        text = spec_path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise SpecFrontmatterError(f"cannot read spec file: {e}") from e
+
+    first_50 = "\n".join(text.splitlines()[:50])
+    m = re.search(
+        r"^\*\*Authority:\*\*\s+(auto-merge|advisory|hold)\b",
+        first_50,
+        re.MULTILINE,
+    )
+    if not m:
+        raise SpecFrontmatterError(
+            f"missing **Authority:** in {spec_path} "
+            "(expected **Authority:** <auto-merge|advisory|hold> at line start, "
+            "e.g. '**Authority:** advisory — ...')"
+        )
+    return m.group(1)
+
+
+def _dispatch_facets(
+    spec_text: str,
+    parsed_target_id: str,
+    repo: str,
+    authority: str,
+    start_time: float,
+) -> str | None:
+    """Invoke Facets deliberation synchronously via subprocess.
+
+    Shells out to `python3 -m facets.adapter deliberate`. Blocks until Facets
+    completes or times out (10 min). Returns the deliberation_id if successful;
+    None on error, timeout, or if Facets is disabled via FACETS_DISPATCH_DISABLED=1.
+
+    Deliberation envelope is written to /srv/lapis/facets/deliberations/ by the adapter.
+    """
+    if os.getenv("FACETS_DISPATCH_DISABLED") == "1":
+        return None
+
+    import subprocess
+    import json as _json
+    import tempfile
+
+    try:
+        context = {
+            "source": "pre-bind-wire",
+            "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
+            "additional_context": f"repo={repo}, authority={authority}",
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as ctx_f:
+            _json.dump(context, ctx_f)
+            context_file = ctx_f.name
+
+        try:
+            result = subprocess.run(
+                [
+                    "python3", "-m", "facets.adapter", "deliberate",
+                    (
+                        f"Scope and timing judgment for {parsed_target_id} "
+                        f"(authority: {authority}, repo: {repo}). "
+                        f"Review the spec for portfolio fit, risk-reward, and readiness."
+                    ),
+                    "--context-file", context_file,
+                    "--format", "json",
+                ],
+                input=spec_text,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        finally:
+            try:
+                os.unlink(context_file)
+            except OSError:
+                pass
+
+        if result.returncode != 0:
+            print(
+                f"[spec-review:facets-dispatch-error] subprocess exited "
+                f"{result.returncode}: {result.stderr}",
+                file=sys.stderr,
+            )
+            return None
+
+        deliberation_json = _json.loads(result.stdout)
+        deliberation_id = deliberation_json.get("deliberation_id")
+        if not deliberation_id:
+            print(
+                "[spec-review:facets-dispatch-error] no deliberation_id in output",
+                file=sys.stderr,
+            )
+            return None
+
+        elapsed_s = int(time.time() - start_time)
+        print(
+            f"[spec-review:facets-complete] deliberation_id={deliberation_id} "
+            f"elapsed={elapsed_s}s",
+            file=sys.stderr,
+        )
+        return deliberation_id
+
+    except subprocess.TimeoutExpired:
+        print(
+            "[spec-review:facets-timeout] Facets did not complete within 10 minutes",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as e:
+        print(
+            f"[spec-review:facets-dispatch-error] {e}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _synth_target_id(parsed_target_id: str) -> str:
@@ -391,26 +514,31 @@ def _dispatch_council(
 
 
 def _poll_until_terminal(
-    spec_reviewer_task_id: str,
     council_run_id: str,
     timeout_s: int,
     start_time: float,
-) -> tuple[dict, dict]:
-    """Block until both sides terminal or timeout elapses.
+    spec_reviewer_task_id: str | None = None,
+) -> tuple[dict | None, dict]:
+    """Block until Council terminal (and optionally Opus) or timeout elapses.
 
-    Returns (opus_raw, council_raw) where each is a dict with keys:
-      status, verdict/council_status, issues, confidence, run_id, ...
+    When spec_reviewer_task_id is None (Facets mode), only Council is polled;
+    opus_result is returned as None. When spec_reviewer_task_id is provided
+    (backward-compat / legacy Opus mode), both sides are polled.
+
+    Returns (opus_raw_or_None, council_raw).
     """
     opus_result: dict | None = None
     council_result: dict | None = None
+    # In Facets mode (no Opus), mark Opus as immediately "done"
+    opus_already_done = spec_reviewer_task_id is None
 
     while True:
         elapsed = time.time() - start_time
         timed_out = elapsed >= timeout_s
 
-        # Check spec_reviewer terminal state
-        if opus_result is None:
-            output_path = _find_reviewer_output(spec_reviewer_task_id)
+        # Check spec_reviewer terminal state (only when Opus was dispatched)
+        if not opus_already_done and opus_result is None:
+            output_path = _find_reviewer_output(spec_reviewer_task_id)  # type: ignore[arg-type]
             if output_path is not None:
                 raw = _read_verdict_from_output(output_path)
                 failed = str(_CLAUDE_QUEUE_FAILED) in str(output_path) or \
@@ -478,10 +606,15 @@ def _poll_until_terminal(
                     "run_id": council_run_id,
                 }
 
+        # Determine effective opus done-ness for convergence + logging
+        opus_effective_done = opus_already_done or opus_result is not None
+
         # Both terminal?
-        if opus_result is not None and council_result is not None:
+        if opus_effective_done and council_result is not None:
             if timed_out:
-                opus_done = opus_result.get("status") != "timeout"
+                opus_done = opus_already_done or (
+                    opus_result is not None and opus_result.get("status") != "timeout"
+                )
                 council_done = council_result.get("status") != "timeout"
                 elapsed_s = int(time.time() - start_time)
                 print(
@@ -493,10 +626,11 @@ def _poll_until_terminal(
 
         if timed_out:
             # Shouldn't reach here, but guard against logic gaps
-            if opus_result is None:
+            if not opus_already_done and opus_result is None:
                 opus_result = {
                     "status": "timeout", "verdict": "timeout",
-                    "issues": [], "confidence": 0.0, "run_id": spec_reviewer_task_id,
+                    "issues": [], "confidence": 0.0,
+                    "run_id": spec_reviewer_task_id or "",
                 }
             if council_result is None:
                 council_result = {
@@ -530,57 +664,83 @@ def _parse_synthesis_str(text: str) -> dict:
 
 
 def _combined_recommendation(
-    opus_verdict: str,
-    opus_issues: list[dict],
-    council_status: str,
-    council_positions: list[dict],
+    opus_verdict: str = "skip",
+    opus_issues: list[dict] = (),
+    council_status: str = "error",
+    council_positions: list[dict] = (),
+    facets_escalation: str | None = None,
+    authority: str = "advisory",
 ) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed"]:
-    """Deterministic combined recommendation — no LLM call."""
-    # parse_failed: parser could not extract a verdict from the output file;
-    # distinct from "incomplete" (which means the agent task itself failed)
+    """Deterministic combined recommendation — Facets (PM) + Council (philosophical).
+
+    opus_verdict="skip" signals that Opus was not dispatched (Facets mode).
+    When facets_escalation is provided and authority is advisory/hold, Facets
+    signals take precedence over Opus. Falls through to Council-only logic on
+    Facets escalation_recommendation="proceed" or when Facets is absent.
+    """
+    # parse_failed: parser could not extract a verdict
     if opus_verdict == "parse_failed":
         return "parse_failed"
 
-    # incomplete: either side timeout or error
-    if opus_verdict in {"timeout", "error"} or council_status in {"timeout", "error"}:
+    # Facets logic — gated on authority and escalation signal
+    if authority in {"advisory", "hold"} and facets_escalation:
+        if facets_escalation == "claude-max":
+            return "shape-with-Erah"
+        if facets_escalation == "investigate-first":
+            return "amend-spec"
+        if facets_escalation == "brief-to-Erah":
+            return "shape-with-Erah"
+        # proceed → fall through to Council signal
+
+    # Council timeout/error → incomplete
+    if council_status in {"timeout", "error"}:
         return "incomplete"
 
-    # shape-with-Erah: opus needs-human, council laid-down, or council open with blocks
+    # Opus timeout/error → incomplete (only when Opus was dispatched)
+    if opus_verdict not in {"skip"} and opus_verdict in {"timeout", "error"}:
+        return "incomplete"
+
+    # shape-with-Erah: council laid-down, council open with blocks, or Opus needs-human
     has_block = any(p.get("position") == "block" for p in council_positions)
-    if (
-        opus_verdict == "needs-human"
-        or council_status == "laid-down"
-        or (council_status == "open" and has_block)
-    ):
+    if council_status == "laid-down" or (council_status == "open" and has_block):
+        return "shape-with-Erah"
+    if opus_verdict not in {"skip"} and opus_verdict == "needs-human":
         return "shape-with-Erah"
 
-    # amend-spec: opus fixable, council open (no blocks), or any HIGH opus issue
-    has_high = any(
-        str(i.get("severity", "")).lower() == "high" for i in opus_issues
-    )
-    if opus_verdict == "fixable" or council_status == "open" or has_high:
+    # amend-spec: council open, or Opus fixable/HIGH-issue (when Opus dispatched)
+    has_high = any(str(i.get("severity", "")).lower() == "high" for i in opus_issues)
+    if council_status == "open":
+        return "amend-spec"
+    if opus_verdict not in {"skip"} and (opus_verdict == "fixable" or has_high):
         return "amend-spec"
 
-    # proceed-to-bind
-    if opus_verdict == "clean" and council_status == "resolved":
+    # proceed-to-bind: council resolved + (Opus clean or Opus not dispatched)
+    if council_status == "resolved" and opus_verdict in {"skip", "clean"}:
         return "proceed-to-bind"
 
     return "incomplete"
 
 
 def _build_brief(
-    opus_raw: dict,
     council_raw: dict,
     spec_path: Path,
     parsed_target_id: str,
     repo: str,
     elapsed_s: float,
+    opus_raw: dict | None = None,
+    facets_deliberation: dict | None = None,
+    authority: str = "advisory",
 ) -> SpecReviewBrief:
-    """Assemble SpecReviewBrief from raw poll results."""
-    opus_verdict = opus_raw.get("verdict", "error")
-    opus_issues = opus_raw.get("issues", [])
-    opus_confidence = float(opus_raw.get("confidence", 0.0))
-    opus_run_id = opus_raw.get("run_id", "")
+    """Assemble SpecReviewBrief from Facets + Council (and optionally Opus) results.
+
+    opus_raw is optional — None when Opus was not dispatched (Facets mode).
+    facets_deliberation is the FacetsDeliberation envelope dict; None if disabled/timeout.
+    """
+    # Opus fields — backward compat; default to "skip" sentinel when not dispatched
+    opus_verdict = opus_raw.get("verdict", "error") if opus_raw is not None else "skip"
+    opus_issues = opus_raw.get("issues", []) if opus_raw is not None else []
+    opus_confidence = float(opus_raw.get("confidence", 0.0)) if opus_raw is not None else 0.0
+    opus_run_id = opus_raw.get("run_id", "") if opus_raw is not None else ""
 
     council_status = council_raw.get("status", "error")
     council_landing = council_raw.get("landing", "")
@@ -589,18 +749,26 @@ def _build_brief(
     council_positions = council_raw.get("positions", [])
     council_run_id = council_raw.get("run_id", "")
 
+    # Extract Facets escalation signal
+    facets_escalation = None
+    if facets_deliberation:
+        synthesis = facets_deliberation.get("synthesis", {})
+        if isinstance(synthesis, dict):
+            facets_escalation = synthesis.get("escalation_recommendation")
+
     recommendation = _combined_recommendation(
-        opus_verdict, opus_issues, council_status, council_positions
+        opus_verdict=opus_verdict,
+        opus_issues=opus_issues,
+        council_status=council_status,
+        council_positions=council_positions,
+        facets_escalation=facets_escalation,
+        authority=authority,
     )
 
     return SpecReviewBrief(
         spec_path=spec_path,
         target_id=parsed_target_id,
         repo=repo,
-        opus_verdict=opus_verdict,
-        opus_issues=opus_issues,
-        opus_confidence=opus_confidence,
-        opus_run_id=opus_run_id,
         council_status=council_status,
         council_landing=council_landing,
         council_open_questions=council_open_questions,
@@ -609,7 +777,12 @@ def _build_brief(
         council_run_id=council_run_id,
         elapsed_s=elapsed_s,
         combined_recommendation=recommendation,
-        parse_error=opus_raw.get("parse_error"),
+        opus_verdict=opus_verdict,
+        opus_issues=opus_issues,
+        opus_confidence=opus_confidence,
+        opus_run_id=opus_run_id,
+        parse_error=opus_raw.get("parse_error") if opus_raw is not None else None,
+        facets_deliberation=facets_deliberation,
     )
 
 
@@ -698,19 +871,46 @@ could not extract a JSON verdict from the output. See chain-sibling \
 `spec-review-output-truncation-runner` for the delivery-path fix.
 """
 
+    # Facets section — omitted if facets_deliberation is None
+    facets_section = ""
+    if brief.facets_deliberation:
+        fd = brief.facets_deliberation
+        syn = fd.get("synthesis", {}) if isinstance(fd.get("synthesis"), dict) else {}
+        stances = fd.get("stances", [])
+        stances_md = "\n".join(
+            f"    - **{s.get('persona', '?')}** ({s.get('confidence', '?')}): "
+            f"{s.get('claim', '')}"
+            for s in stances
+        ) or "    - (none)"
+        facets_section = f"""
+## Facets deliberation (PM domain)
+- **Consensus level:** {syn.get('consensus_level', '?')}
+- **Escalation:** {syn.get('escalation_recommendation', 'proceed')}
+- **Confidence:** {syn.get('confidence', '?')}
+- **Recommendation:** {syn.get('recommendation', '')}
+- **Stances:**
+{stances_md}
+- **Run ID:** {fd.get('deliberation_id', '')}
+"""
+
+    # Opus section — omitted when Opus was not dispatched (verdict="skip")
+    opus_section = ""
+    if brief.opus_verdict != "skip":
+        opus_section = f"""
+## Opus technical review
+- **Verdict:** {brief.opus_verdict} (confidence {brief.opus_confidence:.2f})
+- **Run ID:** {brief.opus_run_id}
+- **Issues:**
+{issues_lines}
+"""
+
     return f"""# Spec Review: {brief.target_id}
 
 **Spec:** {brief.spec_path}
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-
-## Opus technical review
-- **Verdict:** {brief.opus_verdict} (confidence {brief.opus_confidence:.2f})
-- **Run ID:** {brief.opus_run_id}
-- **Issues:**
-{issues_lines}
-
+{facets_section}{opus_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -734,39 +934,77 @@ def run_spec_review(
     council_voicing: str = "local",
     timeout_s: int = 1800,
     repo_override: str | None = None,
+    authority: str | None = None,
+    dispatch_facets: bool = True,
 ) -> SpecReviewBrief:
-    """Run parallel Opus + Council review of a spec document. Synchronous."""
+    """Run Facets (PM) + Council (philosophical) review of a spec document. Synchronous.
+
+    Facets deliberation is synchronous (blocks ~5 min); Council is async (polled up to
+    timeout). Both run in parallel where possible: Facets blocks locally while Council
+    fires async and is polled after Facets completes.
+
+    dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
+    smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
+    back to "advisory" if not found. Only advisory/hold specs dispatch Facets.
+    """
     start_time = time.time()
 
     # 1. Parse frontmatter
     parsed_target_id, parsed_repo = _parse_spec_frontmatter(spec_path)
     repo = repo_override if repo_override else parsed_repo
 
-    # 2. Generate synthetic target_id (never written to TargetStore)
-    synth_tid = _synth_target_id(parsed_target_id)
+    # 2. Parse authority from spec (if not provided)
+    effective_authority = authority
+    if effective_authority is None:
+        try:
+            effective_authority = _parse_spec_authority(spec_path)
+        except SpecFrontmatterError:
+            effective_authority = "advisory"  # default when not found
 
-    # 3. Load invariant context
-    invariant_context = _load_invariant_context(repo)
-
-    # 4. Read full spec text
+    # 3. Read full spec text
     spec_text = spec_path.read_text(encoding="utf-8")
 
-    # 5. Dispatch spec_reviewer (Opus pass)
-    dispatch_result = _dispatch_spec_reviewer(
-        spec_text, synth_tid, parsed_target_id, repo, invariant_context
-    )
+    # 4. Load invariant context
+    invariant_context = _load_invariant_context(repo)
 
-    # 6. Dispatch council deliberation
+    # 5. Dispatch Facets (synchronous; blocks until complete or timeout)
+    facets_deliberation: dict | None = None
+    if dispatch_facets and effective_authority in {"advisory", "hold"}:
+        facets_deliberation_id = _dispatch_facets(
+            spec_text, parsed_target_id, repo, effective_authority, start_time
+        )
+        if facets_deliberation_id:
+            try:
+                import json as _json
+                facets_path = Path(f"/srv/lapis/facets/deliberations/{facets_deliberation_id}.json")
+                facets_deliberation = _json.loads(facets_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(
+                    f"[spec-review:facets-read-error] could not read Facets result: {e}",
+                    file=sys.stderr,
+                )
+
+    # 6. Dispatch Council (async; parallel with any remaining work)
     council_run_id = _dispatch_council(
         spec_text, parsed_target_id, invariant_context, council_voicing
     )
 
-    # 7. Poll until terminal
-    opus_raw, council_raw = _poll_until_terminal(
-        dispatch_result.task_id, council_run_id, timeout_s, start_time
+    # 7. Poll until Council terminal (Opus not dispatched in Facets mode)
+    _, council_raw = _poll_until_terminal(
+        council_run_id=council_run_id,
+        timeout_s=timeout_s,
+        start_time=start_time,
     )
 
     elapsed = time.time() - start_time
 
     # 8. Build and return brief
-    return _build_brief(opus_raw, council_raw, spec_path, parsed_target_id, repo, elapsed)
+    return _build_brief(
+        council_raw=council_raw,
+        spec_path=spec_path,
+        parsed_target_id=parsed_target_id,
+        repo=repo,
+        elapsed_s=elapsed,
+        facets_deliberation=facets_deliberation,
+        authority=effective_authority,
+    )

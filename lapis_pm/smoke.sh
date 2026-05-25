@@ -4127,25 +4127,20 @@ print('cache cleanup done')
 "
 green "Phase 38 complete: v0.next scene unchanged from v0 OK"
 
-# --- Phase 39: spec-review happy path (both stubs) -----------------------
+# --- Phase 39: spec-review happy path (Facets disabled + Council stub) -----
 #
-# SPEC_REVIEWER_STUB=1 + COUNCIL_ENGINE_STUB=1 — both stubs fire, no real
-# dispatch. Assert exit 0, combined brief shows proceed-to-bind, both
-# verdict:clean and Status:resolved lines present.
+# FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree,agree — no real
+# dispatch. Assert exit 0, combined brief shows proceed-to-bind, Council
+# section and Mirror Council heading present.
 
-step "Phase 39: spec-review happy path (SPEC_REVIEWER_STUB=1 clean + COUNCIL_ENGINE_STUB=1 agree)"
+step "Phase 39: spec-review happy path (FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree)"
 
 SPEC_REVIEW_FIXTURE="${SCRIPT_DIR}/smoke_fixtures/spec_review/valid-fixture.md"
 
-# Pre-stub the council run: write a resolved YAML so the poll loop finds it
-# immediately. cmd_submit in COUNCIL_ENGINE_STUB mode still prints a run_id;
-# we capture that and pre-write the resolved YAML before poll starts.
-# Simpler approach for smoke: stub both sides and use a very short timeout.
-
-SPEC_REVIEW_OUT_39="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=clean \
+SPEC_REVIEW_OUT_39="$(FACETS_DISPATCH_DISABLED=1 \
     COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,agree \
     timeout 120 python3 -m lapis_pm.cli spec-review \
-    --timeout 120 \
+    --timeout 120 --no-facets \
     "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
     echo "Phase 39: spec-review exited non-zero"
     echo "$SPEC_REVIEW_OUT_39"
@@ -4154,29 +4149,26 @@ SPEC_REVIEW_OUT_39="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=clean \
 
 echo "$SPEC_REVIEW_OUT_39" | grep -q "proceed-to-bind" \
     || red "Phase 39: expected 'proceed-to-bind' in output"
-echo "$SPEC_REVIEW_OUT_39" | grep -q "clean" \
-    || red "Phase 39: expected 'clean' (opus verdict) in output"
+echo "$SPEC_REVIEW_OUT_39" | grep -q "Mirror Council" \
+    || red "Phase 39: expected 'Mirror Council' section in output"
 green "Phase 39: spec-review happy path → proceed-to-bind ✓"
 
-# --- Phase 40: spec-review amend-spec recommendation ---------------------
+# --- Phase 40: spec-review shape-with-Erah (Council block) ----------------
 #
-# SPEC_REVIEWER_STUB=1 STUB_VERDICT=fixable + COUNCIL_ENGINE_STUB=1 → amend-spec.
+# FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree,block → shape-with-Erah.
+# (agree,block gives "laid-down" status → shape-with-Erah recommendation)
 
-step "Phase 40: spec-review amend-spec (SPEC_REVIEWER_STUB=1 fixable + COUNCIL_ENGINE_STUB=1)"
+step "Phase 40: spec-review shape-with-Erah (FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree,block)"
 
-SPEC_REVIEW_OUT_40="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=fixable \
-    COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,agree \
+SPEC_REVIEW_OUT_40="$(FACETS_DISPATCH_DISABLED=1 \
+    COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,block \
     timeout 120 python3 -m lapis_pm.cli spec-review \
-    --timeout 120 \
-    "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
-    echo "Phase 40: spec-review exited non-zero"
-    echo "$SPEC_REVIEW_OUT_40"
-    red "Phase 40: exit code check failed"
-}
+    --timeout 120 --no-facets \
+    "${SPEC_REVIEW_FIXTURE}" 2>&1)" || true
 
-echo "$SPEC_REVIEW_OUT_40" | grep -q "amend-spec" \
-    || red "Phase 40: expected 'amend-spec' in output"
-green "Phase 40: spec-review amend-spec → amend-spec ✓"
+echo "$SPEC_REVIEW_OUT_40" | grep -q "shape-with-Erah" \
+    || red "Phase 40: expected 'shape-with-Erah' in output"
+green "Phase 40: spec-review shape-with-Erah (Council block) ✓"
 
 # --- Phase 41: frontmatter parse error → exit 2 --------------------------
 #

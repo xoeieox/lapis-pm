@@ -1245,6 +1245,8 @@ def cmd_spec_review(args) -> int:
             council_voicing=args.council_voicing,
             timeout_s=args.timeout,
             repo_override=args.repo_override,
+            authority=getattr(args, "authority", None),
+            dispatch_facets=not getattr(args, "no_facets", False),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -1254,7 +1256,7 @@ def cmd_spec_review(args) -> int:
         return 2
 
     print(format_brief(brief))
-    return 0
+    return 0 if brief.combined_recommendation not in {"parse_failed", "incomplete"} else 1
 
 
 def cmd_eval_gate(args) -> int:
@@ -1772,6 +1774,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         dest="repo_override",
         help="Override repo parsed from spec frontmatter.",
+    )
+    sr.add_argument(
+        "--no-facets",
+        action="store_true",
+        dest="no_facets",
+        help="Skip Facets deliberation dispatch (for smoke or testing).",
+    )
+    sr.add_argument(
+        "--authority",
+        choices=["auto-merge", "advisory", "hold"],
+        default=None,
+        help="Override spec's stated authority for Facets dispatch gating.",
     )
     sr.set_defaults(func=cmd_spec_review)
 

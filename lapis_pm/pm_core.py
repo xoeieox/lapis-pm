@@ -1807,6 +1807,17 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
                 "pr": pr, "cls": cls, "issues": issues,
                 "cycle": reviewer_count, "budget": budget,
             })
+        # LOW-only exhaustion: advisory PRs with only low-severity issues remaining
+        # emit advisory_brief (sweep-later framing) rather than review_exhausted_brief.
+        # Hold authority always escalates regardless of severity.
+        if (
+            pm_authority != "hold"
+            and issues
+            and all(iss.get("severity", "high") == "low" for iss in issues)
+        ):
+            cls.screen_verdict = "fixable"
+            cls.issues = issues
+            return Decision("advisory_brief", payload)
         history = _collect_review_history(target_id, pr_number)
         return Decision("review_exhausted_brief", {
             "pr": pr, "cls": cls, "history": history,

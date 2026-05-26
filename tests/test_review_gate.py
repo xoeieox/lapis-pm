@@ -347,10 +347,11 @@ class TestDecideForPr:
         assert d.payload["cycle"] == 1  # reviewer cycle that returned fixable
 
     def test_fixable_cycles_at_budget_returns_exhausted_brief(self):
-        """Reviewed (cycle 2) fixable + cycles >= budget → review_exhausted_brief."""
-        verdict = {"verdict": "fixable", "issues": ISSUES, "confidence": 0.8}
-        history = [{"cycle": 1, "verdict": "fixable", "issues": ISSUES},
-                   {"cycle": 2, "verdict": "fixable", "issues": ISSUES}]
+        """Reviewed (cycle 2) fixable + cycles >= budget + MED issue → review_exhausted_brief."""
+        med_issues = [{"severity": "med", "path": "src/foo.py", "note": "missing test coverage"}]
+        verdict = {"verdict": "fixable", "issues": med_issues, "confidence": 0.8}
+        history = [{"cycle": 1, "verdict": "fixable", "issues": med_issues},
+                   {"cycle": 2, "verdict": "fixable", "issues": med_issues}]
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
@@ -365,6 +366,122 @@ class TestDecideForPr:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "review_exhausted_brief"
         assert d.payload["history"] == history
+
+    def test_fixable_budget_exhausted_low_only_advisory_returns_advisory_brief(self):
+        """LOW-only issues + budget exhausted + advisory → advisory_brief."""
+        low_issues = [{"severity": "low", "path": "src/foo.py", "note": "nit"}]
+        verdict = {"verdict": "fixable", "issues": low_issues, "confidence": 0.8}
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "advisory_brief"
+        assert d.payload["classification"].issues == low_issues
+
+    def test_fixable_budget_exhausted_low_only_hold_returns_exhausted_brief(self):
+        """LOW-only issues + budget exhausted + hold → review_exhausted_brief (hold always escalates).
+        Hold budget is 4 cycles, so reviewer_count=4 simulates exhaustion."""
+        low_issues = [{"severity": "low", "path": "src/foo.py", "note": "nit"}]
+        verdict = {"verdict": "fixable", "issues": low_issues, "confidence": 0.8}
+        history = [{"cycle": 4, "verdict": "fixable", "issues": low_issues}]
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=4),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=3),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=history),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "hold")
+        assert d.kind == "review_exhausted_brief"
+
+    def test_fixable_budget_exhausted_med_present_advisory_returns_exhausted_brief(self):
+        """MED issue present + budget exhausted + advisory → review_exhausted_brief."""
+        med_issues = [{"severity": "med", "path": "src/bar.py", "note": "missing test"}]
+        verdict = {"verdict": "fixable", "issues": med_issues, "confidence": 0.8}
+        history = [{"cycle": 2, "verdict": "fixable", "issues": med_issues}]
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=history),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "review_exhausted_brief"
+
+    def test_fixable_budget_exhausted_high_present_advisory_returns_exhausted_brief(self):
+        """HIGH issue present + budget exhausted + advisory → review_exhausted_brief."""
+        high_issues = [{"severity": "high", "path": "src/baz.py", "note": "security hole"}]
+        verdict = {"verdict": "fixable", "issues": high_issues, "confidence": 0.8}
+        history = [{"cycle": 2, "verdict": "fixable", "issues": high_issues}]
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=history),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "review_exhausted_brief"
+
+    def test_fixable_budget_exhausted_mixed_low_med_advisory_returns_exhausted_brief(self):
+        """Mixed LOW+MED issues + budget exhausted + advisory → review_exhausted_brief."""
+        mixed_issues = [
+            {"severity": "low", "path": "src/foo.py", "note": "nit"},
+            {"severity": "med", "path": "src/bar.py", "note": "missing test"},
+        ]
+        verdict = {"verdict": "fixable", "issues": mixed_issues, "confidence": 0.8}
+        history = [{"cycle": 2, "verdict": "fixable", "issues": mixed_issues}]
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=history),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "review_exhausted_brief"
+
+    def test_fixable_budget_exhausted_empty_issues_advisory_returns_exhausted_brief(self):
+        """Empty issues list + budget exhausted + advisory → review_exhausted_brief (defensive)."""
+        verdict = {"verdict": "fixable", "issues": [], "confidence": 0.8}
+        history = [{"cycle": 2, "verdict": "fixable", "issues": []}]
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=history),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "review_exhausted_brief"
 
     def test_needs_human_verdict_returns_hold_brief(self):
         """needs-human verdict → immediate hold_brief, no fixer retry."""

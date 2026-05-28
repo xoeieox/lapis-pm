@@ -28,6 +28,7 @@ _CLAUDE_QUEUE_FAILED = Path("/srv/lapis/claude-queue/failed")
 _GPU_QUEUE_COMPLETED = Path("/srv/lapis/gpu-queue/completed")
 _GPU_QUEUE_FAILED = Path("/srv/lapis/gpu-queue/failed")
 _COUNCIL_DIR = Path("/srv/lapis/council")
+_FACETS_REPO_PATH = Path("/srv/git/facets-working")  # facets pkg not pip-installed; inject on PYTHONPATH for `-m facets.adapter`
 
 # Council terminal statuses — per v0.next spec + "closed" for scene mode.
 _COUNCIL_TERMINAL: frozenset[str] = frozenset(
@@ -199,6 +200,12 @@ def _dispatch_facets(
             context_file = ctx_f.name
 
         try:
+            facets_env = {
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    p for p in (str(_FACETS_REPO_PATH), os.environ.get("PYTHONPATH", "")) if p
+                ),
+            }
             result = subprocess.run(
                 [
                     "python3", "-m", "facets.adapter", "deliberate",
@@ -214,6 +221,7 @@ def _dispatch_facets(
                 capture_output=True,
                 text=True,
                 timeout=600,
+                env=facets_env,
             )
         finally:
             try:

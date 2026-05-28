@@ -215,6 +215,7 @@ def _dispatch_facets(
                         f"Review the spec for portfolio fit, risk-reward, and readiness."
                     ),
                     "--context-file", context_file,
+                    "--spec-text-from-stdin",
                     "--format", "json",
                 ],
                 input=spec_text,
@@ -677,6 +678,7 @@ def _combined_recommendation(
     council_status: str = "error",
     council_positions: list[dict] = (),
     facets_escalation: str | None = None,
+    facets_unreliable: bool = False,
     authority: str = "advisory",
 ) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed"]:
     """Deterministic combined recommendation — Facets (PM) + Council (philosophical).
@@ -684,14 +686,15 @@ def _combined_recommendation(
     opus_verdict="skip" signals that Opus was not dispatched (Facets mode).
     When facets_escalation is provided and authority is advisory/hold, Facets
     signals take precedence over Opus. Falls through to Council-only logic on
-    Facets escalation_recommendation="proceed" or when Facets is absent.
+    Facets escalation_recommendation="proceed", when Facets is absent, or when
+    facets_unreliable=True (parse failures present — Council-only branches apply).
     """
     # parse_failed: parser could not extract a verdict
     if opus_verdict == "parse_failed":
         return "parse_failed"
 
-    # Facets logic — gated on authority and escalation signal
-    if authority in {"advisory", "hold"} and facets_escalation:
+    # Facets logic — gated on authority, escalation signal, and reliability
+    if authority in {"advisory", "hold"} and facets_escalation and not facets_unreliable:
         if facets_escalation == "claude-max":
             return "shape-with-Erah"
         if facets_escalation == "investigate-first":
@@ -757,12 +760,18 @@ def _build_brief(
     council_positions = council_raw.get("positions", [])
     council_run_id = council_raw.get("run_id", "")
 
-    # Extract Facets escalation signal
+    # Extract Facets escalation signal and compute reliability
     facets_escalation = None
+    facets_unreliable = False
     if facets_deliberation:
-        synthesis = facets_deliberation.get("synthesis", {})
+        synthesis = facets_deliberation.get("synthesis") or {}
         if isinstance(synthesis, dict):
             facets_escalation = synthesis.get("escalation_recommendation")
+        stances = facets_deliberation.get("stances") or []
+        facets_unreliable = (
+            bool(synthesis.get("parse_failed"))
+            or any(s.get("parse_failed") for s in stances)
+        )
 
     recommendation = _combined_recommendation(
         opus_verdict=opus_verdict,
@@ -770,6 +779,7 @@ def _build_brief(
         council_status=council_status,
         council_positions=council_positions,
         facets_escalation=facets_escalation,
+        facets_unreliable=facets_unreliable,
         authority=authority,
     )
 
@@ -885,20 +895,47 @@ could not extract a JSON verdict from the output. See chain-sibling \
         fd = brief.facets_deliberation
         syn = fd.get("synthesis", {}) if isinstance(fd.get("synthesis"), dict) else {}
         stances = fd.get("stances", [])
+
+        # Compute unreliability from the stored deliberation
+        synth_parse_failed = bool(syn.get("parse_failed"))
+        failed_stances = [s for s in stances if s.get("parse_failed")]
+        facets_unreliable = synth_parse_failed or bool(failed_stances)
+
+        unreliable_header_line = (
+            "\n**Facets leg unreliable; combined recommendation derived from Council only**"
+            if facets_unreliable else ""
+        )
+
+        reliable_line = ""
+        if synth_parse_failed:
+            reliable_line = (
+                f"- **Reliable:** no  (synthesis parse_failed: {syn.get('parse_error', '')})\n"
+            )
+        elif facets_unreliable:
+            reliable_line = "- **Reliable:** no  (persona parse failures)\n"
+
+        failed_personas_line = ""
+        if failed_stances:
+            fp_entries = ", ".join(
+                f"{s.get('persona', '?')} ({s.get('parse_error', 'unknown')})"
+                for s in failed_stances
+            )
+            failed_personas_line = f"- **Personas with parse failures:** {fp_entries}\n"
+
         stances_md = "\n".join(
             f"    - **{s.get('persona', '?')}** ({s.get('confidence', '?')}): "
             f"{s.get('claim', '')}"
             for s in stances
         ) or "    - (none)"
         facets_section = f"""
-## Facets deliberation (PM domain)
-- **Consensus level:** {syn.get('consensus_level', '?')}
+## Facets deliberation (PM domain){unreliable_header_line}
+{reliable_line}- **Consensus level:** {syn.get('consensus_level', '?')}
 - **Escalation:** {syn.get('escalation_recommendation', 'proceed')}
 - **Confidence:** {syn.get('confidence', '?')}
 - **Recommendation:** {syn.get('recommendation', '')}
 - **Stances:**
 {stances_md}
-- **Run ID:** {fd.get('deliberation_id', '')}
+{failed_personas_line}- **Run ID:** {fd.get('deliberation_id', '')}
 """
 
     # Opus section — omitted when Opus was not dispatched (verdict="skip")

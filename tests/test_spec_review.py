@@ -31,6 +31,45 @@ from lapis_pm.spec_review import (
     run_spec_review,
 )
 
+# ---------------------------------------------------------------------------
+# L2 fixtures
+# ---------------------------------------------------------------------------
+
+def _facets_deliberation_with_parse_failures(
+    stance_failed: bool = True,
+    synth_failed: bool = False,
+) -> dict:
+    """Fixture with optional parse failures on stances and/or synthesis."""
+    stances = [
+        {
+            "persona": "technical-integrity",
+            "confidence": "medium",
+            "claim": "",
+            "parse_failed": stance_failed,
+            "parse_error": "no JSON object found" if stance_failed else None,
+        },
+        {
+            "persona": "trickster",
+            "confidence": "medium",
+            "claim": "portfolio fit is good",
+            "parse_failed": False,
+            "parse_error": None,
+        },
+    ]
+    synthesis = {
+        "escalation_recommendation": "brief-to-Erah",
+        "consensus_level": "divergent",
+        "confidence": "low",
+        "recommendation": "Synthesis failed to parse.",
+        "parse_failed": synth_failed,
+        "parse_error": "JSON decode error: ..." if synth_failed else None,
+    }
+    return {
+        "deliberation_id": "test-parse-fail-id",
+        "synthesis": synthesis,
+        "stances": stances,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -522,3 +561,279 @@ def test_cmd_spec_review_no_facets_flag(tmp_path):
         f"Expected dispatch_facets=False, got {calls.get('dispatch_facets')!r}"
     )
     assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# L2-T1: _dispatch_facets passes --spec-text-from-stdin and feeds spec_text
+# ---------------------------------------------------------------------------
+
+def test_dispatch_facets_passes_spec_text_from_stdin():
+    """_dispatch_facets includes --spec-text-from-stdin in argv and passes spec_text via stdin."""
+    fake_output = json.dumps({"deliberation_id": "delib-l2t1"})
+    captured_calls = []
+
+    def mock_run(cmd, **kwargs):
+        captured_calls.append({"cmd": cmd, "input": kwargs.get("input")})
+        return CompletedProcess(args=cmd, returncode=0, stdout=fake_output, stderr="")
+
+    with patch("subprocess.run", side_effect=mock_run), patch.dict(
+        os.environ, {"FACETS_DISPATCH_DISABLED": ""}, clear=False
+    ):
+        result = _dispatch_facets(
+            spec_text="the spec content here",
+            parsed_target_id="my-target",
+            repo="lapis-pm",
+            authority="advisory",
+            start_time=time.time(),
+        )
+
+    assert result == "delib-l2t1"
+    assert len(captured_calls) == 1
+    call = captured_calls[0]
+    assert "--spec-text-from-stdin" in call["cmd"], (
+        f"--spec-text-from-stdin not in argv: {call['cmd']}"
+    )
+    assert call["input"] == "the spec content here", (
+        f"Expected spec_text as stdin input, got: {call['input']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L2-T2: _dispatch_facets respects FACETS_DISPATCH_DISABLED=1
+# ---------------------------------------------------------------------------
+
+def test_dispatch_facets_disabled_returns_none_no_subprocess():
+    """FACETS_DISPATCH_DISABLED=1 → returns None without calling subprocess."""
+    calls = []
+    with patch("subprocess.run", side_effect=lambda *a, **k: calls.append(a)), \
+         patch.dict(os.environ, {"FACETS_DISPATCH_DISABLED": "1"}):
+        result = _dispatch_facets(
+            spec_text="spec",
+            parsed_target_id="tid",
+            repo="repo",
+            authority="advisory",
+            start_time=time.time(),
+        )
+    assert result is None
+    assert calls == [], "subprocess.run must not be called when FACETS_DISPATCH_DISABLED=1"
+
+
+# ---------------------------------------------------------------------------
+# L2-T3: _combined_recommendation with facets_unreliable=True ignores Facets
+# ---------------------------------------------------------------------------
+
+def test_combined_recommendation_facets_unreliable_ignores_escalation():
+    """facets_unreliable=True → Facets escalation (brief-to-Erah) is ignored; Council drives."""
+    result = _combined_recommendation(
+        council_status="resolved",
+        council_positions=[],
+        facets_escalation="brief-to-Erah",
+        facets_unreliable=True,
+        authority="advisory",
+    )
+    # Council resolved + no Opus → proceed-to-bind (Facets escalation ignored)
+    assert result == "proceed-to-bind"
+
+
+# ---------------------------------------------------------------------------
+# L2-T4: _combined_recommendation with facets_unreliable=False behaves as before
+# ---------------------------------------------------------------------------
+
+def test_combined_recommendation_facets_reliable_escalation_applies():
+    """facets_unreliable=False + escalation=brief-to-Erah → shape-with-Erah (existing behavior)."""
+    result = _combined_recommendation(
+        council_status="resolved",
+        council_positions=[],
+        facets_escalation="brief-to-Erah",
+        facets_unreliable=False,
+        authority="advisory",
+    )
+    assert result == "shape-with-Erah"
+
+
+# ---------------------------------------------------------------------------
+# L2-T5: _build_brief sets facets_unreliable=True when any stance has parse_failed
+# ---------------------------------------------------------------------------
+
+def test_build_brief_facets_unreliable_from_stance(tmp_path):
+    """Any stance with parse_failed=True → facets_unreliable=True in combined rec."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_with_parse_failures(stance_failed=True, synth_failed=False)
+    # escalation=brief-to-Erah would give shape-with-Erah if reliable;
+    # with unreliable, Council resolved → proceed-to-bind
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-l2t5",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    assert brief.combined_recommendation == "proceed-to-bind", (
+        f"Expected proceed-to-bind (Facets unreliable), got {brief.combined_recommendation}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L2-T6: _build_brief sets facets_unreliable=True when synthesis has parse_failed
+# ---------------------------------------------------------------------------
+
+def test_build_brief_facets_unreliable_from_synthesis(tmp_path):
+    """synthesis.parse_failed=True → facets_unreliable=True."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_with_parse_failures(stance_failed=False, synth_failed=True)
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-l2t6",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    assert brief.combined_recommendation == "proceed-to-bind", (
+        f"Expected proceed-to-bind (synthesis unreliable), got {brief.combined_recommendation}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L2-T7: _build_brief sets facets_unreliable=False when no parse failures
+# ---------------------------------------------------------------------------
+
+def test_build_brief_facets_reliable_when_no_parse_failures(tmp_path):
+    """No parse failures → facets_unreliable=False; Facets escalation drives recommendation."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = {
+        "deliberation_id": "reliable-id",
+        "synthesis": {
+            "escalation_recommendation": "brief-to-Erah",
+            "consensus_level": "divergent",
+            "confidence": "medium",
+            "recommendation": "Shape with Erah.",
+            "parse_failed": False,
+            "parse_error": None,
+        },
+        "stances": [
+            {
+                "persona": "trickster",
+                "confidence": "high",
+                "claim": "fits well",
+                "parse_failed": False,
+                "parse_error": None,
+            }
+        ],
+    }
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-l2t7",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    # Facets reliable + escalation=brief-to-Erah → shape-with-Erah
+    assert brief.combined_recommendation == "shape-with-Erah", (
+        f"Expected shape-with-Erah (Facets reliable escalation), got {brief.combined_recommendation}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L2-T8: format_brief annotates Facets section with unreliable header
+# ---------------------------------------------------------------------------
+
+def test_format_brief_facets_unreliable_header(tmp_path):
+    """When parse failures present, Facets section contains the unreliable header line."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_with_parse_failures(stance_failed=True, synth_failed=False)
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-l2t8",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    output = format_brief(brief)
+    assert "Facets leg unreliable" in output, (
+        "Expected 'Facets leg unreliable' in format_brief output when parse failures present"
+    )
+    assert "combined recommendation derived from Council only" in output
+
+
+# ---------------------------------------------------------------------------
+# L2-T9: format_brief lists each parse-failed persona with its parse_error reason
+# ---------------------------------------------------------------------------
+
+def test_format_brief_lists_failed_personas(tmp_path):
+    """format_brief surfaces each parse-failed persona and its parse_error reason."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_with_parse_failures(stance_failed=True, synth_failed=False)
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-l2t9",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    output = format_brief(brief)
+    assert "Personas with parse failures" in output, (
+        "Expected 'Personas with parse failures' in output"
+    )
+    # The fixture has technical-integrity with parse_failed=True, parse_error="no JSON object found"
+    assert "technical-integrity" in output
+    assert "no JSON object found" in output

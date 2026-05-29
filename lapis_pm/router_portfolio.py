@@ -167,12 +167,50 @@ class RouterPortfolioEntry:
 _mem_store = None
 
 
+class _MasterMemClient:
+    """Off-master shim routing router-portfolio reads/writes to the mem MASTER
+    over HTTP (substrate cutover: BRIX is canonical). Exposes exactly the tiny
+    MemoryStore surface router_portfolio uses — set() and list_all() — over
+    MemClient, normalizing the tags type (MemoryStore takes a list; MemClient a
+    comma-separated string). Without this, the router-checkpoint Stop hook running
+    on a non-master host (e.g. StarHouse) would write a divergent local sqlite that
+    BRIX→SH replication then clobbers."""
+
+    def __init__(self) -> None:
+        import os
+        from agents_core.mem import MEM_MASTER_URL
+        from agents_core.mem_client import MemClient
+        self._client = MemClient(base_url=os.environ.get("MEM_SERVER") or MEM_MASTER_URL)
+
+    def set(self, key, content, tags=None):
+        if isinstance(tags, (list, tuple)):
+            tags = ",".join(str(t) for t in tags)
+        elif tags is None:
+            tags = ""
+        return self._client.set(key, content, tags=tags)
+
+    def list_all(self, tag="", tags=None, since="", limit=50):
+        # router_portfolio only ever passes a single `tag`; collapse `tags` if given.
+        if not tag and tags:
+            tag = tags[0] if isinstance(tags, (list, tuple)) else str(tags)
+        return self._client.list(tag=tag, since=since, limit=limit)
+
+
 def _mem():
-    """Return the shared module-level MemoryStore instance (lazy init)."""
+    """Return the shared module-level mem accessor (lazy init).
+
+    On the mem master (BRIX) this is a direct MemoryStore (local = master). Off
+    master (e.g. a session/hook running on StarHouse) it is a MemClient-backed
+    shim that routes to the master, so router-portfolio writes never diverge into
+    a local sqlite that reverse-replication would clobber."""
     global _mem_store
     if _mem_store is None:
-        from agents_core.mem import MemoryStore
-        _mem_store = MemoryStore()
+        from agents_core.mem import IS_MASTER
+        if IS_MASTER:
+            from agents_core.mem import MemoryStore
+            _mem_store = MemoryStore()
+        else:
+            _mem_store = _MasterMemClient()
     return _mem_store
 
 

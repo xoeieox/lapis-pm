@@ -582,3 +582,50 @@ class TestFindLatestDecision:
             result = find_latest_decision("t1")
 
         assert result is None
+
+
+class TestMasterAwareMem:
+    """_mem() routes to the mem MASTER off-master (substrate cutover) so the
+    router-checkpoint Stop hook on StarHouse writes BRIX, not a divergent local db."""
+
+    def teardown_method(self):
+        import lapis_pm.router_portfolio as rp
+        rp._mem_store = None
+
+    def test_mem_uses_memorystore_on_master(self, monkeypatch):
+        import lapis_pm.router_portfolio as rp
+        rp._mem_store = None
+        monkeypatch.setattr("agents_core.mem.IS_MASTER", True)
+        sentinel = object()
+        monkeypatch.setattr("agents_core.mem.MemoryStore", lambda *a, **k: sentinel)
+        assert rp._mem() is sentinel
+
+    def test_mem_uses_master_client_off_master(self, monkeypatch):
+        import lapis_pm.router_portfolio as rp
+        rp._mem_store = None
+        monkeypatch.setattr("agents_core.mem.IS_MASTER", False)
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+        monkeypatch.setattr("agents_core.mem_client.MemClient", FakeClient)
+        m = rp._mem()
+        assert isinstance(m, rp._MasterMemClient)
+
+    def test_master_client_normalizes_tags_and_routes(self, monkeypatch):
+        import lapis_pm.router_portfolio as rp
+        calls = []
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            def set(self, key, content, tags=""): calls.append(("set", key, tags))
+            def list(self, tag="", since="", limit=50):
+                calls.append(("list", tag, limit)); return [{"key": "k", "content": "{}"}]
+        monkeypatch.setattr("agents_core.mem_client.MemClient", FakeClient)
+
+        shim = rp._MasterMemClient()
+        shim.set("router/lapis-pm/sessions/x", "{}", tags=["lapis-pm", "router-session"])
+        rows = shim.list_all(tag="router-session", limit=100)
+
+        assert ("set", "router/lapis-pm/sessions/x", "lapis-pm,router-session") in calls
+        assert ("list", "router-session", 100) in calls
+        assert rows == [{"key": "k", "content": "{}"}]

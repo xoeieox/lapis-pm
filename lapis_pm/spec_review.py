@@ -181,6 +181,20 @@ def _dispatch_facets(
     None on error, timeout, or if Facets is disabled via FACETS_DISPATCH_DISABLED=1.
 
     Deliberation envelope is written to /srv/lapis/facets/deliberations/ by the adapter.
+
+    Spec content contract: spec_text is written into the context JSON file under
+    the "spec_text" key so that CompositionPersona.deliberate() can inline it
+    directly into each persona's prompt. This is the established channel for
+    structured context (--context-file); stdin is not used. See:
+    /srv/lapis/planning/specs/spec-review-facets-context-injection-v0.md
+
+    Panel composition: only technical-integrity and trickster are invoked.
+    mirror-rep is excluded because it is corpus-backed over /srv/lapis/council/speakers/
+    (canonical/historical) and does not engage with novel-spec content by design.
+    Including mirror-rep in spec-review panels produces stale output from prior
+    deliberations rather than analysis of the spec under review. This exclusion is
+    local to pre-bind spec-review; mirror-rep's use in other deliberation paths is
+    unaffected.
     """
     if os.getenv("FACETS_DISPATCH_DISABLED") == "1":
         return None
@@ -193,6 +207,7 @@ def _dispatch_facets(
         context = {
             "source": "pre-bind-wire",
             "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
+            "spec_text": spec_text,
             "additional_context": f"repo={repo}, authority={authority}",
         }
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as ctx_f:
@@ -215,10 +230,9 @@ def _dispatch_facets(
                         f"Review the spec for portfolio fit, risk-reward, and readiness."
                     ),
                     "--context-file", context_file,
-                    "--spec-text-from-stdin",
+                    "--personas", "technical-integrity,trickster",
                     "--format", "json",
                 ],
-                input=spec_text,
                 capture_output=True,
                 text=True,
                 timeout=600,

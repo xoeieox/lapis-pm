@@ -564,15 +564,23 @@ def test_cmd_spec_review_no_facets_flag(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# L2-T1: _dispatch_facets passes --spec-text-from-stdin and feeds spec_text
+# L2-T1: _dispatch_facets passes spec_text via context file, excludes mirror-rep
 # ---------------------------------------------------------------------------
 
-def test_dispatch_facets_passes_spec_text_from_stdin():
-    """_dispatch_facets includes --spec-text-from-stdin in argv and passes spec_text via stdin."""
+def test_dispatch_facets_passes_spec_text_via_context_file_and_excludes_mirror_rep():
+    """_dispatch_facets writes spec_text to the context tempfile, does not use stdin,
+    and passes --personas technical-integrity,trickster as a single argv pair."""
     fake_output = json.dumps({"deliberation_id": "delib-l2t1"})
     captured_calls = []
+    captured_context_files = []
 
     def mock_run(cmd, **kwargs):
+        # Capture context-file contents before lapis-pm unlinks it
+        try:
+            ctx_path = cmd[cmd.index("--context-file") + 1]
+            captured_context_files.append(json.loads(Path(ctx_path).read_text()))
+        except (ValueError, IndexError, FileNotFoundError):
+            pass
         captured_calls.append({"cmd": cmd, "input": kwargs.get("input")})
         return CompletedProcess(args=cmd, returncode=0, stdout=fake_output, stderr="")
 
@@ -590,12 +598,16 @@ def test_dispatch_facets_passes_spec_text_from_stdin():
     assert result == "delib-l2t1"
     assert len(captured_calls) == 1
     call = captured_calls[0]
-    assert "--spec-text-from-stdin" in call["cmd"], (
-        f"--spec-text-from-stdin not in argv: {call['cmd']}"
-    )
-    assert call["input"] == "the spec content here", (
-        f"Expected spec_text as stdin input, got: {call['input']!r}"
-    )
+    assert "--spec-text-from-stdin" not in call["cmd"]
+    assert call["input"] is None or call["input"] == ""
+    # --personas is a single argv pair with comma-separated value
+    personas_idx = call["cmd"].index("--personas")
+    assert call["cmd"][personas_idx + 1] == "technical-integrity,trickster"
+    # mirror-rep is not in the personas list anywhere
+    assert "mirror-rep" not in call["cmd"]
+    # spec_text travels in the context file
+    assert len(captured_context_files) == 1
+    assert captured_context_files[0].get("spec_text") == "the spec content here"
 
 
 # ---------------------------------------------------------------------------

@@ -4634,9 +4634,23 @@ echo "(f) audit mem entry decision/review-gate-resume/<ts> contains reason: OK"
 
 green "Phase 47: review-gate paused-persistent-signal smoke ✓"
 
+# --- Phase 48: spec-review facets dispatch (real LLM, real subprocess) ----
+#
+# Exercises _dispatch_facets() end-to-end: spec_text travels via context file,
+# --personas technical-integrity,trickster (no mirror-rep), no --spec-text-from-stdin.
+# Gated by SMOKE_NO_LLM=1 (default off — runs the full path).
+# See: lapis_pm/smoke_fixtures/spec_review/facets_dispatch_smoke.sh
+
+step "Phase 48: spec-review facets dispatch smoke (SMOKE_NO_LLM=${SMOKE_NO_LLM:-0})"
+
+bash "${SCRIPT_DIR}/smoke_fixtures/spec_review/facets_dispatch_smoke.sh" \
+    || red "Phase 48: facets dispatch smoke failed"
+
+green "Phase 48: spec-review facets dispatch smoke ✓"
+
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export, local-reviewer-witness, review-gate-paused-signal all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export, local-reviewer-witness, review-gate-paused-signal, spec-review-facets-dispatch all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

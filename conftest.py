@@ -9,8 +9,20 @@ Also registers archetypes-core (git clone, not yet in user site-packages)
 so that lapis_pm modules that import archetypes_core.* are resolvable.
 """
 
+import os
 import sys
+import tempfile
 import site as _site
+
+# Substrate isolation: redirect the canonical Zephyr attribution log and the slot
+# blackboard to throwaway temp DBs for the whole test session BEFORE any test imports
+# zephyr.attribution / agents_core.slots (both bind their default DB path at import /
+# first-recorder construction). Without this, tests that exercise the gate-5
+# slot-close + deposit path write into the PRODUCTION /data/zephyr/attribution.db and
+# /data/slots/slots.db. Set only if a test runner hasn't already pinned them.
+_test_substrate_dir = tempfile.mkdtemp(prefix="lapis-pm-test-substrate-")
+os.environ.setdefault("ZEPHYR_ATTRIBUTION_DB", os.path.join(_test_substrate_dir, "attribution.db"))
+os.environ.setdefault("SLOTS_DB_PATH", os.path.join(_test_substrate_dir, "slots.db"))
 
 _site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
 

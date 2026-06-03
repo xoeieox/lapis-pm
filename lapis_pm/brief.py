@@ -42,12 +42,12 @@ from pathlib import Path
 from agents_core.llm import call_claude_cli
 from agents_core.notify import send_notification, Priority as NotifyPriority
 
+from . import episodic
+
 logger = logging.getLogger(__name__)
 
 _BRIEF_MODEL = "haiku"
 _BRIEF_RETRIES = 1
-
-from . import episodic
 
 
 DASHBOARD_BASE = "http://203.0.113.12:8400"   # Conductor dashboard
@@ -238,9 +238,11 @@ def synthesize(
         f"{issues_block}"
     )
 
-    body = _synthesize_body(user)
-    if not body:
+    body = None
+    for _ in range(_BRIEF_RETRIES + 1):
         body = _synthesize_body(user)
+        if body:
+            break
     if not body:
         body = (
             "## State\nBrief synthesis failed — composer call returned empty.\n"

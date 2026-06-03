@@ -82,6 +82,7 @@ def _tick_with_patches(target: MagicMock, extra_patches: dict | None = None):
         ("lapis_pm.pm_core._seen_pr_ids", MagicMock(return_value=set())),
         ("lapis_pm.pm_core._encode_new_prs", MagicMock(return_value=[])),
         ("lapis_pm.pm_core._encode_pr_sha_updates", MagicMock(return_value=0)),
+        ("lapis_pm.pm_core._encode_pr_body_updates", MagicMock(return_value=0)),
         ("lapis_pm.pm_core._encode_gpu_results", MagicMock(return_value=(0, []))),
         ("lapis_pm.pm_core._encode_merged_prs", MagicMock(return_value=0)),
         ("lapis_pm.pm_core._consume_brief_decisions", MagicMock(return_value=None)),

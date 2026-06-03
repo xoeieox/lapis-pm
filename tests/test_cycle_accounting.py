@@ -175,7 +175,7 @@ def test_decide_branch_dispatches_reviewer_not_fixer_retry():
                return_value={"verdict": "fixable", "issues": []}), \
          patch("lapis_pm.pm_core._reviewer_dispatch_ts",
                return_value="2026-04-27T06:00:00-07:00"), \
-         patch("lapis_pm.pm_core._pr_sha_advanced_since", return_value=True), \
+         patch("lapis_pm.pm_core._pr_advanced_since", return_value=True), \
          patch("lapis_pm.pm_core._review_gate_paused", return_value=False), \
          patch("lapis_pm.pm_core._review_gate_counter", return_value=0):
 

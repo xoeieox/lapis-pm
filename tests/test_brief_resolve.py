@@ -455,7 +455,7 @@ def test_apply_decision_acknowledge_and_clear_succeeds():
 
     assert result["ok"] is True
     assert result["action_kind"] == "acknowledge_and_clear"
-    mock_clear.assert_called_once_with("test-tid")
+    mock_clear.assert_called_once_with("test-tid", reason="principal_decision")
     mock_mem.set.assert_called_once()
 
 

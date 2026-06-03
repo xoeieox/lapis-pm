@@ -124,6 +124,30 @@ Every tick emits exactly one decision log line per bound target:
 
 **Invariants:** Every tick emits exactly one decision tag per target. The `noop:` and `action:` families are disjoint and machine-greppable. Bare `noop` (without `:` qualifier) is a programming error; unit tests enforce the closed enum.
 
+## fixer_retry completion semantics
+
+A `fixer_retry` is considered complete when the PR advances in either of two ways:
+
+- **Commit-based (SHA advance):** the fixer pushes a new commit; the PR head SHA changes.
+  Perceived via `pm:pr=<n>:sha=<sha>` observation.
+- **Description-based (body advance):** the fixer edits the PR body to resolve the
+  reviewer's issue (e.g. adding justification text); the body fingerprint changes.
+  Perceived via `pm:pr=<n>:body=<fp>` observation (`fp = sha256(body)[:16]`).
+
+Both paths flip the `fixer_retry` record to `processed`, call
+`_close_slot_and_deposit` to close the Zephyr attribution slot, and advance the
+reviewer-fixer bounce to the next reviewer cycle. A description-only completion
+writes a distinct episodic observation:
+`"Fixer retry for PR #N completed: PR description advanced after dispatch"`.
+
+A `fixer_retry` that is terminal in the queue (job `processed`/`failed`) with
+**neither** a SHA advance **nor** a description advance is classified as "lost" by
+`_find_lost_fixer_dispatches` (which now covers `fixer_retry` in addition to the
+initial `fixer`). Resolution: retry once (incrementing `lost_retry_count` on the
+record and carrying `pr_number` to the child dispatch), then raise a brief. The
+terminal path also calls `_close_slot_and_deposit` so the attribution slot closes
+regardless of outcome. A `pending` fixer_retry is never preempted by the lost-net.
+
 ## Structure
 
 ```

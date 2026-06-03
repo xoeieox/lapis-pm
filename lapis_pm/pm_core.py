@@ -1574,6 +1574,17 @@ def _last_observed_pr_sha(target_id: str, pr_number: int) -> str | None:
     return last
 
 
+def _last_observed_pr_body_fp(target_id: str, pr_number: int) -> str | None:
+    """Return the most recently observed body fingerprint for this PR from episodic, or None."""
+    prefix = f"pm:pr={pr_number}:body="
+    last: str | None = None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix):
+                last = t[len(prefix):]
+    return last
+
+
 def _fixer_sha_completion_ts(target_id: str, pr_number: int, dispatch_ts: str) -> str | None:
     """Return ts of first SHA-advance observation for PR N after dispatch_ts, or None."""
     prefix = f"pm:pr={pr_number}:sha="
@@ -1581,6 +1592,18 @@ def _fixer_sha_completion_ts(target_id: str, pr_number: int, dispatch_ts: str) -
         if c.ts > dispatch_ts:
             for t in c.tags:
                 if t.startswith(prefix):
+                    return c.ts
+    return None
+
+
+def _fixer_completion_ts(target_id: str, pr_number: int, dispatch_ts: str) -> str | None:
+    """Return ts of first SHA-advance or body-advance observation for PR N after dispatch_ts."""
+    sha_prefix = f"pm:pr={pr_number}:sha="
+    body_prefix = f"pm:pr={pr_number}:body="
+    for c in episodic.all_comments(target_id):
+        if c.ts > dispatch_ts:
+            for t in c.tags:
+                if t.startswith(sha_prefix) or t.startswith(body_prefix):
                     return c.ts
     return None
 
@@ -1595,13 +1618,14 @@ def _reviewer_dispatch_ts(target_id: str, pr_number: int, cycle: int) -> str | N
     return None
 
 
-def _pr_sha_advanced_since(target_id: str, pr_number: int, since_ts: str) -> bool:
-    """Return True if any SHA-advance observation for PR N exists after since_ts."""
-    prefix = f"pm:pr={pr_number}:sha="
+def _pr_advanced_since(target_id: str, pr_number: int, since_ts: str) -> bool:
+    """Return True if a SHA-advance or body-advance observation for PR N exists after since_ts."""
+    sha_prefix = f"pm:pr={pr_number}:sha="
+    body_prefix = f"pm:pr={pr_number}:body="
     for c in episodic.all_comments(target_id):
         if c.ts > since_ts:
             for t in c.tags:
-                if t.startswith(prefix):
+                if t.startswith(sha_prefix) or t.startswith(body_prefix):
                     return True
     return False
 
@@ -1739,11 +1763,11 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> De
         # If reviewer_ts is unavailable (e.g. record cleared), default to proceed.
         if reviewer_count > 0:
             reviewer_ts = _reviewer_dispatch_ts(target_id, pr_number, reviewer_count)
-            if reviewer_ts and not _pr_sha_advanced_since(target_id, pr_number, reviewer_ts):
+            if reviewer_ts and not _pr_advanced_since(target_id, pr_number, reviewer_ts):
                 return Decision("noop_no_change", {
                     "reason": (
-                        f"PR #{pr_number} head SHA unchanged since reviewer "
-                        f"cycle {reviewer_count} dispatch — waiting for fixer commit"
+                        f"PR #{pr_number} unchanged since reviewer "
+                        f"cycle {reviewer_count} dispatch — waiting for fixer commit or description update"
                     )
                 })
         if reviewer_count >= budget:
@@ -2153,9 +2177,12 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         )
     else:
         schema_extra = ""
+    pr_body = (pr.get("body") or "").strip()
+    pr_body_section = f"\n\n**PR Description:**\n{pr_body}" if pr_body else ""
     user_prompt = (
         f"Review PR #{pr_number} in {repo}. This is reviewer cycle {cycle}.\n\n"
-        f"```diff\n{diff_text}\n```\n\n"
+        f"```diff\n{diff_text}\n```"
+        f"{pr_body_section}\n\n"
         f'Return JSON: {{"verdict": "clean" | "fixable" | "needs-human", '
         f'"issues": [{{"severity": "high"|"med"|"low", "path": "...", "note": "..."'
         f'{"," if schema_extra else ""}{"prior_index?: <int>" if schema_extra else ""}'
@@ -2372,6 +2399,34 @@ def _encode_pr_sha_updates(target_id: str, open_prs: list[dict]) -> int:
     return written
 
 
+def _encode_pr_body_updates(target_id: str, open_prs: list[dict]) -> int:
+    """Write body-fingerprint observation when a PR's description changes. Returns count written."""
+    written = 0
+    for pr in open_prs:
+        pr_num = pr.get("number")
+        body = pr.get("body") or ""
+        if not pr_num:
+            continue
+        fp = hashlib.sha256(body.encode()).hexdigest()[:16]
+        if fp != _last_observed_pr_body_fp(target_id, pr_num):
+            episodic.write_observation(
+                target_id,
+                f"PR #{pr_num} description changed",
+                extra_tags=[f"pm:pr={pr_num}", f"pm:pr={pr_num}:body={fp}"],
+            )
+            # Body changed → invalidate classification so decide loop re-screens
+            ids = _classified_pr_ids(target_id)
+            if pr_num in ids:
+                ids.discard(pr_num)
+                _mem().set(
+                    _classified_prs_key(target_id),
+                    json.dumps(sorted(ids)),
+                    tags=["lapis-pm", "classified-prs"],
+                )
+            written += 1
+    return written
+
+
 def _recover_reviewer_verdict(raw: str) -> dict | None:
     """Attempt to recover a reviewer verdict dict from malformed JSON.
 
@@ -2452,30 +2507,64 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
         if rec.get("status") != "pending":
             continue
 
-        # fixer_retry uses PR SHA advancement as completion signal (preferred per spec)
+        # fixer_retry uses PR SHA/body-advance as completion signal (preferred per spec)
         # rather than GPU output file, so we can detect completion even when the
-        # fixer pushed code but the queue output path differs (e.g. claude-queue).
+        # fixer pushed code or edited the PR description (claude-queue or API path).
         if rec.get("agent_type") == "fixer_retry":
             pr_num = rec.get("pr_number")
             dispatch_ts = rec.get("ts", "")
             if pr_num is not None:
-                completion_ts = _fixer_sha_completion_ts(target_id, pr_num, dispatch_ts)
+                completion_ts = _fixer_completion_ts(target_id, pr_num, dispatch_ts)
                 if completion_ts:
                     rec["status"] = "processed"
                     rec["completed_at"] = completion_ts
                     changed = True
                     total_encoded += 1
                     _close_slot_and_deposit(rec, target_id)
+                    # Distinguish SHA vs description-only advance for episodic trail
+                    body_prefix = f"pm:pr={pr_num}:body="
+                    is_body_advance = any(
+                        t.startswith(body_prefix)
+                        for c in episodic.all_comments(target_id)
+                        if c.ts == completion_ts
+                        for t in c.tags
+                    )
+                    completion_note = (
+                        "PR description advanced after dispatch"
+                        if is_body_advance
+                        else "head SHA advanced after dispatch"
+                    )
                     episodic.write_result(
                         target_id,
-                        f"Fixer retry for PR #{pr_num} completed: head SHA advanced after dispatch",
+                        f"Fixer retry for PR #{pr_num} completed: {completion_note}",
                         extra_tags=[
                             f"pm:gpu={rec['gpu_id']}",
                             "pm:agent=fixer_retry",
                             f"pm:pr={pr_num}",
                         ],
                     )
-                continue  # fixer_retry uses SHA-advance signal, not GPU output file
+                    continue  # handled via advance signal
+                # No advance yet — check if job is terminal via output file.
+                # If terminal but no advance, flip to processed so the
+                # lost-dispatch net can classify and handle it.
+                out_path = _gpu_output_path(rec["gpu_id"])
+                if out_path is not None:
+                    rec["status"] = "processed"
+                    rec["completed_at"] = _now_iso()
+                    changed = True
+                    total_encoded += 1
+                    episodic.write_observation(
+                        target_id,
+                        f"Fixer retry for PR #{pr_num} job complete:"
+                        " no code or description change observed",
+                        extra_tags=[
+                            f"pm:gpu={rec['gpu_id']}",
+                            "pm:agent=fixer_retry",
+                            f"pm:pr={pr_num}",
+                            "pm:fixer-retry-noop",
+                        ],
+                    )
+                continue  # fixer_retry never falls to reviewer verdict path
             # fixer_retry without pr_number: fall through to GPU output file path
             # as defensive fallback (shouldn't happen in practice).
 
@@ -2767,14 +2856,15 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         if t is None:
             continue
 
-        # fixer_retry carve-out: SHA-advance perception is the sole authority
-        # for fixer_retry → processed. If the queue says "completed" for a
-        # fixer_retry, we leave the record as pending — the SHA-advance
-        # perceiver will flip it when it confirms the PR head advanced.
+        # fixer_retry carve-out: advance-perceiver (_fixer_completion_ts) is the
+        # sole authority for fixer_retry → processed. If the queue says "completed"
+        # for a fixer_retry, we leave the record as pending — _encode_gpu_results
+        # will flip it when it confirms the PR advanced (SHA or body) or the job
+        # is terminal with no advance (lost-dispatch net path).
         # Failed flips for fixer_retry are still permitted (the job crashed or
         # was rejected; that doesn't advance the cycle regardless).
         if rec.get("agent_type") == "fixer_retry" and t["state"] == "processed":
-            continue  # SHA-advance perceiver owns fixer_retry → processed
+            continue  # advance-perceiver owns fixer_retry → processed
 
         # reviewer/reviewer_fresh carve-out: output-file verdict-encoder in
         # _encode_gpu_results is the sole authority for reviewer → processed.
@@ -2879,12 +2969,41 @@ def _find_lost_fixer_dispatches(
     needs_brief: list[tuple[dict, dict | None]] = []
 
     for rec in records:
-        if rec.get("agent_type") != "fixer":
+        if rec.get("agent_type") not in ("fixer", "fixer_retry"):
             continue
         if rec.get("parent_gpu_id"):
             continue  # Only classify originals, not retry children
         if rec.get("status") not in ("processed", "failed"):
-            continue  # Not terminal — job may still open a PR
+            continue  # Not terminal — job may still open a PR (fixer) or be pending (fixer_retry)
+
+        # fixer_retry lost classification: different criterion from initial fixer.
+        # A fixer_retry is "lost" when it is terminal but produced neither a SHA
+        # advance nor a description advance after its dispatch_ts.
+        # (A processed fixer_retry with an advance is a normal completion — not lost.)
+        if rec.get("agent_type") == "fixer_retry":
+            dispatch_ts = rec.get("ts", "")
+            pr_num = rec.get("pr_number")
+            if pr_num is None:
+                continue  # No PR to check — skip
+            if _fixer_completion_ts(target_id, pr_num, dispatch_ts):
+                continue  # Advance observed — normal completion, not lost
+
+            orig_gpu_id = rec.get("gpu_id", "")
+            retry_child: dict | None = next(
+                (r for r in records
+                 if r.get("parent_gpu_id") == orig_gpu_id
+                 and r.get("agent_type") == "fixer_retry"),
+                None,
+            )
+            if retry_child is not None and retry_child.get("status") == "pending":
+                continue  # Never preempt a live fixer_retry
+
+            lost_retry_count = rec.get("lost_retry_count", 0)
+            if lost_retry_count == 0:
+                needs_retry.append(rec)
+            else:
+                needs_brief.append((rec, retry_child))
+            continue  # fixer_retry classification done; skip initial-fixer logic below
 
         dispatch_ts = rec.get("ts", "")
 
@@ -2962,18 +3081,26 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
     agent_type = rec.get("agent_type", "fixer")
     intent = rec.get("intent", "(no intent)")
     spec_summary = episodic.spec_summary(target_id)
+    # For fixer_retry, carry pr_number and note that prior attempt was a no-op
+    pr_number_val = str(rec.get("pr_number", "")) if agent_type == "fixer_retry" else ""
+    dispatch_intent = intent
+    if agent_type == "fixer_retry":
+        dispatch_intent = (
+            intent + "\n\nNote: prior attempt completed without pushing any code "
+            "or updating the PR description."
+        )
     vars_ = {
         "target_id": target_id,
         "spec_summary": spec_summary,
         "repo": rec.get("repo", ""),
-        "question": intent,
-        "pr_number": "",
+        "question": dispatch_intent,
+        "pr_number": pr_number_val,
         "slug": rec.get("slug", "forced"),
     }
-    res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
+    res = _SHAPER.dispatch(agent_type, target_id, dispatch_intent, vars_=vars_)
 
     orig_gpu_id = rec.get("gpu_id", "?")
-    new_record = {
+    new_record: dict = {
         "gpu_id": res.task_id,
         "spec_id": res.spec_id,
         "agent_type": agent_type,
@@ -2985,6 +3112,9 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
         "lost_retry_count": 0,
         "parent_gpu_id": orig_gpu_id,
     }
+    # Carry pr_number so the child is perceived by _encode_gpu_results consistently
+    if pr_number_val:
+        new_record["pr_number"] = rec.get("pr_number")
 
     # Increment lost_retry_count on original and append child in one save
     records = load_dispatched(target_id)
@@ -3057,6 +3187,12 @@ def _act_lost_brief(
             )
             return f"noop:lost-brief-suppressed:gpu={orig_id}"
     # --- End idempotency guard ---
+
+    # Close the attribution slot for terminal fixer_retry records. The slot was
+    # opened at dispatch and must close regardless of outcome. For initial fixer
+    # records, the reconciler already called _close_slot_and_deposit; the call
+    # here is idempotent and safe (keyed on slot_id, no double-deposit).
+    _close_slot_and_deposit(original_rec, target_id)
 
     spec_ref = (episodic.spec(target_id) or "")[:80] or "(spec not found)"
     spec_path = f"/srv/lapis/planning/specs/{target_id}.md"
@@ -3356,6 +3492,10 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # Track PR head SHA advances (must precede _encode_gpu_results so the SHA
     # observation is visible when fixer_retry completion is checked below).
     encoded += _encode_pr_sha_updates(target_id, open_prs)
+
+    # Track PR description changes (body fingerprint), also before _encode_gpu_results
+    # so a description-only fixer_retry is perceived as complete this tick.
+    encoded += _encode_pr_body_updates(target_id, open_prs)
 
     gpu_encoded, failed_dispatches = _encode_gpu_results(target_id)
     encoded += gpu_encoded

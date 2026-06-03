@@ -21,8 +21,10 @@ import site as _site
 # slot-close + deposit path write into the PRODUCTION /data/zephyr/attribution.db and
 # /data/slots/slots.db. Set only if a test runner hasn't already pinned them.
 _test_substrate_dir = tempfile.mkdtemp(prefix="lapis-pm-test-substrate-")
-os.environ.setdefault("ZEPHYR_ATTRIBUTION_DB", os.path.join(_test_substrate_dir, "attribution.db"))
-os.environ.setdefault("SLOTS_DB_PATH", os.path.join(_test_substrate_dir, "slots.db"))
+# Unconditional set — silently no-op'ing on already-exported vars risks writes to
+# /data/zephyr/attribution.db and /data/slots/slots.db (the production DBs).
+os.environ["ZEPHYR_ATTRIBUTION_DB"] = os.path.join(_test_substrate_dir, "attribution.db")
+os.environ["SLOTS_DB_PATH"] = os.path.join(_test_substrate_dir, "slots.db")
 
 _site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
 

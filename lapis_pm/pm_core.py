@@ -432,11 +432,17 @@ def _close_slot_and_deposit(rec: dict, project_id: str) -> None:
         manifest = "sha256:" + hashlib.sha256(
             f"slot:{slot_id}:{slot_status}:{completed_at}".encode("utf-8")
         ).hexdigest()
+        # Source model from the shaper registry (dispatch records never store "model").
+        _dep_model = None
+        try:
+            _dep_model = _SHAPER.get_agent(agent_type).model
+        except Exception:
+            pass
         prov = {
             "manifest_hash": manifest,
             "agent_id": task_id,
             "tool": f"lapis-pm:{agent_type}",
-            "model": rec.get("model"),
+            "model": _dep_model,
             "timestamp": completed_at,
             "schema_version": "lapis-provenance-v0",
             "slot": {

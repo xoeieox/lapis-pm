@@ -1,7 +1,13 @@
-"""lapis_pm.spec_review — Pre-bind parallel Opus + Mirror Council review.
+"""lapis_pm.spec_review — Pre-bind Facets + Mirror Council review.
 
-Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override)
-Returns SpecReviewBrief. Synchronous; caller blocks until both passes complete or timeout.
+Default gate: Facets (technical-integrity + trickster personas, Haiku) for the PM /
+technical domain, plus a Mirror Council deliberation for invariant-fit / meaning. The
+legacy Opus spec_reviewer leg is retained and can be run in parallel as a reference
+comparison via compare_opus=True (reference-only — it does not steer the recommendation).
+
+Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override,
+authority, dispatch_facets, compare_opus). Returns SpecReviewBrief. Synchronous; caller
+blocks until all dispatched passes complete or timeout.
 """
 from __future__ import annotations
 
@@ -100,6 +106,7 @@ class SpecReviewBrief:
     opus_run_id: str = ""
     parse_error: dict | None = None
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
+    opus_advisory_only: bool = False  # compare mode: Opus ran for reference but did NOT steer the recommendation
 
 
 # ---------------------------------------------------------------------------
@@ -755,11 +762,15 @@ def _build_brief(
     opus_raw: dict | None = None,
     facets_deliberation: dict | None = None,
     authority: str = "advisory",
+    opus_advisory_only: bool = False,
 ) -> SpecReviewBrief:
     """Assemble SpecReviewBrief from Facets + Council (and optionally Opus) results.
 
     opus_raw is optional — None when Opus was not dispatched (Facets mode).
     facets_deliberation is the FacetsDeliberation envelope dict; None if disabled/timeout.
+    opus_advisory_only — compare mode: Opus output is rendered for reference but is
+    excluded from the combined recommendation (Facets + Council drive the gate). The
+    Opus verdict/issues are still stored on the brief so format_brief renders them.
     """
     # Opus fields — backward compat; default to "skip" sentinel when not dispatched
     opus_verdict = opus_raw.get("verdict", "error") if opus_raw is not None else "skip"
@@ -787,9 +798,16 @@ def _build_brief(
             or any(s.get("parse_failed") for s in stances)
         )
 
+    # In compare mode Opus is reference-only: feed the "skip" sentinel into the
+    # recommendation so a real Opus verdict/issues/timeout cannot move the gate.
+    # Facets + Council remain the sole drivers. The real Opus fields are still
+    # stored on the brief below for side-by-side rendering.
+    rec_opus_verdict = "skip" if opus_advisory_only else opus_verdict
+    rec_opus_issues = () if opus_advisory_only else opus_issues
+
     recommendation = _combined_recommendation(
-        opus_verdict=opus_verdict,
-        opus_issues=opus_issues,
+        opus_verdict=rec_opus_verdict,
+        opus_issues=rec_opus_issues,
         council_status=council_status,
         council_positions=council_positions,
         facets_escalation=facets_escalation,
@@ -815,6 +833,7 @@ def _build_brief(
         opus_run_id=opus_run_id,
         parse_error=opus_raw.get("parse_error") if opus_raw is not None else None,
         facets_deliberation=facets_deliberation,
+        opus_advisory_only=opus_advisory_only,
     )
 
 
@@ -955,8 +974,13 @@ could not extract a JSON verdict from the output. See chain-sibling \
     # Opus section — omitted when Opus was not dispatched (verdict="skip")
     opus_section = ""
     if brief.opus_verdict != "skip":
+        opus_heading = (
+            "Opus technical review (reference — does not affect recommendation)"
+            if brief.opus_advisory_only
+            else "Opus technical review"
+        )
         opus_section = f"""
-## Opus technical review
+## {opus_heading}
 - **Verdict:** {brief.opus_verdict} (confidence {brief.opus_confidence:.2f})
 - **Run ID:** {brief.opus_run_id}
 - **Issues:**
@@ -995,6 +1019,7 @@ def run_spec_review(
     repo_override: str | None = None,
     authority: str | None = None,
     dispatch_facets: bool = True,
+    compare_opus: bool = False,
 ) -> SpecReviewBrief:
     """Run Facets (PM) + Council (philosophical) review of a spec document. Synchronous.
 
@@ -1005,6 +1030,15 @@ def run_spec_review(
     dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
     smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
     back to "advisory" if not found. Only advisory/hold specs dispatch Facets.
+
+    compare_opus=True additionally fires the Opus spec_reviewer in parallel as a
+    reference comparison: it is dispatched async BEFORE the Facets block (so it runs
+    concurrently with Facets' blocking subprocess), polled alongside Council, and
+    rendered side-by-side in the brief. Per the ratified design (Facets drives; Opus
+    is reference), the Opus leg is reference-only — it never moves the combined
+    recommendation. Costs one Opus dispatch; intended for calibrating Facets, not for
+    routine gating. The Opus leg is skipped (with no error) for auto-merge specs, since
+    Facets itself is only dispatched for advisory/hold.
     """
     start_time = time.time()
 
@@ -1025,6 +1059,34 @@ def run_spec_review(
 
     # 4. Load invariant context
     invariant_context = _load_invariant_context(repo)
+
+    # 4b. Compare mode: dispatch the Opus spec_reviewer FIRST (async), so it runs
+    #     concurrently with the Facets blocking subprocess below. Gated on the same
+    #     advisory/hold condition as Facets so the two legs review the same specs.
+    spec_reviewer_task_id: str | None = None
+    do_compare = compare_opus and effective_authority in {"advisory", "hold"}
+    if do_compare:
+        synth_target_id = _synth_target_id(parsed_target_id)
+        try:
+            spec_reviewer_task_id = _dispatch_spec_reviewer(
+                spec_text=spec_text,
+                synth_target_id=synth_target_id,
+                parsed_target_id=parsed_target_id,
+                repo=repo,
+                invariant_context=invariant_context,
+            ).task_id
+            print(
+                f"[spec-review:compare-opus] dispatched reference Opus pass "
+                f"task_id={spec_reviewer_task_id}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            # Opus is reference-only; never let its dispatch failure abort the gate.
+            print(
+                f"[spec-review:compare-opus-dispatch-error] {e} — continuing Facets-only",
+                file=sys.stderr,
+            )
+            spec_reviewer_task_id = None
 
     # 5. Dispatch Facets (synchronous; blocks until complete or timeout)
     facets_deliberation: dict | None = None
@@ -1048,22 +1110,27 @@ def run_spec_review(
         spec_text, parsed_target_id, invariant_context, council_voicing
     )
 
-    # 7. Poll until Council terminal (Opus not dispatched in Facets mode)
-    _, council_raw = _poll_until_terminal(
+    # 7. Poll until terminal. In compare mode both Opus and Council are polled;
+    #    otherwise (Facets mode) only Council is polled and opus_raw stays None.
+    opus_raw, council_raw = _poll_until_terminal(
         council_run_id=council_run_id,
         timeout_s=timeout_s,
         start_time=start_time,
+        spec_reviewer_task_id=spec_reviewer_task_id,
     )
 
     elapsed = time.time() - start_time
 
-    # 8. Build and return brief
+    # 8. Build and return brief. opus_raw is non-None only in compare mode; it is
+    #    rendered for reference but excluded from the recommendation (opus_advisory_only).
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
         parsed_target_id=parsed_target_id,
         repo=repo,
         elapsed_s=elapsed,
+        opus_raw=opus_raw,
         facets_deliberation=facets_deliberation,
         authority=effective_authority,
+        opus_advisory_only=opus_raw is not None,
     )

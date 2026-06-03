@@ -1295,6 +1295,7 @@ def cmd_spec_review(args) -> int:
             repo_override=args.repo_override,
             authority=getattr(args, "authority", None),
             dispatch_facets=not getattr(args, "no_facets", False),
+            compare_opus=getattr(args, "compare_opus", False),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -1806,7 +1807,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = sub.add_parser(
         "spec-review",
-        help="Pre-bind parallel Opus + Council review of a spec document.",
+        help="Pre-bind Facets + Council review of a spec document (--compare-opus to also run Opus for reference).",
     )
     sr.add_argument("spec_path", help="Path to the spec markdown file.")
     sr.add_argument(
@@ -1839,6 +1840,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto-merge", "advisory", "hold"],
         default=None,
         help="Override spec's stated authority for Facets dispatch gating.",
+    )
+    sr.add_argument(
+        "--compare-opus",
+        action="store_true",
+        dest="compare_opus",
+        help=(
+            "Also run the Opus spec_reviewer in parallel as a reference comparison "
+            "(reference-only; does NOT change the recommendation). Costs one Opus "
+            "dispatch. Use to calibrate/tune Facets against Opus."
+        ),
     )
     sr.set_defaults(func=cmd_spec_review)
 

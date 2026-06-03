@@ -528,15 +528,29 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     target = TargetStore().get(target_id)
     if target is None:
         raise ValueError(f"target not found: {target_id}")
+    # Guard: initial fixer must not fire for adopted targets.
+    # The adopted PR already exists; the first action should be a reviewer dispatch.
+    _adopted_pr_num = target.data.get("adopted_pr_number")
+    if agent_type == "fixer" and isinstance(_adopted_pr_num, int):
+        existing_dispatches = load_dispatched(target_id)
+        if not any(r.get("agent_type") == "fixer" for r in existing_dispatches):
+            raise ValueError(
+                f"target {target_id!r} has an adopted PR "
+                f"(#{_adopted_pr_num}) — "
+                "dispatch a reviewer instead of the initial fixer"
+            )
     spec_sum = episodic.spec_summary(target_id)
-    existing_branch = f"lapis/{target_id}/forced"
+    _adopted_branch = target.data.get("adopted_head_branch") or ""
+    existing_branch = _adopted_branch if _adopted_branch else f"lapis/{target_id}/forced"
     base_branch = "main"
     if agent_type == "fixer_retry" and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             for pr in _get_open_prs(target.pm_repo):
                 pr_ref = (pr.get("head") or {}).get("ref", "")
-                if pr_ref.startswith(f"lapis/{target_id}/"):
+                if pr_ref.startswith(f"lapis/{target_id}/") or (
+                    _adopted_branch and pr_ref == _adopted_branch
+                ):
                     existing_branch = pr_ref
                     base_branch = (pr.get("base") or {}).get("ref", "main")
                     break
@@ -1554,8 +1568,14 @@ def _branch_belongs(target_id: str, branch: str) -> bool:
     return branch.startswith(f"lapis/{target_id}/")
 
 
-def _perceive_prs(target_id: str, repo: str) -> tuple[list[dict], bool]:
-    """Return (open_prs, forgejo_ok).  forgejo_ok=False means Forgejo was unreachable."""
+def _perceive_prs(
+    target_id: str, repo: str, adopted_pr_number: int | None = None
+) -> tuple[list[dict], bool]:
+    """Return (open_prs, forgejo_ok).  forgejo_ok=False means Forgejo was unreachable.
+
+    When adopted_pr_number is set (bind --adopt-pr), the matching PR is included
+    even if its head branch does not start with lapis/<target_id>/.
+    """
     if not get_open_prs:
         return [], False
     try:
@@ -1570,6 +1590,8 @@ def _perceive_prs(target_id: str, repo: str) -> tuple[list[dict], bool]:
     for pr in prs:
         head = (pr.get("head") or {}).get("ref") or ""
         if _branch_belongs(target_id, head):
+            out.append(pr)
+        elif adopted_pr_number is not None and pr.get("number") == adopted_pr_number:
             out.append(pr)
     return out, True
 
@@ -3224,7 +3246,10 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     ]
 
     repo = target.pm_repo or ""
-    open_prs, forgejo_ok = _perceive_prs(target_id, repo) if repo else ([], False)
+    _adopted_pr_number: int | None = target.data.get("adopted_pr_number")
+    open_prs, forgejo_ok = (
+        _perceive_prs(target_id, repo, _adopted_pr_number) if repo else ([], False)
+    )
 
     # 3. Encode
     encoded = 0

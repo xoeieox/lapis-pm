@@ -1173,6 +1173,201 @@ print(f"existing_branch={captured['existing_branch']} base_branch={captured['bas
 PYEOF_BRANCHES
 green "reviewer dispatch: existing_branch + base_branch plumbed into vars_ OK (lapis-pm-reviewer-full-context-v0)"
 
+# --- Step 17c: adopt-PR bind + perception + reviewer-first decide --------
+step "17c. Adopt-PR: bind --adopt-pr records fields; perception honors adopted branch; decide picks reviewer"
+TID_ADOPT="pm-smoke-adopt-$$"
+ADOPT_SPEC="/tmp/${TID_ADOPT}-spec.md"
+cat > "$ADOPT_SPEC" <<EOF
+# Adopt-PR smoke spec for ${TID_ADOPT}
+What: verify bind --adopt-pr end-to-end (synthetic, no real Forgejo PR needed).
+EOF
+
+cat > "$TARGETS_DIR/${TID_ADOPT}.yaml" <<EOF
+id: ${TID_ADOPT}
+title: Adopt-PR smoke target
+status: active
+category: research
+urgency: low
+work_mode: anywhere
+created: $(date +%F)
+touched: $(date +%F)
+updated: $(date +%F)
+decay_days: 0
+decay_threshold: 30
+description: Adopt-PR smoke target — safe to delete.
+stages:
+  - name: smoke-stage
+    status: active
+EOF
+
+# 17c-i. Bind with --adopt-pr (mock Forgejo so no real token needed).
+/usr/bin/python3 -c "
+import sys
+import contextlib, io
+from unittest.mock import patch, MagicMock
+from lapis_pm.cli import main
+from agents_core.targets import TargetStore
+
+fake_pr = {
+    'number': 42,
+    'state': 'open',
+    'merged': False,
+    'head': {'ref': 'feat/my-feature', 'repo': {'name': 'lapis-test'}},
+    'base': {'ref': 'main', 'repo': {'name': 'lapis-test'}},
+    'html_url': 'http://forgejo/Erah/lapis-test/pulls/42',
+}
+out = io.StringIO()
+with patch('agents_core.forgejo.get_pr', return_value=fake_pr), \
+     patch('lapis_pm.cli.episodic.spec', return_value=None), \
+     patch('lapis_pm.cli.episodic.write_spec'), \
+     patch('lapis_pm.cli.pm_core.clear_classified_prs'), \
+     patch('lapis_pm.cli.emit_decision_kickoff'), \
+     contextlib.redirect_stdout(out):
+    rc = main(['bind', '${TID_ADOPT}',
+               '--spec-from', '${ADOPT_SPEC}',
+               '--repo', 'lapis-test',
+               '--authority', 'advisory',
+               '--adopt-pr', '42'])
+print(out.getvalue(), end='')
+sys.exit(rc)
+" || red "adopt-pr: bind --adopt-pr failed"
+
+# 17c-ii. Verify adopted fields recorded on target YAML.
+/usr/bin/python3 -c "
+from agents_core.targets import TargetStore
+t = TargetStore().get('${TID_ADOPT}')
+assert t is not None, 'target not found'
+assert t.data.get('adopted_pr_number') == 42, \
+    f'adopted_pr_number not set: {t.data}'
+assert t.data.get('adopted_head_branch') == 'feat/my-feature', \
+    f'adopted_head_branch wrong: {t.data}'
+print(f'adopted_pr_number={t.data[\"adopted_pr_number\"]} '
+      f'adopted_head_branch={t.data[\"adopted_head_branch\"]} OK')
+" || red "adopt-pr: adopted fields not recorded in target YAML"
+
+# 17c-iii. Perception includes adopted PR (branch feat/* not filtered out).
+/usr/bin/python3 -c "
+from unittest.mock import patch
+from lapis_pm import pm_core
+
+adopted_pr = {
+    'number': 42,
+    'state': 'open',
+    'head': {'ref': 'feat/my-feature'},
+    'base': {'ref': 'main'},
+}
+with patch('lapis_pm.pm_core.get_open_prs', return_value=[adopted_pr]):
+    prs, ok = pm_core._perceive_prs('${TID_ADOPT}', 'lapis-test', adopted_pr_number=42)
+assert ok, 'Forgejo not reachable'
+assert any(p['number'] == 42 for p in prs), \
+    f'adopted PR #42 not in perceived PRs (branch filter broken): {prs}'
+print(f'perception: adopted PR #42 included via adopted_pr_number=42 OK')
+" || red "adopt-pr: perception did not include adopted PR"
+
+# 17c-iv. tick() dispatches reviewer (not initial fixer) for adopted target.
+/usr/bin/python3 - <<'PYEOF_ADOPT'
+from unittest.mock import MagicMock, patch
+from lapis_pm import pm_core, authority
+
+adopted_pr = {
+    'number': 42,
+    'title': 'feat: my feature',
+    'html_url': 'http://forgejo/Erah/lapis-test/pulls/42',
+    'head': {'ref': 'feat/my-feature'},
+    'base': {'ref': 'main'},
+}
+mock_cls = authority.PRClassification(
+    verdict='advisory', screen_verdict='unknown',
+    static_outcome=authority.StaticOutcome.static_pass,
+    reasons=[], issues=[], pr_number=42, repo='lapis-test',
+    title='feat: my feature', html_url='http://x',
+    changed_paths=[], diff_loc=0, diff='',
+)
+dispatched_types = []
+
+def capture_dispatch(agent_type, tid, user_prompt, vars_=None, **kw):
+    dispatched_types.append(agent_type)
+    r = MagicMock(); r.task_id = 'smoke-reviewer'; r.spec_id = 'smoke-spec'; return r
+
+with (
+    patch('lapis_pm.pm_core._perceive_prs', return_value=([adopted_pr], True)),
+    patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls),
+    patch('lapis_pm.pm_core._review_gate_paused', return_value=False),
+    patch('lapis_pm.pm_core._review_gate_counter', return_value=0),
+    patch.object(pm_core._SHAPER, 'dispatch', side_effect=capture_dispatch),
+    patch('lapis_pm.pm_core.episodic.spec_summary', return_value='spec'),
+    patch('lapis_pm.pm_core.episodic.write_dispatch'),
+    patch('lapis_pm.pm_core.append_dispatched'),
+    patch('lapis_pm.pm_core._increment_review_gate_counter'),
+    patch('lapis_pm.pm_core.load_dispatched', return_value=[]),
+    patch('agents_core.forgejo.get_pr_diff', return_value='diff'),
+    patch('lapis_pm.pm_core.Shaper.resolve_repo_cwd', return_value='/tmp/smoke'),
+):
+    result = pm_core.tick('pm-smoke-adopt-' + str(__import__('os').getpid()).split('-')[0])
+
+print(f'decision={result.decision} dispatched_types={dispatched_types}')
+assert any('reviewer' in a for a in dispatched_types), \
+    f'expected reviewer dispatch; got: {dispatched_types}'
+assert not any(a == 'fixer' for a in dispatched_types), \
+    f'initial fixer fired for adopted target (must not be): {dispatched_types}'
+print('decide: reviewer dispatched (not initial fixer) for adopted target OK')
+PYEOF_ADOPT
+# Note: the above test uses a synthetic TID since we can't easily pass shell vars into heredoc.
+# The reviewer-first behavior is architecture-level (reviewer_count=fixer_count=0 → dispatch reviewer).
+/usr/bin/python3 -c "
+from unittest.mock import MagicMock, patch
+from lapis_pm import pm_core, authority
+
+tid = '${TID_ADOPT}'
+adopted_pr = {
+    'number': 42, 'title': 'feat: my feature',
+    'html_url': 'http://forgejo/Erah/lapis-test/pulls/42',
+    'head': {'ref': 'feat/my-feature'}, 'base': {'ref': 'main'},
+}
+mock_cls = authority.PRClassification(
+    verdict='advisory', screen_verdict='unknown',
+    static_outcome=authority.StaticOutcome.static_pass,
+    reasons=[], issues=[], pr_number=42, repo='lapis-test',
+    title='feat: my feature', html_url='http://x',
+    changed_paths=[], diff_loc=0, diff='',
+)
+dispatched_types = []
+def capture(agent_type, t, user_prompt, vars_=None, **kw):
+    dispatched_types.append(agent_type)
+    r = MagicMock(); r.task_id = 'reviewer-smoke'; r.spec_id = 'spec'; return r
+
+with (
+    patch('lapis_pm.pm_core._perceive_prs', return_value=([adopted_pr], True)),
+    patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls),
+    patch('lapis_pm.pm_core._review_gate_paused', return_value=False),
+    patch('lapis_pm.pm_core._review_gate_counter', return_value=0),
+    patch.object(pm_core._SHAPER, 'dispatch', side_effect=capture),
+    patch('lapis_pm.pm_core.episodic.spec_summary', return_value='spec'),
+    patch('lapis_pm.pm_core.episodic.write_dispatch'),
+    patch('lapis_pm.pm_core.append_dispatched'),
+    patch('lapis_pm.pm_core._increment_review_gate_counter'),
+    patch('lapis_pm.pm_core.load_dispatched', return_value=[]),
+    patch('agents_core.forgejo.get_pr_diff', return_value='diff'),
+    patch('lapis_pm.pm_core.Shaper.resolve_repo_cwd', return_value='/tmp/smoke'),
+):
+    result = pm_core.tick(tid)
+print(f'decision={result.decision} dispatched_types={dispatched_types}')
+assert any('reviewer' in a for a in dispatched_types), \
+    f'expected reviewer dispatch; got: {dispatched_types}'
+assert not any(a == 'fixer' for a in dispatched_types), \
+    f'initial fixer fired for adopted target: {dispatched_types}'
+print(f'tick adopted target: reviewer-first dispatch confirmed OK')
+" || red "adopt-pr: tick did not dispatch reviewer first for adopted target"
+
+# Cleanup
+rm -f "$TARGETS_DIR/${TID_ADOPT}.yaml" "$COMMENTS_DIR/${TID_ADOPT}.jsonl" "$ADOPT_SPEC"
+/usr/local/bin/mem delete "pm/cursor/${TID_ADOPT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/classified-prs/${TID_ADOPT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/dispatched/${TID_ADOPT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/pause-state/${TID_ADOPT}" 2>/dev/null || true
+/usr/local/bin/mem delete "pm/outstanding-brief/${TID_ADOPT}" 2>/dev/null || true
+green "adopt-pr: bind records fields, perception honors adopted branch, decide picks reviewer OK"
+
 # --- Chain smoke phase (step 18) ----------------------------------------
 step "18. Chain: 3-leg bind → simulated land → auto-dispatch cascade → state.complete"
 

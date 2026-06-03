@@ -107,6 +107,48 @@ def cmd_bind(args) -> int:
     if args.authority is None:
         args.authority = "advisory"
 
+    # Validate --adopt-pr early so we fail before creating or mutating state.
+    _adopted_pr_number: int | None = getattr(args, "adopt_pr", None)
+    _adopted_head_branch: str = ""
+    if _adopted_pr_number is not None:
+        try:
+            from agents_core.forgejo import get_pr as _get_pr
+            _adopted_pr_data = _get_pr(args.repo, _adopted_pr_number)
+        except Exception as e:
+            print(
+                f"ERROR: failed to fetch PR #{_adopted_pr_number} from {args.repo!r}: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        _pr_state = _adopted_pr_data.get("state", "")
+        _pr_merged = _adopted_pr_data.get("merged", False)
+        if _pr_state != "open" or _pr_merged:
+            print(
+                f"ERROR: PR #{_adopted_pr_number} is not open "
+                f"(state={_pr_state!r}, merged={_pr_merged}); only open PRs can be adopted",
+                file=sys.stderr,
+            )
+            return 2
+        _pr_base_repo = (
+            (_adopted_pr_data.get("base") or {}).get("repo") or {}
+        ).get("name", "")
+        if _pr_base_repo and _pr_base_repo != args.repo:
+            print(
+                f"ERROR: PR #{_adopted_pr_number} base repo is {_pr_base_repo!r} "
+                f"but --repo is {args.repo!r}",
+                file=sys.stderr,
+            )
+            return 2
+        _adopted_head_branch = (
+            (_adopted_pr_data.get("head") or {}).get("ref") or ""
+        )
+        if not _adopted_head_branch:
+            print(
+                f"ERROR: PR #{_adopted_pr_number} has no head branch ref",
+                file=sys.stderr,
+            )
+            return 2
+
     store = TargetStore()
 
     if args.create:
@@ -213,6 +255,10 @@ def cmd_bind(args) -> int:
     if loom_vis is not None:
         target.data["loom_visibility"] = loom_vis
 
+    if _adopted_pr_number is not None:
+        target.data["adopted_pr_number"] = _adopted_pr_number
+        target.data["adopted_head_branch"] = _adopted_head_branch
+
     target.bind_pm(repo=args.repo, authority=args.authority)
     target.save()
 
@@ -228,6 +274,8 @@ def cmd_bind(args) -> int:
     except Exception as _e:
         print(f"[router-portfolio:emit-failed] kickoff: {_e}", file=sys.stderr)
     print(f"Bound {args.target_id} → repo={args.repo}, authority={args.authority}")
+    if _adopted_pr_number is not None:
+        print(f"Adopted PR #{_adopted_pr_number} on branch {_adopted_head_branch!r}")
     print(f"Spec: {len(spec_body)} chars")
     return 0
 
@@ -1457,6 +1505,11 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["pinned", "default", "hidden"],
                    help="Per-target Loom visibility. 'pinned' always shows in Loom; 'default' "
                         "shows when active in window (implicit when field absent); 'hidden' never shows.")
+    b.add_argument("--adopt-pr", dest="adopt_pr", type=int, default=None, metavar="N",
+                   help="Adopt an existing open PR by number. Records its head branch so "
+                        "perception honors it and the first tick dispatches a reviewer "
+                        "instead of the initial fixer. The PR must be open and its base "
+                        "repo must match --repo.")
     b.set_defaults(func=cmd_bind)
 
     u = sub.add_parser("unbind", help="Remove PM binding from a target.")

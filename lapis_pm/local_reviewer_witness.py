@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
+from lapis_pm.node_probe import node_reachable
+
+_PROBE_TIMEOUT = 3    # seconds for connect probe before POST
+_CONNECT_TIMEOUT = 5  # seconds connect cap on POST (120s read budget preserved)
+
 
 # ---------------------------------------------------------------------------
 # Lifted verbatim from scripts/reviewer_spike.py (PR #93 — authoritative)
@@ -264,7 +269,7 @@ def run_local_reviewer_witness(
             }
         start = time.time()
         try:
-            resp = httpx.post(endpoint, json=body, timeout=timeout)
+            resp = httpx.post(endpoint, json=body, timeout=httpx.Timeout(timeout, connect=_CONNECT_TIMEOUT))
             lat = int((time.time() - start) * 1000)
             if resp.status_code in (400, 422):
                 return None, lat, None, f"HTTP {resp.status_code}"
@@ -278,6 +283,14 @@ def run_local_reviewer_witness(
             return None, int((time.time() - start) * 1000), None, f"ConnectError: {exc}"
         except Exception as exc:
             return None, int((time.time() - start) * 1000), None, f"{type(exc).__name__}: {exc}"
+
+    # Probe gate: skip POST if endpoint is unreachable (avoids 45-120s SYN block)
+    _t_probe = time.time()
+    if not node_reachable(endpoint, timeout=_PROBE_TIMEOUT):
+        return _make_failure(
+            int((time.time() - _t_probe) * 1000),
+            f"endpoint unreachable (probe): {endpoint}",
+        )
 
     # First attempt: with grammar (json_schema)
     resp_json, latency_ms, raw, err = _do_post(_use_grammar)

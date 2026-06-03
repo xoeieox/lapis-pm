@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from archetypes_core.corroboration import Citation
+from lapis_pm.node_probe import node_reachable
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +210,8 @@ class _IdentifierSubstrate:
 
 _LLM_URL = "http://203.0.113.12:8081/v1/chat/completions"
 _LLM_TIMEOUT = 45  # seconds; Haiku-scale call, should be fast
+_PROBE_TIMEOUT = 3   # seconds for connect probe before POST
+_CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _LLM_TIMEOUT)
 
 # Node 2 — MacBook Pro M4 Max / Gemma-3-27b (MLX, port 8080)
 # Architecturally distinct from StarHouse Qwen; used for parallel corroboration.
@@ -333,7 +336,19 @@ class LapisPMReviewerAdapter:
             }
             if node_model:
                 _body["model"] = node_model
-            resp = httpx.post(_url, json=_body, timeout=_timeout)
+            if not node_reachable(_url, timeout=_PROBE_TIMEOUT):
+                self._last_model = None
+                self._last_prompt_hash = None
+                return CorroborationResult(
+                    verdict="uncertain",
+                    claim="(substrate unavailable)",
+                    citations=[],
+                    freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                    scope_id=scope_id,
+                    drift_class=None,
+                    notes=f"node unreachable (probe {_PROBE_TIMEOUT}s): {_url}",
+                )
+            resp = httpx.post(_url, json=_body, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
             resp.raise_for_status()
             resp_json = resp.json()
             content = resp_json["choices"][0]["message"]["content"].strip()

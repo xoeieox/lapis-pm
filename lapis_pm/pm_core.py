@@ -1618,17 +1618,6 @@ def _reviewer_dispatch_ts(target_id: str, pr_number: int, cycle: int) -> str | N
     return None
 
 
-def _pr_sha_advanced_since(target_id: str, pr_number: int, since_ts: str) -> bool:
-    """Return True if any SHA-advance observation for PR N exists after since_ts."""
-    prefix = f"pm:pr={pr_number}:sha="
-    for c in episodic.all_comments(target_id):
-        if c.ts > since_ts:
-            for t in c.tags:
-                if t.startswith(prefix):
-                    return True
-    return False
-
-
 def _pr_advanced_since(target_id: str, pr_number: int, since_ts: str) -> bool:
     """Return True if a SHA-advance or body-advance observation for PR N exists after since_ts."""
     sha_prefix = f"pm:pr={pr_number}:sha="
@@ -2563,6 +2552,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     rec["status"] = "processed"
                     rec["completed_at"] = _now_iso()
                     changed = True
+                    total_encoded += 1
                     episodic.write_observation(
                         target_id,
                         f"Fixer retry for PR #{pr_num} job complete:"

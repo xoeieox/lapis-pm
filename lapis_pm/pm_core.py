@@ -26,6 +26,8 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
 
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import logging
 import os
@@ -389,6 +391,78 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
 def _now_iso() -> str:
     """Microsecond-precision so it interleaves cleanly with comment timestamps."""
     return datetime.now(PACIFIC).isoformat(timespec="microseconds")
+
+
+# --- Project-slot blackboard: close the slot + emit attribution deposit ------
+# Mirrors the *_DEPOSIT_RECORDER dynamic-import convention used by the weaver/mem
+# servers: lapis-pm never statically imports zephyr — the recorder is resolved from
+# an env spec "<module>:<callable>" so the attribution substrate stays decoupled.
+_SLOT_DEPOSIT_RECORDER_SPEC = os.environ.get(
+    "LAPIS_PM_DEPOSIT_RECORDER", "zephyr.attribution:get_recorder"
+)
+# PM dispatch terminal status -> slot lifecycle status.
+_SLOT_STATUS_MAP = {"processed": "landed", "failed": "abandoned"}
+
+
+def _close_slot_and_deposit(rec: dict, project_id: str) -> None:
+    """Close the project-slot for a completed dispatch and emit its attribution
+    deposit. Best-effort: never raises (mirrors router_portfolio's emit discipline).
+
+    The slot_id is the dispatch spec_id; the contributor-of-record is the task_id
+    (gpu_id). This is the seam that finally lands real (non-smoke) PM-origin rows in
+    the Zephyr attribution log — every shaped slot that completes deposits provenance.
+    The daemon runs on the BRIX master, so the slot transition is a local master write.
+    """
+    slot_id = rec.get("spec_id")
+    task_id = rec.get("gpu_id")
+    if not slot_id or not task_id:
+        return  # legacy dispatch record without a slot; nothing to close
+    slot_status = _SLOT_STATUS_MAP.get(rec.get("status"))
+    if slot_status is None:
+        return
+    completed_at = rec.get("completed_at") or _now_iso()
+    agent_type = rec.get("agent_type", "unknown")
+
+    # 1) transition the slot (contributor-of-record write)
+    try:
+        from agents_core.slots import SlotStore
+
+        SlotStore().update_status(slot_id, slot_status, by=task_id)
+    except Exception as exc:  # never block result encoding
+        logger.warning("[slots:close-failed] %s: %s", slot_id, exc)
+
+    # 2) emit the attribution deposit (Zephyr deposit log)
+    try:
+        module_name, _, attr = _SLOT_DEPOSIT_RECORDER_SPEC.partition(":")
+        recorder = getattr(importlib.import_module(module_name), attr)()
+        manifest = "sha256:" + hashlib.sha256(
+            f"slot:{slot_id}:{slot_status}:{completed_at}".encode("utf-8")
+        ).hexdigest()
+        # Source model from the shaper registry (dispatch records never store "model").
+        _dep_model = None
+        try:
+            _dep_model = _SHAPER.get_agent(agent_type).model
+        except Exception:
+            pass
+        prov = {
+            "manifest_hash": manifest,
+            "agent_id": task_id,
+            "tool": f"lapis-pm:{agent_type}",
+            "model": _dep_model,
+            "timestamp": completed_at,
+            "schema_version": "lapis-provenance-v0",
+            "slot": {
+                "slot_id": slot_id,
+                "project_id": project_id,
+                "status": slot_status,
+                "agent_type": agent_type,
+                "intent": rec.get("intent"),
+                "pr_number": rec.get("pr_number"),
+            },
+        }
+        recorder.record(prov, store_kind="slot", key=slot_id)
+    except Exception as exc:  # never block result encoding
+        logger.warning("[slots:deposit-failed] %s: %s", slot_id, exc)
 
 
 def get_cursor(target_id: str) -> str | None:
@@ -2391,6 +2465,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     rec["completed_at"] = completion_ts
                     changed = True
                     total_encoded += 1
+                    _close_slot_and_deposit(rec, target_id)
                     episodic.write_result(
                         target_id,
                         f"Fixer retry for PR #{pr_num} completed: head SHA advanced after dispatch",
@@ -2435,6 +2510,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     rec["completed_at"] = _now_iso()
                     changed = True
                     total_encoded += 1
+                    _close_slot_and_deposit(rec, target_id)
                     continue  # Skip confabulation + normal result encoding
 
         # Confabulation check: fixer agents that produced substantial prose
@@ -2461,6 +2537,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
         rec["status"] = "failed" if is_failure else "processed"
         rec["completed_at"] = _now_iso()
         changed = True
+        _close_slot_and_deposit(rec, target_id)
 
         snippet = text.strip()
         if len(snippet) > 1500:
@@ -2718,6 +2795,16 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
             rec["completed_at"] = t["completed_at"]
         changed = True
         flipped += 1
+
+        # Close the project-slot + emit its deposit for slots whose terminal flip
+        # is owned by THIS reconciler rather than _encode_gpu_results. The two
+        # carve-outs above (fixer_retry/reviewer → processed) returned early and
+        # are closed by _encode_gpu_results; the remaining case — a plain `fixer`
+        # that handed off a PR and was marked completed by the queue — lands here.
+        # Without this, fixer slots stayed `dispatched` forever (never auto-landed
+        # /deposited), unlike reviewer slots which already close via the encoder.
+        # Best-effort + idempotent (keyed on slot_id), so a double-call is safe.
+        _close_slot_and_deposit(rec, target_id)
 
         # Audit comment — one per flip, de-duped by tag so a second call
         # with the same gpu_id in a later tick writes nothing.

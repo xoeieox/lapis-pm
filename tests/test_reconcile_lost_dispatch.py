@@ -490,6 +490,7 @@ _TICK_BASE_PATCHES = [
     ("lapis_pm.episodic.since", dict(return_value=[])),
     ("lapis_pm.pm_core._encode_new_prs", dict(return_value=[])),
     ("lapis_pm.pm_core._encode_pr_sha_updates", dict(return_value=0)),
+    ("lapis_pm.pm_core._encode_pr_body_updates", dict(return_value=0)),
     ("lapis_pm.pm_core._encode_gpu_results", dict(return_value=(0, []))),
     ("lapis_pm.pm_core._encode_merged_prs", dict(return_value=0)),
     ("lapis_pm.pm_core._encode_user_comments", dict(return_value=[])),

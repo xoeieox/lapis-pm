@@ -34,6 +34,28 @@ The `lapis-pm` shell wrapper at `bin/lapis-pm` sources `conductor.env`
 (FORGEJO_TOKEN, PUSHOVER_\*) and execs `python3 -m lapis_pm.cli`. Symlink
 it to `/usr/local/bin/lapis-pm` for manual use.
 
+### Adopting a freehand PR (post-cutover workflow)
+
+During BRIX cutover, work done in freehand Claude Code sessions produces PRs on
+`feat/*` branches outside the PM loop. Use `--adopt-pr` to bring them in without
+manual branch re-homing:
+
+```bash
+lapis-pm bind <target_id> \
+  --spec-from /srv/lapis/planning/specs/<target_id>.md \
+  --repo <repo> --authority <auth> \
+  --create --title "<title>" \
+  --adopt-pr <pr_number>
+```
+
+The next tick perceives the adopted PR on its existing branch and dispatches a
+**reviewer** (not the initial fixer). The loop then runs the normal
+review → `fixer_retry` → review bounce against the freehand branch.
+
+Constraints: the PR must be open (not closed/merged) and its repo must match
+`--repo`. The `--adopt-pr` flag is mutually exclusive with an already-open
+initial dispatch that has created a `lapis/<tid>/` branch.
+
 ## Service
 
 Runs every 10 minutes via `systemd/lapis-pm.service` + `.timer`:

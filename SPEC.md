@@ -41,6 +41,11 @@ synthesizes an arc doc at `/srv/lapis/lapis-state/<tid>.md` (RoomRAG-indexed).
 - **CLI + systemd** — `cli.py` exposes `bind/unbind/tick/status/pause/resume/
   list/land`. `bind` accepts `--create` to create the target YAML and bind in one
   step (eliminates the historic two-step `TargetStore.create()` + `bind` flow).
+  `bind --adopt-pr <num>` adopts an already-open PR on any branch: the next tick
+  perceives that PR (via `adopted_pr_number` / `adopted_head_branch` on the target
+  state) and dispatches a reviewer instead of the initial fixer. Use this for
+  freehand `feat/*` PRs created outside the PM loop during BRIX cutover — no
+  manual branch re-homing required. See README "Adopting a freehand PR".
   `systemd/lapis-pm.service` + `.timer` runs `tick --all` every 10 minutes.
 - **Router portfolio auto-fill** — `router_portfolio.py` (`router-portfolio-persistence-v0`,
   M0.5) provides `emit_*` helpers that are wired into the three main CLI paths:

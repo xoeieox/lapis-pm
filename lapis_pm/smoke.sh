@@ -1265,55 +1265,6 @@ print(f'perception: adopted PR #42 included via adopted_pr_number=42 OK')
 " || red "adopt-pr: perception did not include adopted PR"
 
 # 17c-iv. tick() dispatches reviewer (not initial fixer) for adopted target.
-/usr/bin/python3 - <<'PYEOF_ADOPT'
-from unittest.mock import MagicMock, patch
-from lapis_pm import pm_core, authority
-
-adopted_pr = {
-    'number': 42,
-    'title': 'feat: my feature',
-    'html_url': 'http://forgejo/Erah/lapis-test/pulls/42',
-    'head': {'ref': 'feat/my-feature'},
-    'base': {'ref': 'main'},
-}
-mock_cls = authority.PRClassification(
-    verdict='advisory', screen_verdict='unknown',
-    static_outcome=authority.StaticOutcome.static_pass,
-    reasons=[], issues=[], pr_number=42, repo='lapis-test',
-    title='feat: my feature', html_url='http://x',
-    changed_paths=[], diff_loc=0, diff='',
-)
-dispatched_types = []
-
-def capture_dispatch(agent_type, tid, user_prompt, vars_=None, **kw):
-    dispatched_types.append(agent_type)
-    r = MagicMock(); r.task_id = 'smoke-reviewer'; r.spec_id = 'smoke-spec'; return r
-
-with (
-    patch('lapis_pm.pm_core._perceive_prs', return_value=([adopted_pr], True)),
-    patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls),
-    patch('lapis_pm.pm_core._review_gate_paused', return_value=False),
-    patch('lapis_pm.pm_core._review_gate_counter', return_value=0),
-    patch.object(pm_core._SHAPER, 'dispatch', side_effect=capture_dispatch),
-    patch('lapis_pm.pm_core.episodic.spec_summary', return_value='spec'),
-    patch('lapis_pm.pm_core.episodic.write_dispatch'),
-    patch('lapis_pm.pm_core.append_dispatched'),
-    patch('lapis_pm.pm_core._increment_review_gate_counter'),
-    patch('lapis_pm.pm_core.load_dispatched', return_value=[]),
-    patch('agents_core.forgejo.get_pr_diff', return_value='diff'),
-    patch('lapis_pm.pm_core.Shaper.resolve_repo_cwd', return_value='/tmp/smoke'),
-):
-    result = pm_core.tick('pm-smoke-adopt-' + str(__import__('os').getpid()).split('-')[0])
-
-print(f'decision={result.decision} dispatched_types={dispatched_types}')
-assert any('reviewer' in a for a in dispatched_types), \
-    f'expected reviewer dispatch; got: {dispatched_types}'
-assert not any(a == 'fixer' for a in dispatched_types), \
-    f'initial fixer fired for adopted target (must not be): {dispatched_types}'
-print('decide: reviewer dispatched (not initial fixer) for adopted target OK')
-PYEOF_ADOPT
-# Note: the above test uses a synthetic TID since we can't easily pass shell vars into heredoc.
-# The reviewer-first behavior is architecture-level (reviewer_count=fixer_count=0 → dispatch reviewer).
 /usr/bin/python3 -c "
 from unittest.mock import MagicMock, patch
 from lapis_pm import pm_core, authority

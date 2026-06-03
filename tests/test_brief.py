@@ -57,7 +57,7 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
     # Capture call_claude_cli arguments
     captured = {}
 
-    def fake_call_claude_cli(prompt, system, model, timeout):
+    def fake_call_claude_cli(prompt, system, model, timeout, **kwargs):
         captured["prompt"] = prompt
         captured["system"] = system
         return "## State\nok\n## Recent activity\n- thing\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
@@ -98,7 +98,7 @@ def test_brief_prompt_inline_screen_ran_when_issues_present():
     """When screen_issues is non-empty, prompt says 'Inline screen: ran'."""
     captured = {}
 
-    def fake_call_claude_cli(prompt, system, model, timeout):
+    def fake_call_claude_cli(prompt, system, model, timeout, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
@@ -160,3 +160,67 @@ def test_synthesize_round_trip_returns_brief():
     assert result.comment_id == "smoke-brief-cid"
     assert result.body == fake_body
     assert result.pushed is False
+
+
+# ---------------------------------------------------------------------------
+# Retry tests
+# ---------------------------------------------------------------------------
+
+def test_brief_synthesis_retries_once_on_empty():
+    """First call returns empty; second call returns valid body — synthesize() uses it."""
+    valid_body = (
+        "## State\nRecovered.\n"
+        "## Recent activity\n- retry worked\n"
+        "## Risk / spec deviation\nnone\n"
+        "## Decision needed\nnone\n"
+    )
+    call_count = {"n": 0}
+
+    def fake_call(prompt, system, model, timeout, **kwargs):
+        call_count["n"] += 1
+        return "" if call_count["n"] == 1 else valid_body
+
+    fake_comment = MagicMock()
+    fake_comment.id = "retry-brief-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_call),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+    ):
+        result = brief.synthesize(
+            target_id="retry-tid",
+            trigger="advisory-clean",
+            notify=None,
+        )
+
+    assert result.body == valid_body, "Expected retry body, got placeholder"
+    assert call_count["n"] == 2, f"Expected 2 calls, got {call_count['n']}"
+
+
+def test_brief_synthesis_fallback_after_two_empties():
+    """Both calls return empty — placeholder is returned and does not contain 'Sonnet'."""
+    fake_comment = MagicMock()
+    fake_comment.id = "fallback-brief-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+    ):
+        result = brief.synthesize(
+            target_id="fallback-tid",
+            trigger="advisory-clean",
+            notify=None,
+        )
+
+    assert "Sonnet" not in result.body, f"Placeholder must not mention 'Sonnet'; got:\n{result.body}"
+    assert "composer call returned empty" in result.body

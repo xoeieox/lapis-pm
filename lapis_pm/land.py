@@ -10,6 +10,7 @@ No TargetStore mutation in this slice. No chub update in this slice.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,6 +18,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agents_core.llm import call_claude_cli
+
+logger = logging.getLogger(__name__)
 
 from . import episodic
 
@@ -131,7 +134,7 @@ def generate_arc_doc(target_id: str, extra_origin_note: str | None = None) -> Ar
 
     body = call_claude_cli(
         prompt=user, system=ARC_DOC_SYSTEM,
-        model="haiku", timeout=180,
+        model="haiku", timeout=180, log=logger.warning,
     )
     if not body:
         body = (

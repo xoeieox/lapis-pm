@@ -569,8 +569,8 @@ class TestReviewerModeVars:
             return self._make_dispatch_result()
 
         with (
-            patch("lapis_pm.pm_core.shaper.dispatch", side_effect=capture_dispatch),
-            patch("lapis_pm.pm_core.shaper._resolve_repo_cwd",
+            patch("lapis_pm.pm_core._SHAPER.dispatch", side_effect=capture_dispatch),
+            patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd",
                   return_value="/srv/git/myrepo-working"),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core.episodic.write_dispatch"),
@@ -592,8 +592,8 @@ class TestReviewerModeVars:
             return self._make_dispatch_result()
 
         with (
-            patch("lapis_pm.pm_core.shaper.dispatch", side_effect=capture_dispatch),
-            patch("lapis_pm.pm_core.shaper._resolve_repo_cwd",
+            patch("lapis_pm.pm_core._SHAPER.dispatch", side_effect=capture_dispatch),
+            patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd",
                   return_value="/srv/git/myrepo-working"),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core.episodic.write_dispatch"),
@@ -616,8 +616,8 @@ class TestReviewerModeVars:
 
         prior_verdict = {"verdict": "fixable", "issues": ISSUES, "confidence": 0.8}
         with (
-            patch("lapis_pm.pm_core.shaper.dispatch", side_effect=capture_dispatch),
-            patch("lapis_pm.pm_core.shaper._resolve_repo_cwd",
+            patch("lapis_pm.pm_core._SHAPER.dispatch", side_effect=capture_dispatch),
+            patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd",
                   return_value="/srv/git/myrepo-working"),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core.episodic.write_dispatch"),
@@ -645,8 +645,8 @@ class TestReviewerModeVars:
             return self._make_dispatch_result()
 
         with (
-            patch("lapis_pm.pm_core.shaper.dispatch", side_effect=capture_dispatch),
-            patch("lapis_pm.pm_core.shaper._resolve_repo_cwd",
+            patch("lapis_pm.pm_core._SHAPER.dispatch", side_effect=capture_dispatch),
+            patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd",
                   return_value="/srv/git/myrepo-working"),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core.episodic.write_dispatch"),

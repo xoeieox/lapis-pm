@@ -218,20 +218,27 @@ def test_gap_analyze_synapse_unreachable_non_stub(tmp_path):
 
     try:
         from lapis_pm.backcaster.schema import Precondition
+        from lapis_pm.backcaster import gap_analyze
         from lapis_pm.backcaster.gap_analyze import analyze_gaps
 
         precs = [
             Precondition(id="p-01", axis="psychological", statement="test precondition")
         ]
 
-        # Patch call_operator to avoid real LLM call
+        # Mock the LLM so the test is hermetic: gap_analyze calls
+        # gap_analyze.call_model_sync (bound at import from llm_routing), not
+        # agents_core.llm.call_operator — patch the name actually used, and
+        # return None to simulate "LLM unavailable too". Also stub MemoryStore
+        # so the mem retrieval path makes no real query. The unreachable
+        # SYNAPSE_URL above makes the real healthz probe fail fast, which is
+        # what drives degraded_paths=["synapse"].
         import unittest.mock as mock
-        with mock.patch("lapis_pm.backcaster.llm_routing.call_operator" if False else "agents_core.llm.call_operator") as _:
-            pass
-
-        # With LLM unavailable too, should still produce a gap (fail-soft)
-        gaps, degraded, _ = analyze_gaps(precs, stub=False)
+        with mock.patch.object(gap_analyze, "call_model_sync", return_value=None), \
+             mock.patch("agents_core.mem.MemoryStore", side_effect=RuntimeError("no mem in test")):
+            # With LLM unavailable too, should still produce a gap (fail-soft)
+            gaps, degraded, _ = analyze_gaps(precs, stub=False)
         assert "synapse" in degraded, f"Expected synapse in degraded_paths, got {degraded}"
+        assert len(gaps) == 1 and gaps[0].unsourced, "Expected one fail-soft gap when LLM unavailable"
     finally:
         if old_stub is not None:
             os.environ["BACKCASTER_STUB"] = old_stub

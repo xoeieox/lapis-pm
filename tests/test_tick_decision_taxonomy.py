@@ -267,7 +267,8 @@ class TestActionTaxonomy:
         mock_brief.pushed = True
         with (
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
-            patch("lapis_pm.pm_core.set_outstanding_brief"),
+            patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
+            patch("lapis_pm.pm_core._post_write_sweep_brief"),
             patch("lapis_pm.pm_core._mark_pr_classified"),
             patch("lapis_pm.pm_core.episodic.write_hold"),
         ):
@@ -290,7 +291,8 @@ class TestActionTaxonomy:
         mock_brief.pushed = True
         with (
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
-            patch("lapis_pm.pm_core.set_outstanding_brief"),
+            patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
+            patch("lapis_pm.pm_core._post_write_sweep_brief"),
             patch("lapis_pm.pm_core._mark_pr_classified"),
         ):
             result = pm_core._act_brief("tid", trigger="advisory PR", hold=False,
@@ -312,7 +314,8 @@ class TestActionTaxonomy:
         mock_brief.pushed = True
         with (
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
-            patch("lapis_pm.pm_core.set_outstanding_brief"),
+            patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
+            patch("lapis_pm.pm_core._post_write_sweep_brief"),
             patch("lapis_pm.pm_core._mark_pr_classified"),
         ):
             result = pm_core._act_brief("tid", trigger="advisory PR", hold=False,

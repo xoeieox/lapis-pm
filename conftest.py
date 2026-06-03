@@ -60,6 +60,19 @@ def _block_sleeping_node_http(monkeypatch):
 
 
 @_pytest.fixture(autouse=True)
+def _clear_node_probe_cache():
+    """Clear node_probe's TTL cache between tests for deterministic isolation."""
+    try:
+        from lapis_pm import node_probe
+    except Exception:
+        yield
+        return
+    node_probe._probe_cache.clear()
+    yield
+    node_probe._probe_cache.clear()
+
+
+@_pytest.fixture(autouse=True)
 def _clear_tick_corr_cache():
     """pm_core._tick_corr_cache is a module-global keyed by (target_id, pr_num).
     A real tick clears it per target at the top of _encode_gpu_results, but tests

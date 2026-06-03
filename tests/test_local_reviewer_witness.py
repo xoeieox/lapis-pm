@@ -67,7 +67,10 @@ class TestRunWitnessSuccessWithGrammar:
     def test_all_fields_populated(self):
         """Mock httpx to return a valid verdict; assert all fields populated + agreement correct."""
         resp = _make_httpx_response("clean", [], 0.95)
-        with patch("httpx.post", return_value=resp):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF,
                 repo="lapis-pm",
@@ -89,7 +92,10 @@ class TestRunWitnessSuccessWithGrammar:
 
     def test_to_dict_is_json_serialisable(self):
         resp = _make_httpx_response("clean", [], 0.95)
-        with patch("httpx.post", return_value=resp):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -117,7 +123,10 @@ class TestRunWitnessJsonParseFailureWhenGrammarOff:
         }
         resp.raise_for_status = MagicMock()
 
-        with patch("httpx.post", return_value=resp):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -137,9 +146,12 @@ class TestRunWitnessJsonParseFailureWhenGrammarOff:
 class TestRunWitnessEndpointUnavailable:
 
     def test_connect_error_returns_failure_dataclass(self):
-        """When httpx raises ConnectError, returns valid dataclass with error, does not raise."""
+        """When httpx raises ConnectError on POST, returns valid dataclass with error."""
         import httpx
-        with patch("httpx.post", side_effect=httpx.ConnectError("refused")):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=httpx.ConnectError("refused")),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -159,9 +171,12 @@ class TestRunWitnessEndpointUnavailable:
 class TestRunWitnessTimeout:
 
     def test_timeout_returns_failure_dataclass(self):
-        """When httpx raises TimeoutException, returns valid dataclass with error."""
+        """When httpx raises TimeoutException on POST, returns valid dataclass with error."""
         import httpx
-        with patch("httpx.post", side_effect=httpx.TimeoutException("timed out")):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=httpx.TimeoutException("timed out")),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -191,7 +206,10 @@ class TestRunWitnessDiffTruncation:
                 captured_prompts.append(json["messages"][0]["content"])
             return resp
 
-        with patch("httpx.post", side_effect=capture_post):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=capture_post),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=big_diff, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -340,7 +358,10 @@ class TestProvenanceFieldsPresent:
 
     def test_prompt_hash_is_sha256_prefixed(self):
         resp = _make_httpx_response("clean", [], 0.95)
-        with patch("httpx.post", return_value=resp):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -351,7 +372,10 @@ class TestProvenanceFieldsPresent:
 
     def test_model_populated_from_response(self):
         resp = _make_httpx_response("clean", [], 0.95, model_name="qwen3.6-custom")
-        with patch("httpx.post", return_value=resp):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -360,7 +384,10 @@ class TestProvenanceFieldsPresent:
 
     def test_dispatched_at_is_iso8601(self):
         resp = _make_httpx_response("clean", [], 0.95)
-        with patch("httpx.post", return_value=resp):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -393,7 +420,10 @@ class TestGracefulDegradationToJsonObject:
                 return bad_resp
             return good_resp
 
-        with patch("httpx.post", side_effect=side_effect):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=side_effect),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
@@ -417,7 +447,10 @@ class TestGracefulDegradationToJsonObject:
             call_count[0] += 1
             return bad_resp
 
-        with patch("httpx.post", side_effect=side_effect):
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=side_effect),
+        ):
             result = run_local_reviewer_witness(
                 diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
                 spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,

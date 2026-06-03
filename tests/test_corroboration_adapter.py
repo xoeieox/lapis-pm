@@ -159,7 +159,10 @@ class TestScoreFlagsMissingReferent:
             summary="NonExistentHelper referenced in prose but not found in repo",
         )
 
-        with patch("httpx.post") as mock_post:
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: llm_resp,
@@ -186,7 +189,10 @@ class TestScoreFlagsMissingReferent:
             summary="PhantomClass not found",
         )
 
-        with patch("httpx.post") as mock_post:
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: llm_resp,
@@ -235,7 +241,10 @@ class TestScoreFlagsRenamedReferent:
             }]
         }
 
-        with patch("httpx.post") as mock_post:
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: llm_resp,
@@ -288,7 +297,10 @@ class TestScoreClean:
             }]
         }
 
-        with patch("httpx.post") as mock_post:
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: llm_resp,
@@ -311,7 +323,10 @@ class TestScoreClean:
         adapter = LapisPMReviewerAdapter()
         substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
 
-        with patch("httpx.post", side_effect=ConnectionError("refused")):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=ConnectionError("refused")),
+        ):
             result = adapter.score("some diff", substrates, "lapis-pm")
 
         assert result.verdict == "uncertain"

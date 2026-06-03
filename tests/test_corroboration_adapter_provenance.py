@@ -100,7 +100,10 @@ class TestPostSuccess:
         """score_provenance() returns model + prompt_hash + upstream_calls after success."""
         adapter = LapisPMReviewerAdapter()
 
-        with patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITH_MODEL)):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITH_MODEL)),
+        ):
             adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
 
         prov = adapter.score_provenance()
@@ -120,7 +123,10 @@ class TestPostSuccess:
                 captured_prompt.append(json["messages"][0]["content"])
             return _make_mock_post(_LLM_RESPONSE_WITH_MODEL)
 
-        with patch("httpx.post", side_effect=capture_and_mock):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=capture_and_mock),
+        ):
             adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
 
         assert captured_prompt, "Expected httpx.post to be called"
@@ -168,7 +174,10 @@ class TestResponseWithoutModel:
         """score() returns CorroborationResult even if LLM response omits 'model'."""
         adapter = LapisPMReviewerAdapter()
 
-        with patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITHOUT_MODEL)):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITHOUT_MODEL)),
+        ):
             result = adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
 
         assert result.verdict == "clean"
@@ -177,7 +186,10 @@ class TestResponseWithoutModel:
         """score_provenance() returns model=None when LLM response omits 'model'."""
         adapter = LapisPMReviewerAdapter()
 
-        with patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITHOUT_MODEL)):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITHOUT_MODEL)),
+        ):
             adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
 
         prov = adapter.score_provenance()
@@ -211,11 +223,17 @@ class TestMultipleCalls:
             })}}],
         }
 
-        with patch("httpx.post", return_value=_make_mock_post(resp_first)):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", return_value=_make_mock_post(resp_first)),
+        ):
             adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
         prov_after_first = adapter.score_provenance()
 
-        with patch("httpx.post", return_value=_make_mock_post(resp_second)):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", return_value=_make_mock_post(resp_second)),
+        ):
             adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
         prov_after_second = adapter.score_provenance()
 
@@ -269,7 +287,10 @@ class TestEnvelopeRoundTrip:
         adapter = LapisPMReviewerAdapter(repo_path="/fake/repo")
 
         # Step 1: run score() to populate provenance state
-        with patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITH_MODEL)):
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", return_value=_make_mock_post(_LLM_RESPONSE_WITH_MODEL)),
+        ):
             adapter.score(_DIFF, _SUBSTRATES, "lapis-pm")
 
         expected_prov = adapter.score_provenance()

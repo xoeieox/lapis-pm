@@ -80,8 +80,8 @@ class TestPostLandDeployHook:
 class TestPostLandGitPull:
     """Tests for _post_land_git_pull."""
 
-    def test_pull_mapped_repo_fires_git_pull(self):
-        """Mapped repo causes a git pull call with the correct args."""
+    def test_pull_lapis_pm_targets_live_tree_first_then_working(self):
+        """lapis-pm pull targets /srv/git/lapis-pm first, then -working, both --ff-only."""
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -91,8 +91,27 @@ class TestPostLandGitPull:
         with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
             pm_core._post_land_git_pull("lapis-pm")
 
+        assert len(calls) == 2
+        assert calls[0] == ["git", "-C", "/srv/git/lapis-pm", "pull", "--ff-only", "origin", "main"]
+        assert calls[1] == ["git", "-C", "/srv/lapis/lapis-pm", "pull", "--ff-only", "origin", "main"]
+
+    def test_lapis_pm_not_in_post_land_restart(self):
+        """lapis-pm must not be in _POST_LAND_RESTART: tick picks up code on next fire."""
+        assert "lapis-pm" not in pm_core._POST_LAND_RESTART
+
+    def test_pull_mapped_repo_fires_git_pull(self):
+        """Mapped repo (agents-core) causes a git pull call with the correct args."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+            pm_core._post_land_git_pull("agents-core")
+
         assert len(calls) == 1
-        assert calls[0] == ["git", "-C", "/srv/lapis/lapis-pm", "pull", "--ff-only", "origin", "main"]
+        assert calls[0] == ["git", "-C", "/srv/git/agents-core-working", "pull", "--ff-only", "origin", "main"]
 
     def test_pull_unmapped_repo_is_noop(self):
         """Unmapped repo results in zero subprocess.run calls."""
@@ -124,8 +143,8 @@ class TestPostLandGitPull:
         assert sudo_calls[0] == ["sudo", "-n", "systemctl", "restart", "claude-queue-runner.service"]
         assert sudo_calls[1] == ["sudo", "-n", "systemctl", "restart", "gpu-queue-runner.service"]
 
-    def test_pull_ff_only_in_args(self):
-        """--ff-only is always present in the git pull args."""
+    def test_pull_ff_only_in_all_args(self):
+        """--ff-only is present in every git pull call (both lapis-pm paths)."""
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -135,8 +154,9 @@ class TestPostLandGitPull:
         with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
             pm_core._post_land_git_pull("lapis-pm")
 
-        assert len(calls) == 1
-        assert "--ff-only" in calls[0]
+        assert len(calls) == 2
+        for call in calls:
+            assert "--ff-only" in call
 
     def test_pull_oserror_does_not_raise(self):
         """OSError from subprocess.run must not propagate."""

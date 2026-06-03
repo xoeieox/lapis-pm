@@ -110,10 +110,16 @@ _tick_corr_cache: dict[tuple[str, int], dict] = {}
 
 _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
     "agents-core": ("claude-queue-runner.service", "gpu-queue-runner.service"),
+    # lapis-pm intentionally absent: the tick is a fresh process per fire and
+    # picks up synced editable code on the next tick; no restart needed.
 }
 
 _POST_LAND_PULL: dict[str, list[str]] = {
-    "lapis-pm":    ["/srv/lapis/lapis-pm"],
+    # Live deploy tree first (the tick runs from /srv/git/lapis-pm via the
+    # editable install symlink); -working second keeps the PM's investigation
+    # tree current.  Both pulls are independent — one failure must not skip
+    # the other.
+    "lapis-pm":    ["/srv/git/lapis-pm", "/srv/lapis/lapis-pm"],
     "agents-core": ["/srv/git/agents-core-working"],
 }
 

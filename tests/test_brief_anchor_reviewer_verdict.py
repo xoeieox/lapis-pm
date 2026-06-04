@@ -66,7 +66,7 @@ def test_synthesize_includes_verdict_block_when_provided():
     """
     captured = {}
 
-    def fake_llm(prompt, system, model, timeout):
+    def fake_llm(prompt, system, model, timeout, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
@@ -99,7 +99,7 @@ def test_synthesize_omits_verdict_block_when_none():
     """synthesize() with reviewer_verdict_text=None produces no 'Reviewer verdict:' block."""
     captured = {}
 
-    def fake_llm(prompt, system, model, timeout):
+    def fake_llm(prompt, system, model, timeout, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
@@ -132,7 +132,7 @@ def test_synthesize_omits_verdict_block_when_empty_string():
     """synthesize() with reviewer_verdict_text='' produces no 'Reviewer verdict:' block."""
     captured = {}
 
-    def fake_llm(prompt, system, model, timeout):
+    def fake_llm(prompt, system, model, timeout, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 

@@ -9,6 +9,7 @@ Opus reviewer (see pm_core.py review-gate loop).
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -16,6 +17,8 @@ from pathlib import Path
 
 from agents_core.llm import call_claude_cli
 from agents_core.forgejo import get_pr, get_pr_diff
+
+logger = logging.getLogger(__name__)
 
 
 # Paths whose touch forces a hold.
@@ -98,7 +101,7 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
     )
     raw = call_claude_cli(
         prompt=user, system=SCREEN_SYSTEM,
-        model="sonnet", timeout=300, json_mode=True,
+        model="sonnet", timeout=300, json_mode=True, log=logger.warning,
     )
     if not raw:
         return {"verdict": "needs-human", "issues": [], "confidence": 0.0,

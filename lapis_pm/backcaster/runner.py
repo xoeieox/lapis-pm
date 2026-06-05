@@ -30,6 +30,26 @@ log = logging.getLogger(__name__)
 BACKCASTER_RUNS_ROOT = Path("/srv/lapis/backcaster/runs")
 
 
+def _check_grounding() -> list[str]:
+    """Probe Synapse /healthz and mem.db; return list of unreachable dep names."""
+    unreachable: list[str] = []
+
+    synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
+    try:
+        import httpx
+        httpx.get(f"{synapse_url}/healthz", timeout=3)
+    except Exception:  # noqa: BLE001
+        unreachable.append("synapse")
+
+    try:
+        from agents_core.mem import MemoryStore
+        MemoryStore()
+    except Exception:  # noqa: BLE001
+        unreachable.append("mem")
+
+    return unreachable
+
+
 # ---------------------------------------------------------------------------
 # Goal-state file parsing
 # ---------------------------------------------------------------------------
@@ -106,6 +126,7 @@ def run_backcaster(
     model: str = "qwen",
     out_dir: str | Path | None = None,
     stub: bool = False,
+    allow_degraded: bool = False,
 ) -> Path:
     """Run the full Backcaster pipeline and write all artifacts.
 
@@ -113,6 +134,18 @@ def run_backcaster(
     """
     if os.environ.get("BACKCASTER_STUB") == "1":
         stub = True
+
+    # Pre-flight grounding check (skipped in stub mode)
+    preflight_degraded: list[str] = []
+    if not stub:
+        preflight_degraded = _check_grounding()
+        if preflight_degraded and not allow_degraded:
+            deps = ", ".join(preflight_degraded)
+            raise RuntimeError(
+                f"Grounding unavailable: {deps}. "
+                f"Re-run with --allow-degraded to proceed without corpus grounding "
+                f"(gap analysis will be model-reasoned, not corpus-grounded)."
+            )
 
     goal_path = Path(goal_file)
     if not goal_path.exists():
@@ -146,7 +179,10 @@ def run_backcaster(
     t_start = time.monotonic()
     started_at_ts = datetime.now(timezone.utc)
     prompt_hashes: dict[str, str] = {}
-    degraded_paths: list[str] = []
+    # Seed degraded_paths from pre-flight (may be empty when stub=True)
+    degraded_paths: list[str] = list(preflight_degraded)
+    if degraded_paths:
+        log.warning("backcaster: proceeding degraded (allow_degraded=True), unavailable: %s", degraded_paths)
 
     # ------------------------------------------------------------------
     # Stage 1: Decompose
@@ -163,9 +199,13 @@ def run_backcaster(
     log.info("backcaster: stage 2 — gap_analyze")
     t0 = time.monotonic()
     gaps, degraded, gap_hash = analyze_gaps(
-        preconditions, corpus_paths=corpus_paths, model=model, stub=stub
+        preconditions, corpus_paths=corpus_paths, model=model, stub=stub,
+        allow_degraded=allow_degraded,
     )
-    degraded_paths.extend(degraded)
+    # Extend with any newly detected deps (dedup - pre-flight may have caught them already)
+    for dep in degraded:
+        if dep not in degraded_paths:
+            degraded_paths.append(dep)
     prompt_hashes["gap_analyze"] = gap_hash
     log.info("backcaster: gap_analyze produced %d gaps, degraded=%s (%.1fs)", len(gaps), degraded, time.monotonic() - t0)
 
@@ -188,6 +228,7 @@ def run_backcaster(
         gaps=gaps,
         components=components,
         run_id=run_id,
+        degraded_paths=degraded_paths,
     )
 
     t_total = time.monotonic() - t_start

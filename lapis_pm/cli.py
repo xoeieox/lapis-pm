@@ -1898,6 +1898,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Override run output directory (default: /srv/lapis/backcaster/runs/<timestamp>-<slug>/).",
     )
+    bc.add_argument(
+        "--allow-degraded",
+        action="store_true",
+        default=False,
+        help=(
+            "Proceed even when grounding services (Synapse, mem) are unreachable. "
+            "Gap analysis will be model-reasoned rather than corpus-grounded; "
+            "a DEGRADED banner is stamped at the top of roadmap.md."
+        ),
+    )
     bc.set_defaults(func=cmd_backcaster)
 
     # ------------------------------------------------------------------

@@ -45,6 +45,7 @@ def cmd_backcaster(args) -> int:
     # raise a clear RuntimeError rather than silently downgrading.
     model: str = getattr(args, "model", "qwen") or "qwen"
     out_dir: str | None = getattr(args, "out", None)
+    allow_degraded: bool = bool(getattr(args, "allow_degraded", False))
 
     try:
         from .runner import run_backcaster
@@ -55,8 +56,12 @@ def cmd_backcaster(args) -> int:
             scenario_ids=scenario_ids,
             model=model,
             out_dir=out_dir,
+            allow_degraded=allow_degraded,
         )
     except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001

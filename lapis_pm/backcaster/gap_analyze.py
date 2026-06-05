@@ -179,6 +179,7 @@ def analyze_gaps(
     corpus_paths: list[str] | None = None,
     model: str = "qwen",
     stub: bool = False,
+    allow_degraded: bool = False,
 ) -> tuple[list[Gap], list[str], str]:
     """Analyze gaps for all preconditions.
 
@@ -198,7 +199,7 @@ def analyze_gaps(
     synapse_ok = True
     mem_ok = True
 
-    # Quick probe
+    # Quick probe (drives per-precondition retrieval skipping; pre-flight is the abort gate)
     synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
     try:
         import httpx
@@ -206,7 +207,10 @@ def analyze_gaps(
     except Exception:  # noqa: BLE001
         synapse_ok = False
         degraded_paths.append("synapse")
-        log.warning("gap_analyze: Synapse unreachable - running in LLM-only mode")
+        if not allow_degraded:
+            log.warning("gap_analyze: Synapse unreachable - running in LLM-only mode")
+        else:
+            log.debug("gap_analyze: Synapse unreachable (allow_degraded) - skipping retrieval")
 
     try:
         from agents_core.mem import MemoryStore
@@ -214,7 +218,10 @@ def analyze_gaps(
     except Exception:  # noqa: BLE001
         mem_ok = False
         degraded_paths.append("mem")
-        log.warning("gap_analyze: mem.db unreachable - running without mem context")
+        if not allow_degraded:
+            log.warning("gap_analyze: mem.db unreachable - running without mem context")
+        else:
+            log.debug("gap_analyze: mem.db unreachable (allow_degraded) - skipping retrieval")
 
     for prec in preconditions:
         # Gather context

@@ -100,9 +100,17 @@ def _render_roadmap(
     components: list[Component],
     histogram: Histogram,
     run_id: str,
+    degraded_paths: list[str] | None = None,
 ) -> str:
     """Render the human-readable roadmap markdown."""
     lines: list[str] = []
+
+    if degraded_paths:
+        deps = ", ".join(degraded_paths)
+        lines.append(
+            f"> WARNING: DEGRADED RUN: grounding unavailable [{deps}]"
+            f" - gap analysis is model-reasoned, not corpus-grounded.\n"
+        )
 
     lines.append(f"# Backcaster Roadmap")
     lines.append(f"\n**Run:** `{run_id}`\n")
@@ -191,6 +199,7 @@ def compose(
     gaps: list[Gap],
     components: list[Component],
     run_id: str,
+    degraded_paths: list[str] | None = None,
 ) -> tuple[str, Histogram, str, list[str]]:
     """Compose roadmap markdown and compute histogram + metadata.
 
@@ -207,6 +216,7 @@ def compose(
         components=components,
         histogram=histogram,
         run_id=run_id,
+        degraded_paths=degraded_paths,
     )
 
     return roadmap_md, histogram, epistemic_caution, concentration_warning

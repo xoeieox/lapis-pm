@@ -112,28 +112,58 @@ _tick_corr_cache: dict[tuple[str, int], dict] = {}
 
 _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
     "agents-core": ("claude-queue-runner.service", "gpu-queue-runner.service"),
-    # lapis-pm intentionally absent: the tick is a fresh process per fire and
-    # picks up synced editable code on the next tick; no restart needed.
+    # lapis-pm intentionally absent: every runtime unit is Type=oneshot (timer-fired).
+    # Each fire spawns a fresh python3 process that imports from the deployed cwd,
+    # so a code-only sync is picked up on the next scheduled fire with no restart.
+    # INVARIANT: if a future lapis-pm unit adds Type=simple or Type=notify, it MUST
+    # be listed here — code-only syncs will not restart it otherwise.
 }
 
 _POST_LAND_PULL: dict[str, list[str]] = {
-    # Live deploy tree first (the tick runs from /srv/git/lapis-pm via the
-    # editable install symlink); -working second keeps the PM's investigation
-    # tree current.  Both pulls are independent — one failure must not skip
-    # the other.
-    "lapis-pm":    ["/srv/git/lapis-pm", "/srv/lapis/lapis-pm"],
+    # Deploy clone only — this is the run path after the WorkingDirectory repoint.
+    # cwd-precedence means python3 -m lapis_pm.cli imports from here, not the
+    # editable install. /srv/lapis/lapis-pm is the dev/PM investigation
+    # tree; it is intentionally NOT on the runtime path and pull failures there
+    # must not block or alert.
+    "lapis-pm":    ["/srv/git/lapis-pm"],
     "agents-core": ["/srv/git/agents-core-working"],
 }
+
+# For lapis-pm, the first (and only) entry in _POST_LAND_PULL is the runtime
+# deploy clone. A failed pull there must alert; it means the next tick will run
+# stale code.  Failures for other repos (agents-core) are best-effort / stderr-only.
+_POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm"})
+
+_DEPLOY_LOG = Path("/srv/lapis/lapis-state/lapis-pm-deploy-log.md")
+_DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"
+_DEPLOY_CURRENCY_COOLDOWN_SECS = 3600  # alert at most once per hour
 
 # Checked once at module load so tests can patch the env before import.
 _DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
 
 
-def _post_land_git_pull(repo: str | None) -> None:
+def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> None:
+    """Append one dated provenance line to the deploy log. Best-effort."""
+    model = getattr(brief, "_BRIEF_MODEL", "unknown")
+    ts = _now_iso()
+    line = f"- `{ts}` | {tree} | synced {old_sha}..{new_sha} | brief.py:{model} | {trigger}\n"
+    try:
+        with open(_DEPLOY_LOG, "a") as f:
+            f.write(line)
+    except OSError as e:
+        print(f"[post-land-pull] deploy log write failed: {e}", file=sys.stderr)
+
+
+def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> None:
     """Git-pull each working clone mapped to `repo`.
 
-    Best-effort. Never raises. Failures are logged to stderr. No-ops on
-    None or unmapped repos. Uses --ff-only so a diverged clone fails
+    The tick runs from the deploy clone (/srv/git/lapis-pm) via cwd-precedence;
+    that clone is the run path and its pull is runtime-critical. A failed pull
+    there sends a Pushover alert at NORMAL priority so silent drift is impossible.
+    A successful pull that advances HEAD appends a dated provenance line to the
+    deploy log.
+
+    Best-effort. Never raises. Uses --ff-only so a diverged clone fails
     loudly rather than silently creating a merge commit.
     """
     if repo is None:
@@ -141,7 +171,18 @@ def _post_land_git_pull(repo: str | None) -> None:
     paths = _POST_LAND_PULL.get(repo)
     if not paths:
         return
+    is_critical_repo = repo in _POST_LAND_PULL_CRITICAL
     for path in paths:
+        pre_head = ""
+        try:
+            pre_result = subprocess.run(
+                ["git", "-C", path, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if pre_result.returncode == 0:
+                pre_head = pre_result.stdout.strip()
+        except Exception:
+            pass
         try:
             result = subprocess.run(
                 ["git", "-C", path, "pull", "--ff-only", "origin", "main"],
@@ -153,8 +194,110 @@ def _post_land_git_pull(repo: str | None) -> None:
                     f"{result.stderr[:200]}",
                     file=sys.stderr,
                 )
+                if is_critical_repo:
+                    try:
+                        from agents_core.notify import send_notification, Priority as _P
+                        send_notification(
+                            message=(
+                                f"post-land pull failed for {path} "
+                                f"(rc={result.returncode}): {result.stderr[:300]}"
+                            ),
+                            title="lapis-pm: deploy pull failed",
+                            priority=_P.NORMAL,
+                        )
+                    except Exception:
+                        pass
+            elif pre_head:
+                post_result = subprocess.run(
+                    ["git", "-C", path, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                post_head = (
+                    post_result.stdout.strip() if post_result.returncode == 0 else ""
+                )
+                if post_head and post_head != pre_head:
+                    _write_deploy_log(path, pre_head[:8], post_head[:8], trigger)
         except (subprocess.TimeoutExpired, OSError) as e:
             print(f"[post-land-pull] pull {path} errored: {e}", file=sys.stderr)
+            if is_critical_repo:
+                try:
+                    from agents_core.notify import send_notification, Priority as _P
+                    send_notification(
+                        message=f"post-land pull errored for {path}: {e}",
+                        title="lapis-pm: deploy pull failed",
+                        priority=_P.NORMAL,
+                    )
+                except Exception:
+                    pass
+
+
+def _check_deploy_currency() -> None:
+    """Alert via Pushover if the lapis-pm deploy clone is behind origin/main.
+
+    Called once per tick_all(). Catches timer outage and persistent pull failures
+    that would otherwise be silent. Cooldown: at most one alert per hour to avoid
+    Pushover spam during a sustained outage.
+    """
+    repo = "/srv/git/lapis-pm"
+    try:
+        subprocess.run(
+            ["git", "-C", repo, "fetch", "origin", "main", "--quiet"],
+            capture_output=True, timeout=15,
+        )
+        local_proc = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        remote_proc = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "origin/main"],
+            capture_output=True, text=True, timeout=5,
+        )
+        local = local_proc.stdout.strip() if local_proc.returncode == 0 else ""
+        remote = remote_proc.stdout.strip() if remote_proc.returncode == 0 else ""
+    except Exception:
+        return  # can't check — don't alert on transient errors
+
+    if not local or not remote or local == remote:
+        return  # up to date or indeterminate
+
+    # Enforce cooldown: alert at most once per _DEPLOY_CURRENCY_COOLDOWN_SECS.
+    try:
+        last_raw = _mem().get(_DEPLOY_CURRENCY_STALE_KEY)
+        if last_raw:
+            last_ts = datetime.fromisoformat(last_raw)
+            now_ts = datetime.now(last_ts.tzinfo)
+            if (now_ts - last_ts).total_seconds() < _DEPLOY_CURRENCY_COOLDOWN_SECS:
+                return
+    except Exception:
+        pass
+
+    print(
+        f"[deploy-currency] ALERT: deploy clone at {local[:8]} but "
+        f"origin/main is {remote[:8]} — deploy timer may be broken",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        from agents_core.notify import send_notification, Priority as _P
+        send_notification(
+            message=(
+                f"lapis-pm deploy clone is stale: running {local[:8]} but "
+                f"origin/main is {remote[:8]}. "
+                "Deploy timer may be broken or post-land pull failing silently."
+            ),
+            title="lapis-pm: deploy currency stale",
+            priority=_P.NORMAL,
+        )
+    except Exception:
+        pass
+    try:
+        _mem().set(
+            _DEPLOY_CURRENCY_STALE_KEY,
+            _now_iso(),
+            tags=["lapis-pm", "deploy"],
+        )
+    except Exception:
+        pass
 
 
 def _post_land_deploy_hook(repo: str | None) -> None:
@@ -3719,6 +3862,13 @@ def tick_all() -> list[TickResult]:
         return skipped
     # Probe succeeded — reset consecutive-fail counter.
     _set_forgejo_consecutive_fails(0)
+
+    # Deploy currency check — alerts if the deploy clone has drifted behind origin/main.
+    # Runs once per tick_all so timer outages or persistent pull failures are never silent.
+    try:
+        _check_deploy_currency()
+    except Exception:
+        pass  # best-effort — must not block target processing
 
     # Emit one log line per tick when review-gate is paused (persistent visibility signal).
     if _review_gate_paused():

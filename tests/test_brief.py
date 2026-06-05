@@ -16,6 +16,7 @@ Optional round-trip smoke test:
 
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -73,6 +74,7 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
         patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         brief.synthesize(
             target_id="contract-test-tid",
@@ -113,6 +115,7 @@ def test_brief_prompt_inline_screen_ran_when_issues_present():
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
         patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         brief.synthesize(
             target_id="contract-test-tid",
@@ -147,6 +150,7 @@ def test_synthesize_round_trip_returns_brief():
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
         patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="smoke-tid",
@@ -165,6 +169,85 @@ def test_synthesize_round_trip_returns_brief():
 # ---------------------------------------------------------------------------
 # Retry tests
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Version line tests (deliverable 5 — running-version provenance)
+# ---------------------------------------------------------------------------
+
+def test_brief_body_contains_version_line():
+    """Every emitted brief body carries the running-version provenance line."""
+    fake_body = (
+        "## State\nRunning.\n"
+        "## Recent activity\n- tick\n"
+        "## Risk / spec deviation\nnone\n"
+        "## Decision needed\nnone\n"
+    )
+    fake_comment = MagicMock()
+    fake_comment.id = "version-line-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    written_body = {}
+
+    def capture_write_brief(target_id, body):
+        written_body["body"] = body
+        return fake_comment
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=fake_body),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", side_effect=capture_write_brief),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        # Stub the git call so the test doesn't depend on the git tree
+        patch("lapis_pm.brief.subprocess.run",
+              return_value=subprocess.CompletedProcess([], 0, stdout="abc1234\n", stderr="")),
+    ):
+        result = brief.synthesize(
+            target_id="version-tid",
+            trigger="advisory-clean",
+            notify=None,
+        )
+
+    body = written_body.get("body", result.body)
+    assert "lapis_pm @" in body, f"Version line missing from brief body:\n{body}"
+    assert "brief.py:" in body
+    # Starts with the synthesized content (version line is additive, not replacing)
+    assert body.startswith(fake_body)
+
+
+def test_brief_fallback_body_also_contains_version_line():
+    """The failure-fallback brief body also carries the version line."""
+    fake_comment = MagicMock()
+    fake_comment.id = "fallback-version-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    written_body = {}
+
+    def capture_write_brief(target_id, body):
+        written_body["body"] = body
+        return fake_comment
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", side_effect=capture_write_brief),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief.subprocess.run",
+              return_value=subprocess.CompletedProcess([], 0, stdout="abc1234\n", stderr="")),
+    ):
+        brief.synthesize(
+            target_id="fallback-version-tid",
+            trigger="advisory-clean",
+            notify=None,
+        )
+
+    body = written_body.get("body", "")
+    assert "lapis_pm @" in body, "Version line must appear even in fallback brief"
+    assert "composer call returned empty" in body
+
 
 def test_brief_synthesis_retries_once_on_empty():
     """First call returns empty; second call returns valid body — synthesize() uses it."""
@@ -191,6 +274,7 @@ def test_brief_synthesis_retries_once_on_empty():
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
         patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="retry-tid",
@@ -215,6 +299,7 @@ def test_brief_synthesis_fallback_after_two_empties():
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
         patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="fallback-tid",

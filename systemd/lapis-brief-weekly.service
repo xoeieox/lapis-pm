@@ -5,7 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=user
-WorkingDirectory=/srv/lapis/lapis-pm
+WorkingDirectory=/srv/git/lapis-pm
 ExecStart=/usr/bin/python3 -m lapis_pm.cli brief --period weekly
 EnvironmentFile=-/data/agents/config/conductor.env
 Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages

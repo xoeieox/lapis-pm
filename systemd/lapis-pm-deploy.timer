@@ -1,0 +1,11 @@
+[Unit]
+Description=Lapis PM — deploy sync timer (10-minute belt-and-suspenders backstop)
+Requires=lapis-pm-deploy.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=lapis-pm-deploy.service
+
+[Install]
+WantedBy=timers.target

@@ -57,6 +57,18 @@ sudo_or_warn() {
 
 # ── Step 1: code sync ──────────────────────────────────────────────────────
 log "Step 1: code sync at $REPO"
+
+# Guard: warn if the deploy clone is dirty (untracked changes or staged/unstaged
+# modifications). A dirty deploy clone will cause --ff-only to abort below, leaving
+# the run path stale. This should never happen; manual edits to the deploy clone
+# violate the run-path invariant (edits belong in the -working dev tree, not here).
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    if ! git -C "$REPO" diff --quiet 2>/dev/null || ! git -C "$REPO" diff --cached --quiet 2>/dev/null; then
+        warn "Deploy clone $REPO has uncommitted changes — ff-only merge may fail."
+        warn "Deploy clone must stay pristine. Stash or discard changes before running sync."
+    fi
+fi
+
 PRE_REV=$(git -C "$REPO" rev-parse HEAD)
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -148,6 +160,16 @@ if [[ ! -x /usr/local/bin/wake-and-run ]]; then
     warn "Drop-ins require it. Install from: /srv/git/conductor/scripts/wake-and-run"
 fi
 
+# ── Step 4b: no-long-running-daemon assertion ─────────────────────────────
+# lapis-pm runtime units are all Type=oneshot (timer-fired). A code-only sync
+# is picked up on the next scheduled fire — no restart needed. If a future unit
+# introduces Type=simple or Type=notify it MUST also be added to step 5 below.
+# This check guards that invariant at deploy time.
+if grep -rl "^Type=simple\|^Type=notify" "$SRC_UNITS"/lapis-pm*.service 2>/dev/null | grep -q .; then
+    warn "INVARIANT: a lapis-pm service has Type=simple or Type=notify."
+    warn "Code-only syncs will NOT restart long-running lapis-pm units — add them to step 5."
+fi
+
 # ── Step 5: restart changed timers ────────────────────────────────────────
 log "Step 5: restarting changed timers"
 declare -A _SEEN=()
@@ -166,6 +188,22 @@ else
         log "Restarting $timer"
         sudo_or_warn systemctl restart "$timer"
     done
+fi
+
+# ── Deploy log ─────────────────────────────────────────────────────────────
+# Append provenance line when code advances. Reads _BRIEF_MODEL from Python for
+# accuracy; falls back to "unknown" if the module is not importable.
+DEPLOY_LOG="/srv/lapis/lapis-state/lapis-pm-deploy-log.md"
+if [[ "$CODE_CHANGED" -eq 1 && "$DRY_RUN" -eq 0 && -f "$DEPLOY_LOG" ]]; then
+    BRIEF_MODEL=$(python3 -c "
+import sys; sys.path.insert(0, '${REPO}')
+from lapis_pm.brief import _BRIEF_MODEL; print(_BRIEF_MODEL)
+" 2>/dev/null || echo "unknown")
+    LOG_TS=$(python3 -c "
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+" 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "- \`${LOG_TS}\` | ${REPO} | synced ${PRE_REV:0:8}..${POST_REV:0:8} | brief.py:${BRIEF_MODEL} | deploy-timer" >> "$DEPLOY_LOG"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

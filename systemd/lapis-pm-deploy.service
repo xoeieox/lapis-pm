@@ -1,17 +1,18 @@
 [Unit]
-Description=Lapis PM — morning state brief (08:00 PT)
+Description=Lapis PM — deploy sync (pull origin/main to deploy clone)
 After=network-online.target
 
 [Service]
 Type=oneshot
 User=user
 WorkingDirectory=/srv/git/lapis-pm
-ExecStart=/usr/bin/python3 -m lapis_pm.cli brief --period morning
+ExecStart=/bin/bash /srv/git/lapis-pm/deploy/sync.sh
 EnvironmentFile=-/data/agents/config/conductor.env
-Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-TimeoutStartSec=300
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

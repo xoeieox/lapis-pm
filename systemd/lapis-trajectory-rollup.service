@@ -5,7 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=user
-WorkingDirectory=/srv/lapis/lapis-pm
+WorkingDirectory=/srv/git/lapis-pm
 ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --rebuild-index
 ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --period per-target --all
 ExecStart=/usr/bin/python3 -m lapis_pm.cli trajectory-rollup --period weekly

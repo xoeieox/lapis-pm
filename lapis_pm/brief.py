@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,25 @@ logger = logging.getLogger(__name__)
 
 _BRIEF_MODEL = "haiku"
 _BRIEF_RETRIES = 1
+
+
+def _brief_version_line() -> str:
+    """One-line running-version provenance appended to every emitted brief.
+
+    Sourced from the *running* module tree (not origin/main) so a stale deploy
+    is immediately visible in the brief: 'lapis_pm @ <old-sha>' vs origin.
+    """
+    repo_root = Path(__file__).parent.parent
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        sha = proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        sha = "unknown"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    return f"\n---\n*lapis_pm @ {sha}, brief.py:{_BRIEF_MODEL}, {ts}*"
 
 
 DASHBOARD_BASE = "http://203.0.113.12:8400"   # Conductor dashboard
@@ -250,6 +270,8 @@ def synthesize(
             f"{episodes_block}\n"
             "## Decision needed\nReview thread directly.\n"
         )
+
+    body = body + _brief_version_line()
 
     comment = episodic.write_brief(target_id, body)
 

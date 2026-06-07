@@ -1296,6 +1296,7 @@ def cmd_spec_review(args) -> int:
             authority=getattr(args, "authority", None),
             dispatch_facets=not getattr(args, "no_facets", False),
             compare_opus=getattr(args, "compare_opus", False),
+            facets_operator=getattr(args, "facets_operator", "haiku"),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -1849,6 +1850,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Also run the Opus spec_reviewer in parallel as a reference comparison "
             "(reference-only; does NOT change the recommendation). Costs one Opus "
             "dispatch. Use to calibrate/tune Facets against Opus."
+        ),
+    )
+    sr.add_argument(
+        "--facets-operator",
+        choices=["haiku", "sonnet", "opus", "qwen"],
+        default="haiku",
+        dest="facets_operator",
+        help=(
+            "Model operator for Facets personas and synthesis (default: haiku). "
+            "Pass sonnet for a more thorough technical pass."
         ),
     )
     sr.set_defaults(func=cmd_spec_review)

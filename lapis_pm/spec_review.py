@@ -107,6 +107,7 @@ class SpecReviewBrief:
     parse_error: dict | None = None
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
     opus_advisory_only: bool = False  # compare mode: Opus ran for reference but did NOT steer the recommendation
+    facets_operator: str = "haiku"  # operator used for Facets personas + synthesis
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +181,7 @@ def _dispatch_facets(
     repo: str,
     authority: str,
     start_time: float,
+    facets_operator: str = "haiku",
 ) -> str | None:
     """Invoke Facets deliberation synchronously via subprocess.
 
@@ -228,18 +230,21 @@ def _dispatch_facets(
                     p for p in (str(_FACETS_REPO_PATH), os.environ.get("PYTHONPATH", "")) if p
                 ),
             }
+            argv = [
+                "python3", "-m", "facets.adapter", "deliberate",
+                (
+                    f"Scope and timing judgment for {parsed_target_id} "
+                    f"(authority: {authority}, repo: {repo}). "
+                    f"Review the spec for portfolio fit, risk-reward, and readiness."
+                ),
+                "--context-file", context_file,
+                "--personas", "technical-integrity,trickster",
+                "--format", "json",
+            ]
+            if facets_operator != "haiku":
+                argv += ["--persona-operator", facets_operator, "--synthesis-operator", facets_operator]
             result = subprocess.run(
-                [
-                    "python3", "-m", "facets.adapter", "deliberate",
-                    (
-                        f"Scope and timing judgment for {parsed_target_id} "
-                        f"(authority: {authority}, repo: {repo}). "
-                        f"Review the spec for portfolio fit, risk-reward, and readiness."
-                    ),
-                    "--context-file", context_file,
-                    "--personas", "technical-integrity,trickster",
-                    "--format", "json",
-                ],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=600,
@@ -763,6 +768,7 @@ def _build_brief(
     facets_deliberation: dict | None = None,
     authority: str = "advisory",
     opus_advisory_only: bool = False,
+    facets_operator: str = "haiku",
 ) -> SpecReviewBrief:
     """Assemble SpecReviewBrief from Facets + Council (and optionally Opus) results.
 
@@ -834,6 +840,7 @@ def _build_brief(
         parse_error=opus_raw.get("parse_error") if opus_raw is not None else None,
         facets_deliberation=facets_deliberation,
         opus_advisory_only=opus_advisory_only,
+        facets_operator=facets_operator,
     )
 
 
@@ -956,18 +963,33 @@ could not extract a JSON verdict from the output. See chain-sibling \
             failed_personas_line = f"- **Personas with parse failures:** {fp_entries}\n"
 
         stances_md = "\n".join(
-            f"    - **{s.get('persona', '?')}** ({s.get('confidence', '?')}): "
+            f"    - **{s.get('persona', '?')}** "
+            f"({'verified' if s.get('verified') else 'inferred'}/{s.get('confidence', '?')}): "
             f"{s.get('claim', '')}"
             for s in stances
         ) or "    - (none)"
+
+        # Uncertainty bounds subsection
+        scope_limits = syn.get("scope_limits") or syn.get("uncertainty")
+        if scope_limits:
+            uncertainty_line = f"- **Uncertainty bounds:** {scope_limits}"
+        elif brief.facets_operator == "haiku":
+            uncertainty_line = (
+                "- **Uncertainty bounds:** not surfaced by this operator"
+                " — consider re-running with sonnet"
+            )
+        else:
+            uncertainty_line = "- **Uncertainty bounds:** not reported by synthesis"
+
         facets_section = f"""
-## Facets deliberation (PM domain){unreliable_header_line}
+## Facets deliberation (PM domain) [operator: {brief.facets_operator}]{unreliable_header_line}
 {reliable_line}- **Consensus level:** {syn.get('consensus_level', '?')}
 - **Escalation:** {syn.get('escalation_recommendation', 'proceed')}
 - **Confidence:** {syn.get('confidence', '?')}
 - **Recommendation:** {syn.get('recommendation', '')}
 - **Stances:**
 {stances_md}
+{uncertainty_line}
 {failed_personas_line}- **Run ID:** {fd.get('deliberation_id', '')}
 """
 
@@ -1020,6 +1042,7 @@ def run_spec_review(
     authority: str | None = None,
     dispatch_facets: bool = True,
     compare_opus: bool = False,
+    facets_operator: str = "haiku",
 ) -> SpecReviewBrief:
     """Run Facets (PM) + Council (philosophical) review of a spec document. Synchronous.
 
@@ -1030,6 +1053,9 @@ def run_spec_review(
     dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
     smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
     back to "advisory" if not found. Only advisory/hold specs dispatch Facets.
+
+    facets_operator controls the Facets persona + synthesis model; default haiku; pass
+    'sonnet' for deeper technical analysis.
 
     compare_opus=True additionally fires the Opus spec_reviewer in parallel as a
     reference comparison: it is dispatched async BEFORE the Facets block (so it runs
@@ -1092,7 +1118,8 @@ def run_spec_review(
     facets_deliberation: dict | None = None
     if dispatch_facets and effective_authority in {"advisory", "hold"}:
         facets_deliberation_id = _dispatch_facets(
-            spec_text, parsed_target_id, repo, effective_authority, start_time
+            spec_text, parsed_target_id, repo, effective_authority, start_time,
+            facets_operator=facets_operator,
         )
         if facets_deliberation_id:
             try:
@@ -1133,4 +1160,5 @@ def run_spec_review(
         facets_deliberation=facets_deliberation,
         authority=effective_authority,
         opus_advisory_only=opus_raw is not None,
+        facets_operator=facets_operator,
     )

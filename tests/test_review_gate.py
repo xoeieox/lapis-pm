@@ -1784,10 +1784,10 @@ class TestRegistryReviewerModels:
             "(hold authority unchanged)"
         )
 
-    def test_spec_reviewer_agent_uses_opus(self):
-        """Spec-review gate uses spec_reviewer agent, which must remain model=opus."""
+    def test_spec_reviewer_agent_uses_sonnet(self):
+        """Spec-review gate uses spec_reviewer agent, switched to model=sonnet (reference-only leg)."""
         agent = pm_core._SHAPER.get_agent("spec_reviewer")
-        assert agent.model == "opus", (
-            f"spec_reviewer agent model is '{agent.model}'; expected 'opus' "
-            "(spec-review gate unchanged)"
+        assert agent.model == "sonnet", (
+            f"spec_reviewer agent model is '{agent.model}'; expected 'sonnet' "
+            "(lapis-pm-spec-review-sonnet-reference-default-v0: switched from opus)"
         )

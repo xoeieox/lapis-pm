@@ -1287,6 +1287,13 @@ def cmd_spec_review(args) -> int:
     )
 
     spec_path = Path(args.spec_path)
+    # Emit deprecation note when caller passes the legacy --compare-opus flag
+    if getattr(args, "compare_opus", False):
+        print(
+            "[spec-review] WARNING: --compare-opus is deprecated and a no-op; "
+            "the Sonnet reference leg now runs by default (sunset 90 days after merge).",
+            file=sys.stderr,
+        )
     try:
         brief = run_spec_review(
             spec_path=spec_path,
@@ -1295,7 +1302,7 @@ def cmd_spec_review(args) -> int:
             repo_override=args.repo_override,
             authority=getattr(args, "authority", None),
             dispatch_facets=not getattr(args, "no_facets", False),
-            compare_opus=getattr(args, "compare_opus", False),
+            sonnet_reviewer=not getattr(args, "no_sonnet_reviewer", False),
             facets_operator=getattr(args, "facets_operator", "haiku"),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
@@ -1808,7 +1815,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = sub.add_parser(
         "spec-review",
-        help="Pre-bind Facets + Council review of a spec document (--compare-opus to also run Opus for reference).",
+        help="Pre-bind Facets + Council review of a spec document (Sonnet deep-reviewer runs by default).",
     )
     sr.add_argument("spec_path", help="Path to the spec markdown file.")
     sr.add_argument(
@@ -1843,13 +1850,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override spec's stated authority for Facets dispatch gating.",
     )
     sr.add_argument(
+        "--no-sonnet-reviewer",
+        action="store_true",
+        dest="no_sonnet_reviewer",
+        help=(
+            "Skip the reference-only Sonnet deep-review leg (on by default for "
+            "advisory/hold; opt out for faster/cheaper runs)."
+        ),
+    )
+    sr.add_argument(
         "--compare-opus",
         action="store_true",
         dest="compare_opus",
         help=(
-            "Also run the Opus spec_reviewer in parallel as a reference comparison "
-            "(reference-only; does NOT change the recommendation). Costs one Opus "
-            "dispatch. Use to calibrate/tune Facets against Opus."
+            "Deprecated/no-op: the Sonnet reference leg now runs by default; "
+            "this flag is kept for back-compat (sunset 90 days after merge)."
         ),
     )
     sr.add_argument(

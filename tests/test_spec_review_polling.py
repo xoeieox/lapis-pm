@@ -57,13 +57,13 @@ def test_both_terminal_immediately():
         out_path = _write_reviewer_output(tid)
         council_path = _write_council_yaml(run_id)
 
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             spec_reviewer_task_id=tid,
             council_run_id=run_id,
             timeout_s=60,
             start_time=time.time(),
         )
-        assert opus_raw["verdict"] == "clean"
+        assert sonnet_raw["verdict"] == "clean"
         assert council_raw["status"] == "resolved"
     finally:
         if out_path and out_path.exists():
@@ -87,13 +87,13 @@ def test_timeout_marks_pending_council():
         # Start with elapsed time already past timeout
         start = time.time() - 100  # 100s elapsed → timeout_s=10 already exceeded
 
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             spec_reviewer_task_id=tid,
             council_run_id=run_id,
             timeout_s=10,
             start_time=start,
         )
-        assert opus_raw["verdict"] == "fixable"
+        assert sonnet_raw["verdict"] == "fixable"
         assert council_raw["status"] == "timeout"
     finally:
         if out_path and out_path.exists():
@@ -114,14 +114,14 @@ def test_timeout_marks_pending_reviewer():
 
         start = time.time() - 100  # already timed out
 
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             spec_reviewer_task_id=tid,
             council_run_id=run_id,
             timeout_s=10,
             start_time=start,
         )
-        assert opus_raw["status"] == "timeout"
-        assert opus_raw["verdict"] == "timeout"
+        assert sonnet_raw["status"] == "timeout"
+        assert sonnet_raw["verdict"] == "timeout"
         assert council_raw["status"] == "resolved"
     finally:
         if council_path and council_path.exists():
@@ -137,24 +137,24 @@ def test_timeout_marks_pending_reviewer():
 # ---------------------------------------------------------------------------
 
 def test_poll_timeout_log_emitted(capsys):
-    """Both sides timeout → [spec-review:timeout] opus_done=False council_done=False."""
+    """Both sides timeout → [spec-review:timeout] sonnet_done=False council_done=False."""
     tid = f"poll-timeout-log-{int(time.time())}"
     run_id = f"council-timeout-log-{int(time.time())}"
     try:
         # No output files written — both sides hit timeout
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             spec_reviewer_task_id=tid,
             council_run_id=run_id,
             timeout_s=60,
             start_time=time.time() - 10000,
         )
-        assert opus_raw["status"] == "timeout"
+        assert sonnet_raw["status"] == "timeout"
         assert council_raw["status"] == "timeout"
         captured = capsys.readouterr()
         assert "[spec-review:timeout] elapsed=" in captured.err
-        assert "opus_done=False" in captured.err
+        assert "sonnet_done=False" in captured.err
         assert "council_done=False" in captured.err
-        assert "opus-complete" not in captured.err
+        assert "sonnet-complete" not in captured.err
         assert "council-complete" not in captured.err
     finally:
         out = _CLAUDE_QUEUE_COMPLETED / f"{tid}-output.md"
@@ -165,27 +165,27 @@ def test_poll_timeout_log_emitted(capsys):
             council_yaml.unlink()
 
 
-def test_opus_complete_log_emitted(capsys):
-    """Reviewer output found, council times out → opus-complete + timeout logs."""
-    tid = f"opus-complete-log-{int(time.time())}"
-    run_id = f"council-opus-timeout-{int(time.time())}"
+def test_sonnet_complete_log_emitted(capsys):
+    """Reviewer output found, council times out → sonnet-complete + timeout logs."""
+    tid = f"sonnet-complete-log-{int(time.time())}"
+    run_id = f"council-sonnet-timeout-{int(time.time())}"
     out_path = None
     try:
         out_path = _write_reviewer_output(tid, "clean")
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             spec_reviewer_task_id=tid,
             council_run_id=run_id,
             timeout_s=60,
             start_time=time.time() - 10000,
         )
-        assert opus_raw["verdict"] == "clean"
+        assert sonnet_raw["verdict"] == "clean"
         assert council_raw["status"] == "timeout"
         captured = capsys.readouterr()
-        assert f"[spec-review:opus-complete] task_id={tid}" in captured.err
+        assert f"[spec-review:sonnet-complete] task_id={tid}" in captured.err
         assert "elapsed=" in captured.err
         assert "verdict=clean" in captured.err
         assert "[spec-review:timeout]" in captured.err
-        assert "opus_done=True" in captured.err
+        assert "sonnet_done=True" in captured.err
         assert "council_done=False" in captured.err
     finally:
         if out_path and out_path.exists():
@@ -202,20 +202,20 @@ def test_council_complete_log_emitted(capsys):
     council_path = None
     try:
         council_path = _write_council_yaml(run_id, "failed")
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             spec_reviewer_task_id=tid,
             council_run_id=run_id,
             timeout_s=60,
             start_time=time.time() - 10000,
         )
-        assert opus_raw["status"] == "timeout"
+        assert sonnet_raw["status"] == "timeout"
         assert council_raw["status"] == "failed"
         captured = capsys.readouterr()
         assert f"[spec-review:council-complete] run_id={run_id}" in captured.err
         assert "elapsed=" in captured.err
         assert "status=failed" in captured.err
         assert "[spec-review:timeout]" in captured.err
-        assert "opus_done=False" in captured.err
+        assert "sonnet_done=False" in captured.err
         assert "council_done=True" in captured.err
     finally:
         if council_path and council_path.exists():

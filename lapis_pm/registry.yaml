@@ -218,7 +218,7 @@ agents:
       }}
 
       No prose outside the JSON.
-    model: opus
+    model: sonnet
     timeout_s: 1800
 
   fixer:

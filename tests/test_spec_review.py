@@ -344,17 +344,17 @@ def test_dispatch_facets_returns_none_on_subprocess_error(capsys):
 # ---------------------------------------------------------------------------
 
 def test_poll_until_terminal_council_only():
-    """spec_reviewer_task_id=None → only Council polled; opus_result=None returned."""
+    """spec_reviewer_task_id=None → only Council polled; sonnet_result=None returned."""
     run_id = f"council-t8-{int(time.time())}"
     council_path = _write_council_yaml(run_id, status="resolved")
     try:
-        opus_raw, council_raw = _poll_until_terminal(
+        sonnet_raw, council_raw = _poll_until_terminal(
             council_run_id=run_id,
             timeout_s=60,
             start_time=time.time(),
             # spec_reviewer_task_id defaults to None
         )
-        assert opus_raw is None
+        assert sonnet_raw is None
         assert council_raw is not None
         assert council_raw["status"] == "resolved"
         assert council_raw["landing"] == "test landing"

@@ -2,17 +2,17 @@
 
 Assertion table (8 representative cases; all checked below):
 
-  opus_verdict  council_status  has_block  expected
-  ---           ---             ---        ---
-  timeout       resolved        False      incomplete
-  clean         timeout         False      incomplete
-  clean         resolved        False      proceed-to-bind
-  clean         resolved        True       proceed-to-bind   (blocks on 'resolved' don't trigger shape)
-  clean         open            False      amend-spec
-  clean         open            True       shape-with-Erah
-  fixable       resolved        False      amend-spec
-  needs-human   resolved        False      shape-with-Erah
-  clean         laid-down       False      shape-with-Erah
+  sonnet_verdict  council_status  has_block  expected
+  ---             ---             ---        ---
+  timeout         resolved        False      incomplete
+  clean           timeout         False      incomplete
+  clean           resolved        False      proceed-to-bind
+  clean           resolved        True       proceed-to-bind   (blocks on 'resolved' don't trigger shape)
+  clean           open            False      amend-spec
+  clean           open            True       shape-with-Erah
+  fixable         resolved        False      amend-spec
+  needs-human     resolved        False      shape-with-Erah
+  clean           laid-down       False      shape-with-Erah
 """
 from __future__ import annotations
 
@@ -27,13 +27,13 @@ def _positions(*pos_strings: str) -> list[dict]:
     return [{"position": p, "entity": f"ent-{i}"} for i, p in enumerate(pos_strings)]
 
 
-def _opus_raw(verdict: str, issues: list[dict] | None = None, confidence: float = 0.9) -> dict:
+def _sonnet_raw(verdict: str, issues: list[dict] | None = None, confidence: float = 0.9) -> dict:
     return {
         "status": "timeout" if verdict == "timeout" else "processed",
         "verdict": verdict,
         "issues": issues or [],
         "confidence": confidence,
-        "run_id": f"opus-{verdict}",
+        "run_id": f"sonnet-{verdict}",
     }
 
 
@@ -52,7 +52,7 @@ def _council_raw(status: str, positions: list[dict] | None = None) -> dict:
 # combined_recommendation unit tests (all 8 assertion table rows)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("opus_verdict,council_status,positions,expected", [
+@pytest.mark.parametrize("sonnet_verdict,council_status,positions,expected", [
     # incomplete cases
     ("timeout", "resolved", [], "incomplete"),
     ("clean", "timeout", [], "incomplete"),
@@ -67,24 +67,24 @@ def _council_raw(status: str, positions: list[dict] | None = None) -> dict:
     ("needs-human", "resolved", [], "shape-with-Erah"),
     ("clean", "laid-down", [], "shape-with-Erah"),
 ])
-def test_combined_recommendation(opus_verdict, council_status, positions, expected):
+def test_combined_recommendation(sonnet_verdict, council_status, positions, expected):
     result = _combined_recommendation(
-        opus_verdict=opus_verdict,
-        opus_issues=[],
+        sonnet_verdict=sonnet_verdict,
+        sonnet_issues=[],
         council_status=council_status,
         council_positions=positions,
     )
     assert result == expected, (
-        f"verdict={opus_verdict!r} status={council_status!r} "
+        f"verdict={sonnet_verdict!r} status={council_status!r} "
         f"positions={positions} → got {result!r}, expected {expected!r}"
     )
 
 
 def test_high_severity_issue_triggers_amend():
-    """HIGH opus issue → amend-spec even if verdict=clean and council=resolved."""
+    """HIGH sonnet issue → amend-spec even if verdict=clean and council=resolved."""
     result = _combined_recommendation(
-        opus_verdict="clean",
-        opus_issues=[{"severity": "high", "note": "missing file"}],
+        sonnet_verdict="clean",
+        sonnet_issues=[{"severity": "high", "note": "missing file"}],
         council_status="resolved",
         council_positions=[],
     )
@@ -93,8 +93,8 @@ def test_high_severity_issue_triggers_amend():
 
 def test_high_severity_case_insensitive():
     result = _combined_recommendation(
-        opus_verdict="clean",
-        opus_issues=[{"severity": "HIGH", "note": "something"}],
+        sonnet_verdict="clean",
+        sonnet_issues=[{"severity": "HIGH", "note": "something"}],
         council_status="resolved",
         council_positions=[],
     )
@@ -110,7 +110,7 @@ def test_build_brief_produces_correct_recommendation(tmp_path):
     spec.write_text("# Spec\n", encoding="utf-8")
 
     brief = _build_brief(
-        opus_raw=_opus_raw("clean"),
+        sonnet_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -132,7 +132,7 @@ def test_build_brief_reservation_fields(tmp_path):
     council["confidence"] = "converged-with-reservation"
 
     brief = _build_brief(
-        opus_raw=_opus_raw("clean"),
+        sonnet_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -148,7 +148,7 @@ def test_build_brief_incomplete_on_timeout(tmp_path):
     spec.write_text("# Spec\n", encoding="utf-8")
 
     brief = _build_brief(
-        opus_raw=_opus_raw("timeout"),
+        sonnet_raw=_sonnet_raw("timeout"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="x",
@@ -156,4 +156,4 @@ def test_build_brief_incomplete_on_timeout(tmp_path):
         elapsed_s=5.0,
     )
     assert brief.combined_recommendation == "incomplete"
-    assert brief.opus_verdict == "timeout"
+    assert brief.sonnet_verdict == "timeout"

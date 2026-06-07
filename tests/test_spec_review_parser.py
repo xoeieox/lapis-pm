@@ -7,7 +7,7 @@ Covers:
 - fenced JSON no preamble → fenced extraction path
 - embedded code-span trap → fence wins over bracket-counter false-positive
 - two competing candidates → fenced JSON wins over small bracket-counter hit
-- _combined_recommendation with opus_verdict="parse_failed" → "parse_failed"
+- _combined_recommendation with sonnet_verdict="parse_failed" → "parse_failed"
 - _build_brief with parse_failed → rendered brief contains ## Parse error section
 """
 from __future__ import annotations
@@ -37,13 +37,13 @@ def _write_output(tmp_path: Path, content: str) -> Path:
     return p
 
 
-def _opus_raw(verdict: str, issues: list | None = None, confidence: float = 0.9, **kw) -> dict:
+def _sonnet_raw(verdict: str, issues: list | None = None, confidence: float = 0.9, **kw) -> dict:
     d = {
         "status": "processed",
         "verdict": verdict,
         "issues": issues or [],
         "confidence": confidence,
-        "run_id": f"opus-{verdict}",
+        "run_id": f"sonnet-{verdict}",
     }
     d.update(kw)
     return d
@@ -170,8 +170,8 @@ def test_two_competing_candidates_fence_wins(tmp_path):
 
 def test_combined_recommendation_parse_failed():
     result = _combined_recommendation(
-        opus_verdict="parse_failed",
-        opus_issues=[],
+        sonnet_verdict="parse_failed",
+        sonnet_issues=[],
         council_status="resolved",
         council_positions=[],
     )
@@ -188,7 +188,7 @@ def test_build_brief_parse_failed_renders_parse_error_section(tmp_path):
     spec = tmp_path / "spec.md"
     spec.write_text("# Spec\n", encoding="utf-8")
 
-    opus = _opus_raw(
+    sonnet = _sonnet_raw(
         "parse_failed",
         confidence=0.0,
         parse_error={
@@ -199,7 +199,7 @@ def test_build_brief_parse_failed_renders_parse_error_section(tmp_path):
     )
 
     brief = _build_brief(
-        opus_raw=opus,
+        sonnet_raw=sonnet,
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="test-tid",

@@ -1,13 +1,15 @@
 """lapis_pm.spec_review — Pre-bind Facets + Mirror Council review.
 
 Default gate: Facets (technical-integrity + trickster personas, Haiku) for the PM /
-technical domain, plus a Mirror Council deliberation for invariant-fit / meaning. The
-legacy Opus spec_reviewer leg is retained and can be run in parallel as a reference
-comparison via compare_opus=True (reference-only — it does not steer the recommendation).
+technical domain, plus a Mirror Council deliberation for invariant-fit / meaning, plus
+a standing Sonnet deep-reviewer leg that fires by default for advisory/hold specs as a
+reference-only signal (never moves the recommendation — Facets + Council are the sole
+drivers). The Sonnet leg can be disabled per-run via --no-sonnet-reviewer or
+SPEC_REVIEW_SONNET_DISABLED=1.
 
 Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override,
-authority, dispatch_facets, compare_opus). Returns SpecReviewBrief. Synchronous; caller
-blocks until all dispatched passes complete or timeout.
+authority, dispatch_facets, sonnet_reviewer, compare_opus). Returns SpecReviewBrief.
+Synchronous; caller blocks until all dispatched passes complete or timeout.
 """
 from __future__ import annotations
 
@@ -99,15 +101,46 @@ class SpecReviewBrief:
     combined_recommendation: Literal[
         "proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
     ]
-    # Optional fields — opus kept for backward compat; facets_deliberation is new
-    opus_verdict: str = "error"
-    opus_issues: list[dict] = field(default_factory=list)
-    opus_confidence: float = 0.0
-    opus_run_id: str = ""
+    # Sonnet deep-reviewer fields (reference-only; never steer the recommendation)
+    sonnet_verdict: str = "error"
+    sonnet_issues: list[dict] = field(default_factory=list)
+    sonnet_confidence: float = 0.0
+    sonnet_run_id: str = ""
     parse_error: dict | None = None
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
-    opus_advisory_only: bool = False  # compare mode: Opus ran for reference but did NOT steer the recommendation
+    # True whenever the Sonnet leg ran (always reference-only now)
+    sonnet_advisory_only: bool = False
     facets_operator: str = "haiku"  # operator used for Facets personas + synthesis
+
+    # ------------------------------------------------------------------
+    # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
+    # Before deletion: grep the tree to confirm no callers remain.
+    # ------------------------------------------------------------------
+
+    @property
+    def opus_verdict(self) -> str:
+        """Deprecated alias for sonnet_verdict. Remove 90 days after merge."""
+        return self.sonnet_verdict
+
+    @property
+    def opus_issues(self) -> list[dict]:
+        """Deprecated alias for sonnet_issues. Remove 90 days after merge."""
+        return self.sonnet_issues
+
+    @property
+    def opus_confidence(self) -> float:
+        """Deprecated alias for sonnet_confidence. Remove 90 days after merge."""
+        return self.sonnet_confidence
+
+    @property
+    def opus_run_id(self) -> str:
+        """Deprecated alias for sonnet_run_id. Remove 90 days after merge."""
+        return self.sonnet_run_id
+
+    @property
+    def opus_advisory_only(self) -> bool:
+        """Deprecated alias for sonnet_advisory_only. Remove 90 days after merge."""
+        return self.sonnet_advisory_only
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +432,7 @@ def _iter_balanced_json_candidates(text: str) -> list[str]:
 def _read_verdict_from_output(output_path: Path) -> dict:
     """Parse the verdict JSON from the spec_reviewer output file.
 
-    Multi-strategy pipeline — handles Opus narrate-then-emit patterns:
+    Multi-strategy pipeline — handles model narrate-then-emit patterns:
     1. Extract from ```(json)? fenced blocks (handles "narration + fence" pattern).
     2. Direct json.loads on stripped content (handles strict JSON-only output).
     3. Bracket-count with backtick/string-literal awareness, try largest-first
@@ -516,7 +549,7 @@ def _dispatch_council(
 
     decision_text = (
         f"Review this spec for ecosystem fit and meaning: target {parsed_target_id}.\n"
-        f"The technical-soundness question is being handled in parallel by an Opus pass.\n"
+        f"The technical-soundness question is being handled in parallel by a Sonnet pass.\n"
         f"Your role: invariant fit and meaning. Does this spec align with the Lapis\n"
         f"Constitution Kernel and the conductor/lapis-ecosystem chub? What does it\n"
         f"imply for what we're building?\n\n"
@@ -554,31 +587,31 @@ def _poll_until_terminal(
     start_time: float,
     spec_reviewer_task_id: str | None = None,
 ) -> tuple[dict | None, dict]:
-    """Block until Council terminal (and optionally Opus) or timeout elapses.
+    """Block until Council terminal (and optionally Sonnet) or timeout elapses.
 
-    When spec_reviewer_task_id is None (Facets mode), only Council is polled;
-    opus_result is returned as None. When spec_reviewer_task_id is provided
-    (backward-compat / legacy Opus mode), both sides are polled.
+    When spec_reviewer_task_id is None (Facets-only mode), only Council is polled;
+    sonnet_result is returned as None. When spec_reviewer_task_id is provided
+    (Sonnet deep-reviewer mode), both sides are polled.
 
-    Returns (opus_raw_or_None, council_raw).
+    Returns (sonnet_raw_or_None, council_raw).
     """
-    opus_result: dict | None = None
+    sonnet_result: dict | None = None
     council_result: dict | None = None
-    # In Facets mode (no Opus), mark Opus as immediately "done"
-    opus_already_done = spec_reviewer_task_id is None
+    # When no Sonnet leg, mark it immediately "done"
+    sonnet_already_done = spec_reviewer_task_id is None
 
     while True:
         elapsed = time.time() - start_time
         timed_out = elapsed >= timeout_s
 
-        # Check spec_reviewer terminal state (only when Opus was dispatched)
-        if not opus_already_done and opus_result is None:
+        # Check spec_reviewer terminal state (only when Sonnet was dispatched)
+        if not sonnet_already_done and sonnet_result is None:
             output_path = _find_reviewer_output(spec_reviewer_task_id)  # type: ignore[arg-type]
             if output_path is not None:
                 raw = _read_verdict_from_output(output_path)
                 failed = str(_CLAUDE_QUEUE_FAILED) in str(output_path) or \
                          str(_GPU_QUEUE_FAILED) in str(output_path)
-                opus_result = {
+                sonnet_result = {
                     "status": "failed" if failed else "processed",
                     "verdict": raw.get("verdict", "error"),
                     "issues": raw.get("issues", []),
@@ -588,12 +621,12 @@ def _poll_until_terminal(
                 }
                 elapsed_s = int(time.time() - start_time)
                 print(
-                    f"[spec-review:opus-complete] task_id={spec_reviewer_task_id} "
-                    f"elapsed={elapsed_s}s verdict={opus_result['verdict']}",
+                    f"[spec-review:sonnet-complete] task_id={spec_reviewer_task_id} "
+                    f"elapsed={elapsed_s}s verdict={sonnet_result['verdict']}",
                     file=sys.stderr,
                 )
             elif timed_out:
-                opus_result = {
+                sonnet_result = {
                     "status": "timeout",
                     "verdict": "timeout",
                     "issues": [],
@@ -641,28 +674,28 @@ def _poll_until_terminal(
                     "run_id": council_run_id,
                 }
 
-        # Determine effective opus done-ness for convergence + logging
-        opus_effective_done = opus_already_done or opus_result is not None
+        # Determine effective sonnet done-ness for convergence + logging
+        sonnet_effective_done = sonnet_already_done or sonnet_result is not None
 
         # Both terminal?
-        if opus_effective_done and council_result is not None:
+        if sonnet_effective_done and council_result is not None:
             if timed_out:
-                opus_done = opus_already_done or (
-                    opus_result is not None and opus_result.get("status") != "timeout"
+                sonnet_done = sonnet_already_done or (
+                    sonnet_result is not None and sonnet_result.get("status") != "timeout"
                 )
                 council_done = council_result.get("status") != "timeout"
                 elapsed_s = int(time.time() - start_time)
                 print(
                     f"[spec-review:timeout] elapsed={elapsed_s}s "
-                    f"opus_done={opus_done} council_done={council_done}",
+                    f"sonnet_done={sonnet_done} council_done={council_done}",
                     file=sys.stderr,
                 )
-            return opus_result, council_result
+            return sonnet_result, council_result
 
         if timed_out:
             # Shouldn't reach here, but guard against logic gaps
-            if not opus_already_done and opus_result is None:
-                opus_result = {
+            if not sonnet_already_done and sonnet_result is None:
+                sonnet_result = {
                     "status": "timeout", "verdict": "timeout",
                     "issues": [], "confidence": 0.0,
                     "run_id": spec_reviewer_task_id or "",
@@ -672,7 +705,7 @@ def _poll_until_terminal(
                     "status": "timeout", "landing": "", "open_questions": [],
                     "confidence": "", "positions": [], "run_id": council_run_id,
                 }
-            return opus_result, council_result
+            return sonnet_result, council_result
 
         time.sleep(_POLL_CADENCE_S)
 
@@ -699,24 +732,37 @@ def _parse_synthesis_str(text: str) -> dict:
 
 
 def _combined_recommendation(
-    opus_verdict: str = "skip",
-    opus_issues: list[dict] = (),
+    sonnet_verdict: str = "skip",
+    sonnet_issues: list[dict] = (),
     council_status: str = "error",
     council_positions: list[dict] = (),
     facets_escalation: str | None = None,
     facets_unreliable: bool = False,
     authority: str = "advisory",
+    # Deprecated aliases — kept for callers that haven't migrated yet
+    opus_verdict: str | None = None,
+    opus_issues: list[dict] | None = None,
 ) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed"]:
     """Deterministic combined recommendation — Facets (PM) + Council (philosophical).
 
-    opus_verdict="skip" signals that Opus was not dispatched (Facets mode).
+    sonnet_verdict="skip" signals that the Sonnet leg was not dispatched (Facets mode).
+    The Sonnet leg is always reference-only: even when present, its verdict/issues are
+    fed the "skip" sentinel into the recommendation so they cannot move the gate.
+    Facets + Council are the sole drivers.
+
     When facets_escalation is provided and authority is advisory/hold, Facets
-    signals take precedence over Opus. Falls through to Council-only logic on
-    Facets escalation_recommendation="proceed", when Facets is absent, or when
+    signals take precedence. Falls through to Council-only logic on
+    facets_escalation="proceed", when Facets is absent, or when
     facets_unreliable=True (parse failures present — Council-only branches apply).
     """
+    # Support deprecated opus_* parameter aliases
+    if opus_verdict is not None:
+        sonnet_verdict = opus_verdict
+    if opus_issues is not None:
+        sonnet_issues = opus_issues
+
     # parse_failed: parser could not extract a verdict
-    if opus_verdict == "parse_failed":
+    if sonnet_verdict == "parse_failed":
         return "parse_failed"
 
     # Facets logic — gated on authority, escalation signal, and reliability
@@ -733,26 +779,28 @@ def _combined_recommendation(
     if council_status in {"timeout", "error"}:
         return "incomplete"
 
-    # Opus timeout/error → incomplete (only when Opus was dispatched)
-    if opus_verdict not in {"skip"} and opus_verdict in {"timeout", "error"}:
+    # Sonnet timeout/error → incomplete (only when Sonnet was dispatched, non-advisory-only)
+    # NOTE: in the current design, sonnet_verdict is always fed as "skip" to this function
+    # (advisory-only mode), so this branch only triggers in legacy non-advisory-only calls.
+    if sonnet_verdict not in {"skip"} and sonnet_verdict in {"timeout", "error"}:
         return "incomplete"
 
-    # shape-with-Erah: council laid-down, council open with blocks, or Opus needs-human
+    # shape-with-Erah: council laid-down, council open with blocks, or Sonnet needs-human
     has_block = any(p.get("position") == "block" for p in council_positions)
     if council_status == "laid-down" or (council_status == "open" and has_block):
         return "shape-with-Erah"
-    if opus_verdict not in {"skip"} and opus_verdict == "needs-human":
+    if sonnet_verdict not in {"skip"} and sonnet_verdict == "needs-human":
         return "shape-with-Erah"
 
-    # amend-spec: council open, or Opus fixable/HIGH-issue (when Opus dispatched)
-    has_high = any(str(i.get("severity", "")).lower() == "high" for i in opus_issues)
+    # amend-spec: council open, or Sonnet fixable/HIGH-issue (when non-advisory-only)
+    has_high = any(str(i.get("severity", "")).lower() == "high" for i in sonnet_issues)
     if council_status == "open":
         return "amend-spec"
-    if opus_verdict not in {"skip"} and (opus_verdict == "fixable" or has_high):
+    if sonnet_verdict not in {"skip"} and (sonnet_verdict == "fixable" or has_high):
         return "amend-spec"
 
-    # proceed-to-bind: council resolved + (Opus clean or Opus not dispatched)
-    if council_status == "resolved" and opus_verdict in {"skip", "clean"}:
+    # proceed-to-bind: council resolved + (Sonnet clean or Sonnet not dispatched)
+    if council_status == "resolved" and sonnet_verdict in {"skip", "clean"}:
         return "proceed-to-bind"
 
     return "incomplete"
@@ -764,25 +812,34 @@ def _build_brief(
     parsed_target_id: str,
     repo: str,
     elapsed_s: float,
-    opus_raw: dict | None = None,
+    sonnet_raw: dict | None = None,
     facets_deliberation: dict | None = None,
     authority: str = "advisory",
-    opus_advisory_only: bool = False,
+    sonnet_advisory_only: bool = False,
     facets_operator: str = "haiku",
+    # Deprecated parameter aliases — kept for callers that haven't migrated yet
+    opus_raw: dict | None = None,
+    opus_advisory_only: bool | None = None,
 ) -> SpecReviewBrief:
-    """Assemble SpecReviewBrief from Facets + Council (and optionally Opus) results.
+    """Assemble SpecReviewBrief from Facets + Council (and optionally Sonnet) results.
 
-    opus_raw is optional — None when Opus was not dispatched (Facets mode).
+    sonnet_raw is optional — None when the Sonnet leg was not dispatched.
     facets_deliberation is the FacetsDeliberation envelope dict; None if disabled/timeout.
-    opus_advisory_only — compare mode: Opus output is rendered for reference but is
-    excluded from the combined recommendation (Facets + Council drive the gate). The
-    Opus verdict/issues are still stored on the brief so format_brief renders them.
+    sonnet_advisory_only — the Sonnet leg is always reference-only: its output is
+    rendered for reference but excluded from the combined recommendation (Facets +
+    Council drive the gate). This flag is set True whenever the Sonnet leg ran.
     """
-    # Opus fields — backward compat; default to "skip" sentinel when not dispatched
-    opus_verdict = opus_raw.get("verdict", "error") if opus_raw is not None else "skip"
-    opus_issues = opus_raw.get("issues", []) if opus_raw is not None else []
-    opus_confidence = float(opus_raw.get("confidence", 0.0)) if opus_raw is not None else 0.0
-    opus_run_id = opus_raw.get("run_id", "") if opus_raw is not None else ""
+    # Support deprecated opus_* parameter aliases
+    if opus_raw is not None and sonnet_raw is None:
+        sonnet_raw = opus_raw
+    if opus_advisory_only is not None and sonnet_advisory_only is False:
+        sonnet_advisory_only = opus_advisory_only
+
+    # Sonnet fields — default to "skip" sentinel when not dispatched
+    sonnet_verdict = sonnet_raw.get("verdict", "error") if sonnet_raw is not None else "skip"
+    sonnet_issues = sonnet_raw.get("issues", []) if sonnet_raw is not None else []
+    sonnet_confidence = float(sonnet_raw.get("confidence", 0.0)) if sonnet_raw is not None else 0.0
+    sonnet_run_id = sonnet_raw.get("run_id", "") if sonnet_raw is not None else ""
 
     council_status = council_raw.get("status", "error")
     council_landing = council_raw.get("landing", "")
@@ -804,16 +861,16 @@ def _build_brief(
             or any(s.get("parse_failed") for s in stances)
         )
 
-    # In compare mode Opus is reference-only: feed the "skip" sentinel into the
-    # recommendation so a real Opus verdict/issues/timeout cannot move the gate.
-    # Facets + Council remain the sole drivers. The real Opus fields are still
-    # stored on the brief below for side-by-side rendering.
-    rec_opus_verdict = "skip" if opus_advisory_only else opus_verdict
-    rec_opus_issues = () if opus_advisory_only else opus_issues
+    # The Sonnet leg is always reference-only: feed the "skip" sentinel into the
+    # recommendation so any Sonnet verdict/issues/timeout cannot move the gate.
+    # Facets + Council remain the sole drivers. The real Sonnet fields are still
+    # stored on the brief for rendering.
+    rec_sonnet_verdict = "skip" if sonnet_advisory_only else sonnet_verdict
+    rec_sonnet_issues = () if sonnet_advisory_only else sonnet_issues
 
     recommendation = _combined_recommendation(
-        opus_verdict=rec_opus_verdict,
-        opus_issues=rec_opus_issues,
+        sonnet_verdict=rec_sonnet_verdict,
+        sonnet_issues=rec_sonnet_issues,
         council_status=council_status,
         council_positions=council_positions,
         facets_escalation=facets_escalation,
@@ -833,13 +890,13 @@ def _build_brief(
         council_run_id=council_run_id,
         elapsed_s=elapsed_s,
         combined_recommendation=recommendation,
-        opus_verdict=opus_verdict,
-        opus_issues=opus_issues,
-        opus_confidence=opus_confidence,
-        opus_run_id=opus_run_id,
-        parse_error=opus_raw.get("parse_error") if opus_raw is not None else None,
+        sonnet_verdict=sonnet_verdict,
+        sonnet_issues=sonnet_issues,
+        sonnet_confidence=sonnet_confidence,
+        sonnet_run_id=sonnet_run_id,
+        parse_error=sonnet_raw.get("parse_error") if sonnet_raw is not None else None,
         facets_deliberation=facets_deliberation,
-        opus_advisory_only=opus_advisory_only,
+        sonnet_advisory_only=sonnet_advisory_only,
         facets_operator=facets_operator,
     )
 
@@ -850,9 +907,9 @@ def format_brief(brief: SpecReviewBrief) -> str:
         "\n".join(
             f"    - [{i.get('severity','?').upper()}] "
             f"{i.get('citation', i.get('path','?'))}: {i.get('note','')}"
-            for i in brief.opus_issues
+            for i in brief.sonnet_issues
         )
-        if brief.opus_issues
+        if brief.sonnet_issues
         else "    - (none)"
     )
 
@@ -993,18 +1050,17 @@ could not extract a JSON verdict from the output. See chain-sibling \
 {failed_personas_line}- **Run ID:** {fd.get('deliberation_id', '')}
 """
 
-    # Opus section — omitted when Opus was not dispatched (verdict="skip")
-    opus_section = ""
-    if brief.opus_verdict != "skip":
-        opus_heading = (
-            "Opus technical review (reference — does not affect recommendation)"
-            if brief.opus_advisory_only
-            else "Opus technical review"
-        )
-        opus_section = f"""
-## {opus_heading}
-- **Verdict:** {brief.opus_verdict} (confidence {brief.opus_confidence:.2f})
-- **Run ID:** {brief.opus_run_id}
+    # Sonnet section — omitted only when the leg did not run (verdict="skip").
+    # This section is always reference-only (purpose stated in heading).
+    # IMPORTANT: always-render is load-bearing, not cosmetic — the whole point is a
+    # standing deep signal in every gate run. Do not remove this section or gate it
+    # on any flag other than sonnet_verdict == "skip".
+    sonnet_section = ""
+    if brief.sonnet_verdict != "skip":
+        sonnet_section = f"""
+## Sonnet technical review — reference only (does not affect recommendation)
+- **Verdict:** {brief.sonnet_verdict} (confidence {brief.sonnet_confidence:.2f})
+- **Run ID:** {brief.sonnet_run_id}
 - **Issues:**
 {issues_lines}
 """
@@ -1015,7 +1071,7 @@ could not extract a JSON verdict from the output. See chain-sibling \
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-{facets_section}{opus_section}
+{facets_section}{sonnet_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -1041,31 +1097,40 @@ def run_spec_review(
     repo_override: str | None = None,
     authority: str | None = None,
     dispatch_facets: bool = True,
-    compare_opus: bool = False,
+    sonnet_reviewer: bool = True,
     facets_operator: str = "haiku",
+    # Deprecated parameter — kept for back-compat; no-op (sonnet_reviewer is always-on)
+    compare_opus: bool = False,
 ) -> SpecReviewBrief:
-    """Run Facets (PM) + Council (philosophical) review of a spec document. Synchronous.
+    """Run Facets (PM) + Council (philosophical) + Sonnet deep-reviewer review. Synchronous.
+
+    The Sonnet spec_reviewer leg fires by default for advisory/hold specs (sonnet_reviewer=True).
+    It is reference-only and never moves combined_recommendation — Facets + Council are
+    the sole recommendation drivers. Disable with sonnet_reviewer=False or
+    SPEC_REVIEW_SONNET_DISABLED=1.
 
     Facets deliberation is synchronous (blocks ~5 min); Council is async (polled up to
-    timeout). Both run in parallel where possible: Facets blocks locally while Council
-    fires async and is polled after Facets completes.
+    timeout). The Sonnet leg is dispatched async BEFORE the Facets block (so it runs
+    concurrently with Facets' blocking subprocess), polled alongside Council.
 
     dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
     smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
-    back to "advisory" if not found. Only advisory/hold specs dispatch Facets.
+    back to "advisory" if not found. Only advisory/hold specs dispatch Facets and Sonnet.
 
-    facets_operator controls the Facets persona + synthesis model; default haiku; pass
-    'sonnet' for deeper technical analysis.
+    facets_operator controls the Facets persona + synthesis model; default haiku.
 
-    compare_opus=True additionally fires the Opus spec_reviewer in parallel as a
-    reference comparison: it is dispatched async BEFORE the Facets block (so it runs
-    concurrently with Facets' blocking subprocess), polled alongside Council, and
-    rendered side-by-side in the brief. Per the ratified design (Facets drives; Opus
-    is reference), the Opus leg is reference-only — it never moves the combined
-    recommendation. Costs one Opus dispatch; intended for calibrating Facets, not for
-    routine gating. The Opus leg is skipped (with no error) for auto-merge specs, since
-    Facets itself is only dispatched for advisory/hold.
+    compare_opus is accepted for back-compat but is a no-op — the Sonnet leg is already
+    on by default, so passing compare_opus=True has no additional effect. A deprecation
+    note is emitted to stderr. Sunset: remove 90 days after merge (2026-09-05).
     """
+    # Emit deprecation note when the caller still passes compare_opus=True
+    if compare_opus:
+        print(
+            "[spec-review] WARNING: --compare-opus / compare_opus is deprecated and has no effect; "
+            "the Sonnet reference leg now runs by default (sunset 90 days after merge).",
+            file=sys.stderr,
+        )
+
     start_time = time.time()
 
     # 1. Parse frontmatter
@@ -1086,12 +1151,13 @@ def run_spec_review(
     # 4. Load invariant context
     invariant_context = _load_invariant_context(repo)
 
-    # 4b. Compare mode: dispatch the Opus spec_reviewer FIRST (async), so it runs
-    #     concurrently with the Facets blocking subprocess below. Gated on the same
-    #     advisory/hold condition as Facets so the two legs review the same specs.
+    # 4b. Sonnet deep-reviewer leg: dispatch async BEFORE the Facets block so it runs
+    #     concurrently with Facets' blocking subprocess. Always-on for advisory/hold;
+    #     reference-only (never moves the recommendation). Intentional — do not remove.
     spec_reviewer_task_id: str | None = None
-    do_compare = compare_opus and effective_authority in {"advisory", "hold"}
-    if do_compare:
+    sonnet_disabled = (not sonnet_reviewer) or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
+    do_sonnet = (not sonnet_disabled) and effective_authority in {"advisory", "hold"}
+    if do_sonnet:
         synth_target_id = _synth_target_id(parsed_target_id)
         try:
             spec_reviewer_task_id = _dispatch_spec_reviewer(
@@ -1102,14 +1168,14 @@ def run_spec_review(
                 invariant_context=invariant_context,
             ).task_id
             print(
-                f"[spec-review:compare-opus] dispatched reference Opus pass "
+                f"[spec-review:sonnet-reviewer] dispatched reference Sonnet pass "
                 f"task_id={spec_reviewer_task_id}",
                 file=sys.stderr,
             )
         except Exception as e:
-            # Opus is reference-only; never let its dispatch failure abort the gate.
+            # Sonnet leg is reference-only; never let its dispatch failure abort the gate.
             print(
-                f"[spec-review:compare-opus-dispatch-error] {e} — continuing Facets-only",
+                f"[spec-review:sonnet-reviewer-dispatch-error] {e} — continuing Facets-only",
                 file=sys.stderr,
             )
             spec_reviewer_task_id = None
@@ -1137,9 +1203,9 @@ def run_spec_review(
         spec_text, parsed_target_id, invariant_context, council_voicing
     )
 
-    # 7. Poll until terminal. In compare mode both Opus and Council are polled;
-    #    otherwise (Facets mode) only Council is polled and opus_raw stays None.
-    opus_raw, council_raw = _poll_until_terminal(
+    # 7. Poll until terminal. When Sonnet leg was dispatched, both Sonnet and Council
+    #    are polled; otherwise only Council is polled and sonnet_raw stays None.
+    sonnet_raw, council_raw = _poll_until_terminal(
         council_run_id=council_run_id,
         timeout_s=timeout_s,
         start_time=start_time,
@@ -1148,17 +1214,17 @@ def run_spec_review(
 
     elapsed = time.time() - start_time
 
-    # 8. Build and return brief. opus_raw is non-None only in compare mode; it is
-    #    rendered for reference but excluded from the recommendation (opus_advisory_only).
+    # 8. Build and return brief. sonnet_raw is non-None when the Sonnet leg ran; it is
+    #    rendered for reference but excluded from the recommendation (sonnet_advisory_only).
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
         parsed_target_id=parsed_target_id,
         repo=repo,
         elapsed_s=elapsed,
-        opus_raw=opus_raw,
+        sonnet_raw=sonnet_raw,
         facets_deliberation=facets_deliberation,
         authority=effective_authority,
-        opus_advisory_only=opus_raw is not None,
+        sonnet_advisory_only=sonnet_raw is not None,
         facets_operator=facets_operator,
     )

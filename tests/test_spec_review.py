@@ -849,3 +849,171 @@ def test_format_brief_lists_failed_personas(tmp_path):
     # The fixture has technical-integrity with parse_failed=True, parse_error="no JSON object found"
     assert "technical-integrity" in output
     assert "no JSON object found" in output
+
+
+# ---------------------------------------------------------------------------
+# facets-operator-v0: _dispatch_facets operator flag injection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("operator,expect_flags", [
+    ("sonnet", True),
+    ("haiku", False),
+])
+def test_dispatch_facets_operator_argv(monkeypatch, operator, expect_flags):
+    """facets_operator='sonnet' adds --persona-operator + --synthesis-operator; 'haiku' adds neither."""
+    monkeypatch.delenv("FACETS_DISPATCH_DISABLED", raising=False)
+    captured_argv = []
+
+    def mock_run(argv, **kwargs):
+        captured_argv.extend(argv)
+        output = json.dumps({"deliberation_id": "test-op-id"})
+        return CompletedProcess(argv, returncode=0, stdout=output, stderr="")
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = _dispatch_facets(
+            spec_text="# Spec\nContent.",
+            parsed_target_id="op-test-target",
+            repo="lapis-pm",
+            authority="advisory",
+            start_time=time.time(),
+            facets_operator=operator,
+        )
+
+    assert result == "test-op-id"
+    has_persona_flag = "--persona-operator" in captured_argv
+    has_synthesis_flag = "--synthesis-operator" in captured_argv
+    assert has_persona_flag == expect_flags, (
+        f"--persona-operator present={has_persona_flag}, expected={expect_flags} for operator={operator}"
+    )
+    assert has_synthesis_flag == expect_flags, (
+        f"--synthesis-operator present={has_synthesis_flag}, expected={expect_flags} for operator={operator}"
+    )
+    if expect_flags:
+        idx = captured_argv.index("--persona-operator")
+        assert captured_argv[idx + 1] == operator
+        idx2 = captured_argv.index("--synthesis-operator")
+        assert captured_argv[idx2 + 1] == operator
+
+
+# ---------------------------------------------------------------------------
+# facets-operator-v0: format_brief operator header
+# ---------------------------------------------------------------------------
+
+def test_format_brief_operator_header(tmp_path):
+    """SpecReviewBrief with facets_operator='sonnet' renders [operator: sonnet] in heading."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_fixture(escalation="proceed", consensus="consensus")
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-op-header",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+        facets_operator="sonnet",
+    )
+    output = format_brief(brief)
+    assert "[operator: sonnet]" in output, (
+        f"Expected '[operator: sonnet]' in Facets heading; got:\n{output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# facets-operator-v0: stance confidence_type (verified vs inferred)
+# ---------------------------------------------------------------------------
+
+def test_format_brief_stance_confidence_type(tmp_path):
+    """Stance with verified=True renders 'verified/high'; without 'verified' renders 'inferred/high'."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = {
+        "deliberation_id": "test-conf-type",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "consensus",
+            "confidence": "high",
+            "recommendation": "OK.",
+        },
+        "stances": [
+            {"persona": "technical-integrity", "confidence": "high", "claim": "Verified claim.", "verified": True},
+            {"persona": "trickster", "confidence": "high", "claim": "Inferred claim."},
+        ],
+    }
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-conf-type",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    output = format_brief(brief)
+    assert "verified/high" in output, (
+        f"Expected 'verified/high' for stance with verified=True; got:\n{output}"
+    )
+    assert "inferred/high" in output, (
+        f"Expected 'inferred/high' for stance without 'verified' key; got:\n{output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# facets-operator-v0: uncertainty bounds fallback
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("operator,expected_fragment", [
+    ("haiku", "not surfaced by this operator"),
+    ("sonnet", "not reported by synthesis"),
+])
+def test_format_brief_uncertainty_bounds_fallback(tmp_path, operator, expected_fragment):
+    """Synthesis without scope_limits/uncertainty renders operator-appropriate fallback."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_fixture(escalation="proceed", consensus="consensus")
+    # Confirm fixture has no scope_limits or uncertainty keys
+    assert "scope_limits" not in fd.get("synthesis", {})
+    assert "uncertainty" not in fd.get("synthesis", {})
+
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": f"council-ub-{operator}",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+        facets_operator=operator,
+    )
+    output = format_brief(brief)
+    assert expected_fragment in output, (
+        f"Expected '{expected_fragment}' in Uncertainty bounds for operator={operator}; got:\n{output}"
+    )

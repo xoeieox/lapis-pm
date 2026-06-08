@@ -458,7 +458,7 @@ def _run_replay(
         bound_host = _poll_health("127.0.0.1", port, max(health_deadline - time.monotonic(), 5))
         if bound_host is None:
             # Try the Tailscale IP
-            ts_ip = os.environ.get("SYNAPSE_HOST", "203.0.113.12")
+            ts_ip = os.environ.get("SYNAPSE_HOST", "203.0.113.10")
             bound_host = _poll_health(ts_ip, port, max(health_deadline - time.monotonic(), 5))
         if bound_host is None:
             logger.warning(

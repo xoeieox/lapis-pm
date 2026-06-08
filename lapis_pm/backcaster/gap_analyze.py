@@ -6,7 +6,7 @@ For each precondition, asks:
   - What's miswired?
 
 Retrieval sources:
-  1. Synapse service at http://203.0.113.12:8401/serve (fail-soft)
+  1. Synapse service at http://203.0.113.10:8401/serve (fail-soft)
   2. mem.db architecture/* + project/* keys (fail-soft)
 
 Returns a list of Gap objects with citation-anchored statements.
@@ -105,7 +105,7 @@ def _retrieve_synapse(precondition: Precondition, session_id: str) -> tuple[list
     """
     try:
         import httpx
-        synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
+        synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.10:8401")
         resp = httpx.post(
             f"{synapse_url}/serve",
             json={"session_id": session_id, "prompt": precondition.statement},
@@ -200,7 +200,7 @@ def analyze_gaps(
     mem_ok = True
 
     # Quick probe (drives per-precondition retrieval skipping; pre-flight is the abort gate)
-    synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
+    synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.10:8401")
     try:
         import httpx
         httpx.get(f"{synapse_url}/healthz", timeout=3)

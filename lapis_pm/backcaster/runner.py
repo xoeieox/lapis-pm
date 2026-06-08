@@ -34,7 +34,7 @@ def _check_grounding() -> list[str]:
     """Probe Synapse /healthz and mem.db; return list of unreachable dep names."""
     unreachable: list[str] = []
 
-    synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.12:8401")
+    synapse_url = os.environ.get("SYNAPSE_URL", "http://203.0.113.10:8401")
     try:
         import httpx
         httpx.get(f"{synapse_url}/healthz", timeout=3)

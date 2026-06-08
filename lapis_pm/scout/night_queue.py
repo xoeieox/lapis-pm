@@ -2,14 +2,15 @@
 
 Replaces the sequential bash loop (scripts/scout_night.sh) with a Python
 orchestrator that gates on llama-server health, quarantines bad scaffolds,
-schedules cells in round-robin across scaffolds, and yields to GPU contention.
+schedules cells in priority-then-relevance order, and yields to GPU contention.
 
 Public surface::
 
-    run_night(sims_dir, until_epoch=None, once=False, log_root=None,
+    run_night(sims_dir, once=False, log_root=None, budget=None,
+              selected_path=None, traces_root=None,
               profiles_override=None) -> NightRunResult
 
-See the spec at /srv/lapis/planning/specs/lapis-scout-night-queue-v0.md.
+See the spec at /srv/lapis/planning/specs/scout-value-selection-budget-v0.md.
 """
 from __future__ import annotations
 
@@ -395,8 +396,6 @@ class Scheduler:
         # Separate state lists by lane for ordered draining
         self._priority_states = [s for s in self._states if s.lane == "priority"]
         self._relevance_states = [s for s in self._states if s.lane == "relevance"]
-        self._priority_index = 0
-        self._relevance_index = 0
 
         # Initialize worklists
         for state in self._states:
@@ -520,12 +519,6 @@ class Scheduler:
             if unit is not None:
                 return unit
         return None
-
-    def _priority_all_done(self) -> bool:
-        return all(
-            s.done or self._quarantine.is_quarantined(s.spec_id)
-            for s in self._priority_states
-        )
 
     def all_done(self) -> bool:
         return all(

@@ -678,35 +678,38 @@ def test_priority_lane_drains_before_relevance(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_gap_list_set_complement(tmp_path):
-    """Gap list contains molten refs that have no covering sim."""
+    """Gap list contains molten refs that have no covering active sim."""
     sims_dir = tmp_path / "sims"
     sims_dir.mkdir()
     traces_root = tmp_path / "traces"
 
-    # sim covers ref-a; ref-b is uncovered
-    path = _make_scaffold_yaml(sims_dir, "spec-gap", covers=["spec:ref-a"])
-    s = load_scaffold(path)
-    s._path = path
+    # spec-active covers spec:ref-active and is in the relevance lane (not saturated)
+    path_active = _make_scaffold_yaml(sims_dir, "spec-active", covers=["spec:ref-active"])
+    s_active = load_scaffold(path_active)
+    s_active._path = path_active
 
-    def liveness_fn(ref):
-        return "molten"  # both are molten
-
-    # Inject a second molten ref via another scaffold with covers
-    path2 = _make_scaffold_yaml(sims_dir, "spec-gap2")
-    s2 = load_scaffold(path2)
-    s2._path = path2
-    # Manually add covers to s2 after loading (not in YAML; test covers detection)
-    # Instead: let's just verify ref-a is covered and ref-b (not in any covers) is NOT in gap
+    # spec-sat covers spec:ref-orphaned but is saturated → parked; ref-orphaned has no active coverage
+    path_sat = _make_scaffold_yaml(sims_dir, "spec-sat-gap", cells=1, covers=["spec:ref-orphaned"])
+    s_sat = load_scaffold(path_sat)
+    s_sat._path = path_sat
+    # Write a clean trace to saturate spec-sat-gap
+    cells_sat = s_sat.cell_params()
+    from lapis_pm.scout.scaffold import ScoutScaffold as _SS
+    cid_sat = _SS.cell_id(cells_sat[0])
+    _write_clean_trace(traces_root, "spec-sat-gap", cid_sat, 0)
 
     plan = select_worklist(
-        scaffolds=[s, s2],
+        scaffolds=[s_active, s_sat],
         selected=[],
         traces_root=traces_root,
-        liveness_fn=liveness_fn,
+        liveness_fn=_molten,  # all refs molten
     )
-    # ref-a is covered by spec-gap → not in gap list
     gap_refs = {g.ref for g in plan.gap_list}
-    assert "spec:ref-a" not in gap_refs
+
+    # ref-active is covered by an active sim → NOT in gap list
+    assert "spec:ref-active" not in gap_refs, "Ref covered by active sim must not appear in gap"
+    # ref-orphaned is only covered by a parked (saturated) sim → MUST appear in gap list
+    assert "spec:ref-orphaned" in gap_refs, "Ref covered only by parked sim must appear in gap"
 
 
 # ---------------------------------------------------------------------------

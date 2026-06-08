@@ -153,8 +153,8 @@ def _parked_summary(spec_id: str, reason: str, scaffold) -> str:
     if reason == "covers-all-spent":
         covers_str = ", ".join(f"`{r}`" for r in (scaffold.covers or [])[:3])
         return (
-            f"Parked: the questions this sim probed ({covers_str}) were bound "
-            f"2026-06-08 or earlier, so its probing window has closed "
+            f"Parked: the questions this sim probed ({covers_str}) have been bound, "
+            f"so its probing window has closed "
             f"(administratively closed, not resolved)."
         )
     if reason == "quarantined":
@@ -308,24 +308,29 @@ def select_worklist(
             summary=_relevance_summary(spec_id, comp, scaffold, molten_refs),
         ))
 
-    # Priority lane: preserve declared order
+    # Warn on missing entries; re-sort priority_entries to match declared order in selected
     for e in selected:
         if e.sim not in scaffold_map:
             log.warning("select_worklist: selected sim %r not found in sims_dir — skipping", e.sim)
-            continue
-        # Find in priority_entries (already built)
+    selected_order = {e.sim: i for i, e in enumerate(selected)}
+    priority_entries.sort(key=lambda e: selected_order.get(e.spec_id, len(selected)))
     plan.priority_lane = priority_entries
 
     plan.parked = parked
 
-    # Gap list: molten refs with no covering sim
-    covered_molten = set()
-    for s in scaffolds:
-        for r in (s.covers or []):
-            if ref_liveness.get(r) == "molten":
-                covered_molten.add(r)
-
-    # All molten refs that appear in any covers declaration
+    # Gap list: molten refs with no covering ACTIVE sim (priority or relevance lane only).
+    # Parked scaffolds don't count as coverage — their sims won't run.
+    active_spec_ids = (
+        {e.spec_id for e in priority_entries}
+        | {sid for _, _, sid, _, _ in relevance_candidates}
+    )
+    covered_molten = {
+        r
+        for s in scaffolds
+        if s.spec_id in active_spec_ids
+        for r in (s.covers or [])
+        if ref_liveness.get(r) == "molten"
+    }
     uncovered = all_molten_refs - covered_molten
     gap_entries = []
     for ref in sorted(uncovered):

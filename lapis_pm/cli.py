@@ -1721,13 +1721,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--until",
         default=None,
         metavar="HHMM",
-        help="Stop at this local time (e.g. 0900). Defaults to next 09:00.",
+        help=(
+            "Stop at this local time today (e.g. 0400). "
+            "If already past, run is a no-op (no next-day roll). "
+            "Superseded by --deadline-in. Default: 4h from now."
+        ),
+    )
+    sc_nr.add_argument(
+        "--deadline-in",
+        default=None,
+        metavar="DURATION",
+        help="Stop after this duration from now (e.g. '4h', '30m', '1h30m'). Supersedes --until.",
+    )
+    sc_nr.add_argument(
+        "--max-units",
+        default=None,
+        type=int,
+        metavar="N",
+        help="Hard ceiling on units executed regardless of time.",
+    )
+    sc_nr.add_argument(
+        "--selected",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Priority-lane YAML (list of {sim, target_pct}). "
+            "Default: <sims-dir>/selected.yaml if it exists; else no priority lane."
+        ),
     )
     sc_nr.add_argument(
         "--once",
         action="store_true",
         default=False,
-        help="Run each scaffold once then exit (overrides --until).",
+        help="Run each scaffold once then exit (drains worklist; budget still applies).",
     )
     sc_nr.add_argument(
         "--sims-dir",

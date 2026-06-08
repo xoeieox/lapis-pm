@@ -48,29 +48,12 @@ def cmd_scout_digest(args) -> int:
         return 1
 
 
-def _resolve_until_epoch(until_hhmm: str | None) -> int:
-    """Convert --until HHMM to a Unix epoch, bumping to tomorrow if past."""
-    from datetime import datetime, timedelta
-
-    now = datetime.now()
-    if until_hhmm is None:
-        # Default: next 09:00 local
-        target = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return int(target.timestamp())
-    hh, mm = int(until_hhmm[:2]), int(until_hhmm[2:])
-    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return int(target.timestamp())
-
-
 def cmd_scout_night_run(args) -> int:
     """Start a night run."""
     import logging
     from pathlib import Path
     from .night_queue import run_night
+    from .budget import NightBudget
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -79,9 +62,11 @@ def cmd_scout_night_run(args) -> int:
 
     once: bool = getattr(args, "once", False)
     until_str: str | None = getattr(args, "until", None)
-    until_epoch: int | None = None
-    if not once:
-        until_epoch = _resolve_until_epoch(until_str)
+    deadline_in_str: str | None = getattr(args, "deadline_in", None)
+    max_units_arg: int | None = getattr(args, "max_units", None)
+
+    selected_arg: str | None = getattr(args, "selected", None)
+    selected_path = Path(selected_arg) if selected_arg else None
 
     log_root_arg: str | None = getattr(args, "log_root", None)
     log_root = Path(log_root_arg) if log_root_arg else None
@@ -97,13 +82,32 @@ def cmd_scout_night_run(args) -> int:
             spec_id, profile = item.split(":", 1)
             profiles_override[spec_id.strip()] = profile.strip()
 
+    # Build budget: --deadline-in > --until (today-only, no roll) > default 4h
+    # --once mode bypasses the budget deadline (drains worklist; budget still applies
+    # for max_units if set)
+    budget: NightBudget | None = None
+    if not once:
+        try:
+            budget = NightBudget.from_cli(
+                until_hhmm=until_str,
+                deadline_in=deadline_in_str,
+                max_units=max_units_arg,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    elif max_units_arg is not None:
+        # --once with --max-units: respect the ceiling
+        budget = NightBudget(deadline=float("inf"), max_units=max_units_arg)
+
     try:
         result = run_night(
             sims_dir=sims_dir,
-            until_epoch=until_epoch,
             once=once,
             log_root=log_root,
             profiles_override=profiles_override,
+            budget=budget,
+            selected_path=selected_path,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)

@@ -276,6 +276,17 @@ def _dispatch_facets(
             ]
             if facets_operator != "haiku":
                 argv += ["--persona-operator", facets_operator, "--synthesis-operator", facets_operator]
+            target_repo_path = Path(f"/srv/git/{repo}-working")
+            if os.getenv("FACETS_GROUNDING_DISABLED") == "1":
+                pass
+            elif target_repo_path.is_dir():
+                argv += ["--target-repo", str(target_repo_path)]
+            else:
+                print(
+                    f"[spec-review:facets] no working tree for repo {repo!r} at "
+                    f"{target_repo_path} - Mode-1 grounding inert",
+                    file=sys.stderr,
+                )
             result = subprocess.run(
                 argv,
                 capture_output=True,

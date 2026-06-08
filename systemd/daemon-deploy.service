@@ -1,0 +1,18 @@
+[Unit]
+Description=Lapis PM — daemon deploy sync (pull weaver to origin/main, restart services)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStart=/bin/bash /srv/git/lapis-pm/deploy/daemon-sync.sh
+EnvironmentFile=-/data/agents/config/conductor.env
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

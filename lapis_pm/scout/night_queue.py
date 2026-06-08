@@ -2,14 +2,15 @@
 
 Replaces the sequential bash loop (scripts/scout_night.sh) with a Python
 orchestrator that gates on llama-server health, quarantines bad scaffolds,
-schedules cells in round-robin across scaffolds, and yields to GPU contention.
+schedules cells in priority-then-relevance order, and yields to GPU contention.
 
 Public surface::
 
-    run_night(sims_dir, until_epoch=None, once=False, log_root=None,
+    run_night(sims_dir, once=False, log_root=None, budget=None,
+              selected_path=None, traces_root=None,
               profiles_override=None) -> NightRunResult
 
-See the spec at /srv/lapis/planning/specs/lapis-scout-night-queue-v0.md.
+See the spec at /srv/lapis/planning/specs/scout-value-selection-budget-v0.md.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 QUARANTINE_THRESHOLD = 3          # consecutive zero-parse runs → quarantine
+ERROR_QUARANTINE_N = 3            # errors within a single run → quarantine for remainder
 HEALTH_ABORT_SECONDS = 3600       # 1 hour continuous unhealthy → abort night run
 BACKOFF_BASE = 5.0                # seconds; base for exponential health backoff
 BACKOFF_CEILING = 120.0           # seconds; max backoff interval
@@ -364,12 +366,17 @@ class _ScaffoldState:
     # For continuous-baseline: cycle counter per cell
     cycle_counters: dict[str, int] = field(default_factory=dict)
     done: bool = False
+    # "priority" or "relevance" lane; drives Scheduler.next_unit ordering
+    lane: str = "relevance"
+    # Hard cap on units emitted for this sim (priority lane: sized to target_pct)
+    max_units: int | None = None
 
 
 class Scheduler:
-    """Owns the worklist; emits WorkUnits in round-robin across scaffolds.
+    """Owns the worklist; emits WorkUnits — priority lane first, then relevance.
 
     Profile-aware: full-pass-once, variance-resolution, continuous-baseline.
+    Priority-lane states drain to their max_units before any relevance-lane work.
     """
 
     def __init__(
@@ -383,7 +390,12 @@ class Scheduler:
         self._quarantine = quarantine
         self._rng = random.Random(shuffle_seed if shuffle_seed is not None else int(time.time()))
         self._traces_root = traces_root or Path("/srv/lapis/scout/traces")
-        self._scaffold_index = 0  # round-robin cursor
+        self._scaffold_index = 0  # round-robin cursor within current phase
+        self._in_relevance_phase = False  # True once all priority states are done
+
+        # Separate state lists by lane for ordered draining
+        self._priority_states = [s for s in self._states if s.lane == "priority"]
+        self._relevance_states = [s for s in self._states if s.lane == "relevance"]
 
         # Initialize worklists
         for state in self._states:
@@ -437,6 +449,11 @@ class Scheduler:
         if self._quarantine.is_quarantined(state.spec_id):
             return None
 
+        # Honor priority-lane unit cap (sized to reach target_pct)
+        if state.max_units is not None and state.pointer >= state.max_units:
+            state.done = True
+            return None
+
         if state.pointer >= len(state.worklist):
             # Worklist exhausted
             if state.profile == PriorityProfile.CONTINUOUS_BASELINE:
@@ -474,32 +491,34 @@ class Scheduler:
         )
 
     def next_unit(self, now: int | None = None) -> WorkUnit | None:  # noqa: ARG002
-        """Return next WorkUnit in round-robin across non-done scaffolds, or None."""
-        non_done = [s for s in self._states if not s.done and not self._quarantine.is_quarantined(s.spec_id)]
-        if not non_done:
+        """Return next WorkUnit — priority lane first, then relevance — or None."""
+        # Phase 1: drain priority lane before any relevance work
+        if not self._in_relevance_phase:
+            unit = self._next_from_lane(self._priority_states)
+            if unit is not None:
+                return unit
+            # All priority states done or quarantined → switch phase
+            self._in_relevance_phase = True
+            log.debug("Scheduler: priority lane exhausted, switching to relevance lane")
+
+        # Phase 2: relevance lane
+        return self._next_from_lane(self._relevance_states)
+
+    def _next_from_lane(self, states: list[_ScaffoldState]) -> WorkUnit | None:
+        """Round-robin through a lane's states, returning the first available unit."""
+        if not states:
             return None
-
-        # Round-robin: try each scaffold up to len(non_done) times
-        for _ in range(len(self._states)):
-            if not self._states:
-                break
-            self._scaffold_index = self._scaffold_index % len(self._states)
-            state = self._states[self._scaffold_index]
+        # Try each state up to len(states) times
+        for _ in range(len(states)):
+            idx = self._scaffold_index % len(states)
             self._scaffold_index += 1
-
+            state = states[idx]
             if state.done or self._quarantine.is_quarantined(state.spec_id):
                 continue
-
             unit = self._next_for_state(state)
             if unit is not None:
                 return unit
-
-        # All non-quarantined non-done scaffolds produced None (edge case)
-        all_done = all(
-            s.done or self._quarantine.is_quarantined(s.spec_id)
-            for s in self._states
-        )
-        return None if all_done else None
+        return None
 
     def all_done(self) -> bool:
         return all(
@@ -612,6 +631,9 @@ def run_night(
     once: bool = False,
     log_root: Path | None = None,
     profiles_override: dict[str, str] | None = None,
+    budget=None,
+    selected_path: Path | None = None,
+    traces_root: Path | None = None,
 ) -> NightRunResult:
     """Run the night-queue orchestrator.
 
@@ -620,7 +642,7 @@ def run_night(
     sims_dir:
         Directory containing scaffold YAML files.
     until_epoch:
-        Stop after this Unix timestamp. None = run --once mode.
+        Legacy: stop after this Unix timestamp. Superseded by budget. None = --once.
     once:
         If True, run each non-continuous-baseline scaffold once then exit.
     log_root:
@@ -628,7 +650,12 @@ def run_night(
         Defaults to /tmp/scout-night-<run_tag>/.
     profiles_override:
         Map spec_id → profile name, overriding the scaffold's declared profile.
-        Intended for testing/smoke.
+    budget:
+        NightBudget (deadline + max_units). Supersedes until_epoch if provided.
+        Default: 4h from now when no until_epoch and no budget.
+    selected_path:
+        Path to selected.yaml priority-lane file. If None, look for
+        <sims_dir>/selected.yaml; if absent, no priority lane.
     """
     global _stop_requested
     _stop_requested = False
@@ -657,38 +684,130 @@ def run_night(
         manifest.close()
         return result
 
-    # Build scaffold states
+    # Build scaffold objects (load once for selection + state building)
     from .scaffold import load_scaffold
-    scaffold_states: list[_ScaffoldState] = []
+    scaffolds_loaded: list = []
+    scaffold_path_map: dict[str, Path] = {}
     for path in scaffold_paths:
         try:
             scaffold = load_scaffold(path)
+            # Attach path for selection.py's _scaffold_path helper
+            scaffold._path = path
+            scaffolds_loaded.append(scaffold)
+            scaffold_path_map[scaffold.spec_id] = path
         except Exception as exc:
             log.error("Failed to load scaffold %s: %s — skipping", path, exc)
             continue
-        spec_id = scaffold.spec_id
 
-        # Determine profile
-        if profiles_override and spec_id in profiles_override:
-            profile_str = profiles_override[spec_id]
+    if not scaffolds_loaded:
+        log.warning("No valid scaffolds loaded.")
+        manifest.close()
+        return result
+
+    # Resolve budget — supersedes until_epoch if provided
+    from .budget import NightBudget
+    if budget is None:
+        if once:
+            # --once: no time budget needed (drain worklist once)
+            budget = NightBudget(deadline=float("inf"))
+        elif until_epoch is not None:
+            budget = NightBudget(deadline=float(until_epoch))
         else:
-            profile_str = scaffold.priority_profile
+            budget = NightBudget.default()
+
+    # No-op if budget already expired
+    if budget.deadline_in_past():
+        log.info(
+            "Budget deadline already in the past (%.0fs ago) — no-op run.",
+            budget.remaining_seconds() * -1,
+        )
+        manifest.close()
+        return result
+
+    # Load selected.yaml for priority lane
+    from .selection import select_worklist, SelectedEntry, render_plan
+    import yaml as _yaml
+
+    if selected_path is None:
+        default_sel = sims_dir / "selected.yaml"
+        selected_path = default_sel if default_sel.exists() else None
+
+    selected_entries: list[SelectedEntry] = []
+    if selected_path is not None and selected_path.exists():
+        try:
+            raw_sel = _yaml.safe_load(selected_path.read_text()) or []
+            for item in raw_sel:
+                if not isinstance(item, dict) or "sim" not in item:
+                    log.warning("selected.yaml: skipping malformed entry: %r", item)
+                    continue
+                selected_entries.append(SelectedEntry(
+                    sim=item["sim"],
+                    target_pct=float(item.get("target_pct", 1.0)),
+                ))
+            log.info("selected.yaml loaded: %d priority entries", len(selected_entries))
+        except Exception as exc:
+            log.warning("Failed to load selected.yaml %s: %s — no priority lane", selected_path, exc)
+
+    # Build selection plan (pure; reads traces, calls liveness, writes nothing)
+    from .liveness import liveness as _default_liveness
+    if traces_root is None:
+        traces_root = Path("/srv/lapis/scout/traces")
+    plan = select_worklist(
+        scaffolds=scaffolds_loaded,
+        selected=selected_entries,
+        traces_root=traces_root,
+        liveness_fn=_default_liveness,
+        budget=budget,
+    )
+    log.info("%s", render_plan(plan))
+
+    # Build scaffold states from selection plan (priority first, then relevance)
+    scaffold_states: list[_ScaffoldState] = []
+
+    parked_ids = {p.spec_id for p in plan.parked}
+
+    def _make_state(entry, lane: str) -> _ScaffoldState | None:
+        scaffold = next((s for s in scaffolds_loaded if s.spec_id == entry.spec_id), None)
+        if scaffold is None:
+            return None
+        path = scaffold_path_map[entry.spec_id]
+        profile_str = scaffold.priority_profile
+        if profiles_override and entry.spec_id in profiles_override:
+            profile_str = profiles_override[entry.spec_id]
         try:
             profile = PriorityProfile.from_str(profile_str)
         except ValueError as exc:
-            log.error("%s — skipping scaffold %s", exc, spec_id)
-            continue
-
-        state = _ScaffoldState(
-            spec_id=spec_id,
+            log.error("%s — skipping %s", exc, entry.spec_id)
+            return None
+        max_units = entry.units_needed if (lane == "priority" and entry.units_needed is not None) else None
+        return _ScaffoldState(
+            spec_id=entry.spec_id,
             scaffold_path=path,
             profile=profile,
             runs_per_cell=scaffold.matrix.runs_per_cell,
+            lane=lane,
+            max_units=max_units,
         )
-        scaffold_states.append(state)
+
+    for entry in plan.priority_lane:
+        state = _make_state(entry, "priority")
+        if state is not None:
+            if entry.units_needed == 0:
+                log.info("priority-sim already at target: %s — skipping", entry.spec_id)
+                state.done = True
+            scaffold_states.append(state)
+
+    for entry in plan.relevance_lane:
+        state = _make_state(entry, "relevance")
+        if state is not None:
+            scaffold_states.append(state)
 
     if not scaffold_states:
-        log.warning("No valid scaffolds loaded.")
+        log.info(
+            "Selection plan: no runnable sims (all parked or already at target). "
+            "Plan: %d priority, %d relevance, %d parked.",
+            len(plan.priority_lane), len(plan.relevance_lane), len(plan.parked),
+        )
         manifest.close()
         return result
 
@@ -708,16 +827,17 @@ def run_night(
     from . import runner as _runner
 
     _quarantine_logged: set[str] = set()
+    _run_error_counts: dict[str, int] = {}  # per-run error counts for ERROR_QUARANTINE_N
 
     while not _stop_requested:
-        # Check time budget
-        if until_epoch is not None and time.time() >= until_epoch:
-            log.info("Reached until_epoch — night run complete.")
+        # Check budget (time + unit ceiling)
+        if budget.is_expired(units_run=result.total_units):
+            log.info("Budget exhausted (deadline or max_units) — night run complete.")
             break
         if scheduler.all_done():
             if once:
                 log.info("--once: all scaffolds done — night run complete.")
-            elif until_epoch is not None:
+            else:
                 log.info("All scaffolds done — exiting before until_epoch.")
             break
 
@@ -725,7 +845,7 @@ def run_night(
         if unit is None:
             if once:
                 break
-            if until_epoch is None:
+            if budget.deadline == float("inf"):
                 break
             # Continuous-baseline scaffolds or waiting — sleep briefly
             time.sleep(1)
@@ -804,13 +924,24 @@ def run_night(
                 exc_info=True,
             )
             exit_code = 1
-            # Do NOT count toward quarantine — can't distinguish infra vs structural
+            # Error-based quarantine: after ERROR_QUARANTINE_N errors this run
+            _run_error_counts[spec_id] = _run_error_counts.get(spec_id, 0) + 1
+            if _run_error_counts[spec_id] >= ERROR_QUARANTINE_N:
+                entry = quarantine.get(spec_id)
+                if not entry.is_quarantined():
+                    entry.quarantined_at = time.time()
+                    entry.reason = f"{ERROR_QUARANTINE_N} errors in current run"
+                    quarantine._persist()
+                    log.warning(
+                        "QUARANTINE (error): spec_id=%s quarantined after %d errors this run",
+                        spec_id, _run_error_counts[spec_id],
+                    )
 
         duration_s = time.time() - t0
 
         if exit_code == 0 and written_paths:
             successful_tick_count, total_tick_count = _read_trace_counts(written_paths)
-            # Quality gate
+            # Quality gate: zero-parse runs
             if total_tick_count > 0 and successful_tick_count == 0:
                 quarantine.record_zero_parse(spec_id)
             elif total_tick_count > 0:

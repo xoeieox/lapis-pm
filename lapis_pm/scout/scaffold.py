@@ -90,6 +90,12 @@ class ScoutScaffold:
     # Lives here (ScoutScaffold), NOT on StaticScaffold — adding it to
     # StaticScaffold would invalidate scaffold_hash for every existing scaffold.
     priority_profile: str = "full-pass-once"
+    # Design-phase relevance — typed refs this scaffold probes.
+    # Outside static_scaffold so scaffold_hash is NOT invalidated.
+    covers: list[str] = field(default_factory=list)
+    # Provenance block (author id, how-derived); carried through untouched.
+    # Outside static_scaffold so scaffold_hash is NOT invalidated.
+    provenance: dict | None = None
 
     # ------------------------------------------------------------------
     # Parameter matrix helpers
@@ -230,6 +236,12 @@ def load_scaffold(path: str | Path) -> ScoutScaffold:
             f"Allowed values: {allowed}"
         )
 
+    covers = data.get("covers", []) or []
+    if not isinstance(covers, list):
+        covers = []
+    provenance_raw = data.get("provenance", None)
+    provenance = dict(provenance_raw) if isinstance(provenance_raw, dict) else None
+
     return ScoutScaffold(
         spec_id=data["spec_id"],
         spec_version=data.get("spec_version", "v0"),
@@ -239,4 +251,6 @@ def load_scaffold(path: str | Path) -> ScoutScaffold:
         context=context,
         matrix=matrix,
         priority_profile=priority_profile,
+        covers=covers,
+        provenance=provenance,
     )

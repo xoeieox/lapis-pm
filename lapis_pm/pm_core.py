@@ -125,14 +125,24 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # editable install. /srv/lapis/lapis-pm is the dev/PM investigation
     # tree; it is intentionally NOT on the runtime path and pull failures there
     # must not block or alert.
-    "lapis-pm":    ["/srv/git/lapis-pm"],
-    "agents-core": ["/srv/git/agents-core-working"],
+    "lapis-pm":       ["/srv/git/lapis-pm"],
+    "agents-core":    ["/srv/git/agents-core-working"],
+    # code-reviewer services are Type=oneshot timer-fired; they re-import on each
+    # fire, so a pull (no restart) is sufficient.  Pull failure → LOW signal so a
+    # stale nightly sweep is attributable without polluting the critical channel.
+    # Spec: lapis-pm-deploy-pull-code-reviewer-v0.
+    "code-reviewer":  ["/srv/git/code-reviewer-working"],
 }
 
 # For lapis-pm, the first (and only) entry in _POST_LAND_PULL is the runtime
 # deploy clone. A failed pull there must alert; it means the next tick will run
 # stale code.  Failures for other repos (agents-core) are best-effort / stderr-only.
 _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm"})
+
+# Repos whose pull failure emits a LOW-priority notification (not critical, not silent).
+# code-reviewer: timer-oneshot services — stale code is a degraded nightly sweep, not
+# a broken daemon.  LOW keeps the failure attributable without paging.
+_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer"})
 
 _DEPLOY_LOG = Path("/srv/lapis/lapis-state/lapis-pm-deploy-log.md")
 _DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"
@@ -172,6 +182,7 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
     if not paths:
         return
     is_critical_repo = repo in _POST_LAND_PULL_CRITICAL
+    is_low_signal_repo = repo in _POST_LAND_PULL_LOW_SIGNAL
     for path in paths:
         pre_head = ""
         try:
@@ -207,6 +218,20 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
                         )
                     except Exception:
                         pass
+                elif is_low_signal_repo:
+                    try:
+                        from agents_core.notify import send_notification, Priority as _P
+                        send_notification(
+                            message=(
+                                f"post-land pull failed for {repo} ({path}) "
+                                f"— git pull --ff-only rc={result.returncode}: "
+                                f"{result.stderr[:300]}"
+                            ),
+                            title=f"{repo}: deploy pull failed",
+                            priority=_P.LOW,
+                        )
+                    except Exception:
+                        pass
             elif pre_head:
                 post_result = subprocess.run(
                     ["git", "-C", path, "rev-parse", "HEAD"],
@@ -226,6 +251,19 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
                         message=f"post-land pull errored for {path}: {e}",
                         title="lapis-pm: deploy pull failed",
                         priority=_P.NORMAL,
+                    )
+                except Exception:
+                    pass
+            elif is_low_signal_repo:
+                try:
+                    from agents_core.notify import send_notification, Priority as _P
+                    send_notification(
+                        message=(
+                            f"post-land pull errored for {repo} ({path}) "
+                            f"— git pull --ff-only failed: {e}"
+                        ),
+                        title=f"{repo}: deploy pull failed",
+                        priority=_P.LOW,
                     )
                 except Exception:
                     pass

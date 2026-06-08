@@ -395,3 +395,98 @@ class TestDeployCurrencyCheck:
 
         with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
             pm_core._check_deploy_currency()  # must not raise
+
+
+class TestCodeReviewerDeploy:
+    """Tests for code-reviewer entry in _POST_LAND_PULL (lapis-pm-deploy-pull-code-reviewer-v0)."""
+
+    def test_code_reviewer_not_in_post_land_restart(self):
+        """code-reviewer must not be in _POST_LAND_RESTART: timers re-import on each fire."""
+        assert "code-reviewer" not in pm_core._POST_LAND_RESTART
+
+    def test_code_reviewer_not_in_post_land_pull_critical(self):
+        """code-reviewer pull failure is LOW signal, not critical — must not be in CRITICAL set."""
+        assert "code-reviewer" not in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_code_reviewer_pull_triggers_git_pull_no_restart(self):
+        """Landing a code-reviewer PR fires exactly one git pull and zero systemctl calls."""
+        pull_calls = []
+        restart_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "sudo":
+                restart_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                pm_core._post_land_deploy_hook("code-reviewer")
+
+        assert len(pull_calls) == 1
+        assert pull_calls[0] == [
+            "git", "-C", "/srv/git/code-reviewer-working", "pull", "--ff-only", "origin", "main"
+        ]
+        assert len(restart_calls) == 0, "code-reviewer is Type=oneshot — no systemctl restart"
+
+    def test_code_reviewer_pull_failure_sends_low_priority_notify(self):
+        """A failed code-reviewer pull emits exactly one LOW-priority notification."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not fast-forward")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("code-reviewer")
+
+        assert len(notify_calls) == 1, "Expected exactly one notification on code-reviewer pull failure"
+        assert notify_calls[0]["priority"] == Priority.LOW, (
+            f"Expected Priority.LOW, got {notify_calls[0]['priority']}"
+        )
+        assert "code-reviewer" in notify_calls[0]["message"]
+        assert "/srv/git/code-reviewer-working" in notify_calls[0]["message"]
+
+    def test_code_reviewer_pull_failure_does_not_raise(self):
+        """A failed code-reviewer pull must not raise — landing must still complete."""
+        def fake_run(cmd, **kwargs):
+            return _make_completed_process(returncode=1, stderr="diverged")
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+            pm_core._post_land_git_pull("code-reviewer")  # must not raise
+
+    def test_code_reviewer_pull_failure_not_critical_channel(self):
+        """code-reviewer pull failure must NOT emit NORMAL or HIGH priority — low signal only."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not ff")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("code-reviewer")
+
+        assert all(p == Priority.LOW for p in notify_calls), (
+            "code-reviewer pull failure must only emit LOW priority — never NORMAL or HIGH"
+        )

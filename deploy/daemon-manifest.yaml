@@ -1,0 +1,18 @@
+# Daemon deploy manifest — v0: weaver only
+#
+# Schema: repos.<name>.deploy_source + .services[{unit, scope}]
+#   deploy_source: editable-install path (NON-uniform per repo — verify before adding)
+#   scope: "system" = sudo systemctl | "user" = systemctl --user
+#
+# v0 ships weaver ONLY. mem-server and slot-server are named follow-ons
+# (daemon-deploy-sync-v1) — add only after deploy_source and scope are
+# each verified via `pip show <pkg> | grep "Editable project location"`
+# and `systemctl`/`systemctl --user` inspection.
+repos:
+  weaver:
+    deploy_source: /srv/git/weaver-working        # editable-installed from -working (verified 2026-06-08)
+    services:
+      - unit: weaver-watcher.service
+        scope: system                              # User=user, /etc/systemd/system
+      - unit: weaver-server.service
+        scope: user                                # systemctl --user, ~/.config/systemd/user

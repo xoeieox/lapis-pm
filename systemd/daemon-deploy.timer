@@ -1,0 +1,11 @@
+[Unit]
+Description=Lapis PM — daemon deploy sync timer (10-minute backstop for weaver + daemon repos)
+Requires=daemon-deploy.service
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+Unit=daemon-deploy.service
+
+[Install]
+WantedBy=timers.target

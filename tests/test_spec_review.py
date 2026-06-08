@@ -1017,3 +1017,93 @@ def test_format_brief_uncertainty_bounds_fallback(tmp_path, operator, expected_f
     assert expected_fragment in output, (
         f"Expected '{expected_fragment}' in Uncertainty bounds for operator={operator}; got:\n{output}"
     )
+
+
+# ---------------------------------------------------------------------------
+# target-repo-v0: --target-repo Mode-1 grounding flag wiring
+# ---------------------------------------------------------------------------
+
+def test_dispatch_facets_target_repo_present_when_dir_exists(monkeypatch):
+    """--target-repo /srv/git/myrepo-working appended to argv when resolved dir exists."""
+    monkeypatch.delenv("FACETS_DISPATCH_DISABLED", raising=False)
+    monkeypatch.delenv("FACETS_GROUNDING_DISABLED", raising=False)
+
+    captured_argv = []
+
+    def mock_run(argv, **kwargs):
+        captured_argv.extend(argv)
+        return CompletedProcess(argv, returncode=0,
+                                stdout=json.dumps({"deliberation_id": "grounding-test"}), stderr="")
+
+    with patch("subprocess.run", side_effect=mock_run), \
+         patch("pathlib.Path.is_dir", return_value=True):
+        result = _dispatch_facets(
+            spec_text="spec content",
+            parsed_target_id="my-target",
+            repo="myrepo",
+            authority="advisory",
+            start_time=time.time(),
+        )
+
+    assert result == "grounding-test"
+    assert "--target-repo" in captured_argv
+    idx = captured_argv.index("--target-repo")
+    assert captured_argv[idx + 1] == "/srv/git/myrepo-working"
+
+
+def test_dispatch_facets_target_repo_absent_when_dir_missing(monkeypatch, capsys):
+    """--target-repo absent + stderr notice when resolved dir does not exist."""
+    monkeypatch.delenv("FACETS_DISPATCH_DISABLED", raising=False)
+    monkeypatch.delenv("FACETS_GROUNDING_DISABLED", raising=False)
+
+    captured_argv = []
+
+    def mock_run(argv, **kwargs):
+        captured_argv.extend(argv)
+        return CompletedProcess(argv, returncode=0,
+                                stdout=json.dumps({"deliberation_id": "no-grounding"}), stderr="")
+
+    with patch("subprocess.run", side_effect=mock_run), \
+         patch("pathlib.Path.is_dir", return_value=False):
+        result = _dispatch_facets(
+            spec_text="spec",
+            parsed_target_id="absent-target",
+            repo="absent-repo",
+            authority="advisory",
+            start_time=time.time(),
+        )
+
+    assert result == "no-grounding"
+    assert "--target-repo" not in captured_argv
+    captured = capsys.readouterr()
+    assert "no working tree for repo 'absent-repo'" in captured.err
+    assert "Mode-1 grounding inert" in captured.err
+
+
+def test_dispatch_facets_target_repo_absent_when_grounding_disabled(monkeypatch, tmp_path):
+    """FACETS_GROUNDING_DISABLED=1 → --target-repo absent even when dir exists."""
+    monkeypatch.delenv("FACETS_DISPATCH_DISABLED", raising=False)
+    monkeypatch.setenv("FACETS_GROUNDING_DISABLED", "1")
+
+    fake_repo_path = tmp_path / "somerepo-working"
+    fake_repo_path.mkdir()
+
+    captured_argv = []
+
+    def mock_run(argv, **kwargs):
+        captured_argv.extend(argv)
+        return CompletedProcess(argv, returncode=0,
+                                stdout=json.dumps({"deliberation_id": "disabled-grounding"}), stderr="")
+
+    with patch("subprocess.run", side_effect=mock_run), \
+         patch("pathlib.Path.is_dir", return_value=True):
+        result = _dispatch_facets(
+            spec_text="spec",
+            parsed_target_id="some-target",
+            repo="somerepo",
+            authority="advisory",
+            start_time=time.time(),
+        )
+
+    assert result == "disabled-grounding"
+    assert "--target-repo" not in captured_argv

@@ -306,7 +306,7 @@ agents:
         when the spec is genuinely already implemented and you can cite specific
         evidence. Hallucinated verdicts waste Erah's review time and damage
         trust in the system.
-    model: sonnet
+    model: haiku
     timeout_s: 2700
 
   fixer_retry:
@@ -352,7 +352,7 @@ agents:
 
       Keep the diff minimal and scoped to the stated issues. No surrounding
       refactors. End your response with: "Pushed fixes to {existing_branch}."
-    model: sonnet
+    model: haiku
     timeout_s: 2700
 
   scout:

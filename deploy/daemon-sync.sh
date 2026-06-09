@@ -4,8 +4,11 @@
 #
 # Brings each repo in daemon-manifest.yaml to origin/main, restarts its
 # services when HEAD advances, and surfaces anomalies to Active Work.md.
-# v0: weaver only (weaver-watcher.service + weaver-server.service).
+# Supports both service-mode (weaver) and copy-mode (conductor) deployments.
 set -euo pipefail
+
+# Track temporary files for cleanup
+CLEANUP_FILES=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$SCRIPT_DIR/daemon-manifest.yaml"
@@ -16,18 +19,27 @@ FORGEJO_TIMEOUT=10
 FORGEJO_LAST_OK_FILE="/tmp/daemon-sync-forgejo-last-ok"
 DRY_RUN=0
 
+cleanup() {
+    for f in "${CLEANUP_FILES[@]}"; do
+        [[ -f "$f" ]] && rm -f "$f"
+    done
+}
+
+trap cleanup EXIT
+
 usage() {
     cat <<'EOF'
 Usage: deploy/daemon-sync.sh [--dry-run] [--help]
 
-Idempotent deploy sync for long-running daemon repos (v0: weaver only).
+Idempotent deploy sync for long-running daemon repos (service and copy modes).
 Reads deploy/daemon-manifest.yaml; for each repo:
   1. Manifest drift check: verify all listed units are known to systemd
   2. Dirty guard: warn+skip if deploy-source has uncommitted changes.
      Logs changed paths, last-commit time, and open-PR status via Forgejo.
      A Forgejo timeout fails to "anomalous" (never to "clean").
   3. git fetch + merge --ff-only origin/main (aborts loudly on divergence)
-  4. pip install -e only if pyproject.toml changed in pulled range
+  4. For service-mode: pip install -e only if pyproject.toml changed
+     For copy-mode: compute transitive import closure and rsync deployed files
   5. If HEAD advanced: restart each listed service in correct scope
   6. Liveness check: confirm active + fresh PID; ANOMALOUS if not
   7. Append deploy-log line when HEAD advances
@@ -380,7 +392,7 @@ except Exception as e:
 
         log "Computing import closure for seeds: ${SEEDS[*]}"
         CLOSURE_FILE=$(mktemp)
-        trap "rm -f $CLOSURE_FILE" RETURN
+        CLEANUP_FILES+=("$CLOSURE_FILE")
         if ! python3 "$SCRIPT_DIR/import_closure.py" "$COPY_FROM" "${SEEDS[@]}" > "$CLOSURE_FILE" 2>&1; then
             surface_anomaly "$repo — import_closure failed: $(cat "$CLOSURE_FILE")"
             continue
@@ -390,6 +402,8 @@ except Exception as e:
         log "Closure computed: $CLOSURE_COUNT files"
 
         # Rsync closure + config files
+        RSYNC_OUTPUT=$(mktemp)
+        CLEANUP_FILES+=("$RSYNC_OUTPUT")
         if [[ "$DRY_RUN" -eq 1 ]]; then
             echo "[dry-run] mkdir -p $COPY_TO"
             echo "[dry-run] rsync -a --no-relative --exclude='__pycache__' --files-from=$CLOSURE_FILE $COPY_FROM/ $COPY_TO/"
@@ -398,8 +412,8 @@ except Exception as e:
             done < <(get_seed_manifests "$repo")
         else
             mkdir -p "$COPY_TO"
-            if rsync -a --no-relative --exclude='__pycache__' --itemize-changes --files-from="$CLOSURE_FILE" "$COPY_FROM/" "$COPY_TO/" 2>&1 | tee /tmp/rsync-out; then
-                RSYNC_CHANGES=$(grep -c '>' /tmp/rsync-out || echo 0)
+            if rsync -a --no-relative --exclude='__pycache__' --itemize-changes --files-from="$CLOSURE_FILE" "$COPY_FROM/" "$COPY_TO/" 2>&1 | tee "$RSYNC_OUTPUT"; then
+                RSYNC_CHANGES=$(grep -c '>' "$RSYNC_OUTPUT" || echo 0)
                 log "Rsync complete: $RSYNC_CHANGES file(s) changed/added"
             else
                 surface_anomaly "$repo — rsync failed for $COPY_FROM to $COPY_TO. Check filesystem permissions and disk space."
@@ -420,7 +434,9 @@ except Exception as e:
         # Step 5: Deploy-time smoke-check (import validation)
         log "Step 5: deploy-time import smoke-check"
         if [[ "$DRY_RUN" -eq 0 ]]; then
-            PYTHONPATH="$COPY_TO:${PYTHONPATH:-}" python3 - "$COPY_TO" "${SEEDS[@]}" <<'SMOKE_CHECK'
+            SMOKE_ERR_FILE=$(mktemp)
+            CLEANUP_FILES+=("$SMOKE_ERR_FILE")
+            PYTHONPATH="$COPY_TO:${PYTHONPATH:-}" python3 - "$COPY_TO" "${SEEDS[@]}" 2>"$SMOKE_ERR_FILE" <<'SMOKE_CHECK'
 import sys, importlib
 copy_to = sys.argv[1]
 seeds = sys.argv[2:]
@@ -440,7 +456,8 @@ if failed:
 SMOKE_CHECK
             SMOKE_EXIT=$?
             if [[ $SMOKE_EXIT -ne 0 ]]; then
-                surface_anomaly "$repo — import smoke-check failed. Some deployed scripts cannot import their dependencies. Check the import closure and deployed files."
+                SMOKE_ERR=$(cat "$SMOKE_ERR_FILE" 2>/dev/null | tr '\n' ' ' || echo "unknown error")
+                surface_anomaly "$repo — import smoke-check failed. Deployed scripts cannot import dependencies: $SMOKE_ERR"
                 continue
             else
                 log "Smoke-check OK: all entry points and seed modules importable"

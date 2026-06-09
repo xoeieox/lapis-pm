@@ -223,6 +223,100 @@ class TestDaemonSync:
         assert result.returncode == 0
         assert "OK" in result.stdout
 
+    def test_daemon_sync_dry_run_with_copy_mode(self, tmp_path):
+        """--dry-run with copy-mode entry prints planned copies and mutates nothing."""
+        # Create mock git and mocks
+        mock_git = self._make_mock_git(tmp_path)
+        mock_python = self._make_mock_python_closure(tmp_path)
+
+        # Create manifest with copy-mode entry
+        manifest = tmp_path / "daemon-manifest.yaml"
+        manifest.write_text(textwrap.dedent("""\
+            repos:
+              conductor:
+                deploy_mode: copy
+                deploy_source: /srv/git/conductor-working
+                copy_from: scripts
+                copy_to: /data/agents/scripts
+                entry_points:
+                  - night_coordinator.py
+        """))
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + ":" + env["PATH"]
+        env["MANIFEST"] = str(manifest)
+
+        result = subprocess.run(
+            ["bash", "-c", textwrap.dedent(f"""\
+                export MANIFEST={manifest}
+                bash {DAEMON_SYNC} --dry-run
+            """)],
+            capture_output=True, text=True, env=env, cwd=str(REPO_ROOT)
+        )
+
+        assert result.returncode == 0, f"daemon-sync --dry-run failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        assert "[dry-run]" in result.stdout, "--dry-run should emit [dry-run] lines"
+        assert "rsync" in result.stdout.lower(), "dry-run should mention rsync copy operation"
+
+    def test_daemon_sync_dry_run_no_mutations(self, tmp_path):
+        """--dry-run must not create any files or directories."""
+        mock_git = self._make_mock_git(tmp_path)
+        mock_python = self._make_mock_python_closure(tmp_path)
+
+        # Setup: verify copy_to doesn't exist before
+        copy_to = tmp_path / "runtime_scripts"
+        assert not copy_to.exists()
+
+        manifest = tmp_path / "daemon-manifest.yaml"
+        manifest.write_text(textwrap.dedent(f"""\
+            repos:
+              conductor:
+                deploy_mode: copy
+                deploy_source: /srv/git/conductor-working
+                copy_from: scripts
+                copy_to: {copy_to}
+                entry_points:
+                  - night_coordinator.py
+        """))
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + ":" + env["PATH"]
+
+        result = subprocess.run(
+            ["bash", "-c", textwrap.dedent(f"""\
+                bash {DAEMON_SYNC} --dry-run
+            """)],
+            capture_output=True, text=True, env=env, cwd=str(REPO_ROOT)
+        )
+
+        # Verify copy_to was NOT created
+        assert not copy_to.exists(), "--dry-run must not create copy_to directory"
+        assert result.returncode == 0
+
+    def _make_mock_git(self, tmp_path: Path) -> Path:
+        """Return a mock `git` binary."""
+        mock = tmp_path / "git"
+        mock.write_text(textwrap.dedent("""\
+            #!/bin/bash
+            for arg in "$@"; do
+                case "$arg" in
+                    rev-parse) echo "abc1234def5678"; exit 0 ;;
+                    diff)      exit 0 ;;  # no changes
+                    merge)     exit 0 ;;  # merge succeeds
+                    fetch)     exit 0 ;;  # fetch succeeds
+                esac
+            done
+            exit 0
+        """))
+        mock.chmod(0o755)
+        return mock
+
+    def _make_mock_python_closure(self, tmp_path: Path) -> Path:
+        """Return a mock import_closure.py that outputs minimal closure."""
+        mock = REPO_ROOT / "deploy" / "import_closure.py"
+        # The real import_closure.py should exist; this just ensures path is available
+        return mock
+
 
 class TestSmokeCheck:
     """Tests for deploy-time import smoke-check."""

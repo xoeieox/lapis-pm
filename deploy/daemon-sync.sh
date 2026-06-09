@@ -93,15 +93,90 @@ print(m['repos']['$repo']['deploy_source'])
 "
 }
 
-get_services() {
-    # Emit TSV: unit \t scope
+get_deploy_mode() {
     local repo="$1"
     python3 -c "
 import yaml
 with open('$MANIFEST') as f:
     m = yaml.safe_load(f)
-for s in m['repos']['$repo']['services']:
+mode = m['repos']['$repo'].get('deploy_mode', 'service')
+print(mode)
+"
+}
+
+get_services() {
+    # Emit TSV: unit \t scope
+    # Tolerates missing 'services' key (returns empty for copy-mode repos)
+    local repo="$1"
+    python3 -c "
+import yaml
+with open('$MANIFEST') as f:
+    m = yaml.safe_load(f)
+for s in m['repos']['$repo'].get('services', []):
     print(s['unit'] + '\t' + s['scope'])
+"
+}
+
+# ── Copy-mode helpers ────────────────────────────────────────────────────────
+
+get_copy_from() {
+    local repo="$1"
+    python3 -c "
+import yaml
+with open('$MANIFEST') as f:
+    m = yaml.safe_load(f)
+copy_from = m['repos']['$repo'].get('copy_from')
+if copy_from:
+    print(copy_from)
+"
+}
+
+get_copy_to() {
+    local repo="$1"
+    python3 -c "
+import yaml
+with open('$MANIFEST') as f:
+    m = yaml.safe_load(f)
+copy_to = m['repos']['$repo'].get('copy_to')
+if copy_to:
+    print(copy_to)
+"
+}
+
+get_entry_points() {
+    local repo="$1"
+    python3 -c "
+import yaml
+with open('$MANIFEST') as f:
+    m = yaml.safe_load(f)
+for ep in m['repos']['$repo'].get('entry_points', []):
+    print(ep)
+"
+}
+
+get_seed_manifests() {
+    local repo="$1"
+    python3 -c "
+import yaml
+with open('$MANIFEST') as f:
+    m = yaml.safe_load(f)
+for sm in m['repos']['$repo'].get('seed_manifests', []):
+    print(sm)
+"
+}
+
+extract_producer_modules() {
+    local manifest_file="$1"
+    python3 -c "
+import yaml, sys
+try:
+    with open('$manifest_file') as f:
+        m = yaml.safe_load(f)
+    for p in m.get('producers', []):
+        print(p['module'])
+except Exception as e:
+    print(f'Error parsing $manifest_file: {e}', file=sys.stderr)
+    sys.exit(1)
 "
 }
 
@@ -144,6 +219,7 @@ surface_anomaly() {
 # ── Step 1: Manifest drift check ──────────────────────────────────────────────
 log "Step 1: manifest drift check"
 while IFS=$'\t' read -r unit scope; do
+    [[ -z "$unit" ]] && continue  # Skip empty lines (copy-mode repos with no services)
     if [[ "$scope" == "system" ]]; then
         load_state=$(systemctl show "$unit" --property=LoadState 2>/dev/null | cut -d= -f2 || echo "unknown")
     else
@@ -257,82 +333,199 @@ except Exception as e:
         log "Code: already up to date ($PRE_REV)"
     fi
 
-    # ── Step 4: conditional reinstall ────────────────────────────────────────
-    log "Step 4: checking pyproject.toml for dep/entry-point changes"
-    if [[ "$CODE_CHANGED" -eq 1 ]]; then
-        if ! git -C "$deploy_source" diff --quiet "${PRE_REV}..${POST_REV}" -- pyproject.toml 2>/dev/null; then
-            log "pyproject.toml changed — reinstalling editable package"
-            if [[ "$DRY_RUN" -eq 1 ]]; then
-                echo "[dry-run] pip install -e $deploy_source"
+    # ── Determine deploy mode and branch ──────────────────────────────────────
+    DEPLOY_MODE=$(get_deploy_mode "$repo")
+    log "Deploy mode: $DEPLOY_MODE"
+
+    if [[ "$DEPLOY_MODE" == "copy" ]]; then
+        # ── COPY MODE ────────────────────────────────────────────────────────
+        log "Step 4: copy-mode deploy (transitive closure + rsync)"
+
+        COPY_FROM_REL=$(get_copy_from "$repo")
+        COPY_TO=$(get_copy_to "$repo")
+        COPY_FROM="${deploy_source}/${COPY_FROM_REL}"
+
+        if [[ -z "$COPY_FROM_REL" || -z "$COPY_TO" ]]; then
+            surface_anomaly "$repo — copy-mode entry missing required fields: copy_from=$COPY_FROM_REL, copy_to=$COPY_TO. Check manifest."
+            continue
+        fi
+
+        if [[ ! -d "$COPY_FROM" ]]; then
+            surface_anomaly "$repo — copy_from directory not found: $COPY_FROM (deploy_source may be unmounted or misconfigured)"
+            continue
+        fi
+
+        # Collect seeds: entry_points + modules from seed_manifests
+        SEEDS=()
+        while read -r ep; do
+            [[ -n "$ep" ]] && SEEDS+=("$ep")
+        done < <(get_entry_points "$repo")
+
+        while read -r manifest; do
+            [[ -n "$manifest" ]] || continue
+            MANIFEST_FILE="${deploy_source}/${COPY_FROM_REL}/${manifest}"
+            if [[ ! -f "$MANIFEST_FILE" ]]; then
+                surface_anomaly "$repo — seed_manifest not found: $MANIFEST_FILE"
+                continue
+            fi
+            while read -r module; do
+                [[ -n "$module" ]] && SEEDS+=("$module")
+            done < <(extract_producer_modules "$MANIFEST_FILE")
+        done < <(get_seed_manifests "$repo")
+
+        if [[ ${#SEEDS[@]} -eq 0 ]]; then
+            surface_anomaly "$repo — no entry_points or seed_manifests configured. Check manifest."
+            continue
+        fi
+
+        log "Computing import closure for seeds: ${SEEDS[*]}"
+        CLOSURE_FILE=$(mktemp)
+        trap "rm -f $CLOSURE_FILE" RETURN
+        if ! python3 "$SCRIPT_DIR/import_closure.py" "$COPY_FROM" "${SEEDS[@]}" > "$CLOSURE_FILE" 2>&1; then
+            surface_anomaly "$repo — import_closure failed: $(cat "$CLOSURE_FILE")"
+            continue
+        fi
+
+        CLOSURE_COUNT=$(wc -l < "$CLOSURE_FILE")
+        log "Closure computed: $CLOSURE_COUNT files"
+
+        # Rsync closure + config files
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "[dry-run] mkdir -p $COPY_TO"
+            echo "[dry-run] rsync -a --no-relative --exclude='__pycache__' --files-from=$CLOSURE_FILE $COPY_FROM/ $COPY_TO/"
+            while read -r manifest; do
+                [[ -n "$manifest" ]] && echo "[dry-run] cp -p ${deploy_source}/${COPY_FROM_REL}/$manifest $COPY_TO/$manifest"
+            done < <(get_seed_manifests "$repo")
+        else
+            mkdir -p "$COPY_TO"
+            if rsync -a --no-relative --exclude='__pycache__' --itemize-changes --files-from="$CLOSURE_FILE" "$COPY_FROM/" "$COPY_TO/" 2>&1 | tee /tmp/rsync-out; then
+                RSYNC_CHANGES=$(grep -c '>' /tmp/rsync-out || echo 0)
+                log "Rsync complete: $RSYNC_CHANGES file(s) changed/added"
             else
-                pip install -e "$deploy_source"
+                surface_anomaly "$repo — rsync failed for $COPY_FROM to $COPY_TO. Check filesystem permissions and disk space."
+                continue
+            fi
+
+            while read -r manifest; do
+                [[ -n "$manifest" ]] || continue
+                SRC="${deploy_source}/${COPY_FROM_REL}/$manifest"
+                DST="$COPY_TO/$manifest"
+                if [[ -f "$SRC" ]]; then
+                    cp -p "$SRC" "$DST"
+                    log "Copied config: $manifest"
+                fi
+            done < <(get_seed_manifests "$repo")
+        fi
+
+        # Step 5: Deploy-time smoke-check (import validation)
+        log "Step 5: deploy-time import smoke-check"
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            PYTHONPATH="$COPY_TO:${PYTHONPATH:-}" python3 - "$COPY_TO" "${SEEDS[@]}" <<'SMOKE_CHECK'
+import sys, importlib
+copy_to = sys.argv[1]
+seeds = sys.argv[2:]
+failed = []
+for seed in seeds:
+    module_name = seed.replace('.py', '')
+    try:
+        importlib.import_module(module_name)
+    except ModuleNotFoundError as e:
+        failed.append(f"Module '{module_name}' not found: {e}")
+    except Exception as e:
+        failed.append(f"Module '{module_name}' import error: {e}")
+if failed:
+    for msg in failed:
+        print(msg, file=sys.stderr)
+    sys.exit(1)
+SMOKE_CHECK
+            SMOKE_EXIT=$?
+            if [[ $SMOKE_EXIT -ne 0 ]]; then
+                surface_anomaly "$repo — import smoke-check failed. Some deployed scripts cannot import their dependencies. Check the import closure and deployed files."
+                continue
+            else
+                log "Smoke-check OK: all entry points and seed modules importable"
+            fi
+        fi
+
+    else
+        # ── SERVICE MODE (default, weaver path unchanged) ─────────────────────
+        log "Step 4: checking pyproject.toml for dep/entry-point changes"
+        if [[ "$CODE_CHANGED" -eq 1 ]]; then
+            if ! git -C "$deploy_source" diff --quiet "${PRE_REV}..${POST_REV}" -- pyproject.toml 2>/dev/null; then
+                log "pyproject.toml changed — reinstalling editable package"
+                if [[ "$DRY_RUN" -eq 1 ]]; then
+                    echo "[dry-run] pip install -e $deploy_source"
+                else
+                    pip install -e "$deploy_source"
+                fi
+            else
+                log "No dep/entry-point change — reinstall skipped"
             fi
         else
-            log "No dep/entry-point change — reinstall skipped"
+            log "No new commits — reinstall skipped"
         fi
-    else
-        log "No new commits — reinstall skipped"
-    fi
 
-    # ── Steps 5+6: restart services + liveness check ─────────────────────────
-    if [[ "$CODE_CHANGED" -eq 0 ]]; then
-        log "Step 5: no new commits — restarts skipped"
-    else
-        log "Step 5: restarting services for $repo (HEAD advanced $PRE_REV..$POST_REV)"
-        while IFS=$'\t' read -r unit scope; do
-            # Capture pre-restart PID for liveness comparison
-            PRE_PID=""
-            if [[ "$scope" == "system" ]]; then
-                PRE_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-            else
-                PRE_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-            fi
-
-            log "Restarting $unit (scope=$scope, pre-restart PID=${PRE_PID:-unknown})"
-            if [[ "$DRY_RUN" -eq 1 ]]; then
-                [[ "$scope" == "system" ]] \
-                    && echo "[dry-run] sudo -n systemctl restart $unit" \
-                    || echo "[dry-run] systemctl --user restart $unit"
-                continue
-            fi
-
-            RESTART_OK=1
-            if [[ "$scope" == "system" ]]; then
-                sudo_or_warn systemctl restart "$unit" || RESTART_OK=0
-            else
-                if ! systemctl --user restart "$unit" 2>/dev/null; then
-                    warn "systemctl --user restart $unit failed — run manually: systemctl --user restart $unit"
-                    RESTART_OK=0
+        # ── Steps 5+6: restart services + liveness check ─────────────────────
+        if [[ "$CODE_CHANGED" -eq 0 ]]; then
+            log "Step 5: no new commits — restarts skipped"
+        else
+            log "Step 5: restarting services for $repo (HEAD advanced $PRE_REV..$POST_REV)"
+            while IFS=$'\t' read -r unit scope; do
+                [[ -z "$unit" ]] && continue
+                # Capture pre-restart PID for liveness comparison
+                PRE_PID=""
+                if [[ "$scope" == "system" ]]; then
+                    PRE_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+                else
+                    PRE_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
                 fi
-            fi
 
-            if [[ "$RESTART_OK" -eq 0 ]]; then
-                surface_anomaly "$repo — $unit restart command failed (scope=$scope). Service may still be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
-                continue
-            fi
+                log "Restarting $unit (scope=$scope, pre-restart PID=${PRE_PID:-unknown})"
+                if [[ "$DRY_RUN" -eq 1 ]]; then
+                    [[ "$scope" == "system" ]] \
+                        && echo "[dry-run] sudo -n systemctl restart $unit" \
+                        || echo "[dry-run] systemctl --user restart $unit"
+                    continue
+                fi
 
-            # Step 6: liveness check — verify active + fresh PID
-            log "Step 6: liveness check for $unit"
-            sleep 3
+                RESTART_OK=1
+                if [[ "$scope" == "system" ]]; then
+                    sudo_or_warn systemctl restart "$unit" || RESTART_OK=0
+                else
+                    if ! systemctl --user restart "$unit" 2>/dev/null; then
+                        warn "systemctl --user restart $unit failed — run manually: systemctl --user restart $unit"
+                        RESTART_OK=0
+                    fi
+                fi
 
-            POST_STATE="unknown"
-            POST_PID=""
-            if [[ "$scope" == "system" ]]; then
-                POST_STATE=$(systemctl show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
-                POST_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-            else
-                POST_STATE=$(systemctl --user show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
-                POST_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-            fi
+                if [[ "$RESTART_OK" -eq 0 ]]; then
+                    surface_anomaly "$repo — $unit restart command failed (scope=$scope). Service may still be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
+                    continue
+                fi
 
-            if [[ "$POST_STATE" != "active" ]]; then
-                surface_anomaly "$repo — $unit is not active after restart (state=$POST_STATE). Restart did not take. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit && systemctl status $unit" || echo "systemctl --user restart $unit && systemctl --user status $unit")"
-            elif [[ -n "$PRE_PID" && "$PRE_PID" != "0" && "$POST_PID" == "$PRE_PID" ]]; then
-                surface_anomaly "$repo — $unit PID unchanged after restart (PID=$POST_PID). Service may be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
-            else
-                log "Liveness OK: $unit active (state=$POST_STATE, PID ${PRE_PID:-?}→${POST_PID:-?})"
-            fi
-        done < <(get_services "$repo")
+                # Step 6: liveness check — verify active + fresh PID
+                log "Step 6: liveness check for $unit"
+                sleep 3
+
+                POST_STATE="unknown"
+                POST_PID=""
+                if [[ "$scope" == "system" ]]; then
+                    POST_STATE=$(systemctl show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
+                    POST_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+                else
+                    POST_STATE=$(systemctl --user show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
+                    POST_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+                fi
+
+                if [[ "$POST_STATE" != "active" ]]; then
+                    surface_anomaly "$repo — $unit is not active after restart (state=$POST_STATE). Restart did not take. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit && systemctl status $unit" || echo "systemctl --user restart $unit && systemctl --user status $unit")"
+                elif [[ -n "$PRE_PID" && "$PRE_PID" != "0" && "$POST_PID" == "$PRE_PID" ]]; then
+                    surface_anomaly "$repo — $unit PID unchanged after restart (PID=$POST_PID). Service may be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
+                else
+                    log "Liveness OK: $unit active (state=$POST_STATE, PID ${PRE_PID:-?}→${POST_PID:-?})"
+                fi
+            done < <(get_services "$repo")
+        fi
     fi
 
     # ── Deploy log ────────────────────────────────────────────────────────────

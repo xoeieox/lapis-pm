@@ -1,18 +1,34 @@
-# Daemon deploy manifest — v0: weaver only
+# Daemon deploy manifest — v0: weaver (service-mode) + conductor (copy-mode)
 #
-# Schema: repos.<name>.deploy_source + .services[{unit, scope}]
-#   deploy_source: editable-install path (NON-uniform per repo — verify before adding)
-#   scope: "system" = sudo systemctl | "user" = systemctl --user
+# Schema:
+#   Service-mode repos: deploy_source + services[{unit, scope}]
+#     deploy_source: editable-install path
+#     services: list of systemd units to restart on code change
+#   Copy-mode repos: deploy_source + copy_from + copy_to + entry_points + seed_manifests
+#     deploy_source: -working tree to ff-only-pull
+#     copy_from: source dir within deploy_source (e.g., scripts)
+#     copy_to: runtime dir where scripts are deployed (e.g., /data/agents/scripts)
+#     entry_points: list of seed scripts (filenames like night_coordinator.py)
+#     seed_manifests: optional config files with declared modules (e.g., night_producers.yaml)
 #
-# v0 ships weaver ONLY. mem-server and slot-server are named follow-ons
-# (daemon-deploy-sync-v1) — add only after deploy_source and scope are
-# each verified via `pip show <pkg> | grep "Editable project location"`
-# and `systemctl`/`systemctl --user` inspection.
+# v0 ships weaver (service) and conductor (copy). mem-server and slot-server are
+# named follow-ons (daemon-deploy-sync-v1).
 repos:
   weaver:
+    deploy_mode: service                           # default when omitted
     deploy_source: /srv/git/weaver-working        # editable-installed from -working (verified 2026-06-08)
     services:
       - unit: weaver-watcher.service
         scope: system                              # User=user, /etc/systemd/system
       - unit: weaver-server.service
         scope: user                                # systemctl --user, ~/.config/systemd/user
+
+  conductor:
+    deploy_mode: copy
+    deploy_source: /srv/git/conductor-working
+    copy_from: scripts
+    copy_to: /data/agents/scripts
+    entry_points:
+      - night_coordinator.py
+    seed_manifests:
+      - night_producers.yaml

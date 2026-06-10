@@ -125,8 +125,12 @@ def classify(repo: str, pr_number: int, spec_summary: str,
     For advisory/hold targets: static checks only; Opus reviewer is dispatched
     by pm_core's review-gate loop (not here).
     """
-    pr = get_pr(repo, pr_number)
-    diff_text = get_pr_diff(repo, pr_number)
+    if "/" in repo:
+        owner, repo_name = repo.split("/", 1)
+    else:
+        repo_name, owner = repo, None
+    pr = get_pr(repo_name, pr_number, owner=owner)
+    diff_text = get_pr_diff(repo_name, pr_number, owner=owner)
 
     paths = changed_paths(diff_text)
     loc = diff_loc(diff_text)

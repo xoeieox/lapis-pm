@@ -469,7 +469,11 @@ def _act_merge_pr(target_id: str, pr_number: int | None) -> str:
         raise ValueError("target has no pm_repo")
     if pr_number is None:
         raise ValueError("pr_number required for merge_pr action")
-    _merge_pr(repo, pr_number)
+    if "/" in repo:
+        owner, repo_name = repo.split("/", 1)
+    else:
+        repo_name, owner = repo, None
+    _merge_pr(repo_name, pr_number, owner=owner)
     return f"merged PR #{pr_number} in {repo}"
 
 

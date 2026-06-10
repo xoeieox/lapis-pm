@@ -499,7 +499,8 @@ def _validate_already_satisfied_pr(repo: str, pr_num: int) -> bool:
     if not repo or not _forgejo_get_pr:
         return False
     try:
-        pr_data = _forgejo_get_pr(repo, pr_num)
+        repo_name, owner = _repo_owner(repo)
+        pr_data = _forgejo_get_pr(repo_name, pr_num, owner=owner)
         return bool(pr_data.get("merged") and pr_data.get("state") == "closed")
     except Exception:
         return False
@@ -868,7 +869,8 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     if agent_type == "fixer_retry" and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
-            for pr in _get_open_prs(target.pm_repo):
+            repo_name, owner = _repo_owner(target.pm_repo)
+            for pr in _get_open_prs(repo_name, owner=owner):
                 pr_ref = (pr.get("head") or {}).get("ref", "")
                 if pr_ref.startswith(f"lapis/{target_id}/") or (
                     _adopted_branch and pr_ref == _adopted_branch
@@ -1414,11 +1416,12 @@ def _is_auto_land_eligible(target_id: str) -> bool:
     if _forgejo_get_pr is not None and _forgejo_get_branch is not None:
         if target and target.pm_repo:
             try:
-                pr_data = _forgejo_get_pr(target.pm_repo, max(merged))
+                repo_name, owner = _repo_owner(target.pm_repo)
+                pr_data = _forgejo_get_pr(repo_name, max(merged), owner=owner)
                 head_ref = (pr_data.get("head") or {}).get("ref", "")
                 if head_ref:
                     try:
-                        _forgejo_get_branch(target.pm_repo, head_ref)
+                        _forgejo_get_branch(repo_name, head_ref, owner=owner)
                         # Branch still exists — not yet eligible
                         return False
                     except Exception:
@@ -1910,6 +1913,17 @@ def _gpu_output_path(task_id: str) -> Path | None:
     return None
 
 
+def _repo_owner(pm_repo: str) -> tuple[str, str | None]:
+    """Split pm_repo into (repo, owner) on first /; return (repo, None) for bare names.
+
+    Examples: "lapis/coderag" -> ("coderag", "lapis"), "conductor" -> ("conductor", None)
+    """
+    if "/" in pm_repo:
+        owner, repo = pm_repo.split("/", 1)
+        return repo, owner
+    return pm_repo, None
+
+
 def _branch_belongs(target_id: str, branch: str) -> bool:
     return branch.startswith(f"lapis/{target_id}/")
 
@@ -1925,7 +1939,8 @@ def _perceive_prs(
     if not get_open_prs:
         return [], False
     try:
-        prs = get_open_prs(repo)
+        repo_name, owner = _repo_owner(repo)
+        prs = get_open_prs(repo_name, owner=owner)
     except Exception as e:
         episodic.write_observation(
             target_id, f"PR fetch failed for {repo}: {e}",

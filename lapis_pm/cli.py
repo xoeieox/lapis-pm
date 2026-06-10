@@ -694,7 +694,11 @@ def _print_target_status(t, explain: bool = False):
     # Review-gate loop context (shown when a review loop is active)
     try:
         from agents_core.forgejo import get_open_prs
-        open_prs = get_open_prs(t.pm_repo) if t.pm_repo else []
+        if t.pm_repo:
+            repo_name, owner = pm_core._repo_owner(t.pm_repo)
+            open_prs = get_open_prs(repo_name, owner=owner)
+        else:
+            open_prs = []
         from . import pm_core as _pm
         review_state = _pm._active_review_state(t.id, open_prs)
         if review_state:

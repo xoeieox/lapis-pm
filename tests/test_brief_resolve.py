@@ -261,7 +261,7 @@ def test_act_merge_pr_calls_forgejo():
     ):
         MockStore.return_value.get.return_value = mock_target
         result = _act_merge_pr("test-tid", 17)
-    mock_merge.assert_called_once_with("test-repo", 17)
+    mock_merge.assert_called_once_with("test-repo", 17, owner=None)
     assert "17" in result
 
 
@@ -491,7 +491,7 @@ def test_apply_decision_merge_pr_succeeds():
 
     assert result["ok"] is True
     assert result["action_kind"] == "merge_pr"
-    mock_merge.assert_called_once_with("test-repo", 99)
+    mock_merge.assert_called_once_with("test-repo", 99, owner=None)
 
 
 # ---------------------------------------------------------------------------

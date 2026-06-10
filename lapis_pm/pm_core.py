@@ -119,6 +119,23 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
     # be listed here — code-only syncs will not restart it otherwise.
 }
 
+# --user units that import agents_core from /data/agents. Restarted via
+# `systemctl --user restart` (no sudo) — the hook runs as user with
+# XDG_RUNTIME_DIR=/run/user/1000 set by lapis-pm.service.
+#
+# §2.3 three-element note (agents-core-data-agents-auto-deploy-v0):
+# 1. Architectural fact: the pip editable-install meta-path finder in /data/agents
+#    dominates all `import agents_core` regardless of PYTHONPATH; /data/agents is
+#    the actual import root for these units.
+# 2. Failure consequence: a pull failure on /data/agents means these units run stale
+#    code with no signal — hence agents-core is in _POST_LAND_PULL_CRITICAL above.
+# 3. Growth obligation: when a third entry is added here, add a runtime audit guard
+#    (grep ~/.config/systemd/user/*.service for agents_core importers; log loudly if
+#    any is absent from this map). See spec §5 tripwire.
+_POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
+    "agents-core": ("doorman-server.service", "slot-server.service"),
+}
+
 _POST_LAND_PULL: dict[str, list[str]] = {
     # Deploy clone only — this is the run path after the WorkingDirectory repoint.
     # cwd-precedence means python3 -m lapis_pm.cli imports from here, not the
@@ -126,7 +143,9 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # tree; it is intentionally NOT on the runtime path and pull failures there
     # must not block or alert.
     "lapis-pm":       ["/srv/git/lapis-pm"],
-    "agents-core":    ["/srv/git/agents-core-working"],
+    # Two paths: the working clone (system-unit runners) + the editable-install
+    # root /data/agents (--user unit runtime). Both must track origin/main.
+    "agents-core":    ["/srv/git/agents-core-working", "/data/agents"],
     # code-reviewer services are Type=oneshot timer-fired; they re-import on each
     # fire, so a pull (no restart) is sufficient.  Pull failure → LOW signal so a
     # stale nightly sweep is attributable without polluting the critical channel.
@@ -134,10 +153,10 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     "code-reviewer":  ["/srv/git/code-reviewer-working"],
 }
 
-# For lapis-pm, the first (and only) entry in _POST_LAND_PULL is the runtime
-# deploy clone. A failed pull there must alert; it means the next tick will run
-# stale code.  Failures for other repos (agents-core) are best-effort / stderr-only.
-_POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm"})
+# lapis-pm: failed pull → next tick runs stale code.
+# agents-core: failed pull on /data/agents → --user units (doorman, slot) silently
+# run stale code with no signal, which is the exact gap this unit closes.
+_POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core"})
 
 # Repos whose pull failure emits a LOW-priority notification (not critical, not silent).
 # code-reviewer: timer-oneshot services — stale code is a degraded nightly sweep, not
@@ -361,25 +380,67 @@ def _post_land_deploy_hook(repo: str | None) -> None:
     if not repo:
         return
     units = _POST_LAND_RESTART.get(repo)
-    if not units:
-        return
-    for unit in units:
-        try:
-            result = subprocess.run(
-                ["sudo", "-n", "systemctl", "restart", unit],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode != 0:
+    if units:
+        for unit in units:
+            try:
+                result = subprocess.run(
+                    ["sudo", "-n", "systemctl", "restart", unit],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    print(
+                        f"[post-land-deploy] restart {unit} failed "
+                        f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                        file=sys.stderr,
+                    )
+            except (subprocess.TimeoutExpired, OSError) as e:
                 print(
-                    f"[post-land-deploy] restart {unit} failed "
-                    f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                    f"[post-land-deploy] restart {unit} errored: {e}",
                     file=sys.stderr,
                 )
-        except (subprocess.TimeoutExpired, OSError) as e:
+
+    user_units = _POST_LAND_RESTART_USER.get(repo)
+    if user_units:
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if not xdg:
             print(
-                f"[post-land-deploy] restart {unit} errored: {e}",
+                f"[post-land-deploy] XDG_RUNTIME_DIR unset — cannot reach user bus, "
+                f"skipping user-unit restarts: {list(user_units)}",
                 file=sys.stderr,
             )
+        else:
+            for unit in user_units:
+                try:
+                    result = subprocess.run(
+                        ["systemctl", "--user", "restart", unit],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if result.returncode != 0:
+                        print(
+                            f"[post-land-deploy] user-unit restart {unit} failed "
+                            f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                            file=sys.stderr,
+                        )
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    print(
+                        f"[post-land-deploy] user-unit restart {unit} errored: {e}",
+                        file=sys.stderr,
+                    )
+                    continue
+                # Post-restart liveness (best-effort). Runs whether restart rc was 0 or non-0.
+                try:
+                    active = subprocess.run(
+                        ["systemctl", "--user", "is-active", unit],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if active.stdout.strip() != "active":
+                        print(
+                            f"[post-land-deploy] user unit {unit} not active after restart "
+                            f"(state={active.stdout.strip()!r})",
+                            file=sys.stderr,
+                        )
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
 
 
 def _read_fixer_meta(spec_id: str) -> dict | None:

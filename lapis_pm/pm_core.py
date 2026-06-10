@@ -1344,9 +1344,10 @@ def _encode_merged_prs(target_id: str, repo: str) -> int:
     seen = _seen_pr_ids(target_id)
     already_noted = _merged_pr_numbers_observed(target_id)
     new_obs = 0
+    repo_name, owner = _repo_owner(repo)
     for pr_num in sorted(seen - already_noted):
         try:
-            pr_data = _forgejo_get_pr(repo, pr_num)
+            pr_data = _forgejo_get_pr(repo_name, pr_num, owner=owner)
         except Exception:
             continue
         if pr_data.get("merged") and pr_data.get("state") == "closed":
@@ -2239,11 +2240,9 @@ def _has_pending_dispatch(target_id: str) -> bool:
 
 def _act_merge(target_id: str, payload: dict) -> str:
     cls: authority.PRClassification = payload["classification"]
-    # merge_pr uses OWNER='Erah' hardcoded in forgejo_api.py. Auto-merge only
-    # works on Erah/* repos; conductor/* repos will fail here and fall through
-    # to the except branch, logging a pm:hold instead of merging.
     try:
-        merge_pr(cls.repo, cls.pr_number)
+        repo_name, owner = _repo_owner(cls.repo)
+        merge_pr(repo_name, cls.pr_number, owner=owner)
     except Exception as e:
         episodic.write_hold(
             target_id,

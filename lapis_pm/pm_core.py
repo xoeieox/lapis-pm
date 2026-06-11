@@ -862,11 +862,50 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
                 f"(#{_adopted_pr_num}) — "
                 "dispatch a reviewer instead of the initial fixer"
             )
+
+    # L1.D1: Extend initial-fixer guard to check for open lapis/<tid>/ PRs
+    if agent_type == "fixer" and target.pm_repo:
+        try:
+            from agents_core.forgejo import get_open_prs as _get_open_prs
+            repo_name, owner = _repo_owner(target.pm_repo)
+            _adopted_branch = target.data.get("adopted_head_branch") or ""
+            for pr in _get_open_prs(repo_name, owner=owner):
+                pr_ref = (pr.get("head") or {}).get("ref", "")
+                if pr_ref.startswith(f"lapis/{target_id}/") or (
+                    _adopted_branch and pr_ref == _adopted_branch
+                ):
+                    pr_num = pr.get("number", "?")
+                    raise ValueError(
+                        f"target {target_id} already has open PR #{pr_num} on {pr_ref} — "
+                        "dispatch a reviewer/fixer_retry, not a new initial fixer"
+                    )
+        except ValueError:
+            raise
+        except Exception:
+            # Degrade-open on Forgejo error; never wedge dispatch on transient API failure
+            import sys
+            print(f"[L1.D1-forgejo-warning] {target_id}: open-PR scan failed; proceeding with dispatch", file=sys.stderr)
+
+    # L1.D3: Target-level concurrency guard for initial fixers
+    if agent_type == "fixer":
+        existing_dispatches = load_dispatched(target_id)
+        for record in existing_dispatches:
+            if (record.get("status") == "pending" and
+                record.get("agent_type") in ("fixer", "fixer_retry")):
+                gpu_id = record.get("gpu_id", "unknown")
+                rec_agent = record.get("agent_type", "unknown")
+                raise ValueError(
+                    f"target {target_id} has a pending {rec_agent} dispatch ({gpu_id}) — "
+                    "not firing a concurrent initial fixer"
+                )
+
     spec_sum = episodic.spec_summary(target_id)
     _adopted_branch = target.data.get("adopted_head_branch") or ""
     existing_branch = _adopted_branch if _adopted_branch else f"lapis/{target_id}/forced"
     base_branch = "main"
-    if agent_type == "fixer_retry" and target.pm_repo:
+    slug = "forced"
+    # L1.D2: Widen open-PR/canonical-branch reuse lookup to include fixer (not just fixer_retry)
+    if agent_type in ("fixer", "fixer_retry") and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -877,6 +916,9 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
                 ):
                     existing_branch = pr_ref
                     base_branch = (pr.get("base") or {}).get("ref", "main")
+                    # Extract slug from the branch name (last component after /)
+                    if pr_ref.startswith(f"lapis/{target_id}/"):
+                        slug = pr_ref.split("/")[-1]
                     break
         except Exception:
             pass
@@ -886,7 +928,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "repo": target.pm_repo or "",
         "question": intent,
         "pr_number": "",
-        "slug": "forced",
+        "slug": slug,
         "existing_branch": existing_branch,
         "base_branch": base_branch,
     }

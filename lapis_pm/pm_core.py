@@ -2074,7 +2074,7 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
             message = (
                 f"Deviant-branch PR #{pr_number} on {head} is not traceable to target {target_id}.\n"
                 f"Markers found: tid={markers.get('tid')}, gpu_id={markers.get('gpu_id')}\n"
-                f"Options: adopt (manually link to target), close (dismiss this PR), or ignore (leave for later)."
+                f"Options: adopt (link to this target), dismiss, or ignore."
             )
             b = brief.synthesize(
                 target_id,

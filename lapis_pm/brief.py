@@ -504,7 +504,7 @@ def _act_adopt_pr(target_id: str, pr_number: int | None) -> str:
     """Adopt a deviant-branch PR: set adopted_head_branch + adopted_pr_number, emit observation."""
     from agents_core.targets import TargetStore
     try:
-        from agents_core.forgejo import get_pr_detail
+        from agents_core.forgejo import get_pr
     except ImportError as exc:
         raise RuntimeError(f"forgejo not available: {exc}") from exc
 
@@ -523,7 +523,7 @@ def _act_adopt_pr(target_id: str, pr_number: int | None) -> str:
         repo_name, owner = repo, None
 
     # Fetch PR details to get head ref
-    pr = get_pr_detail(repo_name, pr_number, owner=owner)
+    pr = get_pr(repo_name, pr_number, owner=owner)
     if pr is None:
         raise ValueError(f"PR #{pr_number} not found in {repo}")
 

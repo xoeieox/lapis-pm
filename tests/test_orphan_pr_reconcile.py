@@ -5,6 +5,7 @@ These tests verify:
 2. Traceability detection
 3. Auto-adoption of traceable deviant-branch PRs
 4. Brief generation for untraceable PRs
+5. Brief option resolution via adopt_pr action
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from lapis_pm import pm_core
+from lapis_pm import pm_core, brief
 
 
 class TestMarkerExtraction:
@@ -293,3 +294,124 @@ class TestTemplateMarkers:
         marker_section = fixer_template[body_start:]
         assert "lapis-gpu-id" in marker_section, "lapis-gpu-id not in PR body section"
         assert "lapis-tid" in marker_section, "lapis-tid not in PR body section"
+
+
+class TestAdoptAction:
+    """Test the adopt_pr brief option resolution."""
+
+    def test_adopt_pr_action_sets_adoption_fields(self):
+        """Adopting a PR via brief option sets adopted_head_branch and adopted_pr_number."""
+        # Mock the target
+        mock_target = MagicMock()
+        mock_target.pm_repo = "my-repo"
+        mock_target.data = {}
+
+        # Mock TargetStore.get to return our mock target
+        with (
+            patch("agents_core.targets.TargetStore") as mock_store_class,
+            patch("agents_core.forgejo.get_pr") as mock_get_pr,
+            patch("lapis_pm.episodic.write_observation") as mock_obs,
+        ):
+            mock_store = MagicMock()
+            mock_store.get.return_value = mock_target
+            mock_store_class.return_value = mock_store
+
+            # Mock the PR return value from get_pr
+            mock_get_pr.return_value = {
+                "number": 42,
+                "head": {"ref": "lapis/feature-branch"}
+            }
+
+            # Call _act_adopt_pr
+            result = brief._act_adopt_pr("my-target", pr_number=42)
+
+            # Assert adoption fields were set
+            assert mock_target.data["adopted_head_branch"] == "lapis/feature-branch"
+            assert mock_target.data["adopted_pr_number"] == 42
+            mock_target.save.assert_called_once()
+
+            # Assert observation was emitted with pm:orphan-adopted tag
+            mock_obs.assert_called_once()
+            call_args = mock_obs.call_args
+            assert "pm:orphan-adopted" in call_args.kwargs.get("extra_tags", [])
+
+            # Assert result message indicates successful adoption
+            assert "adopted PR #42" in result
+
+    def test_adopt_pr_action_via_apply_decision(self):
+        """Test adopt_pr action through the full apply_decision path."""
+        # Create mock target
+        mock_target = MagicMock()
+        mock_target.pm_repo = "my-repo"
+        mock_target.data = {}
+
+        # Create the brief options JSON that would be in a pm:brief-options comment
+        options_json = {
+            "brief_id": "cid-123",
+            "trigger": "orphan-pr-untraceable",
+            "options": [
+                {
+                    "id": "A",
+                    "label": "Adopt this PR into the PM loop",
+                    "action": {"kind": "adopt_pr", "pr": 42}
+                },
+                {
+                    "id": "B",
+                    "label": "Dismiss (leave PR open)",
+                    "action": {"kind": "acknowledge_and_clear"}
+                },
+            ]
+        }
+
+        with (
+            patch("agents_core.targets.TargetStore") as mock_store_class,
+            patch("agents_core.forgejo.get_pr") as mock_get_pr,
+            patch("lapis_pm.episodic.write_observation") as mock_obs,
+            patch("lapis_pm.brief.read_options") as mock_read_options,
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core.get_outstanding_brief") as mock_get_brief,
+            patch("lapis_pm.pm_core.clear_outstanding_brief") as mock_clear_brief,
+        ):
+            mock_store = MagicMock()
+            mock_store.get.return_value = mock_target
+            mock_store_class.return_value = mock_store
+
+            # Mock get_pr to return PR details
+            mock_get_pr.return_value = {
+                "number": 42,
+                "head": {"ref": "lapis/feature-branch"}
+            }
+
+            # Mock read_options to return our options JSON
+            mock_read_options.return_value = options_json
+
+            # Mock mem to indicate no prior resolution
+            mock_mem.return_value.get.return_value = None
+            mock_mem.return_value.set = MagicMock()
+
+            # Mock current outstanding brief
+            mock_get_brief.return_value = "cid-123"
+
+            # Call apply_decision with adopt option
+            result = brief.apply_decision("my-target", "cid-123", "A")
+
+            # Assert success
+            assert result["ok"] is True
+            assert result["action_kind"] == "adopt_pr"
+
+            # Assert adoption fields were set on target
+            assert mock_target.data["adopted_head_branch"] == "lapis/feature-branch"
+            assert mock_target.data["adopted_pr_number"] == 42
+            mock_target.save.assert_called_once()
+
+            # Assert observation was written with pm:orphan-adopted tag
+            obs_calls = mock_obs.call_args_list
+            # Two observations: one from _act_adopt_pr, one from apply_decision (brief-resolved)
+            orphan_adopted_obs = [
+                c for c in obs_calls
+                if "pm:orphan-adopted" in c.kwargs.get("extra_tags", [])
+            ]
+            assert len(orphan_adopted_obs) > 0, "Missing pm:orphan-adopted observation"
+
+            # Assert outstanding brief was cleared
+            mock_clear_brief.assert_called_once()

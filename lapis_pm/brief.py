@@ -105,8 +105,8 @@ Rules:
 # Closed-form trigger → options definitions
 # ---------------------------------------------------------------------------
 
-# The four supported action kinds.  Any other string is an error.
-_ACTION_KINDS = {"merge_pr", "force_dispatch_retry", "pause_target", "unbind_target", "acknowledge_and_clear"}
+# The five supported action kinds.  Any other string is an error.
+_ACTION_KINDS = {"merge_pr", "force_dispatch_retry", "pause_target", "unbind_target", "acknowledge_and_clear", "adopt_pr"}
 
 # Closed-form trigger strings → option list templates.
 # For merge_pr actions the actual pr number is injected at synthesize() time
@@ -163,11 +163,11 @@ _CLOSED_FORM_TRIGGERS: dict[str, list[dict]] = {
         {
             "id": "A",
             "label": "Adopt this PR into the PM loop",
-            "action": {"kind": "force_dispatch_retry"},
+            "action": {"kind": "adopt_pr"},
         },
         {
             "id": "B",
-            "label": "Close this PR",
+            "label": "Dismiss (leave PR open)",
             "action": {"kind": "acknowledge_and_clear"},
         },
         {
@@ -325,10 +325,13 @@ def _write_options_sibling(
     if not option_templates:
         return
     options = copy.deepcopy(option_templates)
-    # Inject pr_number into merge_pr actions when known.
+    # Inject pr_number into merge_pr and adopt_pr actions when known.
     if pr_number is not None:
         for opt in options:
-            if opt.get("action", {}).get("kind") == "merge_pr":
+            kind = opt.get("action", {}).get("kind")
+            if kind == "merge_pr":
+                opt["action"]["pr"] = pr_number
+            elif kind == "adopt_pr":
                 opt["action"]["pr"] = pr_number
     payload = {
         "brief_id": brief_id,
@@ -430,6 +433,9 @@ def apply_decision(target_id: str, brief_id: str, option_id: str) -> dict:
         if kind == "merge_pr":
             pr_number = action.get("pr")
             result_detail = _act_merge_pr(target_id, pr_number)
+        elif kind == "adopt_pr":
+            pr_number = action.get("pr")
+            result_detail = _act_adopt_pr(target_id, pr_number)
         elif kind == "force_dispatch_retry":
             result_detail = _act_force_dispatch_retry(target_id, brief_id)
         elif kind == "pause_target":
@@ -492,6 +498,52 @@ def _act_merge_pr(target_id: str, pr_number: int | None) -> str:
         repo_name, owner = repo, None
     _merge_pr(repo_name, pr_number, owner=owner)
     return f"merged PR #{pr_number} in {repo}"
+
+
+def _act_adopt_pr(target_id: str, pr_number: int | None) -> str:
+    """Adopt a deviant-branch PR: set adopted_head_branch + adopted_pr_number, emit observation."""
+    from agents_core.targets import TargetStore
+    try:
+        from agents_core.forgejo import get_pr_detail
+    except ImportError as exc:
+        raise RuntimeError(f"forgejo not available: {exc}") from exc
+
+    if pr_number is None:
+        raise ValueError("pr_number required for adopt_pr action")
+
+    store = TargetStore()
+    target = store.get(target_id)
+    if target is None:
+        raise ValueError(f"target {target_id} not found")
+
+    repo = target.pm_repo or ""
+    if "/" in repo:
+        owner, repo_name = repo.split("/", 1)
+    else:
+        repo_name, owner = repo, None
+
+    # Fetch PR details to get head ref
+    pr = get_pr_detail(repo_name, pr_number, owner=owner)
+    if pr is None:
+        raise ValueError(f"PR #{pr_number} not found in {repo}")
+
+    head_ref = (pr.get("head") or {}).get("ref") or ""
+    if not head_ref:
+        raise ValueError(f"PR #{pr_number} has no head ref")
+
+    # Adopt the PR: set adopted_head_branch and adopted_pr_number
+    target.data["adopted_head_branch"] = head_ref
+    target.data["adopted_pr_number"] = pr_number
+    target.save()
+
+    # Emit observation
+    episodic.write_observation(
+        target_id,
+        f"Adopted orphan PR #{pr_number} on branch {head_ref} into PM loop",
+        extra_tags=["pm:orphan-adopted", f"pm:pr={pr_number}"],
+    )
+
+    return f"adopted PR #{pr_number} on {head_ref}"
 
 
 def _act_force_dispatch_retry(target_id: str, brief_comment_id: str) -> str:

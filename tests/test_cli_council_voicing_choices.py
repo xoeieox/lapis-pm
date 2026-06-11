@@ -95,8 +95,8 @@ def test_spec_review_council_voicing_invalid_rejected(tmp_path):
     assert "invalid choice" in err.lower(), "error should mention invalid choice"
 
 
-def test_spec_review_council_voicing_default_local(tmp_path):
-    """spec-review without --council-voicing defaults to local."""
+def test_spec_review_council_voicing_default_gravitywell(tmp_path):
+    """spec-review without --council-voicing defaults to gravitywell."""
     spec_file = tmp_path / "spec.md"
     spec_file.write_text("# Spec: Test\n**Target ID:** `test-id`\n**Repo:** `lapis-pm`\n**Authority:** advisory\n")
 
@@ -113,7 +113,7 @@ def test_spec_review_council_voicing_default_local(tmp_path):
         )
 
     assert rc == 0
-    assert captured_args.get("council_voicing") == "local", "default should be local"
+    assert captured_args.get("council_voicing") == "gravitywell", "default should be gravitywell"
 
 
 # ---------------------------------------------------------------------------

@@ -340,6 +340,12 @@ agents:
       existing branch. Do NOT open a new PR. Role separation is architectural:
       reviewer = read-only, fixer = write-only.
 
+      NOTE: fixer_retry does not create PRs — it pushes to an existing PR branch.
+      The HTML-comment traceability markers (lapis-gpu-id, lapis-tid) are not
+      applicable to fixer_retry. These markers are embedded in the fixer template
+      only, which creates PRs and has the opportunity to set them. For details see
+      lapis-pm-fixer-orphan-reconcile-v0 (L2.D0).
+
       ## Mem check first (before editing code)
 
       Load relevant context from mem:

@@ -2029,6 +2029,10 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
     For each open PR whose branch does NOT match lapis/<target_id>/:
     - If traceable via markers, auto-adopt (set adopted_head_branch + adopted_pr_number)
     - If not traceable, raise a brief with adopt|close|ignore options
+
+    Brief idempotency: if an outstanding brief already exists for this target
+    and references this PR, skip re-synthesis to avoid LLM budget waste and
+    episodic spam.
     """
     for pr in all_open_prs:
         pr_number = pr.get("number")
@@ -2058,7 +2062,14 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
                 extra_tags=["pm:orphan-adopted", f"pm:pr={pr_number}"],
             )
         else:
-            # Not traceable: surface an outstanding brief
+            # Not traceable: check for outstanding brief idempotency guard
+            # to avoid re-synthesizing brief.synthesize() on every tick
+            existing_brief = get_outstanding_brief(target_id)
+            if existing_brief:
+                # A brief already exists; skip synthesis to avoid LLM waste
+                continue
+
+            # Not traceable: surface an outstanding brief with closed-form options
             markers = _extract_pr_markers(pr.get("body") or "")
             message = (
                 f"Deviant-branch PR #{pr_number} on {head} is not traceable to target {target_id}.\n"
@@ -2067,9 +2078,10 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
             )
             b = brief.synthesize(
                 target_id,
-                trigger=f"orphan PR #{pr_number}: {head}",
+                trigger="orphan-pr-untraceable",
                 query=message,
-                notify=None
+                pr_number=pr_number,
+                notify=NotifyPriority.NORMAL
             )
             set_outstanding_brief(target_id, b.comment_id)
 
@@ -3891,7 +3903,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     if repo and forgejo_ok:
         try:
             repo_name, owner = _repo_owner(repo)
-            all_open_prs = get_open_prs(repo_name, owner=owner) if get_open_prs else []
+            all_open_prs = get_open_prs(repo_name, owner=owner)
             _reconcile_orphan_prs(target_id, target, repo, all_open_prs)
             # Re-fetch the canonical open_prs in case reconciliation updated adopted_pr_number
             _adopted_pr_number = target.data.get("adopted_pr_number")

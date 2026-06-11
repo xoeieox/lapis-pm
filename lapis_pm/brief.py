@@ -159,6 +159,23 @@ _CLOSED_FORM_TRIGGERS: dict[str, list[dict]] = {
             "action": {"kind": "unbind_target"},
         },
     ],
+    "orphan-pr-untraceable": [
+        {
+            "id": "A",
+            "label": "Adopt this PR into the PM loop",
+            "action": {"kind": "force_dispatch_retry"},
+        },
+        {
+            "id": "B",
+            "label": "Close this PR",
+            "action": {"kind": "acknowledge_and_clear"},
+        },
+        {
+            "id": "C",
+            "label": "Ignore for now",
+            "action": {"kind": "acknowledge_and_clear"},
+        },
+    ],
 }
 
 # Directive consumer path

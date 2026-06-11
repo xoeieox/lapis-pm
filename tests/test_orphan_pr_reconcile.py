@@ -204,6 +204,7 @@ class TestReconciliation:
 
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
             patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
@@ -220,7 +221,7 @@ class TestReconciliation:
         # Should create a brief
         mock_brief.assert_called_once()
         call_args = mock_brief.call_args
-        assert "orphan" in call_args.kwargs["trigger"].lower()
+        assert call_args.kwargs["trigger"] == "orphan-pr-untraceable"
         assert "not traceable" in call_args.kwargs["query"].lower()
 
         # Should set outstanding brief
@@ -230,3 +231,65 @@ class TestReconciliation:
         mock_obs.assert_called()
         call_args = mock_obs.call_args
         assert "pm:orphan-untraceable" in call_args.kwargs.get("extra_tags", [])
+
+    def test_idempotency_skip_existing_brief(self):
+        """Skip brief synthesis if one already exists for the target."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 42,
+            "body": "No markers",
+            "head": {"ref": "some/random/branch"}
+        }
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value="cid-existing"),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            pm_core._reconcile_orphan_prs("my-target", target, "my-repo", [pr])
+
+        # Should NOT synthesize a new brief (idempotency guard)
+        mock_brief.assert_not_called()
+        # Should NOT write observation for new brief
+        mock_obs.assert_not_called()
+
+
+class TestTemplateMarkers:
+    """Test that the fixer template includes HTML comment traceability markers.
+
+    L2.D0 requires fixer template to embed HTML-comment markers for orphan PR
+    reconciliation. This is an integration test of variable substitution.
+    """
+
+    def test_fixer_template_contains_markers(self):
+        """Verify fixer template YAML includes lapis-gpu-id and lapis-tid markers."""
+        import yaml
+        from pathlib import Path
+
+        registry_path = Path(__file__).parent.parent / "lapis_pm" / "registry.yaml"
+        with open(registry_path) as f:
+            registry_data = yaml.safe_load(f)
+
+        fixer_template = registry_data.get("agents", {}).get("fixer", {}).get("system_template", "")
+        assert "<!-- lapis-gpu-id:" in fixer_template, "Missing lapis-gpu-id marker in fixer template"
+        assert "<!-- lapis-tid:" in fixer_template, "Missing lapis-tid marker in fixer template"
+
+    def test_fixer_template_markers_in_pr_body(self):
+        """Verify markers are positioned in PR body creation for substitution."""
+        import yaml
+        from pathlib import Path
+
+        registry_path = Path(__file__).parent.parent / "lapis_pm" / "registry.yaml"
+        with open(registry_path) as f:
+            registry_data = yaml.safe_load(f)
+
+        fixer_template = registry_data.get("agents", {}).get("fixer", {}).get("system_template", "")
+        # Markers should appear in the PR body creation section (around create_pr call)
+        assert "body=" in fixer_template
+        body_start = fixer_template.find("body=")
+        marker_section = fixer_template[body_start:]
+        assert "lapis-gpu-id" in marker_section, "lapis-gpu-id not in PR body section"
+        assert "lapis-tid" in marker_section, "lapis-tid not in PR body section"

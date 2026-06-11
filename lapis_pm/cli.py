@@ -1851,7 +1851,7 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument(
         "--council-voicing",
         default="local",
-        choices=["local", "haiku", "sonnet", "opus"],
+        choices=["local", "gravitywell", "haiku", "sonnet", "opus"],
         dest="council_voicing",
         help="Voicing for Mirror Council deliberation (default: local).",
     )

@@ -1850,10 +1850,10 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("spec_path", help="Path to the spec markdown file.")
     sr.add_argument(
         "--council-voicing",
-        default="local",
+        default="gravitywell",
         choices=["local", "gravitywell", "haiku", "sonnet", "opus"],
         dest="council_voicing",
-        help="Voicing for Mirror Council deliberation (default: local).",
+        help="Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, zero paid spend; Sonnet fallback if GW is down).",
     )
     sr.add_argument(
         "--timeout",

@@ -1103,7 +1103,7 @@ could not extract a JSON verdict from the output. See chain-sibling \
 
 def run_spec_review(
     spec_path: Path,
-    council_voicing: str = "local",
+    council_voicing: str = "gravitywell",
     timeout_s: int = 1800,
     repo_override: str | None = None,
     authority: str | None = None,

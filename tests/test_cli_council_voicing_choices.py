@@ -4,9 +4,11 @@ Verifies:
   - gravitywell is accepted as a valid choice
   - existing choices (local, haiku, sonnet, opus) still work
   - unknown values are rejected
+  - run_spec_review() function signature defaults to gravitywell
 """
 
 import argparse
+import inspect
 import sys
 from io import StringIO
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from lapis_pm.cli import main
+from lapis_pm.spec_review import run_spec_review
 
 
 def test_spec_review_council_voicing_gravitywell_accepted(tmp_path):
@@ -114,6 +117,16 @@ def test_spec_review_council_voicing_default_gravitywell(tmp_path):
 
     assert rc == 0
     assert captured_args.get("council_voicing") == "gravitywell", "default should be gravitywell"
+
+
+def test_run_spec_review_function_signature_default():
+    """run_spec_review() function signature defaults council_voicing to gravitywell."""
+    sig = inspect.signature(run_spec_review)
+    council_voicing_param = sig.parameters['council_voicing']
+    assert council_voicing_param.default == 'gravitywell', (
+        f"run_spec_review() council_voicing default should be 'gravitywell', "
+        f"got {council_voicing_param.default!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1971,6 +1971,115 @@ def _branch_belongs(target_id: str, branch: str) -> bool:
     return branch.startswith(f"lapis/{target_id}/")
 
 
+def _extract_pr_markers(pr_body: str | None) -> dict[str, str | None]:
+    """Extract lapis traceability markers from PR body.
+
+    Returns {"gpu_id": <id> | None, "tid": <id> | None}
+    Searches for HTML comments: <!-- lapis-gpu-id: <id> --> and <!-- lapis-tid: <id> -->
+    """
+    if not pr_body:
+        return {"gpu_id": None, "tid": None}
+
+    gpu_id = None
+    tid = None
+
+    # Search for lapis-gpu-id marker; capture non-whitespace until -->
+    gpu_match = re.search(r'<!--\s*lapis-gpu-id:\s*(\S+?)\s*-->', pr_body)
+    if gpu_match:
+        gpu_id = gpu_match.group(1)
+
+    # Search for lapis-tid marker; capture non-whitespace until -->
+    tid_match = re.search(r'<!--\s*lapis-tid:\s*(\S+?)\s*-->', pr_body)
+    if tid_match:
+        tid = tid_match.group(1)
+
+    return {"gpu_id": gpu_id, "tid": tid}
+
+
+def _is_pr_traceable_to_target(target_id: str, pr: dict) -> bool:
+    """Check if a PR is traceable back to this target via markers or dispatch records.
+
+    Returns True if:
+    1. PR body has lapis-tid marker matching this target, OR
+    2. PR body has lapis-gpu-id marker matching a dispatched gpu_id for this target
+    """
+    pr_body = (pr.get("body") or "")
+    markers = _extract_pr_markers(pr_body)
+
+    # Explicit tid marker takes precedence
+    if markers["tid"] == target_id:
+        return True
+
+    # Check if gpu_id matches any dispatch record for this target
+    if markers["gpu_id"]:
+        try:
+            dispatched = load_dispatched(target_id)
+            for record in dispatched:
+                if record.get("gpu_id") == markers["gpu_id"]:
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[dict]) -> None:
+    """Reconciliation pass: check for deviant-branch PRs and auto-adopt traceable ones.
+
+    For each open PR whose branch does NOT match lapis/<target_id>/:
+    - If traceable via markers, auto-adopt (set adopted_head_branch + adopted_pr_number)
+    - If not traceable, raise a brief with adopt|close|ignore options
+    """
+    for pr in all_open_prs:
+        pr_number = pr.get("number")
+        head = (pr.get("head") or {}).get("ref") or ""
+
+        # Skip canonical-branch PRs (already adopted by _perceive_prs logic)
+        if _branch_belongs(target_id, head):
+            continue
+
+        # Skip already-adopted PRs
+        if target.data.get("adopted_pr_number") == pr_number:
+            continue
+
+        # Check if this deviant PR is traceable to this target
+        if _is_pr_traceable_to_target(target_id, pr):
+            # Auto-adopt: set adopted_head_branch and adopted_pr_number
+            target.data["adopted_head_branch"] = head
+            target.data["adopted_pr_number"] = pr_number
+            target.save()
+
+            markers = _extract_pr_markers(pr.get("body") or "")
+            episodic.write_observation(
+                target_id,
+                f"Orphan PR #{pr_number} on branch {head} auto-adopted "
+                f"(traceable via lapis-tid={markers.get('tid') or 'N/A'} "
+                f"lapis-gpu-id={markers.get('gpu_id') or 'N/A'})",
+                extra_tags=["pm:orphan-adopted", f"pm:pr={pr_number}"],
+            )
+        else:
+            # Not traceable: surface an outstanding brief
+            markers = _extract_pr_markers(pr.get("body") or "")
+            message = (
+                f"Deviant-branch PR #{pr_number} on {head} is not traceable to target {target_id}.\n"
+                f"Markers found: tid={markers.get('tid')}, gpu_id={markers.get('gpu_id')}\n"
+                f"Options: adopt (manually link to target), close (dismiss this PR), or ignore (leave for later)."
+            )
+            b = brief.synthesize(
+                target_id,
+                trigger=f"orphan PR #{pr_number}: {head}",
+                query=message,
+                notify=None
+            )
+            set_outstanding_brief(target_id, b.comment_id)
+
+            episodic.write_observation(
+                target_id,
+                f"Orphan PR #{pr_number} on {head} not traceable; raised brief {b.comment_id}",
+                extra_tags=["pm:orphan-untraceable", f"pm:pr={pr_number}", f"pm:brief={b.comment_id}"],
+            )
+
+
 def _perceive_prs(
     target_id: str, repo: str, adopted_pr_number: int | None = None
 ) -> tuple[list[dict], bool]:
@@ -3777,6 +3886,21 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     open_prs, forgejo_ok = (
         _perceive_prs(target_id, repo, _adopted_pr_number) if repo else ([], False)
     )
+
+    # 2.5. Orphan PR reconciliation (L2.D1): detect and auto-adopt traceable deviant-branch PRs
+    if repo and forgejo_ok:
+        try:
+            repo_name, owner = _repo_owner(repo)
+            all_open_prs = get_open_prs(repo_name, owner=owner) if get_open_prs else []
+            _reconcile_orphan_prs(target_id, target, repo, all_open_prs)
+            # Re-fetch the canonical open_prs in case reconciliation updated adopted_pr_number
+            _adopted_pr_number = target.data.get("adopted_pr_number")
+            open_prs, _ = _perceive_prs(target_id, repo, _adopted_pr_number)
+        except Exception as e:
+            episodic.write_observation(
+                target_id, f"Orphan PR reconciliation failed: {e}",
+                extra_tags=["pm:error", "pm:orphan-reconcile-failed"],
+            )
 
     # 3. Encode
     encoded = 0

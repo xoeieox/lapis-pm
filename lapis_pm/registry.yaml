@@ -247,16 +247,30 @@ agents:
 
       Required steps (execute, don't narrate):
       1. `pwd` to confirm you are in the {repo} working clone (dispatch sets
-         cwd for you), then `git fetch origin main`.
-      2. Create branch `lapis/{target_id}/{slug}` off main with `git checkout -b`.
-      3. Use Read/Grep to inspect relevant files; use Edit or Write to apply
+         cwd for you), then `git fetch origin {base_branch}` (base_branch={base_branch}).
+      2. **Fresh-base guard (L2.D2):** If working on an existing PR branch (existing_branch={existing_branch}),
+         verify the base is not superseded: `git merge-base --is-ancestor origin/{base_branch} origin/{existing_branch}`.
+         If this check fails (exit code nonzero), the base has moved past this branch's fork point —
+         **abort cleanly: exit with non-zero status and open NO PR. Do NOT create a verdict file.**
+         This triggers the daemon's _find_lost_fixer_dispatches → _act_lost_fixer_retry path to retry off fresh state.
+      3. Create branch `lapis/{target_id}/{slug}` off {base_branch} (or check out {existing_branch} if it exists):
+         - If {existing_branch} == `lapis/{target_id}/{slug}`, just check it out: `git checkout {existing_branch} && git pull`.
+         - If {existing_branch} != `lapis/{target_id}/{slug}`, branch off {base_branch}: `git checkout -b lapis/{target_id}/{slug} origin/{base_branch}`.
+      4. Use Read/Grep to inspect relevant files; use Edit or Write to apply
          the minimal fix described in the user prompt.
-      4. Run any obviously relevant tests (pytest, etc.) if a test suite exists.
-      5. `git add` only the files you changed, `git commit` with a clear message,
-         `git push -u origin lapis/{target_id}/{slug}`.
-      6. Open a PR via the Forgejo API helper:
+      5. Run any obviously relevant tests (pytest, etc.) if a test suite exists.
+      6. `git add` only the files you changed, `git commit` with a clear message,
+         `git push -u origin lapis/{target_id}/{slug}` (or just `git push origin` if already tracking).
+      7. Open a PR via the Forgejo API helper:
          `cd /data/agents && export $(grep FORGEJO_TOKEN /data/agents/config/conductor.env | xargs)`
-         then `python3 -c "from agents_core.forgejo import create_pr; print(create_pr(repo='{repo}'.split('/')[-1], title='...', head='lapis/{target_id}/{slug}', base='main', body='...'))"`
+         then determine the task_id by querying `mem get "pm/dispatched/{target_id}" | jq -r '.[-1].gpu_id'` (the most recent dispatch),
+         then `python3 -c "from agents_core.forgejo import create_pr; print(create_pr(repo='{repo}'.split('/')[-1], title='...', head='lapis/{target_id}/{slug}', base='main', body='<PR title and description>\n\n<!-- lapis-gpu-id: <task_id> -->\n<!-- lapis-tid: {target_id} -->'))"`
+
+      **PR body requirement:** Every PR MUST include HTML-comment traceability markers:
+      - `<!-- lapis-gpu-id: <task_id> -->` (the GPU queue task ID for this dispatch)
+      - `<!-- lapis-tid: {target_id} -->` (the Lapis PM target ID)
+      These markers enable orphan-PR reconciliation (deviant-branch PRs are auto-adopted if
+      traceable). See lapis-pm-fixer-orphan-reconcile-v0 for details.
 
       Keep the diff minimal and scoped to the stated issue. No surrounding
       refactors. End your response with the PR URL returned by create_pr.

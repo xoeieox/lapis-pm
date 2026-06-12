@@ -2423,7 +2423,8 @@ def _pr_mergeable(repo_name: str, pr_number: int, owner: str | None = None) -> b
     return None
 
 
-def _act_needs_review(target_id: str, cls: authority.PRClassification, reason: str) -> str:
+def _act_needs_review(target_id: str, cls: authority.PRClassification, reason: str,
+                      base_branch: str | None = None) -> str:
     """Route a PR with merge conflicts to NEEDS_REVIEW state (first-class, state-only).
 
     Writes a conflict-specific brief, marks PR classified, sets outstanding brief.
@@ -2433,7 +2434,7 @@ def _act_needs_review(target_id: str, cls: authority.PRClassification, reason: s
     episodic.write_hold(
         target_id,
         f"PR #{cls.pr_number} cannot merge cleanly — {reason}.\n"
-        f"Base branch: {cls.base_branch or 'main'}\n"
+        f"Base branch: {base_branch or 'main'}\n"
         f"Title: {cls.title}\n{cls.html_url}\n\n"
         f"The branch has diverged from the base. Rebase and re-push, or merge manually.",
         extra_tags=[f"pm:repo={cls.repo}", f"pm:pr={cls.pr_number}", "pm:needs-review"],
@@ -2446,13 +2447,15 @@ def _act_needs_review(target_id: str, cls: authority.PRClassification, reason: s
         screen_issues=None,
         notify=NotifyPriority.NORMAL,
     )
-    set_outstanding_brief_verified(target_id, b.comment_id)
     _mark_pr_classified(target_id, cls.pr_number)
+    set_outstanding_brief_verified(target_id, b.comment_id)
+    _post_write_sweep_brief(target_id, b.comment_id)
     return f"action:needs_review:pr={cls.pr_number}:reason={reason}"
 
 
 def _act_merge(target_id: str, payload: dict) -> str:
     cls: authority.PRClassification = payload["classification"]
+    pr: dict = payload.get("pr", {})
     repo_name, owner = _repo_owner(cls.repo)
 
     # Dry-run-merge discipline (guaardvark@51d9829c131d, merge_manager.check_conflicts):
@@ -2461,7 +2464,8 @@ def _act_merge(target_id: str, payload: dict) -> str:
     # first-class NEEDS_REVIEW state, not a swallowed failure.
     mergeable = _pr_mergeable(repo_name, cls.pr_number, owner)
     if mergeable is False:
-        return _act_needs_review(target_id, cls, reason="merge_conflict")
+        base_branch = (pr.get("base") or {}).get("ref") or "main"
+        return _act_needs_review(target_id, cls, reason="merge_conflict", base_branch=base_branch)
     # mergeable is True  -> clean path (unchanged below)
     # mergeable is None   -> indeterminate (still computing / field absent):
     #                        fall through to existing attempt-then-catch path

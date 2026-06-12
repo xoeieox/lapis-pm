@@ -16,6 +16,9 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
   Noop:   noop:no_change | noop:paused | noop:reviewer_in_flight:pr=N:cycle=K
           | noop:fixer_in_flight:dispatch=ID | noop:awaiting_chain_dependency:waiting_on=TID
   Action: action:auto_merge:pr=N | action:auto_land:pr=N:arc=PATH
+          | action:needs_review:pr=N:reason=... (merge conflict, cannot merge cleanly)
+          | action:merge_attempted:mergeability_unknown:pr=N (mergeable=None, indeterminate)
+          | action:merge_failed:... (merge API/transient failure)
           | action:reviewer_dispatched:pr=N:cycle=K
           | action:fixer_dispatched:source=(init|retry):...
           | action:brief_emitted:kind=KIND:cid=CID | action:brief_decision_applied:BID:OID
@@ -2401,10 +2404,75 @@ def _has_pending_dispatch(target_id: str) -> bool:
 # Act
 # ---------------------------------------------------------------------------
 
+def _pr_mergeable(repo_name: str, pr_number: int, owner: str | None = None) -> bool | None:
+    """Check if a PR can merge cleanly via Forgejo.
+
+    Returns:
+      True   - PR can merge cleanly
+      False  - PR has conflicts and cannot merge
+      None   - Mergeability is indeterminate (Forgejo still computing, or get_pr failed)
+
+    Tolerant of get_pr raising — returns None to allow fall-through to attempt-then-catch.
+    """
+    try:
+        pr = _forgejo_get_pr(repo_name, pr_number, owner=owner)
+        if pr:
+            return pr.get("mergeable")
+    except Exception:
+        pass
+    return None
+
+
+def _act_needs_review(target_id: str, cls: authority.PRClassification, reason: str,
+                      base_branch: str | None = None) -> str:
+    """Route a PR with merge conflicts to NEEDS_REVIEW state (first-class, state-only).
+
+    Writes a conflict-specific brief, marks PR classified, sets outstanding brief.
+    Per spec: NEEDS_REVIEW is state-only (no buttons in this target); button wiring
+    is the follow-on lapis-pm-needs-review-buttons-v0.
+    """
+    episodic.write_hold(
+        target_id,
+        f"PR #{cls.pr_number} cannot merge cleanly — {reason}.\n"
+        f"Base branch: {base_branch or 'main'}\n"
+        f"Title: {cls.title}\n{cls.html_url}\n\n"
+        f"The branch has diverged from the base. Rebase and re-push, or merge manually.",
+        extra_tags=[f"pm:repo={cls.repo}", f"pm:pr={cls.pr_number}", "pm:needs-review"],
+    )
+    b = brief.synthesize(
+        target_id,
+        trigger=f"PR #{cls.pr_number} needs review — cannot merge cleanly",
+        query=f"PR #{cls.pr_number} merge conflict: {cls.title}",
+        diff_snippet=cls.diff or None,
+        screen_issues=None,
+        notify=NotifyPriority.NORMAL,
+    )
+    _mark_pr_classified(target_id, cls.pr_number)
+    set_outstanding_brief_verified(target_id, b.comment_id)
+    _post_write_sweep_brief(target_id, b.comment_id)
+    return f"action:needs_review:pr={cls.pr_number}:reason={reason}"
+
+
 def _act_merge(target_id: str, payload: dict) -> str:
     cls: authority.PRClassification = payload["classification"]
+    pr: dict = payload.get("pr", {})
+    repo_name, owner = _repo_owner(cls.repo)
+
+    # Dry-run-merge discipline (guaardvark@51d9829c131d, merge_manager.check_conflicts):
+    # never issue a merge we haven't proven applies cleanly. Forgejo already computes
+    # mergeability — read it instead of merging blind. A not-mergeable PR is a
+    # first-class NEEDS_REVIEW state, not a swallowed failure.
+    mergeable = _pr_mergeable(repo_name, cls.pr_number, owner)
+    if mergeable is False:
+        base_branch = (pr.get("base") or {}).get("ref") or "main"
+        return _act_needs_review(target_id, cls, reason="merge_conflict", base_branch=base_branch)
+    # mergeable is True  -> clean path (unchanged below)
+    # mergeable is None   -> indeterminate (still computing / field absent):
+    #                        fall through to existing attempt-then-catch path
+    #                        (no regression vs today). Per ⚑ Decision 2(A): emit the
+    #                        distinct outcome string merge_attempted:mergeability_unknown
+    #                        so audit record keeps the two epistemic states distinct.
     try:
-        repo_name, owner = _repo_owner(cls.repo)
         merge_pr(repo_name, cls.pr_number, owner=owner)
     except Exception as e:
         episodic.write_hold(
@@ -2413,6 +2481,8 @@ def _act_merge(target_id: str, payload: dict) -> str:
             extra_tags=[f"pm:repo={cls.repo}"],
         )
         return f"action:merge_failed:{e}"
+
+    # Success path — only reached if mergeable is True or None and merge succeeded
     episodic.write_merge(
         target_id,
         f"Auto-merged PR #{cls.pr_number} ({cls.title}) — "
@@ -2420,6 +2490,8 @@ def _act_merge(target_id: str, payload: dict) -> str:
         extra_tags=[f"pm:repo={cls.repo}", f"pm:pr={cls.pr_number}"],
     )
     _mark_pr_classified(target_id, cls.pr_number)
+    if mergeable is None:
+        return f"action:merge_attempted:mergeability_unknown:pr={cls.pr_number}"
     return f"action:auto_merge:pr={cls.pr_number}"
 
 

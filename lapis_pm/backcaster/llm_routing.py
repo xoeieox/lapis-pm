@@ -1,6 +1,7 @@
 """Backcaster LLM routing — model-aware sync dispatch.
 
-Qwen  → call_operator (local backend, synchronous)
+GravityWell → call_operator (local backend, synchronous)
+Qwen        → call_operator (local backend, synchronous)
 Opus/Sonnet/Haiku → call_claude_cli (claude -p subprocess, synchronous)
 
 Timeout auto-bump: Anthropic-family calls enforce a floor of 300s since
@@ -21,6 +22,8 @@ _MODEL_NAMES = {
 }
 
 _ANTHROPIC_TIMEOUT_FLOOR = 300  # seconds
+
+_GRAVITYWELL_WAKE_FAIL = "skip"  # GravityWell unavailable: skip without paid fallback
 
 try:
     from agents_core.llm import call_operator
@@ -44,7 +47,19 @@ def call_model_sync(
 
     Returns the response string, or None if the call could not be made.
     """
-    if model == "qwen":
+    if model == "gravitywell":
+        if call_operator is None:
+            log.warning("call_model_sync: call_operator unavailable; returning None")
+            return None
+        return call_operator(
+            "gravitywell",
+            prompt=prompt,
+            system=system,
+            json_mode=json_mode,
+            timeout=timeout,
+            on_wake_fail=_GRAVITYWELL_WAKE_FAIL,
+        )
+    elif model == "qwen":
         if call_operator is None:
             log.warning("call_model_sync: call_operator unavailable; returning None")
             return None

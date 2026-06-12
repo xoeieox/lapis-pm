@@ -193,6 +193,13 @@ def run_backcaster(
     prompt_hashes["decompose"] = decomp_hash
     log.info("backcaster: decompose produced %d preconditions (%.1fs)", len(preconditions), time.monotonic() - t0)
 
+    # Detect GravityWell unavailability (skip path, no paid fallback)
+    if model == "gravitywell" and not preconditions and not stub:
+        slug = _derive_slug(Path(goal_file))
+        log.warning("BACKCASTER_GW_UNAVAILABLE: goal=%s skipped, no paid fallback — rerun when GW up", slug)
+        if "gravitywell" not in degraded_paths:
+            degraded_paths.append("gravitywell")
+
     # ------------------------------------------------------------------
     # Stage 2: Gap analysis
     # ------------------------------------------------------------------

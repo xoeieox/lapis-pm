@@ -54,6 +54,36 @@ def test_opus_timeout_floor():
     assert kwargs.get("timeout") == 300
 
 
+def test_gravitywell_routes_to_call_operator():
+    """model='gravitywell' delegates to call_operator with 'gravitywell' as first arg and on_wake_fail forwarded."""
+    from lapis_pm.backcaster.llm_routing import call_model_sync, _GRAVITYWELL_WAKE_FAIL
+
+    with patch("lapis_pm.backcaster.llm_routing.call_operator", return_value="gravitywell result") as mock_op:
+        result = call_model_sync("gravitywell", "prompt")
+
+    mock_op.assert_called_once()
+    assert mock_op.call_args.args[0] == "gravitywell"
+    assert mock_op.call_args.kwargs.get("on_wake_fail") == _GRAVITYWELL_WAKE_FAIL
+    assert result == "gravitywell result"
+
+
+def test_gravitywell_call_operator_unavailable_returns_none():
+    """If call_operator is None, call_model_sync('gravitywell', ...) returns None."""
+    from lapis_pm.backcaster import llm_routing
+
+    original_op = llm_routing.call_operator
+    try:
+        llm_routing.call_operator = None
+
+        from lapis_pm.backcaster.llm_routing import call_model_sync
+
+        result = call_model_sync("gravitywell", "prompt")
+    finally:
+        llm_routing.call_operator = original_op
+
+    assert result is None
+
+
 def test_import_error_returns_none():
     """If both call_operator and call_claude_cli are None, call_model_sync returns None."""
     from lapis_pm.backcaster import llm_routing

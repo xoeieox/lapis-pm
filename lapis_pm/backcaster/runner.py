@@ -123,7 +123,7 @@ def run_backcaster(
     axes: list[str] | None = None,
     corpus_paths: list[str] | None = None,
     scenario_ids: list[str] | None = None,
-    model: str = "qwen",
+    model: str = "gravitywell",
     out_dir: str | Path | None = None,
     stub: bool = False,
     allow_degraded: bool = False,
@@ -189,12 +189,12 @@ def run_backcaster(
     # ------------------------------------------------------------------
     log.info("backcaster: stage 1 — decompose")
     t0 = time.monotonic()
-    preconditions, decomp_hash = decompose(goal_text, axes=axes, model=model, stub=stub)
+    preconditions, decomp_hash, gw_skipped = decompose(goal_text, axes=axes, model=model, stub=stub)
     prompt_hashes["decompose"] = decomp_hash
     log.info("backcaster: decompose produced %d preconditions (%.1fs)", len(preconditions), time.monotonic() - t0)
 
     # Detect GravityWell unavailability (skip path, no paid fallback)
-    if model == "gravitywell" and not preconditions and not stub:
+    if gw_skipped:
         slug = _derive_slug(Path(goal_file))
         log.warning("BACKCASTER_GW_UNAVAILABLE: goal=%s skipped, no paid fallback — rerun when GW up", slug)
         if "gravitywell" not in degraded_paths:

@@ -134,17 +134,18 @@ def decompose(
     axes: list[str] | None = None,
     model: str = "qwen",
     stub: bool = False,
-) -> tuple[list[Precondition], str]:
+) -> tuple[list[Precondition], str, bool]:
     """Decompose goal_text into preconditions.
 
-    Returns (preconditions, prompt_hash).
+    Returns (preconditions, prompt_hash, gw_skipped).
+    gw_skipped=True only when model='gravitywell' and call_model_sync returned None.
     """
     if axes is None:
         axes = list(AXES)
 
     if stub or os.environ.get("BACKCASTER_STUB") == "1":
         preconditions = _preconditions_from_stub(axes)
-        return preconditions, "stub:decompose"
+        return preconditions, "stub:decompose", False
 
     prompt = (
         f"Goal-state to decompose:\n\n{goal_text}\n\n"
@@ -157,19 +158,23 @@ def decompose(
         raw = call_model_sync(model, prompt=prompt, system=_SYSTEM_PROMPT, json_mode=True, timeout=120)
     except Exception as exc:  # noqa: BLE001
         log.warning("decompose: LLM call failed (%s); returning empty preconditions", exc)
-        return [], prompt_hash
+        return [], prompt_hash, False
 
     if raw is None:
-        log.warning("decompose: LLM returned None; returning empty preconditions")
-        return [], prompt_hash
+        gw_skipped = model == "gravitywell"
+        if gw_skipped:
+            log.warning("decompose: GravityWell unavailable; returning empty preconditions")
+        else:
+            log.warning("decompose: LLM returned None; returning empty preconditions")
+        return [], prompt_hash, gw_skipped
 
     try:
         preconditions = _parse_decomposition(raw, axes)
     except Exception as exc:  # noqa: BLE001
         log.warning("decompose: parse failed (%s); returning empty preconditions", exc)
-        return [], prompt_hash
+        return [], prompt_hash, False
 
-    return preconditions, prompt_hash
+    return preconditions, prompt_hash, False
 
 
 def _preconditions_from_stub(axes: list[str]) -> list[Precondition]:

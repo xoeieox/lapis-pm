@@ -2,7 +2,7 @@
 
 Wired into the main lapis-pm CLI as:
   lapis-pm backcaster <goal-file> [--axes ax1,ax2,...] [--corpus PATH]
-                       [--scenarios <run-ids>] [--model opus|sonnet|qwen]
+                       [--scenarios <run-ids>] [--model gravitywell|qwen|sonnet|opus]
                        [--out /srv/lapis/backcaster/runs/<run-id>/]
 """
 from __future__ import annotations
@@ -39,11 +39,9 @@ def cmd_backcaster(args) -> int:
     scenarios_raw: str | None = getattr(args, "scenarios", None)
     scenario_ids = [s.strip() for s in scenarios_raw.split(",")] if scenarios_raw else None
 
-    # Spec default is opus; v0 interim default is qwen because the ClaudeQueue
-    # synchronous-call surface for Anthropic-family models is not yet implemented
-    # (see agents-core-claude-queue-sync-surface-v0). Passing --model opus will
-    # raise a clear RuntimeError rather than silently downgrading.
-    model: str = getattr(args, "model", "qwen") or "qwen"
+    # Spec default is opus; current default is gravitywell (owned 122B local).
+    # Fallback to gravitywell if for any reason the argparse default is not applied.
+    model: str = getattr(args, "model", "gravitywell") or "gravitywell"
     out_dir: str | None = getattr(args, "out", None)
     allow_degraded: bool = bool(getattr(args, "allow_degraded", False))
 

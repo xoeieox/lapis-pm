@@ -1944,9 +1944,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bc.add_argument(
         "--model",
-        default="qwen",
-        choices=["qwen", "sonnet", "opus"],
-        help="LLM model to use (default: qwen).",
+        default="gravitywell",
+        choices=["gravitywell", "qwen", "sonnet", "opus"],
+        help="LLM model to use (default: gravitywell - owned 122B local).",
     )
     bc.add_argument(
         "--out",

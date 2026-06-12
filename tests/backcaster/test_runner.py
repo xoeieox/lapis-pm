@@ -384,3 +384,54 @@ def test_run_id_collision_appends_hex_suffix(tmp_path):
     assert _re.search(r"-[0-9a-f]{4}$", name), (
         f"Expected run_dir name to end with -{{4hex}}, got: {name}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test: GravityWell unavailability → legible skip signal
+# ---------------------------------------------------------------------------
+
+def test_gravitywell_unavailable_emits_warning_and_degraded_marker(tmp_path, caplog):
+    """When GravityWell is unavailable (call_model_sync returns None),
+    run_backcaster emits BACKCASTER_GW_UNAVAILABLE warning and marks the
+    roadmap.md with 'GW UNAVAILABLE' degraded marker.
+    """
+    import unittest.mock as mock
+    import logging
+    from lapis_pm.backcaster import decompose as decompose_module
+
+    goal = tmp_path / "goal.md"
+    goal.write_text("test goal\n")
+
+    out_dir = tmp_path / "out"
+
+    # Capture logs from the runner logger
+    caplog.set_level(logging.WARNING, logger="lapis_pm.backcaster.runner")
+
+    # Mock call_model_sync to return None for gravitywell, simulating unavailability
+    with mock.patch.object(
+        decompose_module, "call_model_sync", return_value=None
+    ):
+        from lapis_pm.backcaster.runner import run_backcaster
+
+        run_dir = run_backcaster(goal, model="gravitywell", out_dir=out_dir, stub=False, allow_degraded=True)
+
+    # Verify BACKCASTER_GW_UNAVAILABLE warning was emitted
+    assert "BACKCASTER_GW_UNAVAILABLE" in caplog.text, (
+        f"Expected 'BACKCASTER_GW_UNAVAILABLE' warning in logs. Got:\n{caplog.text}"
+    )
+
+    # Verify the roadmap.md contains 'GW UNAVAILABLE'
+    roadmap_path = run_dir / "roadmap.md"
+    assert roadmap_path.exists(), f"roadmap.md not found in {run_dir}"
+
+    roadmap_content = roadmap_path.read_text()
+    assert "GW UNAVAILABLE" in roadmap_content, (
+        f"Expected 'GW UNAVAILABLE' marker in roadmap.md. Got:\n{roadmap_content}"
+    )
+
+    # Verify run.yaml has gravitywell in degraded_paths
+    run_yaml_path = run_dir / "run.yaml"
+    run_meta = yaml.safe_load(run_yaml_path.read_text())
+    assert "gravitywell" in run_meta.get("degraded_paths", []), (
+        f"Expected 'gravitywell' in degraded_paths. Got: {run_meta.get('degraded_paths')}"
+    )

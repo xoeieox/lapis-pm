@@ -106,11 +106,24 @@ def _render_roadmap(
     lines: list[str] = []
 
     if degraded_paths:
-        deps = ", ".join(degraded_paths)
-        lines.append(
-            f"> WARNING: DEGRADED RUN: grounding unavailable [{deps}]"
-            f" - gap analysis is model-reasoned, not corpus-grounded.\n"
-        )
+        if "gravitywell" in degraded_paths:
+            lines.append(
+                "> WARNING: GW UNAVAILABLE - skipped, no fallback. "
+                "Rerun when GravityWell is up.\n"
+            )
+            # Remove gravitywell from the display list since we have a dedicated message
+            other_deps = [d for d in degraded_paths if d != "gravitywell"]
+            if other_deps:
+                deps = ", ".join(other_deps)
+                lines.append(
+                    f"> Also unavailable [{deps}] - gap analysis is model-reasoned, not corpus-grounded.\n"
+                )
+        else:
+            deps = ", ".join(degraded_paths)
+            lines.append(
+                f"> WARNING: DEGRADED RUN: grounding unavailable [{deps}]"
+                f" - gap analysis is model-reasoned, not corpus-grounded.\n"
+            )
 
     lines.append(f"# Backcaster Roadmap")
     lines.append(f"\n**Run:** `{run_id}`\n")

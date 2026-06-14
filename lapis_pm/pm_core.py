@@ -174,6 +174,76 @@ _DEPLOY_CURRENCY_COOLDOWN_SECS = 3600  # alert at most once per hour
 _DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
 
 
+def _ensure_head_branch_deleted(repo: str, pr_number: int, *, owner: str | None = None) -> None:
+    """Ensure the head branch of a PR is deleted, idempotently.
+
+    Best-effort. If Forgejo honors delete_branch_after_merge, the branch is
+    already gone and get_branch returns 404 (normal path). If the flag is not
+    honored or stale state persists, an explicit DELETE is issued. Either way,
+    the branch ends deleted. If both probes fail, log and continue — do not
+    raise. This guard is a safety backstop, not a critical operation.
+    """
+    if not _forgejo_get_pr or not _forgejo_get_branch:
+        return  # forgejo not available
+    try:
+        pr = _forgejo_get_pr(repo, pr_number, owner=owner)
+        ref = pr.get("head", {}).get("ref") if pr else None
+        if not ref:
+            return  # can't determine branch
+        try:
+            _forgejo_get_branch(repo, ref, owner=owner)
+        except Exception as e:
+            # 404 or other error — if 404, branch is already deleted (normal).
+            # For other errors, log and continue (best-effort).
+            if "404" in str(e) or "not found" in str(e).lower():
+                return  # already deleted
+            logger.warning("_ensure_head_branch_deleted: get_branch failed: %s", e)
+            # fall through to explicit DELETE attempt
+        # branch still exists — issue explicit DELETE
+        try:
+            import httpx
+            default_owner = owner or (repo.split("/", 1)[0] if "/" in repo else "Erah")
+            repo_name = repo.split("/", 1)[-1] if "/" in repo else repo
+            url = f"https://203.0.113.10:3000/api/v1/repos/{default_owner}/{repo_name}/branches/{ref}"
+            headers = {}
+            token = os.environ.get("FORGEJO_TOKEN")
+            if token:
+                headers["Authorization"] = f"token {token}"
+            resp = httpx.delete(url, headers=headers, timeout=10, verify=False)
+            if resp.status_code not in (204, 404):
+                logger.warning(
+                    "_ensure_head_branch_deleted: DELETE failed with status %d",
+                    resp.status_code,
+                )
+        except Exception as e:
+            logger.warning("_ensure_head_branch_deleted: DELETE attempt failed: %s", e)
+    except Exception as e:
+        logger.warning("_ensure_head_branch_deleted: outer exception (non-fatal): %s", e)
+
+
+def merge_and_deploy(repo: str, pr_number: int, *, owner: str | None = None) -> dict:
+    """Merge a PR and immediately bring its deploy clone(s) to origin/main.
+
+    Single chokepoint for every merge path. Deploy currency must NOT depend on
+    the daemon auto-land gate (merged + branch-deleted + no-pending + 60s race),
+    which has silently left agents-core --user units on stale code.
+
+    The hook is best-effort and never raises: a failed ff-only pull already
+    alerts loudly (Pushover) inside _post_land_deploy_hook, and a merge that
+    succeeded must never be reported as failed because the follow-on pull hit a
+    dirty/diverged clone. _act_auto_land keeps its own hook call as an
+    idempotent backstop — firing twice is a no-op (ff-only pull of an
+    already-current clone changes nothing).
+    """
+    result = merge_pr(repo, pr_number, owner=owner)  # raises on real merge failure
+    try:
+        _post_land_deploy_hook(repo, trigger="post-merge-hook")
+        _ensure_head_branch_deleted(repo, pr_number, owner=owner)
+    except Exception as e:
+        logger.warning("merge_and_deploy post-merge step failed (non-fatal): %s", e)
+    return result
+
+
 def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> None:
     """Append one dated provenance line to the deploy log. Best-effort."""
     model = getattr(brief, "_BRIEF_MODEL", "unknown")
@@ -360,7 +430,7 @@ def _check_deploy_currency() -> None:
         pass
 
 
-def _post_land_deploy_hook(repo: str | None) -> None:
+def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") -> None:
     """Pull working clones then restart long-running services for `repo`.
 
     Best-effort. Failures (sudo unavailable, unit missing, restart timeout)
@@ -379,7 +449,7 @@ def _post_land_deploy_hook(repo: str | None) -> None:
             file=sys.stderr,
         )
         return
-    _post_land_git_pull(repo)
+    _post_land_git_pull(repo, trigger=trigger)
     if not repo:
         return
     units = _POST_LAND_RESTART.get(repo)
@@ -2473,7 +2543,7 @@ def _act_merge(target_id: str, payload: dict) -> str:
     #                        distinct outcome string merge_attempted:mergeability_unknown
     #                        so audit record keeps the two epistemic states distinct.
     try:
-        merge_pr(repo_name, cls.pr_number, owner=owner)
+        merge_and_deploy(repo_name, cls.pr_number, owner=owner)
     except Exception as e:
         episodic.write_hold(
             target_id,

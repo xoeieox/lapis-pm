@@ -626,3 +626,258 @@ class TestCodeReviewerDeploy:
         assert all(p == Priority.LOW for p in notify_calls), (
             "code-reviewer pull failure must only emit LOW priority — never NORMAL or HIGH"
         )
+
+
+class TestMergeAndDeploy:
+    """Tests for merge_and_deploy choicepoint."""
+
+    def test_merge_and_deploy_fires_hook_for_mapped_repo(self):
+        """merge_and_deploy merges the PR and fires the deploy hook for a mapped repo."""
+        merge_calls = []
+        pull_calls = []
+
+        def fake_merge(*args, **kwargs):
+            merge_calls.append((args, kwargs))
+            return {"merged": True}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "git" and "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=0)
+
+        with (
+            patch("lapis_pm.pm_core.merge_pr", side_effect=fake_merge),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+            patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}),
+        ):
+            result = pm_core.merge_and_deploy("agents-core", 42)
+
+        assert result == {"merged": True}
+        assert len(merge_calls) == 1
+        assert merge_calls[0] == (("agents-core", 42), {"owner": None})
+        assert len(pull_calls) == 2
+
+    def test_merge_and_deploy_hook_exception_does_not_propagate(self):
+        """Post-merge hook/branch-delete exception does not mask merge success."""
+        merge_calls = []
+
+        def fake_merge(*args, **kwargs):
+            merge_calls.append((args, kwargs))
+            return {"merged": True}
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+
+        with (
+            patch("lapis_pm.pm_core.merge_pr", side_effect=fake_merge),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+        ):
+            result = pm_core.merge_and_deploy("agents-core", 42)
+
+        assert result == {"merged": True}
+        assert len(merge_calls) == 1
+
+    def test_merge_and_deploy_uses_post_merge_hook_trigger(self, tmp_path):
+        """merge_and_deploy passes trigger='post-merge-hook' to the hook."""
+        log_file = tmp_path / "deploy-log.md"
+        log_file.write_text("# log\n---\n")
+
+        call_count = {"n": 0}
+
+        def fake_merge(*args, **kwargs):
+            return {"merged": True}
+
+        def fake_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if "rev-parse" in cmd:
+                return _make_completed_process(
+                    returncode=0,
+                    stdout="oldsha0" if call_count["n"] <= 1 else "newsha1",
+                )
+            return _make_completed_process(returncode=0)
+
+        with (
+            patch("lapis_pm.pm_core.merge_pr", side_effect=fake_merge),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+        ):
+            pm_core.merge_and_deploy("lapis-pm", 42)
+
+        contents = log_file.read_text()
+        assert "post-merge-hook" in contents
+
+    def test_merge_failure_propagates(self):
+        """A merge_pr failure raises and never calls the post-merge steps."""
+        def fake_merge(*args, **kwargs):
+            raise RuntimeError("Merge API error")
+
+        with patch("lapis_pm.pm_core.merge_pr", side_effect=fake_merge):
+            with patch("lapis_pm.pm_core._post_land_deploy_hook") as mock_hook:
+                try:
+                    pm_core.merge_and_deploy("agents-core", 42)
+                    assert False, "Should have raised"
+                except RuntimeError as e:
+                    assert "Merge API error" in str(e)
+                    mock_hook.assert_not_called()
+
+
+class TestEnsureHeadBranchDeleted:
+    """Tests for _ensure_head_branch_deleted branch hygiene."""
+
+    def test_branch_already_deleted_returns_early(self):
+        """If get_branch returns 404 (branch already deleted), no DELETE is issued."""
+        delete_calls = []
+
+        def fake_get_pr(*args, **kwargs):
+            return {"head": {"ref": "lapis/tid/slug"}}
+
+        def fake_get_branch(*args, **kwargs):
+            exc = Exception("404 Not Found")
+            exc.args = ("404 Not Found",)
+            raise exc
+
+        with (
+            patch("lapis_pm.pm_core._forgejo_get_pr", side_effect=fake_get_pr),
+            patch("lapis_pm.pm_core._forgejo_get_branch", side_effect=fake_get_branch),
+        ):
+            pm_core._ensure_head_branch_deleted("agents-core", 42)
+            # No exception, no DELETE attempt
+
+    def test_branch_present_issues_explicit_delete(self):
+        """If branch still exists, an explicit DELETE is issued via httpx."""
+        delete_calls = []
+
+        def fake_get_pr(*args, **kwargs):
+            return {"head": {"ref": "lapis/tid/slug"}}
+
+        def fake_get_branch(*args, **kwargs):
+            return {}  # branch exists
+
+        def fake_delete(url, **kwargs):
+            delete_calls.append(url)
+            resp = MagicMock()
+            resp.status_code = 204
+            return resp
+
+        with (
+            patch("lapis_pm.pm_core._forgejo_get_pr", side_effect=fake_get_pr),
+            patch("lapis_pm.pm_core._forgejo_get_branch", side_effect=fake_get_branch),
+            patch.dict("os.environ", {"FORGEJO_TOKEN": "fake-token"}),
+        ):
+            import httpx
+            with patch.object(httpx, "delete", side_effect=fake_delete):
+                pm_core._ensure_head_branch_deleted("agents-core", 42)
+
+        assert len(delete_calls) == 1
+        assert "lapis/tid/slug" in delete_calls[0]
+
+    def test_delete_exception_swallowed(self):
+        """If DELETE raises, the exception is logged and does not propagate."""
+        def fake_get_pr(*args, **kwargs):
+            return {"head": {"ref": "lapis/tid/slug"}}
+
+        def fake_get_branch(*args, **kwargs):
+            return {}  # branch exists
+
+        def fake_delete(url, **kwargs):
+            raise OSError("Network error")
+
+        with (
+            patch("lapis_pm.pm_core._forgejo_get_pr", side_effect=fake_get_pr),
+            patch("lapis_pm.pm_core._forgejo_get_branch", side_effect=fake_get_branch),
+            patch.dict("os.environ", {"FORGEJO_TOKEN": "fake-token"}),
+        ):
+            import httpx
+            with patch.object(httpx, "delete", side_effect=fake_delete):
+                pm_core._ensure_head_branch_deleted("agents-core", 42)
+                # Must not raise
+
+    def test_no_forgejo_apis_is_noop(self):
+        """If forgejo APIs are unavailable, the function is a noop."""
+        with (
+            patch("lapis_pm.pm_core._forgejo_get_pr", None),
+            patch("lapis_pm.pm_core._forgejo_get_branch", None),
+        ):
+            pm_core._ensure_head_branch_deleted("agents-core", 42)
+            # Must not raise
+
+
+class TestPostLandDeployHookTrigger:
+    """Tests for trigger parameter plumbing."""
+
+    def test_post_land_deploy_hook_defaults_trigger_to_post_land_hook(self, tmp_path):
+        """_post_land_deploy_hook defaults trigger to 'post-land-hook'."""
+        log_file = tmp_path / "deploy-log.md"
+        log_file.write_text("# log\n---\n")
+
+        call_count = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if "rev-parse" in cmd:
+                return _make_completed_process(
+                    returncode=0,
+                    stdout="oldsha0" if call_count["n"] <= 1 else "newsha1",
+                )
+            return _make_completed_process(returncode=0)
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+        ):
+            pm_core._post_land_deploy_hook("lapis-pm")
+
+        contents = log_file.read_text()
+        assert "post-land-hook" in contents
+
+    def test_post_land_deploy_hook_custom_trigger(self, tmp_path):
+        """_post_land_deploy_hook forwards custom trigger to _post_land_git_pull."""
+        log_file = tmp_path / "deploy-log.md"
+        log_file.write_text("# log\n---\n")
+
+        call_count = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if "rev-parse" in cmd:
+                return _make_completed_process(
+                    returncode=0,
+                    stdout="oldsha0" if call_count["n"] <= 1 else "newsha1",
+                )
+            return _make_completed_process(returncode=0)
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+        ):
+            pm_core._post_land_deploy_hook("lapis-pm", trigger="post-merge-hook")
+
+        contents = log_file.read_text()
+        assert "post-merge-hook" in contents
+
+    def test_double_fire_already_current_no_log(self, tmp_path):
+        """When git pull is a no-op (already current), second deploy-log line is not added."""
+        log_file = tmp_path / "deploy-log.md"
+        log_file.write_text("# log\n---\n")
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="same1234")
+            return _make_completed_process(returncode=0)
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+        ):
+            pm_core._post_land_deploy_hook("lapis-pm", trigger="post-merge-hook")
+
+        contents = log_file.read_text()
+        assert "synced" not in contents  # no new entry when already current

@@ -481,9 +481,9 @@ def _act_merge_pr(target_id: str, pr_number: int | None) -> str:
     """Merge the advisory PR cited by the brief."""
     from agents_core.targets import TargetStore
     try:
-        from agents_core.forgejo import merge_pr as _merge_pr
+        from lapis_pm.pm_core import merge_and_deploy
     except ImportError as exc:
-        raise RuntimeError(f"forgejo not available: {exc}") from exc
+        raise RuntimeError(f"pm_core not available: {exc}") from exc
 
     store = TargetStore()
     target = store.get(target_id)
@@ -496,7 +496,7 @@ def _act_merge_pr(target_id: str, pr_number: int | None) -> str:
         owner, repo_name = repo.split("/", 1)
     else:
         repo_name, owner = repo, None
-    _merge_pr(repo_name, pr_number, owner=owner)
+    merge_and_deploy(repo_name, pr_number, owner=owner)
     return f"merged PR #{pr_number} in {repo}"
 
 

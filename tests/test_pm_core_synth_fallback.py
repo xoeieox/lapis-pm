@@ -245,11 +245,13 @@ def test_all_set_outstanding_brief_call_sites_routed():
     loop, lines ~1146/1158) or within _set_brief_outstanding itself, which are expected.
     """
     import subprocess
+    import lapis_pm.pm_core as _m
+    pm_core_path = _m.__file__
     result = subprocess.run(
         [
             "grep", "-n",
             "_set_brief_outstanding",
-            "/tmp/lapis-pm-worktrees/claude_20260615_231532_9788_fixerbriefsynthesisfallb/lapis_pm/pm_core.py",
+            pm_core_path,
         ],
         capture_output=True,
         text=True,

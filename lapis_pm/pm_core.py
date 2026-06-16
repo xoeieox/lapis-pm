@@ -163,6 +163,13 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # Pull failure → LOW signal (advisory-only, per-invocation).
     # NOTE: facets is NOT in _POST_LAND_RESTART/_RESTART_USER — timer re-imports on each
     # fire and picks up the pulled code naturally.
+    # LIABILITIES: (1) facets.adapter must remain importable as python3 -m facets.adapter;
+    # breaking module-level changes will break spec-review silently until detected.
+    # (2) facets is treated as advisory-only, per-invocation; if it becomes authority-tier
+    # or long-running, this classification is wrong — it would need _POST_LAND_PULL_CRITICAL
+    # + a _POST_LAND_RESTART/_RESTART_USER entry. (3) this unit makes the current single-tree
+    # topology correct; it does not solve the facets-prod-deploy-gap double-duty-tree
+    # structure, which is a separate tracked concern.
     "facets":         [_FACETS_DEPLOY_CLONE],
 }
 

@@ -26,6 +26,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Literal
 
+# Import the canonical facets deploy clone path from pm_core (source-enforce coupling).
+# pm_core has no module-level spec_review import, so this is circular-free.
+from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE
+
 
 # ---------------------------------------------------------------------------
 # Paths and constants
@@ -36,7 +40,8 @@ _CLAUDE_QUEUE_FAILED = Path("/srv/lapis/claude-queue/failed")
 _GPU_QUEUE_COMPLETED = Path("/srv/lapis/gpu-queue/completed")
 _GPU_QUEUE_FAILED = Path("/srv/lapis/gpu-queue/failed")
 _COUNCIL_DIR = Path("/srv/lapis/council")
-_FACETS_REPO_PATH = Path("/srv/git/facets-working")  # facets pkg not pip-installed; inject on PYTHONPATH for `-m facets.adapter`
+# Facets deploy clone path — the same path the post-land pull deploys and the gate injects on PYTHONPATH.
+_FACETS_REPO_PATH = Path(_FACETS_DEPLOY_CLONE)
 
 # Council terminal statuses — per v0.next spec + "closed" for scene mode.
 _COUNCIL_TERMINAL: frozenset[str] = frozenset(

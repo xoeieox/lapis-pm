@@ -88,6 +88,10 @@ REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
 REVIEW_GATE_PAUSED_KEY = "pm/review-gate/paused"
 REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
 
+# Synth-fail counter constants
+_SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
+_SYNTH_FAIL_THRESHOLD = 3
+
 # Cycle budgets per authority level (number of reviewer dispatches before exhausted)
 _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
     "advisory": 2,
@@ -605,6 +609,24 @@ def _brief_key(target_id: str) -> str:
 
 def _classified_prs_key(target_id: str) -> str:
     return f"pm/classified-prs/{target_id}"
+
+
+def _get_synth_fail_count(target_id: str) -> int:
+    """Get the current synthesis-failure counter for target."""
+    v = _mem().get(_SYNTH_FAIL_KEY.format(target_id))
+    return int(v["content"]) if v else 0
+
+
+def _inc_synth_fail_count(target_id: str) -> int:
+    """Increment the synthesis-failure counter, return new count."""
+    n = _get_synth_fail_count(target_id) + 1
+    _mem().set(_SYNTH_FAIL_KEY.format(target_id), str(n), tags=["lapis-pm", "synth-fail"])
+    return n
+
+
+def _reset_synth_fail_count(target_id: str) -> None:
+    """Reset the synthesis-failure counter to 0."""
+    _mem().delete(_SYNTH_FAIL_KEY.format(target_id))
 
 
 REVIEW_STATE_KEY_PREFIX = "pm/review-state/"
@@ -1140,6 +1162,55 @@ def set_outstanding_brief_verified(target_id: str, comment_id: str) -> None:
     )
 
 
+def _set_brief_outstanding(
+    target_id: str,
+    b: brief.Brief,
+    *,
+    verified: bool = False,
+) -> bool:
+    """Set the outstanding brief, skipping if synthesis failed (within threshold).
+
+    Returns True if the brief was set outstanding, False if skipped for retry.
+    When synthesis keeps failing past _SYNTH_FAIL_THRESHOLD ticks, sets outstanding
+    anyway so a human can force-clear or redirect.
+    """
+    if not b.synthesis_failed:
+        _reset_synth_fail_count(target_id)
+        if verified:
+            set_outstanding_brief_verified(target_id, b.comment_id)
+            _post_write_sweep_brief(target_id, b.comment_id)
+        else:
+            set_outstanding_brief(target_id, b.comment_id)
+        return True
+
+    fail_n = _inc_synth_fail_count(target_id)
+    if fail_n >= _SYNTH_FAIL_THRESHOLD:
+        logger.warning(
+            "brief synthesis failed %d consecutive ticks for %s — setting outstanding "
+            "to unblock; clear manually or force-dispatch",
+            fail_n, target_id,
+        )
+        if verified:
+            set_outstanding_brief_verified(target_id, b.comment_id)
+            _post_write_sweep_brief(target_id, b.comment_id)
+        else:
+            set_outstanding_brief(target_id, b.comment_id)
+        return True
+
+    logger.warning(
+        "brief synthesis failed (attempt %d/%d) for %s — skipping set_outstanding_brief, "
+        "will retry next tick",
+        fail_n, _SYNTH_FAIL_THRESHOLD, target_id,
+    )
+    episodic.write_observation(
+        target_id,
+        f"Brief synthesis failed (attempt {fail_n}/{_SYNTH_FAIL_THRESHOLD}); "
+        "underlying state preserved - next tick will retry.",
+        extra_tags=["pm:synthesis-failed"],
+    )
+    return False
+
+
 def _post_write_sweep_brief(target_id: str, comment_id: str) -> None:
     """Read the brief key once more after _mark_pr_classified ran.
 
@@ -1310,6 +1381,8 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
     if mem.get(_review_state_key(target_id)) is not None:
         summary["review_state"] = 1
     mem.delete(_review_state_key(target_id))
+
+    mem.delete(_SYNTH_FAIL_KEY.format(target_id))
 
     return summary
 
@@ -1719,7 +1792,7 @@ def _act_brief_already_satisfied_invalid(target_id: str) -> str:
         query=f"Fixer already-satisfied verdict: invalid PR #{pr_num}",
         notify=NotifyPriority.NORMAL,
     )
-    set_outstanding_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b)
     episodic.write_observation(
         target_id,
         f"Brief posted for invalid already_satisfied verdict (PR #{pr_num}): {b.comment_id}",
@@ -2156,7 +2229,7 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
                 pr_number=pr_number,
                 notify=NotifyPriority.NORMAL
             )
-            set_outstanding_brief(target_id, b.comment_id)
+            _set_brief_outstanding(target_id, b)
 
             episodic.write_observation(
                 target_id,
@@ -2518,8 +2591,7 @@ def _act_needs_review(target_id: str, cls: authority.PRClassification, reason: s
         notify=NotifyPriority.NORMAL,
     )
     _mark_pr_classified(target_id, cls.pr_number)
-    set_outstanding_brief_verified(target_id, b.comment_id)
-    _post_write_sweep_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b, verified=True)
     return f"action:needs_review:pr={cls.pr_number}:reason={reason}"
 
 
@@ -2606,8 +2678,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         reviewer_verdict_text=reviewer_verdict_text,
     )
     _mark_pr_classified(target_id, cls.pr_number)
-    set_outstanding_brief_verified(target_id, b.comment_id)
-    _post_write_sweep_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b, verified=True)
     if hold:
         kind = "hold"
     elif cls.issues:
@@ -2877,7 +2948,7 @@ def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
         screen_issues=None,
         notify=NotifyPriority.HIGH,
     )
-    set_outstanding_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b)
     _mark_pr_classified(target_id, cls.pr_number)
     return f"action:review_exhausted_brief:cid={b.comment_id}"
 
@@ -2903,7 +2974,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
         query="review-gate pause — token budget exceeded",
         notify=NotifyPriority.HIGH,
     )
-    set_outstanding_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b)
     _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
                tags=["lapis-pm", "review-gate"])
     return f"action:review_gate_paused:cid={b.comment_id}"
@@ -3773,7 +3844,7 @@ def _act_lost_brief(
         notify=NotifyPriority.NORMAL,
         options_extra_tags=[gpu_tag],
     )
-    set_outstanding_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b)
 
     dispatch_ids = f"{orig_id},{retry_id}" if retry_rec else orig_id
     return f"fixer_lost:briefing:dispatches={dispatch_ids}"
@@ -3940,8 +4011,7 @@ def _act_eval_gate_brief(
             f"pm:synapse-eval:status={result.status}",
         ],
     )
-    set_outstanding_brief_verified(target_id, b.comment_id)
-    _post_write_sweep_brief(target_id, b.comment_id)
+    _set_brief_outstanding(target_id, b, verified=True)
     return (
         f"action:eval_gate_brief:pr={result.pr_number}"
         f":status={result.status}:cid={b.comment_id}"
@@ -4115,7 +4185,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         encoded += 1
         b = brief.synthesize(target_id, trigger=f"user directive: {d.content[:80]}",
                              query=d.content, notify=None)
-        set_outstanding_brief(target_id, b.comment_id)
+        _set_brief_outstanding(target_id, b)
         decision_str = f"action:directive_brief:cid={b.comment_id}"
 
     elif open_prs:
@@ -4208,7 +4278,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                 query=rec.get("intent", ""),
                 notify=NotifyPriority.HIGH,
             )
-            set_outstanding_brief(target_id, b.comment_id)
+            _set_brief_outstanding(target_id, b)
             decision_str = f"action:abandon_brief:cid={b.comment_id}"
 
     elif _already_satisfied_pending(target_id) is not None:

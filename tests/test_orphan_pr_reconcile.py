@@ -205,6 +205,7 @@ class TestReconciliation:
 
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core._pr_owned_by_bound_sibling", return_value=False),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
             patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set_brief,
@@ -247,6 +248,7 @@ class TestReconciliation:
 
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core._pr_owned_by_bound_sibling", return_value=False),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value="cid-existing"),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
@@ -256,6 +258,215 @@ class TestReconciliation:
         # Should NOT synthesize a new brief (idempotency guard)
         mock_brief.assert_not_called()
         # Should NOT write observation for new brief
+        mock_obs.assert_not_called()
+
+    def test_sibling_owned_by_canonical_branch_is_skipped(self):
+        """PR on sibling's canonical branch is skipped (no brief raised)."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 142,
+            "body": "Some PR description",
+            "head": {"ref": "lapis/target-B/forced"}
+        }
+
+        # Mock a sibling target bound to the same repo
+        mock_sibling = MagicMock()
+        mock_sibling.id = "target-B"
+        mock_sibling.pm_bound = True
+        mock_sibling.pm_repo = "lapis-pm"
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set_brief,
+        ):
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = [mock_sibling]
+            mock_store_class.return_value = mock_store
+
+            pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
+
+        # Should NOT create a brief (sibling-owned)
+        mock_brief.assert_not_called()
+        mock_set_brief.assert_not_called()
+
+    def test_sibling_owned_by_marker_on_deviant_branch_is_skipped(self):
+        """PR on deviant branch with sibling marker is skipped (no brief)."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 142,
+            "body": "<!-- lapis-tid: target-B -->\nPR description",
+            "head": {"ref": "hotfix/something"}
+        }
+
+        # Mock a sibling target bound to the same repo
+        mock_sibling = MagicMock()
+        mock_sibling.id = "target-B"
+        mock_sibling.pm_bound = True
+        mock_sibling.pm_repo = "lapis-pm"
+
+        def traceable_side_effect(tid, pr_dict):
+            """Return True if traceable to target-B, False otherwise."""
+            return tid == "target-B"
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", side_effect=traceable_side_effect),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set_brief,
+        ):
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = [mock_sibling]
+            mock_store_class.return_value = mock_store
+
+            pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
+
+        # Should NOT create a brief (sibling-owned via marker)
+        mock_brief.assert_not_called()
+        mock_set_brief.assert_not_called()
+
+    def test_genuine_orphan_still_raises_brief(self):
+        """Genuinely orphaned PR still raises brief when no sibling owns it."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 999,
+            "body": "<!-- lapis-tid: ghost-target -->\nNo sibling owns this",
+            "head": {"ref": "lapis/ghost-target/forced"}
+        }
+
+        # Mock a sibling target for a different target
+        mock_sibling = MagicMock()
+        mock_sibling.id = "target-B"
+        mock_sibling.pm_bound = True
+        mock_sibling.pm_repo = "lapis-pm"
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = [mock_sibling]
+            mock_store_class.return_value = mock_store
+
+            mock_brief_obj = MagicMock()
+            mock_brief_obj.comment_id = "cid-999"
+            mock_brief_obj.synthesis_failed = False
+            mock_brief.return_value = mock_brief_obj
+
+            pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
+
+        # Should create a brief (genuine orphan)
+        mock_brief.assert_called_once()
+        call_args = mock_brief.call_args
+        assert call_args.kwargs["trigger"] == "orphan-pr-untraceable"
+        mock_set_brief.assert_called_once()
+
+    def test_self_traceable_deviant_pr_is_auto_adopted(self):
+        """Self-traceable deviant PR is auto-adopted (not skipped by sibling check)."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 50,
+            "body": "<!-- lapis-tid: target-A -->\nPR description",
+            "head": {"ref": "hotfix/something"}
+        }
+
+        # Mock a sibling target
+        mock_sibling = MagicMock()
+        mock_sibling.id = "target-B"
+        mock_sibling.pm_bound = True
+        mock_sibling.pm_repo = "lapis-pm"
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=True),  # traceable to self
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = [mock_sibling]
+            mock_store_class.return_value = mock_store
+
+            pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
+
+        # Should auto-adopt (sibling check is not reached)
+        assert target.data["adopted_head_branch"] == "hotfix/something"
+        assert target.data["adopted_pr_number"] == 50
+        target.save.assert_called_once()
+
+    def test_store_failure_emits_verify_fail_signal(self):
+        """Store read failure emits verify-fail notification, not orphan brief."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 99,
+            "body": "Genuine orphan (no markers)",
+            "head": {"ref": "lapis/unknown/forced"}
+        }
+
+        store_error = RuntimeError("TargetStore read failed")
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
+            patch("lapis_pm.pm_core._emit_reconcile_verify_failure") as mock_emit_fail,
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+        ):
+            mock_store = MagicMock()
+            mock_store.load_all.side_effect = store_error
+            mock_store_class.return_value = mock_store
+
+            pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
+
+        # Should emit verify-fail, not synthesize brief
+        mock_emit_fail.assert_called_once()
+        call_args = mock_emit_fail.call_args
+        assert call_args.args[0] == "target-A"
+        assert call_args.args[1] == 99
+        assert isinstance(call_args.args[2], RuntimeError)
+        mock_brief.assert_not_called()
+
+    def test_verify_fail_dedup_within_cooldown(self):
+        """Verify-fail alerts deduped within cooldown window."""
+        from datetime import timedelta
+
+        target_id = "target-A"
+        pr_number = 99
+
+        # Set a recent alert timestamp in mem
+        recent_ts = pm_core._now_iso()
+        cooldown_key = pm_core._RECONCILE_VERIFY_FAIL_KEY.format(target_id)
+
+        with (
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core._now_iso", return_value=recent_ts),
+            patch("lapis_pm.pm_core.logger.debug") as mock_log_debug,
+            patch("agents_core.notify.send_notification") as mock_notify,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            mock_mem_instance = MagicMock()
+            # Simulate existing recent cooldown entry
+            mock_mem_instance.get.return_value = {"content": recent_ts}
+            mock_mem.return_value = mock_mem_instance
+
+            err = RuntimeError("test error")
+            pm_core._emit_reconcile_verify_failure(target_id, pr_number, err)
+
+        # Should log debug, not notify
+        mock_log_debug.assert_called_once()
+        mock_notify.assert_not_called()
         mock_obs.assert_not_called()
 
 

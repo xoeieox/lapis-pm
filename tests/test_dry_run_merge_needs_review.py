@@ -89,6 +89,7 @@ class TestDryRunMergeConflict:
             # Prepare brief.synthesize() return
             mock_brief = MagicMock()
             mock_brief.comment_id = "brief-cid-ac1"
+            mock_brief.synthesis_failed = False
             mock_synth.return_value = mock_brief
 
             # Call _act_merge with mergeable=False
@@ -130,6 +131,7 @@ class TestDryRunMergeConflict:
 
             mock_brief = MagicMock()
             mock_brief.comment_id = "cid"
+            mock_brief.synthesis_failed = False
             mock_synth.return_value = mock_brief
 
             payload = {"classification": cls, "pr": pr}
@@ -286,6 +288,7 @@ class TestDryRunMergeDedupBrief:
 
             mock_brief = MagicMock()
             mock_brief.comment_id = "brief-cid-701"
+            mock_brief.synthesis_failed = False
             mock_synth.return_value = mock_brief
 
             payload = {"classification": cls, "pr": pr}
@@ -331,6 +334,7 @@ class TestDryRunMergeDedupBrief:
 
             mock_brief = MagicMock()
             mock_brief.comment_id = "cid"
+            mock_brief.synthesis_failed = False
             mock_synth.return_value = mock_brief
 
             payload = {"classification": cls, "pr": pr}
@@ -358,6 +362,7 @@ class TestDryRunMergeDedupBrief:
 
             mock_brief = MagicMock()
             mock_brief.comment_id = "cid-sweep"
+            mock_brief.synthesis_failed = False
             mock_synth.return_value = mock_brief
 
             payload = {"classification": cls, "pr": pr}

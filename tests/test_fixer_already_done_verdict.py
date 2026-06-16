@@ -364,6 +364,7 @@ class TestInvalidPrFallback:
         )
         mock_brief = MagicMock()
         mock_brief.comment_id = "brief-xyz"
+        mock_brief.synthesis_failed = False
         mock_brief.pushed = True
 
         with (

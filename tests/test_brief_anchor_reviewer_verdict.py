@@ -177,6 +177,7 @@ def test_act_brief_advisory_clean_passes_verdict_text():
     captured_kwargs: dict = {}
     mock_brief_result = MagicMock()
     mock_brief_result.comment_id = "brief-anchor-cid"
+    mock_brief_result.synthesis_failed = False
     mock_brief_result.pushed = False
 
     def fake_synthesize(*args, **kwargs):
@@ -220,6 +221,7 @@ def test_act_brief_advisory_clean_no_verdict_passes_none():
     captured_kwargs: dict = {}
     mock_brief_result = MagicMock()
     mock_brief_result.comment_id = "brief-anchor-cid-none"
+    mock_brief_result.synthesis_failed = False
     mock_brief_result.pushed = False
 
     def fake_synthesize(*args, **kwargs):

@@ -702,6 +702,7 @@ class TestKillSwitch:
         """Kill-switch brief is emitted only once (idempotent on first call)."""
         brief_mock = MagicMock()
         brief_mock.comment_id = "brief-1"
+        brief_mock.synthesis_failed = False
         mem = MagicMock()
         mem.get.return_value = None  # no existing brief
 

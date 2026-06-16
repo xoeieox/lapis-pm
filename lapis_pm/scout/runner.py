@@ -61,6 +61,50 @@ class _ScoutJsonAdapter(LlamaAdapter):
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
+_SCOUT_GRAVITYWELL_WAKE_FAIL = "skip"
+
+
+class ScoutGravityWellUnavailable(Exception):
+    """GravityWell is unavailable (not serving, doorman unreachable, or wake failed)."""
+
+    pass
+
+
+class _ScoutGravityWellAdapter:
+    """Consumer-side GravityWell adapter for Scout voicing.
+
+    Routes through call_operator("gravitywell", ...) for doorman-leased
+    wake-on-demand, keepawake hold, and legible skip-on-unavailable.
+    Implements the chat(system, messages) -> str protocol.
+    """
+
+    model = "gravitywell-122b"
+
+    def __init__(self, timeout: int = 300) -> None:
+        self.timeout = timeout
+
+    def chat(self, system: str, messages: list[Message]) -> str:  # type: ignore[override]
+        """Call GravityWell via call_operator; raise ScoutGravityWellUnavailable on skip."""
+        try:
+            from agents_core.llm import call_operator  # type: ignore[import]
+        except ImportError:
+            log.error("agents_core.llm not available — cannot route to GravityWell")
+            raise ScoutGravityWellUnavailable("agents_core.llm not available") from None
+
+        prompt = "".join(m.content for m in messages)
+        result = call_operator(
+            "gravitywell",
+            prompt=prompt,
+            system=system,
+            json_mode=True,
+            timeout=self.timeout,
+            on_wake_fail=_SCOUT_GRAVITYWELL_WAKE_FAIL,
+        )
+        if result is None:
+            raise ScoutGravityWellUnavailable("GravityWell unavailable (wake failed, not serving, or doorman unreachable)")
+        return str(result)
+
+
 # ---------------------------------------------------------------------------
 # Hashing helpers
 # ---------------------------------------------------------------------------
@@ -224,45 +268,64 @@ def run_single(
 ) -> tuple[Any, str]:  # (LapisToolReturn, run_id)
     """Run a single (cell, seed) and return (LapisToolReturn, run_id)."""
     if llm is None:
-        llm = _ScoutJsonAdapter(max_tokens=2048)
+        llm = _ScoutGravityWellAdapter(timeout=300)
 
     cell_id = ScoutScaffold.cell_id(cell_params)
     run_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{seed:04d}"
     )
 
-    entity = PseudocodeSystemEntity(
-        scaffold=scaffold,
-        cell_id=cell_id,
-        seed=seed,
-        llm=llm,
-    )
-    director = ScoutDirector(
-        id=f"scout-director/{scaffold.spec_id}/{cell_id}/{seed}",
-        scaffold=scaffold,
-        cell_id=cell_id,
-    )
+    director = None
+    try:
+        entity = PseudocodeSystemEntity(
+            scaffold=scaffold,
+            cell_id=cell_id,
+            seed=seed,
+            llm=llm,
+        )
+        director = ScoutDirector(
+            id=f"scout-director/{scaffold.spec_id}/{cell_id}/{seed}",
+            scaffold=scaffold,
+            cell_id=cell_id,
+        )
 
-    engine = Engine()
-    run_log = engine.run(director=director, entities=[entity])
+        engine = Engine()
+        run_log = engine.run(director=director, entities=[entity])
 
-    payload = _build_trace_payload(scaffold, cell_id, cell_params, seed, run_log, director)
+        payload = _build_trace_payload(scaffold, cell_id, cell_params, seed, run_log, director)
+    except ScoutGravityWellUnavailable:
+        payload = ScoutTracePayload(
+            scaffold_hash=scaffold.scaffold_hash(cell_params),
+            spec_version=scaffold.spec_version,
+            cell_id=cell_id,
+            seed=seed,
+            scenario_generated="",
+            execution_trace="",
+            gw_skipped=True,
+        )
 
-    tick_prompts = director.tick_prompts()
+    tick_prompts = director.tick_prompts() if director and not payload.gw_skipped else []
     ph = _prompt_hash(tick_prompts) if tick_prompts else None
 
-    # Build summary (parse-free; Router reads this)
-    n_breaks = len(payload.breaks_observed)
-    break_sigs = ", ".join(
-        b.get("signature", "?") for b in payload.breaks_observed[:3]
-    ) or "none"
     summary = (
         f"Run {run_id} spec={scaffold.spec_id} cell={cell_id}: "
-        f"{n_breaks} break(s) ({break_sigs}), "
-        f"{len(payload.leverage_points)} leverage point(s), "
-        f"{len(payload.drift_signals)} drift signal(s), "
-        f"tools_used={list(payload.tools_used.keys()) or 'none'}"
+        if not payload.gw_skipped
+        else f"Run {run_id} spec={scaffold.spec_id} cell={cell_id} (GW skipped): "
     )
+
+    if payload.gw_skipped:
+        summary += "skipped (GravityWell unavailable)"
+    else:
+        n_breaks = len(payload.breaks_observed)
+        break_sigs = ", ".join(
+            b.get("signature", "?") for b in payload.breaks_observed[:3]
+        ) or "none"
+        summary += (
+            f"{n_breaks} break(s) ({break_sigs}), "
+            f"{len(payload.leverage_points)} leverage point(s), "
+            f"{len(payload.drift_signals)} drift signal(s), "
+            f"tools_used={list(payload.tools_used.keys()) or 'none'}"
+        )
 
     input_refs = [
         InputRef(ref=f"/srv/lapis/scout/sims/{scaffold.spec_id}.yaml", content_hash=None, type="file"),
@@ -331,7 +394,7 @@ def simulate(
     cells:
         If given, only run the listed cell IDs (e.g. from ``--cell`` CLI flag).
     llm:
-        LanguageModel to use.  Defaults to LlamaAdapter pointing at llama-server.
+        LanguageModel to use. Defaults to GravityWell (122B, doorman-leased).
     traces_root:
         Override the default ``/srv/lapis/scout/traces`` root (useful for tests).
 

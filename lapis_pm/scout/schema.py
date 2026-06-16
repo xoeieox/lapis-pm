@@ -85,6 +85,9 @@ class ScoutTracePayload:
     parse_failure_count: int = 0
     total_tick_count: int = 0
 
+    # GravityWell skip marker (set when GW unavailable, cell skipped legibly)
+    gw_skipped: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "scaffold_hash": self.scaffold_hash,
@@ -104,6 +107,7 @@ class ScoutTracePayload:
             "tick_prompt_hashes": self.tick_prompt_hashes,
             "parse_failure_count": self.parse_failure_count,
             "total_tick_count": self.total_tick_count,
+            "gw_skipped": self.gw_skipped,
         }
 
 

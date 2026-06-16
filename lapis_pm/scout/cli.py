@@ -15,15 +15,22 @@ import sys
 
 def cmd_scout_simulate(args) -> int:
     """Run a scaffold simulation (full matrix or a specific cell)."""
-    from .runner import simulate
+    from .runner import simulate, _ScoutJsonAdapter, _ScoutGravityWellAdapter
 
     scaffold_path = args.scaffold
     runs: int | None = getattr(args, "runs", None)
     cell_arg: str | None = getattr(args, "cell", None)
     cells = [cell_arg] if cell_arg else None
+    model: str = getattr(args, "model", "gravitywell")
+
+    llm = None
+    if model == "qwen":
+        llm = _ScoutJsonAdapter(max_tokens=2048)
+    elif model == "gravitywell":
+        llm = _ScoutGravityWellAdapter(timeout=300)
 
     try:
-        written = simulate(scaffold_path, runs_per_cell=runs, cells=cells)
+        written = simulate(scaffold_path, runs_per_cell=runs, cells=cells, llm=llm)
         for p in written:
             print(f"wrote: {p}")
         print(f"done: {len(written)} trace(s) written")
@@ -71,6 +78,8 @@ def cmd_scout_night_run(args) -> int:
     log_root_arg: str | None = getattr(args, "log_root", None)
     log_root = Path(log_root_arg) if log_root_arg else None
 
+    model: str = getattr(args, "model", "gravitywell")
+
     profiles_override: dict[str, str] | None = None
     overrides_raw: list[str] = getattr(args, "profile_override", []) or []
     if overrides_raw:
@@ -108,6 +117,7 @@ def cmd_scout_night_run(args) -> int:
             profiles_override=profiles_override,
             budget=budget,
             selected_path=selected_path,
+            model=model,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
@@ -116,7 +126,7 @@ def cmd_scout_night_run(args) -> int:
     print("Night run complete.")
     print(f"  Manifest: {result.manifest_path}")
     print(f"  Total: {result.total_units} units | OK: {result.completed_ok} | Err: {result.errored}")
-    print(f"  Quarantine-skip: {result.skipped_quarantine} | Health-skip: {result.skipped_health}")
+    print(f"  Quarantine-skip: {result.skipped_quarantine} | Health-skip: {result.skipped_health} | GW-skip: {result.skipped_gw}")
     if result.aborted:
         print(f"  ABORTED: {result.abort_reason}", file=sys.stderr)
         return 1

@@ -212,6 +212,7 @@ class TestReconciliation:
         ):
             mock_brief_obj = MagicMock()
             mock_brief_obj.comment_id = "cid-123"
+            mock_brief_obj.synthesis_failed = False
             mock_brief.return_value = mock_brief_obj
 
             pm_core._reconcile_orphan_prs("my-target", target, "my-repo", [pr])

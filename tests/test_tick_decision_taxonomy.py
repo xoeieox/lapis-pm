@@ -265,6 +265,7 @@ class TestActionTaxonomy:
         cls.reasons = ["static hold path"]
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-hold-001"
+        mock_brief.synthesis_failed = False
         mock_brief.pushed = True
         with (
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
@@ -289,6 +290,7 @@ class TestActionTaxonomy:
         cls.repo = "myrepo"
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-adv-001"
+        mock_brief.synthesis_failed = False
         mock_brief.pushed = True
         with (
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
@@ -312,6 +314,7 @@ class TestActionTaxonomy:
         cls.repo = "myrepo"
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-issue-001"
+        mock_brief.synthesis_failed = False
         mock_brief.pushed = True
         with (
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
@@ -437,6 +440,7 @@ class TestActionTaxonomy:
         directive.id = "dir-001"
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-dir-001"
+        mock_brief.synthesis_failed = False
         result = _tick_with_patches(target, {
             "lapis_pm.pm_core._encode_user_comments": MagicMock(return_value=[directive]),
             "lapis_pm.pm_core.brief.synthesize": MagicMock(return_value=mock_brief),
@@ -456,6 +460,7 @@ class TestActionTaxonomy:
         }
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-abandon-001"
+        mock_brief.synthesis_failed = False
         result = _tick_with_patches(target, {
             "lapis_pm.pm_core._encode_gpu_results": MagicMock(
                 return_value=(0, [failed_rec])
@@ -477,6 +482,7 @@ class TestActionTaxonomy:
         pr = {"number": 42}
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-exhaust-001"
+        mock_brief.synthesis_failed = False
         with (
             patch("lapis_pm.pm_core.episodic.write_hold"),
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
@@ -492,6 +498,7 @@ class TestActionTaxonomy:
         """Kill-switch first fire → action:review_gate_paused:cid=..."""
         mock_brief = MagicMock()
         mock_brief.comment_id = "cmt-gate-001"
+        mock_brief.synthesis_failed = False
         from lapis_pm import authority as _auth
         cls = MagicMock(spec=_auth.PRClassification)
         pr = {"number": 42}

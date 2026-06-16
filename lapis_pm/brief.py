@@ -188,6 +188,7 @@ class Brief:
     body: str
     comment_id: str
     pushed: bool
+    synthesis_failed: bool = False
 
 
 def _format_episodes(scored: list[episodic.ScoredComment], limit_chars: int = 200) -> str:
@@ -280,7 +281,9 @@ def synthesize(
         body = _synthesize_body(user)
         if body:
             break
+    synthesis_failed = False
     if not body:
+        synthesis_failed = True
         body = (
             "## State\nBrief synthesis failed — composer call returned empty.\n"
             "## Recent activity\n"
@@ -300,7 +303,7 @@ def synthesize(
 
     deep_link = f"{DASHBOARD_BASE}/thread/{target_id}"
     pushed = False
-    if notify is not None:
+    if notify is not None and not synthesis_failed:
         pushed = send_notification(
             message=body,
             title=f"Lapis PM: {target_id}",
@@ -309,7 +312,7 @@ def synthesize(
             url_title="Open thread",
         )
 
-    return Brief(target_id=target_id, body=body, comment_id=comment.id, pushed=pushed)
+    return Brief(target_id=target_id, body=body, comment_id=comment.id, pushed=pushed, synthesis_failed=synthesis_failed)
 
 
 def _write_options_sibling(

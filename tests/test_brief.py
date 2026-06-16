@@ -309,3 +309,123 @@ def test_brief_synthesis_fallback_after_two_empties():
 
     assert "Sonnet" not in result.body, f"Placeholder must not mention 'Sonnet'; got:\n{result.body}"
     assert "composer call returned empty" in result.body
+
+
+# ---------------------------------------------------------------------------
+# Synthesis-failed flag tests (acceptance criteria 1, 5)
+# ---------------------------------------------------------------------------
+
+def test_synthesize_returns_synthesis_failed_when_fallback_used():
+    """When _synthesize_body() returns None, synthesize() sets synthesis_failed=True."""
+    fake_comment = MagicMock()
+    fake_comment.id = "synthesis-failed-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
+    ):
+        result = brief.synthesize(
+            target_id="synthesis-failed-tid",
+            trigger="advisory-clean",
+            notify=None,
+        )
+
+    assert result.synthesis_failed is True, "Expected synthesis_failed=True when fallback is used"
+
+
+def test_synthesize_synthesis_success_not_failed():
+    """When _synthesize_body() returns valid body, synthesis_failed=False."""
+    valid_body = (
+        "## State\nGood.\n"
+        "## Recent activity\n- ok\n"
+        "## Risk / spec deviation\nnone\n"
+        "## Decision needed\nnone\n"
+    )
+    fake_comment = MagicMock()
+    fake_comment.id = "synthesis-success-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=valid_body),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
+    ):
+        result = brief.synthesize(
+            target_id="synthesis-success-tid",
+            trigger="advisory-clean",
+            notify=None,
+        )
+
+    assert result.synthesis_failed is False, "Expected synthesis_failed=False when synthesis succeeds"
+
+
+def test_pushover_not_sent_when_synthesis_failed():
+    """Pushover is not pushed when b.synthesis_failed=True."""
+    fake_comment = MagicMock()
+    fake_comment.id = "pushover-failed-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    send_notification = MagicMock(return_value=True)
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("lapis_pm.brief.send_notification", send_notification),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
+    ):
+        result = brief.synthesize(
+            target_id="pushover-failed-tid",
+            trigger="advisory-clean",
+            notify=brief.NotifyPriority.NORMAL,
+        )
+
+    assert result.synthesis_failed is True
+    assert result.pushed is False, "Expected pushed=False when synthesis_failed=True"
+    send_notification.assert_not_called()
+
+
+def test_pushover_sent_when_synthesis_succeeds():
+    """Pushover IS pushed when b.synthesis_failed=False."""
+    valid_body = (
+        "## State\nGood.\n"
+        "## Recent activity\n- ok\n"
+        "## Risk / spec deviation\nnone\n"
+        "## Decision needed\nnone\n"
+    )
+    fake_comment = MagicMock()
+    fake_comment.id = "pushover-success-cid"
+    fake_comment.tags = ["pm:brief"]
+
+    send_notification = MagicMock(return_value=True)
+
+    with (
+        patch("lapis_pm.brief.call_claude_cli", return_value=valid_body),
+        patch("lapis_pm.brief.send_notification", send_notification),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
+    ):
+        result = brief.synthesize(
+            target_id="pushover-success-tid",
+            trigger="advisory-clean",
+            notify=brief.NotifyPriority.NORMAL,
+        )
+
+    assert result.synthesis_failed is False
+    assert result.pushed is True, "Expected pushed=True when synthesis_failed=False"
+    send_notification.assert_called_once()

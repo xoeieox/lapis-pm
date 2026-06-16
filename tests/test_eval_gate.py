@@ -396,6 +396,7 @@ class TestBriefEmissionByStatus:
             brief_calls.append(kwargs)
             m = MagicMock()
             m.comment_id = "cid-4c"
+            m.synthesis_failed = False
             return m
 
         def fake_write_observation(*args, **kwargs):
@@ -592,6 +593,7 @@ class TestSmokeIntegration:
             brief_calls.append(kwargs)
             m = MagicMock()
             m.comment_id = "smoke-brief-cid"
+            m.synthesis_failed = False
             return m
 
         observation_calls = []
@@ -708,6 +710,7 @@ class TestBriefBodyShape:
             captured_kwargs.update(kwargs)
             m = MagicMock()
             m.comment_id = "cid-8"
+            m.synthesis_failed = False
             return m
 
         mock_eval_gate_obj = MagicMock()
@@ -753,6 +756,7 @@ class TestBriefBodyShape:
             captured_kwargs.update(kwargs)
             m = MagicMock()
             m.comment_id = "cid-unverified"
+            m.synthesis_failed = False
             return m
 
         mock_eval_gate_obj = MagicMock()

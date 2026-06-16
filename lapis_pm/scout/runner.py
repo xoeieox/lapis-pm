@@ -91,7 +91,7 @@ class _ScoutGravityWellAdapter:
             log.error("agents_core.llm not available — cannot route to GravityWell")
             raise ScoutGravityWellUnavailable("agents_core.llm not available") from None
 
-        prompt = "\n".join(m.content for m in messages)
+        prompt = "".join(m.content for m in messages)
         result = call_operator(
             "gravitywell",
             prompt=prompt,
@@ -275,38 +275,57 @@ def run_single(
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{seed:04d}"
     )
 
-    entity = PseudocodeSystemEntity(
-        scaffold=scaffold,
-        cell_id=cell_id,
-        seed=seed,
-        llm=llm,
-    )
-    director = ScoutDirector(
-        id=f"scout-director/{scaffold.spec_id}/{cell_id}/{seed}",
-        scaffold=scaffold,
-        cell_id=cell_id,
-    )
+    director = None
+    try:
+        entity = PseudocodeSystemEntity(
+            scaffold=scaffold,
+            cell_id=cell_id,
+            seed=seed,
+            llm=llm,
+        )
+        director = ScoutDirector(
+            id=f"scout-director/{scaffold.spec_id}/{cell_id}/{seed}",
+            scaffold=scaffold,
+            cell_id=cell_id,
+        )
 
-    engine = Engine()
-    run_log = engine.run(director=director, entities=[entity])
+        engine = Engine()
+        run_log = engine.run(director=director, entities=[entity])
 
-    payload = _build_trace_payload(scaffold, cell_id, cell_params, seed, run_log, director)
+        payload = _build_trace_payload(scaffold, cell_id, cell_params, seed, run_log, director)
+    except ScoutGravityWellUnavailable:
+        payload = ScoutTracePayload(
+            scaffold_hash=scaffold.scaffold_hash(cell_params),
+            spec_version=scaffold.spec_version,
+            cell_id=cell_id,
+            seed=seed,
+            scenario_generated="",
+            execution_trace="",
+            gw_skipped=True,
+        )
 
-    tick_prompts = director.tick_prompts()
+    tick_prompts = director.tick_prompts() if director and not payload.gw_skipped else []
     ph = _prompt_hash(tick_prompts) if tick_prompts else None
 
-    # Build summary (parse-free; Router reads this)
-    n_breaks = len(payload.breaks_observed)
-    break_sigs = ", ".join(
-        b.get("signature", "?") for b in payload.breaks_observed[:3]
-    ) or "none"
     summary = (
         f"Run {run_id} spec={scaffold.spec_id} cell={cell_id}: "
-        f"{n_breaks} break(s) ({break_sigs}), "
-        f"{len(payload.leverage_points)} leverage point(s), "
-        f"{len(payload.drift_signals)} drift signal(s), "
-        f"tools_used={list(payload.tools_used.keys()) or 'none'}"
+        if not payload.gw_skipped
+        else f"Run {run_id} spec={scaffold.spec_id} cell={cell_id} (GW skipped): "
     )
+
+    if payload.gw_skipped:
+        summary += "skipped (GravityWell unavailable)"
+    else:
+        n_breaks = len(payload.breaks_observed)
+        break_sigs = ", ".join(
+            b.get("signature", "?") for b in payload.breaks_observed[:3]
+        ) or "none"
+        summary += (
+            f"{n_breaks} break(s) ({break_sigs}), "
+            f"{len(payload.leverage_points)} leverage point(s), "
+            f"{len(payload.drift_signals)} drift signal(s), "
+            f"tools_used={list(payload.tools_used.keys()) or 'none'}"
+        )
 
     input_refs = [
         InputRef(ref=f"/srv/lapis/scout/sims/{scaffold.spec_id}.yaml", content_hash=None, type="file"),

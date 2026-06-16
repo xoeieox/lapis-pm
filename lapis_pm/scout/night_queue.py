@@ -940,36 +940,42 @@ def run_night(
                 cells=[unit.cell_id],
                 llm=llm_adapter,
             )
+            # Check if any trace has gw_skipped=True
+            if written_paths:
+                for trace_path in written_paths:
+                    try:
+                        ltr_data = json.loads(trace_path.read_text())
+                        if ltr_data.get("payload", {}).get("gw_skipped"):
+                            log.warning(
+                                "SCOUT_GW_UNAVAILABLE: scaffold=%s cell=%s skipped, no paid fallback — rerun when GW up",
+                                spec_id,
+                                unit.cell_id,
+                            )
+                            exit_code = 5
+                            break
+                    except (json.JSONDecodeError, OSError):
+                        pass
         except Exception as exc:
-            from .runner import ScoutGravityWellUnavailable
-            if isinstance(exc, ScoutGravityWellUnavailable):
-                log.warning(
-                    "SCOUT_GW_UNAVAILABLE: scaffold=%s cell=%s skipped, no paid fallback — rerun when GW up",
-                    spec_id,
-                    unit.cell_id,
-                )
-                exit_code = 5
-            else:
-                log.error(
-                    "simulate raised for spec_id=%s cell_id=%s: %s",
-                    spec_id,
-                    unit.cell_id,
-                    exc,
-                    exc_info=True,
-                )
-                exit_code = 1
-                # Error-based quarantine: after ERROR_QUARANTINE_N errors this run
-                _run_error_counts[spec_id] = _run_error_counts.get(spec_id, 0) + 1
-                if _run_error_counts[spec_id] >= ERROR_QUARANTINE_N:
-                    entry = quarantine.get(spec_id)
-                    if not entry.is_quarantined():
-                        entry.quarantined_at = time.time()
-                        entry.reason = f"{ERROR_QUARANTINE_N} errors in current run"
-                        quarantine._persist()
-                        log.warning(
-                            "QUARANTINE (error): spec_id=%s quarantined after %d errors this run",
-                            spec_id, _run_error_counts[spec_id],
-                        )
+            log.error(
+                "simulate raised for spec_id=%s cell_id=%s: %s",
+                spec_id,
+                unit.cell_id,
+                exc,
+                exc_info=True,
+            )
+            exit_code = 1
+            # Error-based quarantine: after ERROR_QUARANTINE_N errors this run
+            _run_error_counts[spec_id] = _run_error_counts.get(spec_id, 0) + 1
+            if _run_error_counts[spec_id] >= ERROR_QUARANTINE_N:
+                entry = quarantine.get(spec_id)
+                if not entry.is_quarantined():
+                    entry.quarantined_at = time.time()
+                    entry.reason = f"{ERROR_QUARANTINE_N} errors in current run"
+                    quarantine._persist()
+                    log.warning(
+                        "QUARANTINE (error): spec_id=%s quarantined after %d errors this run",
+                        spec_id, _run_error_counts[spec_id],
+                    )
 
         duration_s = time.time() - t0
 

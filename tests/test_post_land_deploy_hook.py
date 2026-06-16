@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock, call
 
 import pytest
 
-from lapis_pm import pm_core
+from lapis_pm import pm_core, spec_review
 
 
 def _make_completed_process(returncode=0, stderr="", stdout=""):
@@ -625,6 +625,93 @@ class TestCodeReviewerDeploy:
 
         assert all(p == Priority.LOW for p in notify_calls), (
             "code-reviewer pull failure must only emit LOW priority — never NORMAL or HIGH"
+        )
+
+
+class TestFacetsDeploy:
+    """Tests for facets entry in _POST_LAND_PULL (lapis-pm-deploy-pull-facets-v0)."""
+
+    def test_facets_not_in_post_land_restart(self):
+        """facets must not be in _POST_LAND_RESTART: adapter invoked per-fire, no daemon."""
+        assert "facets" not in pm_core._POST_LAND_RESTART
+
+    def test_facets_not_in_post_land_restart_user(self):
+        """facets must not be in _POST_LAND_RESTART_USER: no long-running user service."""
+        assert "facets" not in pm_core._POST_LAND_RESTART_USER
+
+    def test_facets_not_in_post_land_pull_critical(self):
+        """facets pull failure is LOW signal, not critical — must not be in CRITICAL set."""
+        assert "facets" not in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_facets_in_post_land_pull_low_signal(self):
+        """facets pull failure emits LOW-priority notification (advisory, per-invocation)."""
+        assert "facets" in pm_core._POST_LAND_PULL_LOW_SIGNAL
+
+    def test_facets_pull_triggers_git_pull_no_restart(self):
+        """Landing a facets PR fires exactly one git pull and zero systemctl calls."""
+        pull_calls = []
+        restart_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "sudo":
+                restart_calls.append(cmd)
+            elif cmd[0] == "systemctl" and "--user" in cmd:
+                restart_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                pm_core._post_land_deploy_hook("facets")
+
+        assert len(pull_calls) == 1
+        assert pull_calls[0] == [
+            "git", "-C", "/srv/git/facets-working", "pull", "--ff-only", "origin", "main"
+        ]
+        assert len(restart_calls) == 0, "facets is Type=oneshot per-fire adapter — no systemctl restart"
+
+    def test_facets_pull_failure_sends_low_priority_notify(self):
+        """A failed facets pull emits exactly one LOW-priority notification."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not fast-forward")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("facets")
+
+        assert len(notify_calls) == 1, "Expected exactly one notification on facets pull failure"
+        assert notify_calls[0]["priority"] == Priority.LOW, (
+            f"Expected Priority.LOW, got {notify_calls[0]['priority']}"
+        )
+        assert "facets" in notify_calls[0]["message"]
+        assert "/srv/git/facets-working" in notify_calls[0]["message"]
+
+    def test_facets_pull_failure_does_not_raise(self):
+        """A failed facets pull must not raise — landing must still complete."""
+        def fake_run(cmd, **kwargs):
+            return _make_completed_process(returncode=1, stderr="diverged")
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+            pm_core._post_land_git_pull("facets")  # must not raise
+
+    def test_facets_pull_path_synced_with_spec_review(self):
+        """Guard: facets pull path MUST match spec_review._FACETS_REPO_PATH."""
+        assert pm_core._POST_LAND_PULL["facets"] == [str(spec_review._FACETS_REPO_PATH)], (
+            "facets pull path diverged from spec_review._FACETS_REPO_PATH — "
+            "post-land pull and PYTHONPATH injection must target the same clone"
         )
 
 

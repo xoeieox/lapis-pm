@@ -1699,6 +1699,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Override runs_per_cell from the scaffold.",
     )
+    sc_sim.add_argument(
+        "--model",
+        default="gravitywell",
+        choices=["gravitywell", "qwen"],
+        help="Voicing model: gravitywell (owned 122B local, default) | qwen (StarHouse 35B-A3B).",
+    )
     sc_sim.set_defaults(func=cmd_scout)
 
     sc_dig = sc_sub.add_parser(
@@ -1777,6 +1783,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="SPEC_ID:PROFILE",
         help="Override a scaffold's priority profile (may be repeated).",
+    )
+    sc_nr.add_argument(
+        "--model",
+        default="gravitywell",
+        choices=["gravitywell", "qwen"],
+        help="Voicing model: gravitywell (owned 122B local, default) | qwen (StarHouse 35B-A3B).",
     )
     sc_nr.set_defaults(func=cmd_scout)
 

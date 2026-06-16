@@ -189,15 +189,22 @@ class Quarantine:
 # HealthGate
 # ---------------------------------------------------------------------------
 
-def _derive_health_url() -> str:
-    """Derive health URL from lapis_engine.adapters.LLAMA_SERVER_URL at runtime.
+def _derive_health_url(model: str = "gravitywell") -> str:
+    """Derive health URL based on model choice.
 
-    The URL is the source of truth — do not duplicate the literal here.
-    An env-var override (LAPIS_SCOUT_HEALTH_URL) wins when set.
+    For gravitywell: uses GW_URL (from env or default 203.0.113.11:8081).
+    For qwen: uses LLAMA_SERVER_URL from lapis_engine.adapters.
+    An explicit LAPIS_SCOUT_HEALTH_URL env-var override wins in both cases.
     """
     override = os.environ.get("LAPIS_SCOUT_HEALTH_URL", "")
     if override:
         return override
+
+    if model == "gravitywell":
+        gw_url = os.environ.get("GW_URL", "http://203.0.113.11:8081")
+        base = gw_url.rstrip("/")
+        return base + "/health"
+
     try:
         from lapis_engine.adapters import LLAMA_SERVER_URL  # type: ignore[import]
         base = LLAMA_SERVER_URL
@@ -206,7 +213,6 @@ def _derive_health_url() -> str:
             "lapis_engine is unavailable — cannot derive health URL. "
             "Set the LAPIS_SCOUT_HEALTH_URL env var to override."
         ) from exc
-    # Strip known suffix if present; fall back to simple rstrip approach.
     SUFFIX = "/v1/chat/completions"
     if base.endswith(SUFFIX):
         base = base[: -len(SUFFIX)]
@@ -214,14 +220,16 @@ def _derive_health_url() -> str:
 
 
 class HealthGate:
-    """Checks llama-server health before each WorkUnit.
+    """Checks llama-server (or GravityWell) health before each WorkUnit.
 
     Implements exponential backoff (base BACKOFF_BASE, ceiling BACKOFF_CEILING)
     and a wall-clock abort budget (HEALTH_ABORT_SECONDS).
+    Model-aware: probes GW health for gravitywell, StarHouse for qwen.
     """
 
-    def __init__(self) -> None:
-        self._health_url = _derive_health_url()
+    def __init__(self, model: str = "gravitywell") -> None:
+        self._model = model
+        self._health_url = _derive_health_url(model=model)
         self._backoff_interval = BACKOFF_BASE
         self._first_unhealthy_at: float | None = None
 
@@ -588,6 +596,7 @@ class NightRunResult:
     skipped_quarantine: int = 0
     skipped_health: int = 0
     skipped_contention: int = 0
+    skipped_gw: int = 0
     errored: int = 0
     aborted: bool = False
     abort_reason: str = ""
@@ -634,6 +643,7 @@ def run_night(
     budget=None,
     selected_path: Path | None = None,
     traces_root: Path | None = None,
+    model: str = "gravitywell",
 ) -> NightRunResult:
     """Run the night-queue orchestrator.
 
@@ -656,6 +666,8 @@ def run_night(
     selected_path:
         Path to selected.yaml priority-lane file. If None, look for
         <sims_dir>/selected.yaml; if absent, no priority lane.
+    model:
+        Voicing model: "gravitywell" (default, 122B GW) or "qwen" (StarHouse 35B).
     """
     global _stop_requested
     _stop_requested = False
@@ -814,13 +826,25 @@ def run_night(
     scheduler = Scheduler(scaffold_states, quarantine, shuffle_seed=shuffle_seed)
 
     # Instantiate infrastructure
-    health_gate = HealthGate()
+    health_gate = HealthGate(model=model)
     try:
         from agents_core.gpu import GPUQueue  # type: ignore[import]
         contention_monitor = ContentionMonitor(GPUQueue())
     except ImportError:
         log.warning("agents_core.gpu not available — contention monitoring disabled")
         contention_monitor = None
+
+    # Build model-specific adapter
+    if model == "qwen":
+        from .runner import _ScoutJsonAdapter
+        llm_adapter = _ScoutJsonAdapter(max_tokens=2048)
+    elif model == "gravitywell":
+        from .runner import _ScoutGravityWellAdapter
+        llm_adapter = _ScoutGravityWellAdapter(timeout=300)
+    else:
+        log.error("Unknown model: %s — defaulting to gravitywell", model)
+        from .runner import _ScoutGravityWellAdapter
+        llm_adapter = _ScoutGravityWellAdapter(timeout=300)
 
     # Deferred import of runner (avoid circular at module load; keep reference on
     # the module so tests can monkeypatch lapis_pm.scout.runner.simulate)
@@ -914,28 +938,38 @@ def run_night(
                 str(unit.scaffold_path),
                 runs_per_cell=1,
                 cells=[unit.cell_id],
+                llm=llm_adapter,
             )
         except Exception as exc:
-            log.error(
-                "simulate raised for spec_id=%s cell_id=%s: %s",
-                spec_id,
-                unit.cell_id,
-                exc,
-                exc_info=True,
-            )
-            exit_code = 1
-            # Error-based quarantine: after ERROR_QUARANTINE_N errors this run
-            _run_error_counts[spec_id] = _run_error_counts.get(spec_id, 0) + 1
-            if _run_error_counts[spec_id] >= ERROR_QUARANTINE_N:
-                entry = quarantine.get(spec_id)
-                if not entry.is_quarantined():
-                    entry.quarantined_at = time.time()
-                    entry.reason = f"{ERROR_QUARANTINE_N} errors in current run"
-                    quarantine._persist()
-                    log.warning(
-                        "QUARANTINE (error): spec_id=%s quarantined after %d errors this run",
-                        spec_id, _run_error_counts[spec_id],
-                    )
+            from .runner import ScoutGravityWellUnavailable
+            if isinstance(exc, ScoutGravityWellUnavailable):
+                log.warning(
+                    "SCOUT_GW_UNAVAILABLE: scaffold=%s cell=%s skipped, no paid fallback — rerun when GW up",
+                    spec_id,
+                    unit.cell_id,
+                )
+                exit_code = 5
+            else:
+                log.error(
+                    "simulate raised for spec_id=%s cell_id=%s: %s",
+                    spec_id,
+                    unit.cell_id,
+                    exc,
+                    exc_info=True,
+                )
+                exit_code = 1
+                # Error-based quarantine: after ERROR_QUARANTINE_N errors this run
+                _run_error_counts[spec_id] = _run_error_counts.get(spec_id, 0) + 1
+                if _run_error_counts[spec_id] >= ERROR_QUARANTINE_N:
+                    entry = quarantine.get(spec_id)
+                    if not entry.is_quarantined():
+                        entry.quarantined_at = time.time()
+                        entry.reason = f"{ERROR_QUARANTINE_N} errors in current run"
+                        quarantine._persist()
+                        log.warning(
+                            "QUARANTINE (error): spec_id=%s quarantined after %d errors this run",
+                            spec_id, _run_error_counts[spec_id],
+                        )
 
         duration_s = time.time() - t0
 
@@ -963,6 +997,8 @@ def run_night(
         result.total_units += 1
         if exit_code == 0:
             result.completed_ok += 1
+        elif exit_code == 5:
+            result.skipped_gw += 1
         else:
             result.errored += 1
 
@@ -1025,8 +1061,8 @@ def read_status(log_root: Path, as_json: bool = False) -> str:
 
     # Aggregate per-scaffold counts
     from collections import defaultdict
-    per_scaffold: dict[str, dict] = defaultdict(lambda: {"completed": 0, "errored": 0, "skipped_quarantine": 0})
-    total = units_completed = units_errored = units_skipped_q = units_skipped_h = units_skipped_c = 0
+    per_scaffold: dict[str, dict] = defaultdict(lambda: {"completed": 0, "errored": 0, "skipped_quarantine": 0, "skipped_gw": 0})
+    total = units_completed = units_errored = units_skipped_q = units_skipped_h = units_skipped_c = units_skipped_gw = 0
     for row in rows:
         ec = row["exit_code"]
         sid = row["spec_id"]
@@ -1044,6 +1080,9 @@ def read_status(log_root: Path, as_json: bool = False) -> str:
             units_skipped_h += 1
         elif ec == 4:
             units_skipped_c += 1
+        elif ec == 5:
+            units_skipped_gw += 1
+            per_scaffold[sid]["skipped_gw"] += 1
 
     # Quarantine state
     quarantined_entries = []
@@ -1076,6 +1115,7 @@ def read_status(log_root: Path, as_json: bool = False) -> str:
         "units_skipped_quarantine": units_skipped_q,
         "units_skipped_health": units_skipped_h,
         "units_skipped_contention": units_skipped_c,
+        "units_skipped_gw": units_skipped_gw,
         "scaffolds": [
             {"spec_id": sid, **counts}
             for sid, counts in sorted(per_scaffold.items())
@@ -1092,14 +1132,14 @@ def read_status(log_root: Path, as_json: bool = False) -> str:
         f"Manifest:  {manifest_path}",
         f"Started:   {started_at}  Last row: {last_at}",
         f"Units:     {total} total | {units_completed} ok | {units_errored} err "
-        f"| {units_skipped_q} quarantined | {units_skipped_h} health | {units_skipped_c} contention",
+        f"| {units_skipped_q} quar | {units_skipped_h} health | {units_skipped_c} contention | {units_skipped_gw} gw",
         "",
         "Per-scaffold:",
     ]
     for sid, counts in sorted(per_scaffold.items()):
         lines.append(
             f"  {sid}: {counts['completed']} ok, {counts['errored']} err, "
-            f"{counts['skipped_quarantine']} quar-skip"
+            f"{counts['skipped_quarantine']} quar, {counts['skipped_gw']} gw"
         )
     if quarantined_entries:
         lines.append("")

@@ -61,6 +61,50 @@ class _ScoutJsonAdapter(LlamaAdapter):
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
+_SCOUT_GRAVITYWELL_WAKE_FAIL = "skip"
+
+
+class ScoutGravityWellUnavailable(Exception):
+    """GravityWell is unavailable (not serving, doorman unreachable, or wake failed)."""
+
+    pass
+
+
+class _ScoutGravityWellAdapter:
+    """Consumer-side GravityWell adapter for Scout voicing.
+
+    Routes through call_operator("gravitywell", ...) for doorman-leased
+    wake-on-demand, keepawake hold, and legible skip-on-unavailable.
+    Implements the chat(system, messages) -> str protocol.
+    """
+
+    model = "gravitywell-122b"
+
+    def __init__(self, timeout: int = 300) -> None:
+        self.timeout = timeout
+
+    def chat(self, system: str, messages: list[Message]) -> str:  # type: ignore[override]
+        """Call GravityWell via call_operator; raise ScoutGravityWellUnavailable on skip."""
+        try:
+            from agents_core.llm import call_operator  # type: ignore[import]
+        except ImportError:
+            log.error("agents_core.llm not available — cannot route to GravityWell")
+            raise ScoutGravityWellUnavailable("agents_core.llm not available") from None
+
+        prompt = "\n".join(m.content for m in messages)
+        result = call_operator(
+            "gravitywell",
+            prompt=prompt,
+            system=system,
+            json_mode=True,
+            timeout=self.timeout,
+            on_wake_fail=_SCOUT_GRAVITYWELL_WAKE_FAIL,
+        )
+        if result is None:
+            raise ScoutGravityWellUnavailable("GravityWell unavailable (wake failed, not serving, or doorman unreachable)")
+        return str(result)
+
+
 # ---------------------------------------------------------------------------
 # Hashing helpers
 # ---------------------------------------------------------------------------
@@ -224,7 +268,7 @@ def run_single(
 ) -> tuple[Any, str]:  # (LapisToolReturn, run_id)
     """Run a single (cell, seed) and return (LapisToolReturn, run_id)."""
     if llm is None:
-        llm = _ScoutJsonAdapter(max_tokens=2048)
+        llm = _ScoutGravityWellAdapter(timeout=300)
 
     cell_id = ScoutScaffold.cell_id(cell_params)
     run_id = (
@@ -331,7 +375,7 @@ def simulate(
     cells:
         If given, only run the listed cell IDs (e.g. from ``--cell`` CLI flag).
     llm:
-        LanguageModel to use.  Defaults to LlamaAdapter pointing at llama-server.
+        LanguageModel to use. Defaults to GravityWell (122B, doorman-leased).
     traces_root:
         Override the default ``/srv/lapis/scout/traces`` root (useful for tests).
 

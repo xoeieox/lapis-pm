@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -71,6 +72,73 @@ def diff_loc(diff_text: str) -> int:
 
 def is_held_path(path: str) -> bool:
     return any(p.search(path) for p in HELD_PATTERNS)
+
+
+def render_systemd_semantics(diff_text: str, held_hits: list[str]) -> list[str]:
+    """Extract OnCalendar semantics from held systemd timer/service diffs.
+
+    Parses ADDED OnCalendar= lines from changed .timer/.service files in the diff,
+    runs systemd-analyze calendar on each, and returns human-readable cadence lines.
+    Failures degrade gracefully — no exception raised, just append unavailable note.
+    """
+    result = []
+
+    # Find all .timer/.service files in held_hits
+    systemd_files = [p for p in held_hits if p.endswith(".timer") or p.endswith(".service")]
+    if not systemd_files:
+        return result
+
+    # Extract ADDED OnCalendar= lines from the diff
+    oncalendar_pattern = re.compile(r"^\+OnCalendar=(.+)$", re.MULTILINE)
+    matches = oncalendar_pattern.findall(diff_text)
+    if not matches:
+        return result
+
+    # For each OnCalendar value, run systemd-analyze and extract the cadence
+    for value in matches:
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            output = subprocess.run(
+                ["/usr/bin/systemd-analyze", "calendar", value],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if output.returncode != 0:
+                result.append(f"(semantics render unavailable: systemd-analyze returned {output.returncode})")
+                continue
+
+            # Parse the output: look for "Next elapse" or "Normalized form" line
+            lines = output.stdout.strip().split("\n")
+            normalized = None
+            cadence = None
+            for line in lines:
+                if line.startswith("  Normalized form:"):
+                    normalized = line.replace("  Normalized form:", "").strip()
+                elif "Next elapse" in line or "From now" in line:
+                    cadence = line.strip()
+
+            if normalized and cadence:
+                # Extract a short human-readable summary
+                result.append(f"OnCalendar={value} -> {cadence}")
+            elif normalized:
+                result.append(f"OnCalendar={value} -> {normalized}")
+            else:
+                result.append(f"OnCalendar={value} (parsed OK, limited detail)")
+
+        except FileNotFoundError:
+            result.append("(semantics render unavailable: systemd-analyze not found)")
+            break
+        except subprocess.TimeoutExpired:
+            result.append("(semantics render unavailable: systemd-analyze timeout)")
+            break
+        except Exception as e:
+            result.append(f"(semantics render unavailable: {type(e).__name__})")
+            break
+
+    return result
 
 
 SCREEN_SYSTEM = """You are a strict PR screener. Read the diff and return JSON:
@@ -140,6 +208,9 @@ def classify(repo: str, pr_number: int, spec_summary: str,
     # --- Static: held paths (applies to all authority levels) ---
     if held_hits:
         reasons = [f"held path(s) touched: {', '.join(held_hits[:5])}"]
+        # Enrich with systemd semantics if applicable
+        rendered = render_systemd_semantics(diff_text, held_hits)
+        reasons.extend(rendered)
         return PRClassification(
             verdict="hold",
             screen_verdict="unknown",

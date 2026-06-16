@@ -2197,11 +2197,8 @@ def _pr_owned_by_bound_sibling(pr: dict, self_target_id: str, repo: str) -> bool
 
     Raises exception if TargetStore.load_all() fails — caller applies verify-failure policy.
     """
-    try:
-        store = TargetStore()
-        all_targets = store.load_all()
-    except Exception:
-        raise  # let caller handle store failure
+    store = TargetStore()
+    all_targets = store.load_all()
 
     head = (pr.get("head") or {}).get("ref") or ""
 

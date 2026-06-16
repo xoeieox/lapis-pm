@@ -205,12 +205,17 @@ class TestReconciliation:
 
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
-            patch("lapis_pm.pm_core._pr_owned_by_bound_sibling", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
             patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
         ):
+            # Mock empty bound set (no siblings)
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = []
+            mock_store_class.return_value = mock_store
+
             mock_brief_obj = MagicMock()
             mock_brief_obj.comment_id = "cid-123"
             mock_brief_obj.synthesis_failed = False
@@ -248,11 +253,16 @@ class TestReconciliation:
 
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
-            patch("lapis_pm.pm_core._pr_owned_by_bound_sibling", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value="cid-existing"),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
         ):
+            # Mock empty bound set (no siblings)
+            mock_store = MagicMock()
+            mock_store.load_all.return_value = []
+            mock_store_class.return_value = mock_store
+
             pm_core._reconcile_orphan_prs("my-target", target, "my-repo", [pr])
 
         # Should NOT synthesize a new brief (idempotency guard)
@@ -421,21 +431,41 @@ class TestReconciliation:
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
             patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
-            patch("lapis_pm.pm_core._emit_reconcile_verify_failure") as mock_emit_fail,
+            patch("agents_core.notify.send_notification") as mock_notify,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core._now_iso") as mock_now_iso,
         ):
             mock_store = MagicMock()
             mock_store.load_all.side_effect = store_error
             mock_store_class.return_value = mock_store
 
+            # Mock mem to avoid cooldown; first call returns None (no prior alert)
+            mock_mem_instance = MagicMock()
+            mock_mem_instance.get.return_value = None
+            mock_mem.return_value = mock_mem_instance
+
+            mock_now_iso.return_value = "2026-06-16T12:00:00+00:00"
+
             pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
 
-        # Should emit verify-fail, not synthesize brief
-        mock_emit_fail.assert_called_once()
-        call_args = mock_emit_fail.call_args
-        assert call_args.args[0] == "target-A"
-        assert call_args.args[1] == 99
-        assert isinstance(call_args.args[2], RuntimeError)
+        # Should emit verify-fail notification (NotifyPriority.NORMAL)
+        mock_notify.assert_called_once()
+        notify_call = mock_notify.call_args
+        message = notify_call.kwargs.get("message")
+        assert "target-A" in message
+        assert "TargetStore read failed" in message
+        assert notify_call.kwargs.get("priority") == pm_core.NotifyPriority.NORMAL
+
+        # Should write episodic observation with pm:reconcile-verify-failure tag
+        mock_obs.assert_called_once()
+        obs_call = mock_obs.call_args
+        assert obs_call.args[0] == "target-A"  # target_id
+        assert "pm:reconcile-verify-failure" in obs_call.kwargs.get("extra_tags", [])
+        assert f"pm:pr=99" in obs_call.kwargs.get("extra_tags", [])
+
+        # Should NOT synthesize orphan brief
         mock_brief.assert_not_called()
 
     def test_verify_fail_dedup_within_cooldown(self):
@@ -468,6 +498,50 @@ class TestReconciliation:
         mock_log_debug.assert_called_once()
         mock_notify.assert_not_called()
         mock_obs.assert_not_called()
+
+    def test_verify_fail_dedup_past_cooldown(self):
+        """Verify-fail alerts fire again after cooldown expires."""
+        from datetime import timedelta, datetime, timezone
+
+        target_id = "target-A"
+        pr_number = 99
+
+        # Set an old timestamp (past cooldown window)
+        now = datetime.now(timezone.utc)
+        old_ts = (now - timedelta(seconds=3700)).isoformat()  # 3700s ago > 3600s cooldown
+        cooldown_key = pm_core._RECONCILE_VERIFY_FAIL_KEY.format(target_id)
+
+        with (
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core._now_iso") as mock_now_iso,
+            patch("agents_core.notify.send_notification") as mock_notify,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            mock_mem_instance = MagicMock()
+            # Simulate existing old cooldown entry
+            mock_mem_instance.get.return_value = {"content": old_ts}
+            mock_mem.return_value = mock_mem_instance
+
+            # Mock _now_iso to return current time (past cooldown)
+            current_ts = now.isoformat()
+            mock_now_iso.return_value = current_ts
+
+            err = RuntimeError("test error")
+            pm_core._emit_reconcile_verify_failure(target_id, pr_number, err)
+
+        # Should notify (cooldown expired)
+        mock_notify.assert_called_once()
+        call_args = mock_notify.call_args
+        # Verify message contains target and repo context
+        message = call_args.kwargs.get("message")
+        assert target_id in message
+        assert "TargetStore read failed" in message
+
+        # Should write observation
+        mock_obs.assert_called_once()
+        call_args = mock_obs.call_args
+        assert target_id == call_args.args[0]
+        assert "pm:reconcile-verify-failure" in call_args.kwargs.get("extra_tags", [])
 
 
 class TestTemplateMarkers:

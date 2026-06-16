@@ -53,7 +53,9 @@ class TestRenderSystemdSemantics:
             result = authority.render_systemd_semantics(diff, held_hits)
 
         assert len(result) > 0
-        assert any("4s" in line or "*:*:00/5" in line for line in result)
+        # Must contain the cadence (From now or Next elapse substring), not the limited-detail fallback
+        assert any("From now" in line or "Next elapse" in line for line in result)
+        assert not any("limited detail" in line for line in result)
 
     def test_oncalendar_5min_cadence(self):
         """OnCalendar=*:00/5:00 should yield a ~5min cadence line."""
@@ -75,7 +77,9 @@ class TestRenderSystemdSemantics:
             result = authority.render_systemd_semantics(diff, held_hits)
 
         assert len(result) > 0
-        assert any("4min" in line or "*:00/5:00" in line for line in result)
+        # Must contain the cadence (From now or Next elapse substring), not the limited-detail fallback
+        assert any("From now" in line or "Next elapse" in line for line in result)
+        assert not any("limited detail" in line for line in result)
 
     def test_systemd_analyze_missing(self):
         """Missing systemd-analyze binary yields unavailable note."""
@@ -117,6 +121,28 @@ class TestRenderSystemdSemantics:
         assert len(result) > 0
         assert any("unavailable" in line.lower() and "1" in line for line in result)
 
+    def test_oncalendar_no_cadence_fallback(self):
+        """When systemd-analyze has no 'From now' line, fall back to limited-detail note."""
+        diff = "+++ b/systemd/app.timer\n+OnCalendar=something"
+        held_hits = ["systemd/app.timer"]
+
+        # Mock output with no "From now" or "Next elapse" line
+        mock_output = """\
+  Original form: something
+  Normalized form: something
+"""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=mock_output,
+                stderr="",
+            )
+            result = authority.render_systemd_semantics(diff, held_hits)
+
+        assert len(result) > 0
+        # Should fall back to limited-detail note
+        assert any("limited detail" in line for line in result)
+
 
 class TestClassifyWithSystemdRendering:
     """Test that classify() correctly wires in systemd rendering."""
@@ -146,10 +172,12 @@ class TestClassifyWithSystemdRendering:
 
         assert cls.verdict == "hold"
         assert cls.static_outcome == authority.StaticOutcome.auto_hold_path
-        # Should have both the base "held path(s) touched" line and a rendered line
+        # Should have both the base "held path(s) touched" line and a rendered line with cadence
         assert len(cls.reasons) >= 2
         assert "held path(s) touched" in cls.reasons[0]
-        assert any("4s" in r or "*:*:00/5" in r for r in cls.reasons[1:])
+        # The rendered line must contain the cadence (From now / Next elapse), not limited detail
+        assert any(("From now" in r or "Next elapse" in r) for r in cls.reasons[1:])
+        assert not any("limited detail" in r for r in cls.reasons)
 
     def test_classify_held_path_non_systemd_no_rendering(self):
         """classify() with non-systemd held path yields no extra lines."""

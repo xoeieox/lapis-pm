@@ -110,22 +110,20 @@ def render_systemd_semantics(diff_text: str, held_hits: list[str]) -> list[str]:
                 result.append(f"(semantics render unavailable: systemd-analyze returned {output.returncode})")
                 continue
 
-            # Parse the output: look for "Next elapse" or "Normalized form" line
+            # Parse the output: look for cadence line (Next elapse / From now)
+            # The cadence line is what matters most for the human reading the brief
             lines = output.stdout.strip().split("\n")
-            normalized = None
             cadence = None
             for line in lines:
-                if line.startswith("  Normalized form:"):
-                    normalized = line.replace("  Normalized form:", "").strip()
-                elif "Next elapse" in line or "From now" in line:
+                if "Next elapse" in line or "From now" in line:
                     cadence = line.strip()
+                    break
 
-            if normalized and cadence:
-                # Extract a short human-readable summary
+            if cadence:
+                # Emit the cadence line (this is the critical info for the human)
                 result.append(f"OnCalendar={value} -> {cadence}")
-            elif normalized:
-                result.append(f"OnCalendar={value} -> {normalized}")
             else:
+                # Only fall back to limited-detail note if we truly found no cadence
                 result.append(f"OnCalendar={value} (parsed OK, limited detail)")
 
         except FileNotFoundError:

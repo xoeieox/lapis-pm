@@ -2188,12 +2188,110 @@ def _is_pr_traceable_to_target(target_id: str, pr: dict) -> bool:
     return False
 
 
+def _pr_owned_by_bound_sibling(pr: dict, self_target_id: str, repo: str) -> bool:
+    """Check if a PR is owned by another bound target in this repo.
+
+    Returns True if, for any sibling target (bound to the same repo and not self):
+    - The PR's branch matches lapis/<sibling_id>/, OR
+    - The PR is traceable to the sibling via markers/dispatch records
+
+    Raises exception if TargetStore.load_all() fails — caller applies verify-failure policy.
+    """
+    store = TargetStore()
+    all_targets = store.load_all()
+
+    head = (pr.get("head") or {}).get("ref") or ""
+
+    for sib in all_targets:
+        if sib.id == self_target_id:
+            continue  # skip self
+        if not sib.pm_bound or sib.pm_repo != repo:
+            continue  # skip targets not bound to this repo
+
+        # Check canonical branch
+        if _branch_belongs(sib.id, head):
+            return True
+
+        # Check traceability to sibling
+        if _is_pr_traceable_to_target(sib.id, pr):
+            return True
+
+    return False
+
+
+_RECONCILE_VERIFY_FAIL_KEY = "pm/reconcile-verify-fail-last-alert/{}"
+_RECONCILE_VERIFY_FAIL_COOLDOWN_SECS = 3600
+
+
+def _emit_reconcile_verify_failure(target_id: str, pr_number: int, err: Exception) -> None:
+    """Emit a deduped verification-failure signal when TargetStore read fails.
+
+    Uses cooldown to prevent notification storms during an outage. When the last
+    alert for this target is within the cooldown window, logs and returns silently.
+    Otherwise, sends one NORMAL-priority notification + episodic observation.
+    """
+    cooldown_key = _RECONCILE_VERIFY_FAIL_KEY.format(target_id)
+
+    # Check cooldown
+    try:
+        last_raw = _mem().get(cooldown_key)
+        if last_raw:
+            last_ts = datetime.fromisoformat(last_raw["content"])
+            now_ts = datetime.now(last_ts.tzinfo or PACIFIC)
+            if (now_ts - last_ts).total_seconds() < _RECONCILE_VERIFY_FAIL_COOLDOWN_SECS:
+                logger.debug(
+                    "reconcile verify-fail alert for %s within cooldown; skipping notify",
+                    target_id,
+                )
+                return
+    except Exception:
+        pass  # cooldown check failure is non-fatal
+
+    # Set cooldown key
+    try:
+        _mem().set(
+            cooldown_key,
+            _now_iso(),
+            tags=["lapis-pm", "reconcile-verify-failure"],
+        )
+    except Exception:
+        pass  # cache failure is non-fatal
+
+    # Send notification
+    try:
+        from agents_core.notify import send_notification
+        send_notification(
+            message=(
+                f"reconcile could not verify PR ownership for `{target_id}` "
+                f"(TargetStore read failed: {type(err).__name__}); "
+                "orphan detection paused for this target until the store recovers."
+            ),
+            title=f"lapis-pm: reconcile verification failure for {target_id}",
+            priority=NotifyPriority.NORMAL,
+        )
+    except Exception as notify_err:
+        logger.warning("reconcile verify-fail notification failed: %s", notify_err)
+
+    # Write episodic observation
+    try:
+        episodic.write_observation(
+            target_id,
+            f"Reconcile verify-failure: TargetStore read failed while checking PR #{pr_number} "
+            f"ownership ({type(err).__name__}: {err}); "
+            "orphan detection paused until store recovers.",
+            extra_tags=["pm:reconcile-verify-failure", f"pm:pr={pr_number}"],
+        )
+    except Exception as obs_err:
+        logger.warning("reconcile verify-fail observation failed: %s", obs_err)
+
+
 def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[dict]) -> None:
     """Reconciliation pass: check for deviant-branch PRs and auto-adopt traceable ones.
 
     For each open PR whose branch does NOT match lapis/<target_id>/:
     - If traceable via markers, auto-adopt (set adopted_head_branch + adopted_pr_number)
-    - If not traceable, raise a brief with adopt|close|ignore options
+    - If owned by another bound target, skip silently
+    - If not traceable to any target, raise a brief with adopt|close|ignore options
 
     Brief idempotency: if an outstanding brief already exists for this target
     and references this PR, skip re-synthesis to avoid LLM budget waste and
@@ -2227,7 +2325,18 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
                 extra_tags=["pm:orphan-adopted", f"pm:pr={pr_number}"],
             )
         else:
-            # Not traceable: check for outstanding brief idempotency guard
+            # Not traceable to self: check if owned by another bound target
+            try:
+                owned_by_sibling = _pr_owned_by_bound_sibling(pr, target_id, repo)
+            except Exception as e:
+                _emit_reconcile_verify_failure(target_id, pr_number, e)
+                continue
+
+            if owned_by_sibling:
+                # PR belongs to another bound target; skip silently
+                continue
+
+            # Not traceable to any target: check for outstanding brief idempotency guard
             # to avoid re-synthesizing brief.synthesize() on every tick
             existing_brief = get_outstanding_brief(target_id)
             if existing_brief:

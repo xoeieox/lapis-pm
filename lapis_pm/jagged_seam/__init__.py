@@ -6,7 +6,7 @@ DRY arbiter — surfaces decision-variables a single balanced pass misses.
 
 This package provides the arbiter and adapters to normalize Scout (fear) and Backcaster
 (desire) outputs into a common contract and extract named decision-variables at their
-intersection.
+intersection. The warmup module provides a thin run-driver for U2 calibration.
 """
 from __future__ import annotations
 

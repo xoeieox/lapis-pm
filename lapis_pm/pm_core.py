@@ -190,6 +190,15 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # Unlike lapis-pm's split dev/deploy trees, synapse has a SINGLE tree used for both PM-investigation
     # and runtime. Pull failure → stale runtime → see _POST_LAND_PULL_CRITICAL below.
     "synapse":        ["/srv/git/synapse-working"],
+    # gardener is pip editable-installed from /srv/git/gardener-working; gardener-night.service
+    # (Type=oneshot, 07:00 LA) re-imports from this tree on each fire, so a pull (no restart) picks
+    # up new code on the next nightly. Pull failure → LOW signal (a degraded/stale nightly synthesis
+    # is attributable, not a broken daemon). Spec: lapis-pm-deploy-pull-gardener-v0.
+    # LIABILITY: this is the single double-duty tree (shared dev/PM-investigation + runtime), the same
+    # structure flagged for facets - a /pm-pr-review that checks a branch OUT into this tree, or any
+    # dirty/detached state, makes the ff-only pull fail (LOW alert) until the tree is restored to main.
+    # The durable decouple to a dedicated deploy clone is a deferred follow-on (see §4), NOT this unit.
+    "gardener":       ["/srv/git/gardener-working"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -205,7 +214,9 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # a broken daemon.  LOW keeps the failure attributable without paging.
 # facets: advisory-only, per-invocation gate (Haiku personas, spec-review). Stale
 # code → degraded next spec-review fire. LOW keeps it attributable.
-_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets"})
+# gardener: timer-oneshot service (07:00 LA nightly synthesis) — stale code is a
+# degraded synthesis, not a broken daemon. LOW keeps it attributable.
+_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener"})
 
 _DEPLOY_LOG = Path("/srv/lapis/lapis-state/lapis-pm-deploy-log.md")
 _DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"

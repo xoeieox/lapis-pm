@@ -896,6 +896,111 @@ class TestSynapseDeploy:
         )
 
 
+class TestGardenerDeploy:
+    """Tests for gardener entry in _POST_LAND_PULL (lapis-pm-deploy-pull-gardener-v0)."""
+
+    def test_gardener_not_in_post_land_restart(self):
+        """gardener must not be in _POST_LAND_RESTART: timer re-imports on each fire."""
+        assert "gardener" not in pm_core._POST_LAND_RESTART
+
+    def test_gardener_not_in_post_land_restart_user(self):
+        """gardener must not be in _POST_LAND_RESTART_USER: no long-running user service."""
+        assert "gardener" not in pm_core._POST_LAND_RESTART_USER
+
+    def test_gardener_not_in_post_land_pull_critical(self):
+        """gardener pull failure is LOW signal, not critical — must not be in CRITICAL set."""
+        assert "gardener" not in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_gardener_in_post_land_pull_low_signal(self):
+        """gardener pull failure emits LOW-priority notification (timer oneshot nightly)."""
+        assert "gardener" in pm_core._POST_LAND_PULL_LOW_SIGNAL
+
+    def test_gardener_pull_triggers_git_pull_no_restart(self):
+        """Landing a gardener PR fires exactly one git pull and zero systemctl calls."""
+        pull_calls = []
+        restart_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "sudo":
+                restart_calls.append(cmd)
+            elif cmd[0] == "systemctl" and "--user" in cmd:
+                restart_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                pm_core._post_land_deploy_hook("gardener")
+
+        assert len(pull_calls) == 1
+        assert pull_calls[0] == [
+            "git", "-C", "/srv/git/gardener-working", "pull", "--ff-only", "origin", "main"
+        ]
+        assert len(restart_calls) == 0, "gardener is Type=oneshot — no systemctl restart"
+
+    def test_gardener_pull_failure_sends_low_priority_notify(self):
+        """A failed gardener pull emits exactly one LOW-priority notification."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not fast-forward")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("gardener")
+
+        assert len(notify_calls) == 1, "Expected exactly one notification on gardener pull failure"
+        assert notify_calls[0]["priority"] == Priority.LOW, (
+            f"Expected Priority.LOW, got {notify_calls[0]['priority']}"
+        )
+        assert "gardener" in notify_calls[0]["message"]
+        assert "/srv/git/gardener-working" in notify_calls[0]["message"]
+
+    def test_gardener_pull_failure_does_not_raise(self):
+        """A failed gardener pull must not raise — landing must still complete."""
+        def fake_run(cmd, **kwargs):
+            return _make_completed_process(returncode=1, stderr="diverged")
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+            pm_core._post_land_git_pull("gardener")  # must not raise
+
+    def test_gardener_pull_failure_not_critical_channel(self):
+        """gardener pull failure must NOT emit NORMAL or HIGH priority — low signal only."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not ff")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("gardener")
+
+        assert all(p == Priority.LOW for p in notify_calls), (
+            "gardener pull failure must only emit LOW priority — never NORMAL or HIGH"
+        )
+
+
 class TestMergeAndDeploy:
     """Tests for merge_and_deploy choicepoint."""
 

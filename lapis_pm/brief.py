@@ -70,7 +70,7 @@ def _brief_version_line() -> str:
     return f"\n---\n*lapis_pm @ {sha}, brief.py:{_BRIEF_MODEL}, {ts}*"
 
 
-DASHBOARD_BASE = "http://203.0.113.12:8400"   # Conductor dashboard
+DASHBOARD_BASE = "http://203.0.113.10:8400"   # BRIX Conductor dashboard
 _DIFF_CAP = 30000
 
 BRIEF_SYSTEM = """You are the Lapis PM agent producing a *brief* for Erah.

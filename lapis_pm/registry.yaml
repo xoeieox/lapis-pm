@@ -43,6 +43,7 @@ agents:
     chub_bundles: []
     capture_meta: false
     notify: true
+    notify_policy: infra-only
     system_template: |
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
@@ -225,6 +226,7 @@ agents:
     chub_bundles: []
     capture_meta: true
     notify: true
+    notify_policy: infra-only
     system_template: |
       You are a fix agent for repo {repo}, working on target {target_id}.
 

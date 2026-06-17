@@ -157,3 +157,336 @@ def test_build_brief_incomplete_on_timeout(tmp_path):
     )
     assert brief.combined_recommendation == "incomplete"
     assert brief.sonnet_verdict == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# Effective voicing / operator surface tests
+# ---------------------------------------------------------------------------
+
+def test_build_brief_council_voicing_no_degrade(tmp_path):
+    """Council ran on GravityWell with no degrade."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    council = _council_raw("resolved")
+    council["voicing_effective"] = "gravitywell"
+    council["voicing_degraded"] = False
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=council,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        council_voicing_requested="gravitywell",
+    )
+    assert brief.council_voicing_requested == "gravitywell"
+    assert brief.council_voicing_effective == "gravitywell"
+    assert brief.council_voicing_degraded is False
+    assert brief.council_voicing_degraded_reason == ""
+
+
+def test_build_brief_council_voicing_degraded(tmp_path):
+    """Council degraded from GravityWell to Sonnet due to gw_not_serving."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    council = _council_raw("resolved")
+    council["voicing_effective"] = "sonnet"
+    council["voicing_degraded"] = True
+    council["voicing_degraded_reason"] = "gw_not_serving"
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=council,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        council_voicing_requested="gravitywell",
+    )
+    assert brief.council_voicing_requested == "gravitywell"
+    assert brief.council_voicing_effective == "sonnet"
+    assert brief.council_voicing_degraded is True
+    assert brief.council_voicing_degraded_reason == "gw_not_serving"
+
+
+def test_build_brief_council_voicing_missing_provenance(tmp_path):
+    """Council effective voicing missing (older run) renders as unknown."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    council = _council_raw("resolved")
+    # No voicing_effective field
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=council,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        council_voicing_requested="gravitywell",
+    )
+    assert brief.council_voicing_effective == "unknown"
+    assert brief.council_voicing_degraded is False
+
+
+def test_build_brief_facets_operator_no_degrade(tmp_path):
+    """Facets ran on haiku with no degrade (no operator_requested field)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    facets = {
+        "deliberation_id": "fac-123",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        "methodology": {
+            "operator_requested": None,
+            "synthesis_operator": "haiku",
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "haiku"},
+        },
+        "stances": [],
+    }
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    assert brief.facets_operator_requested == ""
+    assert brief.facets_operator_effective == "haiku"
+    assert brief.facets_operator_degraded is False
+
+
+def test_build_brief_facets_operator_degraded(tmp_path):
+    """Facets degraded from gravitywell to haiku (operator_requested set)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    facets = {
+        "deliberation_id": "fac-456",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        "methodology": {
+            "operator_requested": "gravitywell",
+            "synthesis_operator": "haiku",
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "haiku"},
+        },
+        "stances": [],
+    }
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    assert brief.facets_operator_requested == "gravitywell"
+    assert brief.facets_operator_effective == "haiku"
+    assert brief.facets_operator_degraded is True
+
+
+def test_build_brief_facets_operator_missing_provenance(tmp_path):
+    """Facets missing synthesis_operator (incomplete provenance)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    facets = {
+        "deliberation_id": "fac-789",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        "methodology": {
+            "operator_requested": None,
+            # Missing synthesis_operator
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "sonnet"},
+        },
+        "stances": [],
+    }
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    assert brief.facets_operator_effective == "unknown"
+    assert brief.facets_operator_degraded is False
+
+
+def test_format_brief_degradation_summary_council_only(tmp_path):
+    """Degradation summary line appears when Council degraded."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    council = _council_raw("resolved")
+    council["voicing_effective"] = "sonnet"
+    council["voicing_degraded"] = True
+    council["voicing_degraded_reason"] = "gw_not_serving"
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=council,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        council_voicing_requested="gravitywell",
+    )
+    output = format_brief(brief)
+    assert "⚠️ DEGRADED:" in output
+    assert "Council" in output
+    assert "gw_not_serving" in output
+
+
+def test_format_brief_degradation_summary_facets_only(tmp_path):
+    """Degradation summary line appears when Facets degraded."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    facets = {
+        "deliberation_id": "fac-456",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        "methodology": {
+            "operator_requested": "gravitywell",
+            "synthesis_operator": "haiku",
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "haiku"},
+        },
+        "stances": [],
+    }
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    output = format_brief(brief)
+    assert "⚠️ DEGRADED:" in output
+    assert "Facets" in output
+
+
+def test_format_brief_no_degradation_summary_when_clean(tmp_path):
+    """No degradation summary line when both legs are clean."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    council = _council_raw("resolved")
+    council["voicing_effective"] = "gravitywell"
+    council["voicing_degraded"] = False
+
+    facets = {
+        "deliberation_id": "fac-123",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        "methodology": {
+            "operator_requested": None,
+            "synthesis_operator": "haiku",
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "haiku"},
+        },
+        "stances": [],
+    }
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=council,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        council_voicing_requested="gravitywell",
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    output = format_brief(brief)
+    assert "⚠️ DEGRADED:" not in output
+    assert "(on GW)" in output
+
+
+def test_format_brief_voicing_lines(tmp_path):
+    """Voicing lines are rendered with proper formatting."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    council = _council_raw("resolved")
+    council["voicing_effective"] = "gravitywell"
+    council["voicing_degraded"] = False
+
+    facets = {
+        "deliberation_id": "fac-123",
+        "synthesis": {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        "methodology": {
+            "operator_requested": None,
+            "synthesis_operator": "haiku",
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "haiku"},
+        },
+        "stances": [],
+    }
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=council,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        council_voicing_requested="gravitywell",
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    output = format_brief(brief)
+    assert "Council voicing:" in output
+    assert "Facets operator:" in output
+    assert "gravitywell (on GW)" in output

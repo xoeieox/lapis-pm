@@ -116,6 +116,14 @@ class SpecReviewBrief:
     # True whenever the Sonnet leg ran (always reference-only now)
     sonnet_advisory_only: bool = False
     facets_operator: str = "haiku"  # operator used for Facets personas + synthesis
+    # Effective voicing/operator fields (read from provenance, unknown if absent)
+    council_voicing_requested: str = "gravitywell"  # what was requested
+    council_voicing_effective: str = "unknown"  # what actually ran (from run YAML)
+    council_voicing_degraded: bool = False  # whether it fell back
+    council_voicing_degraded_reason: str = ""  # reason for fallback (gw_not_serving, etc.)
+    facets_operator_requested: str = ""  # what was requested (empty if not degraded)
+    facets_operator_effective: str = "unknown"  # what actually ran
+    facets_operator_degraded: bool = False  # whether it fell back
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -670,6 +678,9 @@ def _poll_until_terminal(
                             "confidence": synthesis.get("confidence", ""),
                             "positions": synthesis.get("positions", []),
                             "run_id": council_run_id,
+                            "voicing_effective": run.get("effective_voicing"),
+                            "voicing_degraded": run.get("voicing_degraded", False),
+                            "voicing_degraded_reason": run.get("voicing_degraded_reason", ""),
                         }
                         elapsed_s = int(time.time() - start_time)
                         print(
@@ -833,6 +844,7 @@ def _build_brief(
     authority: str = "advisory",
     sonnet_advisory_only: bool = False,
     facets_operator: str = "haiku",
+    council_voicing_requested: str = "gravitywell",
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
@@ -844,6 +856,7 @@ def _build_brief(
     sonnet_advisory_only — the Sonnet leg is always reference-only: its output is
     rendered for reference but excluded from the combined recommendation (Facets +
     Council drive the gate). This flag is set True whenever the Sonnet leg ran.
+    council_voicing_requested — the voicing value that was requested (default gravitywell).
     """
     # Support deprecated opus_* parameter aliases
     if opus_raw is not None and sonnet_raw is None:
@@ -864,9 +877,18 @@ def _build_brief(
     council_positions = council_raw.get("positions", [])
     council_run_id = council_raw.get("run_id", "")
 
+    # Extract effective voicing from Council run provenance
+    council_voicing_effective = council_raw.get("voicing_effective")
+    council_voicing_degraded = council_raw.get("voicing_degraded", False)
+    council_voicing_degraded_reason = council_raw.get("voicing_degraded_reason", "")
+
     # Extract Facets escalation signal and compute reliability
     facets_escalation = None
     facets_unreliable = False
+    facets_operator_requested = ""
+    facets_operator_effective = "unknown"
+    facets_operator_degraded = False
+
     if facets_deliberation:
         synthesis = facets_deliberation.get("synthesis") or {}
         if isinstance(synthesis, dict):
@@ -876,6 +898,32 @@ def _build_brief(
             bool(synthesis.get("parse_failed"))
             or any(s.get("parse_failed") for s in stances)
         )
+
+        # Extract Facets operator information from methodology
+        methodology = facets_deliberation.get("methodology") or {}
+        facets_operator_requested = methodology.get("operator_requested") or ""
+        if facets_operator_requested:
+            # Degrade detected: requested differs from what ran
+            facets_operator_degraded = True
+            # Determine effective operator from persona operators or synthesis operator
+            persona_ops = methodology.get("persona_operators") or {}
+            synthesis_op = methodology.get("synthesis_operator")
+            if synthesis_op:
+                facets_operator_effective = synthesis_op
+            elif persona_ops and all(v == persona_ops.get("technical-integrity") for v in persona_ops.values()):
+                # All personas use same operator
+                facets_operator_effective = persona_ops.get("technical-integrity", "unknown")
+            else:
+                facets_operator_effective = "unknown"
+        else:
+            # No degrade; effective = what the synthesis actually used
+            synthesis_op = methodology.get("synthesis_operator")
+            if synthesis_op:
+                facets_operator_effective = synthesis_op
+            else:
+                persona_ops = methodology.get("persona_operators") or {}
+                if persona_ops and all(v == persona_ops.get("technical-integrity") for v in persona_ops.values()):
+                    facets_operator_effective = persona_ops.get("technical-integrity", "unknown")
 
     # The Sonnet leg is always reference-only: feed the "skip" sentinel into the
     # recommendation so any Sonnet verdict/issues/timeout cannot move the gate.
@@ -914,6 +962,13 @@ def _build_brief(
         facets_deliberation=facets_deliberation,
         sonnet_advisory_only=sonnet_advisory_only,
         facets_operator=facets_operator,
+        council_voicing_requested=council_voicing_requested,
+        council_voicing_effective=council_voicing_effective or "unknown",
+        council_voicing_degraded=council_voicing_degraded,
+        council_voicing_degraded_reason=council_voicing_degraded_reason,
+        facets_operator_requested=facets_operator_requested,
+        facets_operator_effective=facets_operator_effective,
+        facets_operator_degraded=facets_operator_degraded,
     )
 
 
@@ -944,6 +999,45 @@ def format_brief(brief: SpecReviewBrief) -> str:
         if brief.council_open_questions
         else "    - (none)"
     )
+
+    # Format effective voicing lines for Council and Facets
+    def _voicing_line(requested: str, effective: str, degraded: bool, reason: str = "") -> str:
+        """Format a single voicing/operator display line."""
+        if effective == "unknown":
+            return f"{requested} (effective: unknown)"
+        if degraded:
+            reason_str = f" ({reason})" if reason else ""
+            return f"{requested} → {effective} (degraded{reason_str})"
+        return f"{requested} (on GW)"
+
+    council_voicing_line = _voicing_line(
+        brief.council_voicing_requested,
+        brief.council_voicing_effective,
+        brief.council_voicing_degraded,
+        brief.council_voicing_degraded_reason,
+    )
+
+    # Only render Facets operator line if Facets deliberation was dispatched
+    facets_operator_line = ""
+    if brief.facets_deliberation is not None:
+        facets_operator_line = _voicing_line(
+            brief.facets_operator_requested or brief.facets_operator,
+            brief.facets_operator_effective,
+            brief.facets_operator_degraded,
+            "",
+        )
+
+    # Degradation summary line — unmissable alert when ANY leg fell back
+    degraded_summary = ""
+    degraded_legs = []
+    if brief.council_voicing_degraded:
+        reason_str = f": {brief.council_voicing_degraded_reason}" if brief.council_voicing_degraded_reason else ""
+        degraded_legs.append(f"Council{reason_str}")
+    if brief.facets_operator_degraded:
+        degraded_legs.append("Facets")
+    if degraded_legs:
+        legs_str = ", ".join(degraded_legs)
+        degraded_summary = f"\n⚠️ DEGRADED: 1+ leg fell off GravityWell to paid Claude ({legs_str}).\n"
 
     # Plain-English suggested next step — mention reservations for converged-with-reservation
     step_map = {
@@ -1081,13 +1175,19 @@ could not extract a JSON verdict from the output. See chain-sibling \
 {issues_lines}
 """
 
+    # Render voicing section only if there's data to show
+    voicing_lines = f"- Council voicing: {council_voicing_line}"
+    if facets_operator_line:
+        voicing_lines += f"\n- Facets operator: {facets_operator_line}"
+    voicing_section = f"\n**Leg voicing / operator:**\n{voicing_lines}\n" if voicing_lines else ""
+
     return f"""# Spec Review: {brief.target_id}
 
 **Spec:** {brief.spec_path}
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-{facets_section}{sonnet_section}
+{voicing_section}{degraded_summary}{facets_section}{sonnet_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -1243,4 +1343,5 @@ def run_spec_review(
         authority=effective_authority,
         sonnet_advisory_only=sonnet_raw is not None,
         facets_operator=facets_operator,
+        council_voicing_requested=council_voicing,
     )

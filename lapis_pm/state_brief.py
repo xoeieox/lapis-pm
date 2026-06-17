@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -168,6 +169,10 @@ def _generate_prose(period: str, buckets: dict[str, list[str]], start_label: str
 
     Respects LAPIS_BRIEF_DRY_RUN=1 — returns a placeholder with all five
     bucket headings if set.
+
+    For daily periods (morning, afternoon, live), wraps call_llm in a fail-fast
+    guard with ~30s wall-clock timeout. On timeout/unreachable, returns atomic
+    degraded brief (local sections + marker) instead of hanging.
     """
     from .state_brief_prompts import (
         DAILY_SYSTEM, WEEKLY_SYSTEM,
@@ -189,17 +194,47 @@ def _generate_prose(period: str, buckets: dict[str, list[str]], start_label: str
     else:
         prompt = build_daily_prompt(buckets, start_label)
         from agents_core.llm import call_llm
-        result = call_llm(
-            prompt=prompt,
-            system=DAILY_SYSTEM,
-            timeout=300,
-        )
+        result = _call_llm_with_timeout(prompt, DAILY_SYSTEM, timeout_sec=30)
 
     if not result:
         # Fallback: placeholder so the file is always structurally valid
-        return _dry_run_placeholder(buckets, start_label, tag="(LLM returned empty)")
+        return _dry_run_placeholder(buckets, start_label, tag="*(DEGRADED — StarHouse unreachable)*")
 
     return result
+
+
+def _call_llm_with_timeout(prompt: str, system: str, timeout_sec: int = 30) -> str | None:
+    """Call qwen LLM with fail-fast timeout guard.
+
+    Wraps call_llm in a ThreadPoolExecutor to enforce a hard wall-clock limit.
+    If the call times out or raises an exception, returns None so the brief
+    can degrade gracefully to deterministic local sections.
+
+    Args:
+        prompt: The prompt to send to the LLM.
+        system: The system message.
+        timeout_sec: Wall-clock timeout in seconds (default 30s per spec).
+
+    Returns:
+        The LLM result string, or None if timeout/error occurs.
+    """
+    from agents_core.llm import call_llm
+
+    def _do_call():
+        return call_llm(prompt=prompt, system=system, timeout=timeout_sec)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_do_call)
+        result = future.result(timeout=timeout_sec)
+        executor.shutdown(wait=False)
+        return result if result else None
+    except FuturesTimeoutError:
+        executor.shutdown(wait=False)
+        return None
+    except Exception:
+        executor.shutdown(wait=False)
+        return None
 
 
 def _dry_run_placeholder(

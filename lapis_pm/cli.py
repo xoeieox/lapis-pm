@@ -1911,12 +1911,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sr.add_argument(
         "--facets-operator",
-        choices=["haiku", "sonnet", "opus", "qwen"],
+        choices=["haiku", "sonnet", "opus", "qwen", "gravitywell"],
         default="haiku",
         dest="facets_operator",
         help=(
-            "Model operator for Facets personas and synthesis (default: haiku). "
-            "Pass sonnet for a more thorough technical pass."
+            "Model operator for Facets personas and synthesis (default: haiku). gravitywell = owned 122B local, "
+            "zero paid spend, opt-in; degrades to haiku when unavailable. Pass sonnet for a more thorough paid "
+            "technical pass."
         ),
     )
     sr.set_defaults(func=cmd_spec_review)

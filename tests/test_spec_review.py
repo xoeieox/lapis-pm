@@ -858,6 +858,7 @@ def test_format_brief_lists_failed_personas(tmp_path):
 @pytest.mark.parametrize("operator,expect_flags", [
     ("sonnet", True),
     ("haiku", False),
+    ("gravitywell", True),
 ])
 def test_dispatch_facets_operator_argv(monkeypatch, operator, expect_flags):
     """facets_operator='sonnet' adds --persona-operator + --synthesis-operator; 'haiku' adds neither."""

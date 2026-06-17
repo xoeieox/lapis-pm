@@ -11,6 +11,8 @@ from typing import Any
 
 import pytest
 
+from unittest.mock import patch, MagicMock
+
 from lapis_pm.facets_gw_eval import (
     Envelope,
     ArmMetrics,
@@ -19,6 +21,7 @@ from lapis_pm.facets_gw_eval import (
     _parse_consensus_and_confidence,
     _parse_operator_requested,
     _compute_verdict,
+    _run_eval_pass,
 )
 
 
@@ -400,3 +403,9 @@ class TestHarnessInvariants:
             "variance_ratio", "variance_fragile",
         }
         assert all(f in verdict for f in required_fields)
+
+    def test_doorman_lease_failure_raises_error(self):
+        """Clean pass raises ValueError if doorman lease acquisition fails."""
+        with patch('lapis_pm.facets_gw_eval._acquire_doorman_lease', return_value=None):
+            with pytest.raises(ValueError, match="Could not acquire doorman lease"):
+                _run_eval_pass("clean", [])

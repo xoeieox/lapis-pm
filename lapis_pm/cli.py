@@ -1461,7 +1461,6 @@ def cmd_facets_gw_eval(args) -> int:
         print("=" * 70)
 
         if args.json:
-            from dataclasses import asdict
             print(json.dumps({
                 "verdict": verdict,
                 "report_path": result.report_path,

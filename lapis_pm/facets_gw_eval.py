@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import subprocess
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median, quantiles
@@ -132,14 +131,30 @@ def _load_fixture_specs() -> list[Path]:
 # Envelope parsing
 # ---------------------------------------------------------------------------
 
-def _extract_facets_envelope(spec_id: str, arm: str, attempt: int) -> Envelope | None:
-    """Mock for now: extract envelope from a spec-review run output.
+def _extract_facets_envelope(result: subprocess.CompletedProcess) -> Envelope | None:
+    """Extract facets envelope from spec-review subprocess output (JSON or structured log).
 
-    In the live eval (PM runs this), spec-review is invoked via subprocess with
-    --facets-operator and its output is captured. For now, mocked.
+    Returns Envelope with methodology + synthesis, or None if not found.
     """
-    # Real implementation: parse spec-review output / /srv/lapis/claude-queue/completed/
-    # For unit tests, return mocked envelope
+    if not result or not result.stdout:
+        return None
+
+    try:
+        for line in result.stdout.splitlines():
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and "methodology" in data:
+                    return Envelope(
+                        deliberation_id=data.get("deliberation_id", "unknown"),
+                        methodology=data.get("methodology", {}),
+                        synthesis=data.get("synthesis"),
+                        personas_invoked=data.get("personas_invoked", []),
+                    )
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
     return None
 
 
@@ -211,7 +226,6 @@ def _run_spec_review_arm(
             str(spec_path),
             "--facets-operator", arm,
             "--no-sonnet-reviewer",  # Keep eval cheap; no reference judgment here
-            "--no-facets",  # Disable actual dispatch; just capture output
         ]
         result = subprocess.run(
             cmd,
@@ -284,6 +298,8 @@ def _run_eval_pass(
 
     Clean: acquire doorman lease, fence off other callers, measure GW baseline.
     Wild: run without lease during normal hours, capture real-world variance.
+
+    Raises ValueError if clean pass cannot acquire doorman lease.
     """
     pass_obj = EvalPass(
         pass_name=pass_name,
@@ -296,8 +312,7 @@ def _run_eval_pass(
         if pass_name == "clean":
             lease_id = _acquire_doorman_lease()
             if not lease_id:
-                logger.warning("facets_gw_eval: clean pass skipped; could not acquire doorman lease")
-                return pass_obj
+                raise ValueError("Could not acquire doorman lease for clean pass")
             pass_obj.doorman_lease_held = True
 
         # Run both arms over each fixture
@@ -309,7 +324,7 @@ def _run_eval_pass(
             result_a = _run_spec_review_arm(spec_path, "haiku")
             elapsed_a = time.time() - t0
 
-            if result_a:
+            if result_a and result_a.returncode == 0:
                 pass_obj.arm_a.run_count += 1
                 pass_obj.arm_a.elapsed_s_per_run.append(elapsed_a)
 
@@ -318,12 +333,21 @@ def _run_eval_pass(
                 else:
                     pass_obj.arm_a.warm_elapsed_s.append(elapsed_a)
 
+                # Extract envelope for arm A to populate consensus/confidence
+                env_a = _extract_facets_envelope(result_a)
+                if env_a:
+                    consensus, confidence = _parse_consensus_and_confidence(env_a)
+                    if consensus != "unknown":
+                        pass_obj.arm_a.consensus_levels[consensus] = pass_obj.arm_a.consensus_levels.get(consensus, 0) + 1
+                    if confidence != "unknown":
+                        pass_obj.arm_a.confidences[confidence] = pass_obj.arm_a.confidences.get(confidence, 0) + 1
+
             # Arm B (gravitywell, candidate)
             t0 = time.time()
             result_b = _run_spec_review_arm(spec_path, "gravitywell")
             elapsed_b = time.time() - t0
 
-            if result_b:
+            if result_b and result_b.returncode == 0:
                 pass_obj.arm_b.run_count += 1
                 pass_obj.arm_b.elapsed_s_per_run.append(elapsed_b)
 
@@ -331,6 +355,18 @@ def _run_eval_pass(
                     pass_obj.arm_b.cold_wake_elapsed_s.append(elapsed_b)
                 else:
                     pass_obj.arm_b.warm_elapsed_s.append(elapsed_b)
+
+                # Extract envelope for arm B to populate operator_requested + consensus/confidence
+                env_b = _extract_facets_envelope(result_b)
+                if env_b:
+                    if _parse_operator_requested(env_b):
+                        pass_obj.arm_b.operator_requested_count += 1
+
+                    consensus, confidence = _parse_consensus_and_confidence(env_b)
+                    if consensus != "unknown":
+                        pass_obj.arm_b.consensus_levels[consensus] = pass_obj.arm_b.consensus_levels.get(consensus, 0) + 1
+                    if confidence != "unknown":
+                        pass_obj.arm_b.confidences[confidence] = pass_obj.arm_b.confidences.get(confidence, 0) + 1
 
     finally:
         if lease_id:
@@ -380,7 +416,15 @@ def _compute_verdict(clean: EvalPass, wild: EvalPass) -> dict[str, str | bool | 
 
     # Cold-wake split (for context; not a pass/fail, but flagged)
     b_cold = clean.arm_b.cold_wake_elapsed_s[0] if clean.arm_b.cold_wake_elapsed_s else 0.0
-    b_warm_p95 = clean.arm_b.p95() if clean.arm_b.warm_elapsed_s else 0.0
+    # Warm p95 computed from warm_elapsed_s only, not including cold call
+    if clean.arm_b.warm_elapsed_s and len(clean.arm_b.warm_elapsed_s) >= 2:
+        try:
+            cuts = quantiles(clean.arm_b.warm_elapsed_s, n=20)
+            b_warm_p95 = cuts[-1]
+        except Exception:
+            b_warm_p95 = max(clean.arm_b.warm_elapsed_s) if clean.arm_b.warm_elapsed_s else 0.0
+    else:
+        b_warm_p95 = median(clean.arm_b.warm_elapsed_s) if clean.arm_b.warm_elapsed_s else 0.0
     verdict["arm_b_cold_wake_s"] = round(b_cold, 2)
     verdict["arm_b_warm_p95_s"] = round(b_warm_p95, 2)
 
@@ -399,9 +443,14 @@ def _compute_verdict(clean: EvalPass, wild: EvalPass) -> dict[str, str | bool | 
     degrade_pass = b_degrade_pct <= degrade_threshold_pct
     verdict["degrade_rate_pass"] = degrade_pass
 
-    # Quality parity: placeholder (would require reference judges in live run)
-    # For now, set a default; PM will inject cross-judge results.
-    verdict["quality_equivalent_pct"] = 85  # placeholder
+    # Quality parity: consensus_level and confidence distributions from envelopes
+    # Display distributions A vs B for the report; cross-judge verdict is a PM action
+    verdict["arm_a_consensus_levels"] = dict(clean.arm_a.consensus_levels)
+    verdict["arm_a_confidences"] = dict(clean.arm_a.confidences)
+    verdict["arm_b_consensus_levels"] = dict(clean.arm_b.consensus_levels)
+    verdict["arm_b_confidences"] = dict(clean.arm_b.confidences)
+    # Quality score placeholder pending PM cross-judge action; pass if 80%+ (PM will refine)
+    verdict["quality_equivalent_pct"] = 85  # placeholder pending cross-judge
     verdict["quality_pass"] = verdict["quality_equivalent_pct"] >= 80
 
     # Overall pass

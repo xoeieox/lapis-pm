@@ -902,28 +902,20 @@ def _build_brief(
         # Extract Facets operator information from methodology
         methodology = facets_deliberation.get("methodology") or {}
         facets_operator_requested = methodology.get("operator_requested") or ""
-        if facets_operator_requested:
-            # Degrade detected: requested differs from what ran
-            facets_operator_degraded = True
-            # Determine effective operator from persona operators or synthesis operator
-            persona_ops = methodology.get("persona_operators") or {}
-            synthesis_op = methodology.get("synthesis_operator")
-            if synthesis_op:
-                facets_operator_effective = synthesis_op
-            elif persona_ops and all(v == persona_ops.get("technical-integrity") for v in persona_ops.values()):
-                # All personas use same operator
-                facets_operator_effective = persona_ops.get("technical-integrity", "unknown")
-            else:
-                facets_operator_effective = "unknown"
+        # Determine effective operator from persona operators or synthesis operator
+        persona_ops = methodology.get("persona_operators") or {}
+        synthesis_op = methodology.get("synthesis_operator")
+        if synthesis_op:
+            facets_operator_effective = synthesis_op
+        elif persona_ops and all(v == persona_ops.get("technical-integrity") for v in persona_ops.values()):
+            # All personas use same operator
+            facets_operator_effective = persona_ops.get("technical-integrity", "unknown")
         else:
-            # No degrade; effective = what the synthesis actually used
-            synthesis_op = methodology.get("synthesis_operator")
-            if synthesis_op:
-                facets_operator_effective = synthesis_op
-            else:
-                persona_ops = methodology.get("persona_operators") or {}
-                if persona_ops and all(v == persona_ops.get("technical-integrity") for v in persona_ops.values()):
-                    facets_operator_effective = persona_ops.get("technical-integrity", "unknown")
+            facets_operator_effective = "unknown"
+        # Degrade detected iff operator_requested is set AND differs from effective
+        facets_operator_degraded = bool(
+            facets_operator_requested and facets_operator_requested != facets_operator_effective
+        )
 
     # The Sonnet leg is always reference-only: feed the "skip" sentinel into the
     # recommendation so any Sonnet verdict/issues/timeout cannot move the gate.
@@ -1008,7 +1000,9 @@ def format_brief(brief: SpecReviewBrief) -> str:
         if degraded:
             reason_str = f" ({reason})" if reason else ""
             return f"{requested} → {effective} (degraded{reason_str})"
-        return f"{requested} (on GW)"
+        if effective.lower() == "gravitywell":
+            return f"{requested} (on GW)"
+        return f"{effective} (no degrade)"
 
     council_voicing_line = _voicing_line(
         brief.council_voicing_requested,

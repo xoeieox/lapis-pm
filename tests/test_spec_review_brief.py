@@ -490,3 +490,5 @@ def test_format_brief_voicing_lines(tmp_path):
     assert "Council voicing:" in output
     assert "Facets operator:" in output
     assert "gravitywell (on GW)" in output
+    assert "haiku (no degrade)" in output
+    assert "haiku (on GW)" not in output

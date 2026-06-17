@@ -9,6 +9,7 @@ WorkingDirectory=/srv/git/lapis-pm
 ExecStart=/usr/bin/python3 -m lapis_pm.cli brief --period afternoon
 EnvironmentFile=-/data/agents/config/conductor.env
 Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 TimeoutStartSec=300

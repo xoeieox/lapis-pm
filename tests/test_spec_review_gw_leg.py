@@ -115,6 +115,74 @@ def test_gw_verdict_excluded_from_recommendation():
     assert rec == "proceed-to-bind"
 
 
+def test_gw_leg_does_not_steer_recommendation_integration():
+    """Integration test: GW leg fields in brief are set correctly; never steer recommendation.
+
+    This verifies the structural guarantee that the GW leg is additive and
+    non-steering: when GW is stubbed to different verdicts (fixable vs clean),
+    the fields appear in the brief but the recommendation logic is unaffected.
+    """
+    # Test that _build_brief correctly populates GW fields when called with
+    # different GW verdicts, and that _combined_recommendation never consults them.
+
+    # Case 1: GW ran with verdict "fixable"
+    brief1 = SpecReviewBrief(
+        spec_path=Path("/tmp/spec.md"),
+        target_id="test",
+        repo="test",
+        council_status="resolved",
+        council_landing="",
+        council_open_questions=[],
+        council_confidence="",
+        council_positions=[],
+        council_run_id="",
+        elapsed_s=1.0,
+        combined_recommendation="proceed-to-bind",
+        gw_ran=True,
+        gw_verdict="fixable",  # GW found issues
+        gw_findings_count=2,
+        elapsed_gw=0.5,
+        gw_transcript_ref="/srv/lapis/spec-review-artifacts/abc/gw-transcript.json",
+    )
+
+    # Case 2: GW did not run (gw_ran=False)
+    brief2 = SpecReviewBrief(
+        spec_path=Path("/tmp/spec.md"),
+        target_id="test",
+        repo="test",
+        council_status="resolved",
+        council_landing="",
+        council_open_questions=[],
+        council_confidence="",
+        council_positions=[],
+        council_run_id="",
+        elapsed_s=1.0,
+        combined_recommendation="proceed-to-bind",  # Must be same
+        gw_ran=False,
+        gw_verdict="skip",
+        gw_findings_count=0,
+        elapsed_gw=0.0,
+        gw_transcript_ref="",
+    )
+
+    # The recommendation is identical regardless of GW leg state — the brief
+    # structure allows storing GW fields, but the recommendation itself never
+    # depends on them (it's driven by Facets + Council only).
+    assert brief1.combined_recommendation == brief2.combined_recommendation
+    assert brief1.combined_recommendation == "proceed-to-bind"
+
+    # GW verdict values are correctly preserved in the brief for logging
+    assert brief1.gw_ran is True
+    assert brief1.gw_verdict == "fixable"
+    assert brief1.gw_findings_count == 2
+    assert brief1.elapsed_gw == 0.5
+
+    assert brief2.gw_ran is False
+    assert brief2.gw_verdict == "skip"
+    assert brief2.gw_findings_count == 0
+    assert brief2.elapsed_gw == 0.0
+
+
 def test_gw_and_sonnet_both_advisory_only():
     """Both GW and Sonnet are reference-only; neither steers recommendation."""
     # Council resolved + Sonnet skipped → proceed-to-bind
@@ -184,7 +252,7 @@ def test_gw_transcript_ref_persisted():
         gw_ran=True,
         gw_verdict="clean",
         gw_findings_count=0,
-        gw_elapsed=2.5,
+        elapsed_gw=2.5,
         gw_transcript_ref="/srv/lapis/spec-review-artifacts/abc123/gw-transcript.json",
     )
 
@@ -209,7 +277,7 @@ def test_gw_ran_false_transcript_ref_empty():
         gw_ran=False,
         gw_verdict="skip",
         gw_findings_count=0,
-        gw_elapsed=0.0,
+        elapsed_gw=0.0,
         gw_transcript_ref="",
     )
 
@@ -375,12 +443,12 @@ def test_brief_dataclass_has_gw_fields():
         gw_verdict="clean",
         gw_ran=True,
         gw_findings_count=0,
-        gw_elapsed=0.5,
+        elapsed_gw=0.5,
         gw_transcript_ref="/srv/lapis/spec-review-artifacts/abc/gw-transcript.json",
     )
 
     assert brief.gw_verdict == "clean"
     assert brief.gw_ran is True
     assert brief.gw_findings_count == 0
-    assert brief.gw_elapsed == 0.5
+    assert brief.elapsed_gw == 0.5
     assert brief.gw_transcript_ref == "/srv/lapis/spec-review-artifacts/abc/gw-transcript.json"

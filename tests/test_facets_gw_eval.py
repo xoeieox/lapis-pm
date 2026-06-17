@@ -22,6 +22,7 @@ from lapis_pm.facets_gw_eval import (
     _parse_operator_requested,
     _compute_verdict,
     _run_eval_pass,
+    run_quality_cross_judge,
 )
 
 
@@ -310,7 +311,7 @@ class TestVerdictLogic:
         assert "arm_b_warm_p95_s" in verdict
 
     def test_verdict_overall_pass(self):
-        """Overall PASS when all three metrics pass."""
+        """Overall PASS when latency and degrade pass; quality pending."""
         clean = self._make_pass(
             arm_a_times=[10.0] * 10,
             arm_b_times=[12.0] * 10,
@@ -323,10 +324,11 @@ class TestVerdictLogic:
 
         verdict = _compute_verdict(clean, wild)
 
-        # All thresholds should pass
+        # Latency and degrade should pass; quality is pending (None) until cross-judge runs
         assert verdict["latency_p95_delta_pass"] is True
         assert verdict["degrade_rate_pass"] is True
-        assert verdict["quality_pass"] is True
+        assert verdict["quality_pass"] is None
+        # Overall pass treats None as True (pending quality judgment)
         assert verdict["overall_pass"] is True
 
     def test_verdict_overall_fail_on_any(self):
@@ -409,3 +411,110 @@ class TestHarnessInvariants:
         with patch('lapis_pm.facets_gw_eval._acquire_doorman_lease', return_value=None):
             with pytest.raises(ValueError, match="Could not acquire doorman lease"):
                 _run_eval_pass("clean", [])
+
+
+# ---------------------------------------------------------------------------
+# Tests: quality cross-judge
+# ---------------------------------------------------------------------------
+
+class TestQualityCrossJudge:
+    """Test quality cross-judge functionality (mocked LLM calls)."""
+
+    def test_cross_judge_all_equivalent(self):
+        """Cross-judge returns 100% when all fixtures are equivalent."""
+        clean = EvalPass(
+            pass_name="clean",
+            pass_at="2026-06-17T00:00:00Z",
+            arm_a=ArmMetrics("haiku", run_count=3, elapsed_s_per_run=[10.0] * 3,
+                           consensus_levels={"consensus": 3},
+                           confidences={"high": 3}),
+            arm_b=ArmMetrics("gravitywell", run_count=3, elapsed_s_per_run=[11.0] * 3,
+                           consensus_levels={"consensus": 3},
+                           confidences={"high": 3}),
+        )
+        spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(3)]
+
+        # Mock call_claude_cli to return "equivalent" verdict for all fixtures
+        mock_verdict = json.dumps({"judgment": "equivalent", "reasoning": "both make same recommendation"})
+
+        with patch('lapis_pm.facets_gw_eval.call_claude_cli', return_value=mock_verdict):
+            result = run_quality_cross_judge(clean, spec_paths)
+
+        assert result == 100.0
+
+    def test_cross_judge_mixed_verdicts(self):
+        """Cross-judge aggregates equivalent and stronger, excludes weaker."""
+        clean = EvalPass(
+            pass_name="clean",
+            pass_at="2026-06-17T00:00:00Z",
+            arm_a=ArmMetrics("haiku", run_count=3, elapsed_s_per_run=[10.0] * 3,
+                           consensus_levels={"consensus": 3},
+                           confidences={"high": 3}),
+            arm_b=ArmMetrics("gravitywell", run_count=3, elapsed_s_per_run=[11.0] * 3,
+                           consensus_levels={"consensus": 2, "split": 1},
+                           confidences={"high": 3}),
+        )
+        spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(3)]
+
+        verdicts = [
+            json.dumps({"judgment": "equivalent", "reasoning": "same"}),
+            json.dumps({"judgment": "stronger", "reasoning": "clearer"}),
+            json.dumps({"judgment": "weaker", "reasoning": "less confident"}),
+        ]
+
+        with patch('lapis_pm.facets_gw_eval.call_claude_cli', side_effect=verdicts):
+            result = run_quality_cross_judge(clean, spec_paths)
+
+        # 2 out of 3 are equivalent-or-stronger = 66.7%
+        assert result == pytest.approx(66.67, abs=0.1)
+
+    def test_cross_judge_no_runs(self):
+        """Cross-judge returns None if no runs in clean pass."""
+        clean = EvalPass(
+            pass_name="clean",
+            pass_at="2026-06-17T00:00:00Z",
+            arm_a=ArmMetrics("haiku", run_count=0),
+            arm_b=ArmMetrics("gravitywell", run_count=0),
+        )
+        spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(2)]
+
+        result = run_quality_cross_judge(clean, spec_paths)
+
+        assert result is None
+
+    def test_cross_judge_unavailable(self):
+        """Cross-judge returns None if call_claude_cli is unavailable."""
+        clean = EvalPass(
+            pass_name="clean",
+            pass_at="2026-06-17T00:00:00Z",
+            arm_a=ArmMetrics("haiku", run_count=1, elapsed_s_per_run=[10.0]),
+            arm_b=ArmMetrics("gravitywell", run_count=1, elapsed_s_per_run=[11.0]),
+        )
+        spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(1)]
+
+        with patch('lapis_pm.facets_gw_eval.call_claude_cli', None):
+            result = run_quality_cross_judge(clean, spec_paths)
+
+        assert result is None
+
+    def test_cross_judge_malformed_response(self):
+        """Cross-judge handles malformed LLM responses gracefully."""
+        clean = EvalPass(
+            pass_name="clean",
+            pass_at="2026-06-17T00:00:00Z",
+            arm_a=ArmMetrics("haiku", run_count=2, elapsed_s_per_run=[10.0] * 2),
+            arm_b=ArmMetrics("gravitywell", run_count=2, elapsed_s_per_run=[11.0] * 2),
+        )
+        spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(2)]
+
+        # First response is malformed JSON, second is valid
+        responses = [
+            "not valid json",
+            json.dumps({"judgment": "equivalent", "reasoning": "ok"}),
+        ]
+
+        with patch('lapis_pm.facets_gw_eval.call_claude_cli', side_effect=responses):
+            result = run_quality_cross_judge(clean, spec_paths)
+
+        # Only 1 out of 2 parsed correctly and is equivalent = 50%
+        assert result == 50.0

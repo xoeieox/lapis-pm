@@ -18,6 +18,11 @@ from pathlib import Path
 from statistics import median, quantiles
 from typing import Literal
 
+try:
+    from agents_core.llm import call_claude_cli
+except ImportError:
+    call_claude_cli = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 # Filesystem layout
@@ -33,9 +38,12 @@ DOORMAN_ACQUIRE_TIMEOUT_S = 210
 # Fixture corpus: fixed set of recent landed specs for reproducibility.
 # These are real specs that exercise the personas; use recent landed ones.
 FIXTURE_SPEC_IDS = [
-    "lapis-pm-facets-operator-gravitywell-choice-v0",
-    "brief-synthesis-starhouse-hang-failfast-v0",
-    "facets-gw-fanout-load-eval-v0",
+    "agents-core-bundle-loader-v0",
+    "lapis-pm-dispatch-queue-reconciliation",
+    "lapis-provenance-corroborate-envelope-v0",
+    "facets-persona-definitions-v0",
+    "pm-target-chaining-v0",
+    "gardener-v0",
 ]
 
 
@@ -287,6 +295,82 @@ def _release_doorman_lease(lease_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Quality cross-judge (optional PM-run phase)
+# ---------------------------------------------------------------------------
+
+QUALITY_JUDGE_SYSTEM = """You are a decision-quality judge comparing two deliberation outputs.
+
+Arm A (baseline): Haiku-powered Facets personas + synthesis.
+Arm B (candidate): GravityWell-powered Facets personas + synthesis.
+
+For each spec fixture, rate whether Arm B's persona outputs and synthesis are:
+- "equivalent": decision-equivalent to Arm A (both make the same recommendation)
+- "weaker": materially weaker (would lead to a different/lower-confidence decision)
+- "stronger": materially stronger (clearer recommendation or higher confidence)
+
+Output a JSON object:
+{
+  "judgment": "equivalent" | "weaker" | "stronger",
+  "reasoning": "brief explanation"
+}
+
+Be conservative: only rate "equivalent" if you are confident both would lead to the same decision.
+"""
+
+
+def run_quality_cross_judge(clean_pass: EvalPass, fixture_specs: list[Path]) -> float | None:
+    """Run Sonnet quality cross-judge on Arm A vs Arm B outputs.
+
+    For each fixture, judges whether Arm-B outputs are decision-equivalent to Arm-A.
+    Returns: percentage of fixtures judged equivalent-or-stronger, or None if judge unavailable.
+
+    This is a PM-optional action; unit tests mock it.
+    """
+    if not call_claude_cli:
+        logger.warning("facets_gw_eval: call_claude_cli not available; quality cross-judge skipped")
+        return None
+
+    if clean_pass.arm_a.run_count == 0 or clean_pass.arm_b.run_count == 0:
+        logger.warning("facets_gw_eval: no runs in clean pass; cannot judge quality")
+        return None
+
+    equivalent_count = 0
+    total_fixtures = len(fixture_specs)
+
+    for spec_path in fixture_specs:
+        prompt = (
+            f"Fixture: {spec_path.name}\n\n"
+            f"Arm A consensus levels: {clean_pass.arm_a.consensus_levels}\n"
+            f"Arm A confidences: {clean_pass.arm_a.confidences}\n\n"
+            f"Arm B consensus levels: {clean_pass.arm_b.consensus_levels}\n"
+            f"Arm B confidences: {clean_pass.arm_b.confidences}\n\n"
+            "Judge whether Arm B's outputs are decision-equivalent, weaker, or stronger than Arm A."
+        )
+
+        try:
+            verdict_json = call_claude_cli(
+                prompt=prompt, system=QUALITY_JUDGE_SYSTEM,
+                model="sonnet", timeout=60, log=logger.warning,
+            )
+            if verdict_json:
+                verdict = json.loads(verdict_json)
+                judgment = verdict.get("judgment", "").lower()
+                if judgment in ("equivalent", "stronger"):
+                    equivalent_count += 1
+                elif judgment == "weaker":
+                    logger.info("facets_gw_eval: fixture %s judged WEAKER", spec_path.name)
+        except Exception as exc:
+            logger.warning("facets_gw_eval: cross-judge error for %s: %s", spec_path.name, exc)
+            continue
+
+    if total_fixtures > 0:
+        equiv_pct = (equivalent_count / total_fixtures) * 100.0
+        logger.info("facets_gw_eval: quality cross-judge result: %.0f%% equivalent-or-stronger", equiv_pct)
+        return equiv_pct
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Eval harness: run one pass (clean or wild)
 # ---------------------------------------------------------------------------
 
@@ -449,12 +533,13 @@ def _compute_verdict(clean: EvalPass, wild: EvalPass) -> dict[str, str | bool | 
     verdict["arm_a_confidences"] = dict(clean.arm_a.confidences)
     verdict["arm_b_consensus_levels"] = dict(clean.arm_b.consensus_levels)
     verdict["arm_b_confidences"] = dict(clean.arm_b.confidences)
-    # Quality score placeholder pending PM cross-judge action; pass if 80%+ (PM will refine)
-    verdict["quality_equivalent_pct"] = 85  # placeholder pending cross-judge
-    verdict["quality_pass"] = verdict["quality_equivalent_pct"] >= 80
+    # Quality score pending PM cross-judge action (None until run_quality_cross_judge is called)
+    verdict["quality_equivalent_pct"] = None
+    verdict["quality_pass"] = None
 
-    # Overall pass
-    overall_pass = latency_pass and degrade_pass and verdict["quality_pass"]
+    # Overall pass: latency + degrade + quality (quality pending if None)
+    quality_pass_val = verdict["quality_pass"] if verdict["quality_pass"] is not None else True
+    overall_pass = latency_pass and degrade_pass and quality_pass_val
     verdict["overall_pass"] = overall_pass
 
     return verdict
@@ -491,12 +576,20 @@ def _write_report(clean: EvalPass, wild: EvalPass, verdict: dict) -> str:
             verdict.get("arm_b_degrade_rate_pct", 0),
             "✓" if verdict.get("degrade_rate_pass") else "✗",
         ),
-        "- Quality equivalent: {:.0f}% {}".format(
-            verdict.get("quality_equivalent_pct", 0),
-            "✓" if verdict.get("quality_pass") else "✗",
-        ),
-        "",
     ]
+
+    quality_pct = verdict.get("quality_equivalent_pct")
+    if quality_pct is not None:
+        lines.append(
+            "- Quality equivalent: {:.0f}% {}".format(
+                quality_pct,
+                "✓" if verdict.get("quality_pass") else "✗",
+            )
+        )
+    else:
+        lines.append("- Quality equivalent: pending PM cross-judge (not yet run)")
+
+    lines.append("")
 
     lines.extend([
         "## Clean Pass (Exclusive Doorman Lease)",
@@ -528,6 +621,39 @@ def _write_report(clean: EvalPass, wild: EvalPass, verdict: dict) -> str:
             f"⚠️ **FRAGILE:** {verdict.get('variance_note', 'Wild variance >3x clean p95')}"
         )
 
+    # Quality Distribution section
+    lines.extend([
+        "",
+        "## Quality Distribution (A vs B)",
+        "",
+        "**Consensus Levels:**",
+        "",
+        "| Level | Arm A (Haiku) | Arm B (GravityWell) |",
+        "|-------|---------------|---------------------|",
+    ])
+
+    # Collect all consensus levels from both arms
+    all_consensus_keys = set(verdict.get("arm_a_consensus_levels", {}).keys()) | set(verdict.get("arm_b_consensus_levels", {}).keys())
+    for consensus_key in sorted(all_consensus_keys):
+        a_count = verdict.get("arm_a_consensus_levels", {}).get(consensus_key, 0)
+        b_count = verdict.get("arm_b_consensus_levels", {}).get(consensus_key, 0)
+        lines.append(f"| {consensus_key} | {a_count} | {b_count} |")
+
+    lines.extend([
+        "",
+        "**Confidence Levels:**",
+        "",
+        "| Level | Arm A (Haiku) | Arm B (GravityWell) |",
+        "|-------|---------------|---------------------|",
+    ])
+
+    # Collect all confidence levels from both arms
+    all_confidence_keys = set(verdict.get("arm_a_confidences", {}).keys()) | set(verdict.get("arm_b_confidences", {}).keys())
+    for confidence_key in sorted(all_confidence_keys):
+        a_count = verdict.get("arm_a_confidences", {}).get(confidence_key, 0)
+        b_count = verdict.get("arm_b_confidences", {}).get(confidence_key, 0)
+        lines.append(f"| {confidence_key} | {a_count} | {b_count} |")
+
     lines.extend([
         "",
         "## Mechanism & Caveats",
@@ -547,8 +673,18 @@ def _write_report(clean: EvalPass, wild: EvalPass, verdict: dict) -> str:
         f"{'✓' if verdict.get('latency_p95_delta_pass') else '✗'} |",
         f"| Degrade-rate | ≤5% | {verdict.get('arm_b_degrade_rate_pct', 0):.1f}% | "
         f"{'✓' if verdict.get('degrade_rate_pass') else '✗'} |",
-        f"| Quality equivalent | ≥80% | {verdict.get('quality_equivalent_pct', 0):.0f}% | "
-        f"{'✓' if verdict.get('quality_pass') else '✗'} |",
+    ])
+
+    quality_pct_val = verdict.get("quality_equivalent_pct")
+    if quality_pct_val is not None:
+        lines.append(
+            f"| Quality equivalent | ≥80% | {quality_pct_val:.0f}% | "
+            f"{'✓' if verdict.get('quality_pass') else '✗'} |"
+        )
+    else:
+        lines.append("| Quality equivalent | ≥80% | pending | ⏳ |")
+
+    lines.extend([
         f"| Variance (wild/clean) | <3x | {verdict.get('variance_ratio', 1.0):.2f}x | "
         f"{'✓ (flagged separately if >3x)' if not verdict.get('variance_fragile') else '⚠️ FRAGILE'} |",
         "",

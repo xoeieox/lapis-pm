@@ -22,6 +22,7 @@ import re
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Literal
@@ -124,6 +125,12 @@ class SpecReviewBrief:
     facets_operator_requested: str = ""  # what was requested (empty if not degraded)
     facets_operator_effective: str = "unknown"  # what actually ran
     facets_operator_degraded: bool = False  # whether it fell back
+    # GravityWell reference leg fields (reference-only; never steer the recommendation)
+    gw_verdict: str = "skip"  # verdict from GW, or "skip" if not dispatched
+    gw_ran: bool = False  # whether the GW leg actually ran
+    gw_findings_count: int = 0  # number of findings/issues from GW
+    elapsed_gw: float = 0.0  # wall-clock time for GW leg
+    gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -556,6 +563,110 @@ def _dispatch_spec_reviewer(
     )
 
 
+def _check_doorman_heartbeat(doorman_host: str = "203.0.113.10", doorman_port: int = 8407) -> bool:
+    """Check if doorman is reachable via a fast liveness probe.
+
+    Returns True if doorman responds; False if unreachable or timeout.
+    Uses a 2-second timeout for the probe.
+    """
+    try:
+        import requests as _requests
+        response = _requests.get(
+            f"http://{doorman_host}:{doorman_port}/health",
+            timeout=2.0,
+        )
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def _dispatch_gw_reviewer(
+    spec_text: str,
+    synth_target_id: str,
+    parsed_target_id: str,
+    repo: str,
+    run_id: str,
+) -> tuple[str | None, list[dict], float]:
+    """Dispatch and run the GW reference reviewer synchronously.
+
+    Returns (text, transcript, elapsed_s) where text is the verdict string (or None
+    if GW did not run), transcript is the list of tool calls, and elapsed_s is the
+    wall-clock time for the run.
+
+    Stub-aware: if GW_REVIEW_STUB=1, uses GW_REVIEW_STUB_VERDICT env var.
+    """
+    start_time = time.time()
+
+    # Stub path
+    if os.getenv("GW_REVIEW_STUB") == "1":
+        verdict = os.getenv("GW_REVIEW_STUB_VERDICT", "clean")
+        elapsed = time.time() - start_time
+        return verdict, [], elapsed
+
+    # Doorman pre-flight heartbeat
+    if not _check_doorman_heartbeat():
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] doorman unreachable — skipping GW leg",
+            file=sys.stderr,
+        )
+        return None, [], elapsed
+
+    try:
+        from agents_core.gw_agent import call_gw_agent, DEFAULT_READONLY_TOOLS
+    except ImportError as e:
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] agents_core import failed: {e} — skipping GW leg",
+            file=sys.stderr,
+        )
+        return None, [], elapsed
+
+    prompt = (
+        f"Review this spec for technical soundness, implementability, and "
+        f"coverage of DON'T-do constraints and Definition-of-Done. "
+        f"Return a JSON verdict with structure: "
+        f"{{\"verdict\": \"clean|fixable|needs-human\", "
+        f"\"issues\": [{{\"severity\": \"HIGH|MED|LOW\", \"note\": \"...\"}}], "
+        f"\"confidence\": 0.0-1.0}}\n\n"
+        f"=== SPEC ===\n{spec_text}"
+    )
+
+    try:
+        text, transcript = call_gw_agent(
+            prompt=prompt,
+            system="",
+            cwd=f"/srv/git/{repo}-working",
+            tools=DEFAULT_READONLY_TOOLS,
+            json_mode=True,
+            on_wake_fail="skip",
+            return_transcript=True,
+            work_id=run_id,
+            timeout=300,
+        )
+        elapsed = time.time() - start_time
+        if text is not None:
+            print(
+                f"[spec-review:gw-reviewer] completed task_id={run_id} "
+                f"elapsed={elapsed:.1f}s",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[spec-review:gw-reviewer] GW did not run (on_wake_fail=skip) "
+                f"elapsed={elapsed:.1f}s",
+                file=sys.stderr,
+            )
+        return text, transcript, elapsed
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] call_gw_agent failed: {e} — skipping",
+            file=sys.stderr,
+        )
+        return None, [], elapsed
+
+
 def _dispatch_council(
     spec_text: str,
     parsed_target_id: str,
@@ -845,6 +956,11 @@ def _build_brief(
     sonnet_advisory_only: bool = False,
     facets_operator: str = "haiku",
     council_voicing_requested: str = "gravitywell",
+    gw_verdict: str = "skip",
+    gw_ran: bool = False,
+    gw_findings_count: int = 0,
+    elapsed_gw: float = 0.0,
+    gw_transcript_ref: str = "",
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
@@ -961,6 +1077,11 @@ def _build_brief(
         facets_operator_requested=facets_operator_requested,
         facets_operator_effective=facets_operator_effective,
         facets_operator_degraded=facets_operator_degraded,
+        gw_verdict=gw_verdict,
+        gw_ran=gw_ran,
+        gw_findings_count=gw_findings_count,
+        elapsed_gw=elapsed_gw,
+        gw_transcript_ref=gw_transcript_ref,
     )
 
 
@@ -1169,6 +1290,18 @@ could not extract a JSON verdict from the output. See chain-sibling \
 {issues_lines}
 """
 
+    # GravityWell section — rendered when the leg ran (gw_ran=True).
+    # Like Sonnet, this is always reference-only and never steers the recommendation.
+    gw_section = ""
+    if brief.gw_ran:
+        gw_section = f"""
+## GravityWell reference leg — reference only (does not affect recommendation)
+- **Verdict:** {brief.gw_verdict}
+- **Findings:** {brief.gw_findings_count}
+- **Elapsed:** {brief.elapsed_gw:.1f}s
+- **Transcript:** {brief.gw_transcript_ref or '(not persisted)'}
+"""
+
     # Render voicing section only if there's data to show
     voicing_lines = f"- Council voicing: {council_voicing_line}"
     if facets_operator_line:
@@ -1181,7 +1314,7 @@ could not extract a JSON verdict from the output. See chain-sibling \
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-{voicing_section}{degraded_summary}{facets_section}{sonnet_section}
+{voicing_section}{degraded_summary}{facets_section}{sonnet_section}{gw_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -1290,6 +1423,35 @@ def run_spec_review(
             )
             spec_reviewer_task_id = None
 
+    # 4c. GW reference leg: submit to ThreadPoolExecutor BEFORE Facets block so it runs
+    #     in parallel. Always-on for advisory/hold; reference-only (never moves the
+    #     recommendation). Bounded timeout + doorman pre-flight so it NEVER stalls the gate.
+    gw_future = None
+    executor = None
+    gw_run_id = str(uuid.uuid4())[:8]
+    do_gw = effective_authority in {"advisory", "hold"}
+    if do_gw:
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            gw_future = executor.submit(
+                _dispatch_gw_reviewer,
+                spec_text=spec_text,
+                synth_target_id=gw_run_id,
+                parsed_target_id=parsed_target_id,
+                repo=repo,
+                run_id=gw_run_id,
+            )
+            print(
+                f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f"[spec-review:gw-reviewer-submit-error] {e}",
+                file=sys.stderr,
+            )
+            gw_future = None
+
     # 5. Dispatch Facets (synchronous; blocks until complete or timeout)
     facets_deliberation: dict | None = None
     if dispatch_facets and effective_authority in {"advisory", "hold"}:
@@ -1313,7 +1475,32 @@ def run_spec_review(
         spec_text, parsed_target_id, invariant_context, council_voicing
     )
 
-    # 7. Poll until terminal. When Sonnet leg was dispatched, both Sonnet and Council
+    # 7. Collect GW Future (with bounded timeout)
+    gw_text: str | None = None
+    gw_transcript: list[dict] = []
+    gw_elapsed: float = 0.0
+    if gw_future is not None:
+        try:
+            gw_text, gw_transcript, gw_elapsed = gw_future.result(timeout=300)
+        except FuturesTimeoutError:
+            print(
+                f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
+                file=sys.stderr,
+            )
+            gw_text = None
+            gw_elapsed = 300.0
+        except Exception as e:
+            print(
+                f"[spec-review:gw-reviewer-collect-error] {e}",
+                file=sys.stderr,
+            )
+            gw_text = None
+        finally:
+            # Clean up executor to prevent thread pool leak
+            if executor is not None:
+                executor.shutdown(wait=False)
+
+    # 8. Poll until terminal. When Sonnet leg was dispatched, both Sonnet and Council
     #    are polled; otherwise only Council is polled and sonnet_raw stays None.
     sonnet_raw, council_raw = _poll_until_terminal(
         council_run_id=council_run_id,
@@ -1324,8 +1511,73 @@ def run_spec_review(
 
     elapsed = time.time() - start_time
 
-    # 8. Build and return brief. sonnet_raw is non-None when the Sonnet leg ran; it is
-    #    rendered for reference but excluded from the recommendation (sonnet_advisory_only).
+    # 9. Persist GW transcript and divergence record
+    gw_verdict: str = "skip"
+    gw_ran: bool = gw_text is not None
+    gw_findings_count: int = 0
+    gw_transcript_ref: str = ""
+
+    if gw_ran and gw_text:
+        try:
+            gw_verdict_obj = json.loads(gw_text)
+            gw_verdict = gw_verdict_obj.get("verdict", "error")
+            gw_findings_count = len(gw_verdict_obj.get("issues", []))
+        except json.JSONDecodeError:
+            gw_verdict = "error"
+            gw_findings_count = 0
+
+        # Write transcript JSON to /srv/lapis/spec-review-artifacts/<run_id>/gw-transcript.json
+        artifacts_dir = Path(f"/srv/lapis/spec-review-artifacts/{gw_run_id}")
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = artifacts_dir / "gw-transcript.json"
+        try:
+            transcript_path.write_text(json.dumps(gw_transcript, indent=2), encoding="utf-8")
+            gw_transcript_ref = str(transcript_path.resolve())
+        except Exception as e:
+            print(
+                f"[spec-review:gw-transcript-write-error] {e}",
+                file=sys.stderr,
+            )
+
+    # Write divergence record to mem via subprocess — always, even when gw_ran=False,
+    # so that skip-rate visibility is preserved (gw_ran: bool field tracks success/failure)
+    sonnet_verdict_str = sonnet_raw.get("verdict", "skip") if sonnet_raw else "skip"
+    divergence_record = {
+        "run_id": gw_run_id,
+        "spec_path": str(spec_path),
+        "repo": repo,
+        "sonnet_verdict": sonnet_verdict_str,
+        "gw_verdict": gw_verdict,
+        "agree": (gw_verdict == sonnet_verdict_str) if gw_ran else None,
+        "gw_ran": gw_ran,
+        "gw_transcript_ref": gw_transcript_ref,
+        "sonnet_findings_count": len(sonnet_raw.get("issues", [])) if sonnet_raw else 0,
+        "gw_findings_count": gw_findings_count,
+        "elapsed_gw": gw_elapsed,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        import subprocess as _subprocess
+        _subprocess.run(
+            ["mem", "set", f"router/gw-review-divergence/{gw_run_id}",
+             json.dumps(divergence_record)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        print(
+            f"[spec-review:gw-divergence-record] logged to mem",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(
+            f"[spec-review:gw-divergence-record-error] {e}",
+            file=sys.stderr,
+        )
+
+    # 10. Build and return brief. sonnet_raw is non-None when the Sonnet leg ran; it is
+    #     rendered for reference but excluded from the recommendation (sonnet_advisory_only).
+    #     GW leg data is also reference-only and non-steering.
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
@@ -1338,4 +1590,9 @@ def run_spec_review(
         sonnet_advisory_only=sonnet_raw is not None,
         facets_operator=facets_operator,
         council_voicing_requested=council_voicing,
+        gw_verdict=gw_verdict,
+        gw_ran=gw_ran,
+        gw_findings_count=gw_findings_count,
+        elapsed_gw=gw_elapsed,
+        gw_transcript_ref=gw_transcript_ref,
     )

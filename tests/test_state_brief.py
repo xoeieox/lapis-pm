@@ -78,7 +78,7 @@ class TestDegradedBriefTimeout:
         assert "In flight" in result
         assert "Captured" in result
         assert "Awaiting your call" in result
-        assert "(LLM returned empty)" in result or "(dry run" in result
+        assert "*(DEGRADED — StarHouse unreachable)*" in result
 
     def test_dry_run_mode_never_calls_llm(self):
         """LAPIS_BRIEF_DRY_RUN=1 skips the LLM call entirely."""
@@ -126,7 +126,7 @@ class TestGenerateBriefWallClockBudget:
     def test_generate_brief_morning_returns_within_budget(self):
         """Morning brief completes within 30s even with qwen timeout."""
         def slow_call_llm(**kwargs):
-            time.sleep(10)
+            time.sleep(45)
             return "should not reach"
 
         with (
@@ -146,12 +146,12 @@ class TestGenerateBriefWallClockBudget:
                 pass  # stdout mode doesn't write file
             elapsed = time.time() - start
 
-        assert elapsed < 30, f"Morning brief took {elapsed:.1f}s (budget: 30s)"
+        assert elapsed < 32, f"Morning brief took {elapsed:.1f}s (budget: 30s + overhead)"
 
     def test_generate_brief_afternoon_returns_within_budget(self):
         """Afternoon brief completes within 30s even with qwen timeout."""
         def slow_call_llm(**kwargs):
-            time.sleep(10)
+            time.sleep(45)
             return "should not reach"
 
         with (
@@ -171,12 +171,12 @@ class TestGenerateBriefWallClockBudget:
                 pass  # stdout mode doesn't write file
             elapsed = time.time() - start
 
-        assert elapsed < 30, f"Afternoon brief took {elapsed:.1f}s (budget: 30s)"
+        assert elapsed < 32, f"Afternoon brief took {elapsed:.1f}s (budget: 30s + overhead)"
 
     def test_generate_brief_live_returns_within_budget(self):
         """Live brief completes within 30s even with qwen timeout."""
         def slow_call_llm(**kwargs):
-            time.sleep(10)
+            time.sleep(45)
             return "should not reach"
 
         with (
@@ -196,4 +196,4 @@ class TestGenerateBriefWallClockBudget:
                 pass  # stdout mode doesn't write file
             elapsed = time.time() - start
 
-        assert elapsed < 30, f"Live brief took {elapsed:.1f}s (budget: 30s)"
+        assert elapsed < 32, f"Live brief took {elapsed:.1f}s (budget: 30s + overhead)"

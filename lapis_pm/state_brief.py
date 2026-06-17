@@ -198,7 +198,7 @@ def _generate_prose(period: str, buckets: dict[str, list[str]], start_label: str
 
     if not result:
         # Fallback: placeholder so the file is always structurally valid
-        return _dry_run_placeholder(buckets, start_label, tag="(LLM returned empty)")
+        return _dry_run_placeholder(buckets, start_label, tag="*(DEGRADED — StarHouse unreachable)*")
 
     return result
 
@@ -221,16 +221,19 @@ def _call_llm_with_timeout(prompt: str, system: str, timeout_sec: int = 30) -> s
     from agents_core.llm import call_llm
 
     def _do_call():
-        return call_llm(prompt=prompt, system=system, timeout=300)
+        return call_llm(prompt=prompt, system=system, timeout=timeout_sec)
 
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do_call)
-            result = future.result(timeout=timeout_sec)
-            return result if result else None
+        future = executor.submit(_do_call)
+        result = future.result(timeout=timeout_sec)
+        executor.shutdown(wait=False)
+        return result if result else None
     except FuturesTimeoutError:
+        executor.shutdown(wait=False)
         return None
     except Exception:
+        executor.shutdown(wait=False)
         return None
 
 

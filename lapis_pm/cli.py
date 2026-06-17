@@ -1430,6 +1430,51 @@ def cmd_eval_gate(args) -> int:
     return 2
 
 
+def cmd_facets_gw_eval(args) -> int:
+    """Handle `lapis-pm facets-gw-eval` subcommand."""
+    from . import facets_gw_eval as fge
+
+    try:
+        result = fge.run_eval()
+        if result is None:
+            print("ERROR: eval failed (check logs for details)", file=sys.stderr)
+            return 1
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("Facets-on-GW Load Eval - Summary")
+        print("=" * 70)
+        verdict = result.verdict
+        print(
+            f"Overall: {'🟢 PASS' if verdict.get('overall_pass') else '🔴 FAIL'}"
+        )
+        print(f"  Latency p95 delta (B-A): {verdict.get('latency_p95_delta_s', 0):.2f}s "
+              f"({'✓' if verdict.get('latency_p95_delta_pass') else '✗'})")
+        print(f"  Degrade-rate: {verdict.get('arm_b_degrade_rate_pct', 0):.1f}% "
+              f"({'✓' if verdict.get('degrade_rate_pass') else '✗'})")
+        print(f"  Quality equivalent: {verdict.get('quality_equivalent_pct', 0):.0f}% "
+              f"({'✓' if verdict.get('quality_pass') else '✗'})")
+        if verdict.get('variance_fragile'):
+            print(f"  ⚠️  Variance FRAGILE (wild {verdict.get('variance_ratio', 1.0):.2f}x clean p95)")
+        print()
+        print(f"Report: {result.report_path}")
+        print("=" * 70)
+
+        if args.json:
+            print(json.dumps({
+                "verdict": verdict,
+                "report_path": result.report_path,
+            }, ensure_ascii=False, indent=2))
+
+        return 0 if verdict.get('overall_pass') else 1
+
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def cmd_trajectory_rollup(args) -> int:
     """Handle `lapis-pm trajectory-rollup` subcommand."""
     import logging
@@ -1854,6 +1899,18 @@ def build_parser() -> argparse.ArgumentParser:
     eg_bl_show.add_argument("--json", action="store_true", default=False,
                             help="Emit raw JSON (default: human-readable).")
     eg_bl_show.set_defaults(func=cmd_eval_gate)
+
+    fge = sub.add_parser(
+        "facets-gw-eval",
+        help="Facets-on-GW load eval: two-arm latency + quality test (haiku vs gravitywell).",
+    )
+    fge.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit verdict as JSON (in addition to markdown report).",
+    )
+    fge.set_defaults(func=cmd_facets_gw_eval)
 
     sr = sub.add_parser(
         "spec-review",

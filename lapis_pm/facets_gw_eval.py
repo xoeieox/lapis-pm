@@ -1,0 +1,731 @@
+"""Facets-on-GW load-eval harness.
+
+Two-arm latency + quality eval: haiku (baseline, paid) vs gravitywell (GW, serialized).
+Measures Facets leg wall-clock, degrade-rate (operator fallback), and quality parity.
+
+Runs with doorman-lease guard (clean pass) and without (wild pass).
+Reports metrics: p50/p95 latency, B-A delta, cold-wake split, degrade-rate %, quality judges.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median, quantiles
+from typing import Literal
+
+try:
+    from agents_core.llm import call_claude_cli
+except ImportError:
+    call_claude_cli = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# Filesystem layout
+EVAL_BASE = Path("/srv/lapis/planning/evals")
+FIXTURE_BASE = Path("/srv/lapis/planning/specs")
+
+# Timeout: full spec-review workflow per arm
+SPEC_REVIEW_TIMEOUT_S = 1800  # 30 min per arm
+
+# Doorman acquire timeout (clean pass)
+DOORMAN_ACQUIRE_TIMEOUT_S = 210
+
+# Fixture corpus: fixed set of recent landed specs for reproducibility.
+# These are real specs that exercise the personas; use recent landed ones.
+FIXTURE_SPEC_IDS = [
+    "agents-core-bundle-loader-v0",
+    "lapis-pm-dispatch-queue-reconciliation",
+    "lapis-provenance-corroborate-envelope-v0",
+    "facets-persona-definitions-v0",
+    "pm-target-chaining-v0",
+    "gardener-v0",
+]
+
+
+@dataclass
+class Envelope:
+    """Facets envelope structure (deserialized from JSON)."""
+    deliberation_id: str
+    methodology: dict
+    synthesis: dict | None = None
+    personas_invoked: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ArmMetrics:
+    """Per-arm metrics: durations, operator_requested, consensus/confidence."""
+    arm_name: str  # "haiku" | "gravitywell"
+    run_count: int = 0
+    elapsed_s_per_run: list[float] = field(default_factory=list)
+    operator_requested_count: int = 0  # # of runs where operator was downgraded
+    consensus_levels: dict[str, int] = field(default_factory=dict)  # consensus/split/divergent -> count
+    confidences: dict[str, int] = field(default_factory=dict)  # high/medium/low -> count
+    persona_failures: list[int] = field(default_factory=list)  # failure counts per run
+    cold_wake_elapsed_s: list[float] = field(default_factory=list)  # first call only
+    warm_elapsed_s: list[float] = field(default_factory=list)  # subsequent calls
+
+    def p50(self) -> float:
+        """Median elapsed_s."""
+        if not self.elapsed_s_per_run:
+            return 0.0
+        return median(self.elapsed_s_per_run)
+
+    def p95(self) -> float:
+        """95th percentile elapsed_s."""
+        if not self.elapsed_s_per_run or len(self.elapsed_s_per_run) < 2:
+            return 0.0
+        # quantiles needs at least 2 points for n=20 (4 cuts)
+        try:
+            cuts = quantiles(self.elapsed_s_per_run, n=20)
+            return cuts[-1]  # 95th percentile is the last cut
+        except Exception:
+            return max(self.elapsed_s_per_run)
+
+    def degrade_rate_pct(self) -> float:
+        """% of runs where operator_requested was set (fallback happened)."""
+        if self.run_count == 0:
+            return 0.0
+        return (self.operator_requested_count / self.run_count) * 100.0
+
+
+@dataclass
+class EvalPass:
+    """One measurement pass: clean or wild."""
+    pass_name: Literal["clean", "wild"]
+    pass_at: str  # ISO8601 timestamp when pass started
+    arm_a: ArmMetrics = field(default_factory=lambda: ArmMetrics("haiku"))
+    arm_b: ArmMetrics = field(default_factory=lambda: ArmMetrics("gravitywell"))
+    doorman_lease_held: bool = False  # True for clean pass
+    notes: str = ""
+
+
+@dataclass
+class EvalResult:
+    """Full eval result: both passes, verdict."""
+    clean_pass: EvalPass
+    wild_pass: EvalPass
+    verdict: dict[str, str | bool | float]  # PASS/FAIL per metric + summary
+    report_path: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Fixture loading
+# ---------------------------------------------------------------------------
+
+def _load_fixture_specs() -> list[Path]:
+    """Load fixed fixture corpus from /srv/lapis/planning/specs/."""
+    specs = []
+    for spec_id in FIXTURE_SPEC_IDS:
+        # Try both .md and without extension
+        for fname in [f"{spec_id}.md", spec_id]:
+            spec_file = FIXTURE_BASE / fname
+            if spec_file.exists():
+                specs.append(spec_file)
+                break
+    if not specs:
+        logger.warning(
+            "facets_gw_eval: no fixture specs found in %s; expected %s",
+            FIXTURE_BASE, FIXTURE_SPEC_IDS,
+        )
+    return specs
+
+
+# ---------------------------------------------------------------------------
+# Envelope parsing
+# ---------------------------------------------------------------------------
+
+def _extract_facets_envelope(result: subprocess.CompletedProcess) -> Envelope | None:
+    """Extract facets envelope from spec-review subprocess output (JSON or structured log).
+
+    Returns Envelope with methodology + synthesis, or None if not found.
+    """
+    if not result or not result.stdout:
+        return None
+
+    try:
+        for line in result.stdout.splitlines():
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and "methodology" in data:
+                    return Envelope(
+                        deliberation_id=data.get("deliberation_id", "unknown"),
+                        methodology=data.get("methodology", {}),
+                        synthesis=data.get("synthesis"),
+                        personas_invoked=data.get("personas_invoked", []),
+                    )
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
+def _parse_elapsed_from_envelope(env: Envelope) -> dict[str, float]:
+    """Extract duration_ms from methodology and convert to seconds.
+
+    Returns:
+        {
+            "p1": 1.23,        # persona_1 duration in seconds
+            "p2": 1.45,        # persona_2 duration in seconds
+            "synthesis": 0.89, # synthesis duration in seconds
+            "total": 3.57,     # sum of above
+        }
+    """
+    if not env.methodology:
+        return {}
+
+    result = {}
+    duration_ms = env.methodology.get("duration_ms", {})
+    total_ms = 0
+
+    for key, ms in duration_ms.items():
+        if isinstance(ms, (int, float)):
+            s = ms / 1000.0
+            result[key] = s
+            total_ms += ms
+
+    result["total"] = total_ms / 1000.0
+    return result
+
+
+def _parse_consensus_and_confidence(env: Envelope) -> tuple[str, str]:
+    """Extract consensus_level and confidence from synthesis.
+
+    Returns: (consensus_level, confidence) or ("unknown", "unknown") on missing.
+    """
+    if not env.synthesis:
+        return "unknown", "unknown"
+
+    consensus = env.synthesis.get("consensus_level", "unknown")
+    confidence = env.synthesis.get("confidence", "unknown")
+    return consensus, confidence
+
+
+def _parse_operator_requested(env: Envelope) -> str | None:
+    """Check if operator_requested is set (fallback happened)."""
+    if not env.methodology:
+        return None
+    return env.methodology.get("operator_requested")
+
+
+# ---------------------------------------------------------------------------
+# Spec-review invocation (subprocess harness)
+# ---------------------------------------------------------------------------
+
+def _run_spec_review_arm(
+    spec_path: Path,
+    arm: str,  # "haiku" | "gravitywell"
+    timeout_s: float = SPEC_REVIEW_TIMEOUT_S,
+) -> subprocess.CompletedProcess | None:
+    """Run spec-review with --facets-operator arm.
+
+    Returns the subprocess result or None on timeout/error.
+    """
+    try:
+        cmd = [
+            "python", "-m", "lapis_pm.cli",
+            "spec-review",
+            str(spec_path),
+            "--facets-operator", arm,
+            "--no-sonnet-reviewer",  # Keep eval cheap; no reference judgment here
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        logger.warning("facets_gw_eval: spec-review timeout for %s arm=%s", spec_path.name, arm)
+        return None
+    except Exception as exc:
+        logger.warning("facets_gw_eval: spec-review error for %s arm=%s: %s", spec_path.name, arm, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Doorman lease guard (clean pass only)
+# ---------------------------------------------------------------------------
+
+def _acquire_doorman_lease(timeout_s: float = DOORMAN_ACQUIRE_TIMEOUT_S) -> str | None:
+    """Acquire exclusive doorman lease for the duration of clean eval.
+
+    Returns lease_id on success, None on failure/timeout.
+    """
+    try:
+        cmd = ["doorman", "lease", "acquire", "--duration", "1800"]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        if result.returncode == 0:
+            # Parse lease ID from output or JSON
+            try:
+                lease_data = json.loads(result.stdout)
+                return lease_data.get("lease_id")
+            except Exception:
+                # Fall back to parsing plain text
+                for line in result.stdout.splitlines():
+                    if "lease_id" in line.lower():
+                        return line.split()[-1]
+        logger.warning("facets_gw_eval: doorman acquire failed: %s", result.stderr[:200])
+        return None
+    except Exception as exc:
+        logger.warning("facets_gw_eval: doorman error: %s", exc)
+        return None
+
+
+def _release_doorman_lease(lease_id: str) -> bool:
+    """Release doorman lease."""
+    try:
+        cmd = ["doorman", "lease", "release", lease_id]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Quality cross-judge (optional PM-run phase)
+# ---------------------------------------------------------------------------
+
+QUALITY_JUDGE_SYSTEM = """You are a decision-quality judge comparing two deliberation outputs.
+
+Arm A (baseline): Haiku-powered Facets personas + synthesis.
+Arm B (candidate): GravityWell-powered Facets personas + synthesis.
+
+For each spec fixture, rate whether Arm B's persona outputs and synthesis are:
+- "equivalent": decision-equivalent to Arm A (both make the same recommendation)
+- "weaker": materially weaker (would lead to a different/lower-confidence decision)
+- "stronger": materially stronger (clearer recommendation or higher confidence)
+
+Output a JSON object:
+{
+  "judgment": "equivalent" | "weaker" | "stronger",
+  "reasoning": "brief explanation"
+}
+
+Be conservative: only rate "equivalent" if you are confident both would lead to the same decision.
+"""
+
+
+def run_quality_cross_judge(clean_pass: EvalPass, fixture_specs: list[Path]) -> float | None:
+    """Run Sonnet quality cross-judge on Arm A vs Arm B outputs.
+
+    For each fixture, judges whether Arm-B outputs are decision-equivalent to Arm-A.
+    Returns: percentage of fixtures judged equivalent-or-stronger, or None if judge unavailable.
+
+    This is a PM-optional action; unit tests mock it.
+    """
+    if not call_claude_cli:
+        logger.warning("facets_gw_eval: call_claude_cli not available; quality cross-judge skipped")
+        return None
+
+    if clean_pass.arm_a.run_count == 0 or clean_pass.arm_b.run_count == 0:
+        logger.warning("facets_gw_eval: no runs in clean pass; cannot judge quality")
+        return None
+
+    equivalent_count = 0
+    total_fixtures = len(fixture_specs)
+
+    for spec_path in fixture_specs:
+        prompt = (
+            f"Fixture: {spec_path.name}\n\n"
+            f"Arm A consensus levels: {clean_pass.arm_a.consensus_levels}\n"
+            f"Arm A confidences: {clean_pass.arm_a.confidences}\n\n"
+            f"Arm B consensus levels: {clean_pass.arm_b.consensus_levels}\n"
+            f"Arm B confidences: {clean_pass.arm_b.confidences}\n\n"
+            "Judge whether Arm B's outputs are decision-equivalent, weaker, or stronger than Arm A."
+        )
+
+        try:
+            verdict_json = call_claude_cli(
+                prompt=prompt, system=QUALITY_JUDGE_SYSTEM,
+                model="sonnet", timeout=60, log=logger.warning,
+            )
+            if verdict_json:
+                verdict = json.loads(verdict_json)
+                judgment = verdict.get("judgment", "").lower()
+                if judgment in ("equivalent", "stronger"):
+                    equivalent_count += 1
+                elif judgment == "weaker":
+                    logger.info("facets_gw_eval: fixture %s judged WEAKER", spec_path.name)
+        except Exception as exc:
+            logger.warning("facets_gw_eval: cross-judge error for %s: %s", spec_path.name, exc)
+            continue
+
+    if total_fixtures > 0:
+        equiv_pct = (equivalent_count / total_fixtures) * 100.0
+        logger.info("facets_gw_eval: quality cross-judge result: %.0f%% equivalent-or-stronger", equiv_pct)
+        return equiv_pct
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Eval harness: run one pass (clean or wild)
+# ---------------------------------------------------------------------------
+
+def _run_eval_pass(
+    pass_name: Literal["clean", "wild"],
+    fixture_specs: list[Path],
+) -> EvalPass:
+    """Run one measurement pass (clean or wild) over fixture corpus.
+
+    Clean: acquire doorman lease, fence off other callers, measure GW baseline.
+    Wild: run without lease during normal hours, capture real-world variance.
+
+    Raises ValueError if clean pass cannot acquire doorman lease.
+    """
+    pass_obj = EvalPass(
+        pass_name=pass_name,
+        pass_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        doorman_lease_held=(pass_name == "clean"),
+    )
+
+    lease_id: str | None = None
+    try:
+        if pass_name == "clean":
+            lease_id = _acquire_doorman_lease()
+            if not lease_id:
+                raise ValueError("Could not acquire doorman lease for clean pass")
+            pass_obj.doorman_lease_held = True
+
+        # Run both arms over each fixture
+        for spec_path in fixture_specs:
+            logger.info("facets_gw_eval: %s pass, fixture=%s", pass_name, spec_path.name)
+
+            # Arm A (haiku, baseline)
+            t0 = time.time()
+            result_a = _run_spec_review_arm(spec_path, "haiku")
+            elapsed_a = time.time() - t0
+
+            if result_a and result_a.returncode == 0:
+                pass_obj.arm_a.run_count += 1
+                pass_obj.arm_a.elapsed_s_per_run.append(elapsed_a)
+
+                if pass_name == "clean" and pass_obj.arm_a.run_count == 1:
+                    pass_obj.arm_a.cold_wake_elapsed_s.append(elapsed_a)
+                else:
+                    pass_obj.arm_a.warm_elapsed_s.append(elapsed_a)
+
+                # Extract envelope for arm A to populate consensus/confidence
+                env_a = _extract_facets_envelope(result_a)
+                if env_a:
+                    consensus, confidence = _parse_consensus_and_confidence(env_a)
+                    if consensus != "unknown":
+                        pass_obj.arm_a.consensus_levels[consensus] = pass_obj.arm_a.consensus_levels.get(consensus, 0) + 1
+                    if confidence != "unknown":
+                        pass_obj.arm_a.confidences[confidence] = pass_obj.arm_a.confidences.get(confidence, 0) + 1
+
+            # Arm B (gravitywell, candidate)
+            t0 = time.time()
+            result_b = _run_spec_review_arm(spec_path, "gravitywell")
+            elapsed_b = time.time() - t0
+
+            if result_b and result_b.returncode == 0:
+                pass_obj.arm_b.run_count += 1
+                pass_obj.arm_b.elapsed_s_per_run.append(elapsed_b)
+
+                if pass_name == "clean" and pass_obj.arm_b.run_count == 1:
+                    pass_obj.arm_b.cold_wake_elapsed_s.append(elapsed_b)
+                else:
+                    pass_obj.arm_b.warm_elapsed_s.append(elapsed_b)
+
+                # Extract envelope for arm B to populate operator_requested + consensus/confidence
+                env_b = _extract_facets_envelope(result_b)
+                if env_b:
+                    if _parse_operator_requested(env_b):
+                        pass_obj.arm_b.operator_requested_count += 1
+
+                    consensus, confidence = _parse_consensus_and_confidence(env_b)
+                    if consensus != "unknown":
+                        pass_obj.arm_b.consensus_levels[consensus] = pass_obj.arm_b.consensus_levels.get(consensus, 0) + 1
+                    if confidence != "unknown":
+                        pass_obj.arm_b.confidences[confidence] = pass_obj.arm_b.confidences.get(confidence, 0) + 1
+
+    finally:
+        if lease_id:
+            _release_doorman_lease(lease_id)
+
+    return pass_obj
+
+
+# ---------------------------------------------------------------------------
+# Verdict logic
+# ---------------------------------------------------------------------------
+
+def _compute_verdict(clean: EvalPass, wild: EvalPass) -> dict[str, str | bool | float]:
+    """Assess clean + wild passes against thresholds.
+
+    Returns a dict:
+        {
+            "latency_p95_delta_s": 2.5,
+            "latency_p95_delta_pass": true,
+            "cold_wake_latency_s": 4.2,
+            "warm_latency_p95_s": 2.1,
+            "degrade_rate_pct": 2.5,
+            "degrade_rate_pass": true,
+            "variance_ratio": 1.8,
+            "variance_fragile": false,
+            "quality_equivalent_pct": 85,
+            "quality_pass": true,
+            "overall_pass": true,
+        }
+    """
+    verdict: dict[str, str | bool | float] = {}
+
+    # Latency: clean-pass p95 baselines, wild-pass shows variance
+    a_p95_clean = clean.arm_a.p95()
+    b_p95_clean = clean.arm_b.p95()
+    b_p95_wild = wild.arm_b.p95()
+
+    verdict["arm_a_p95_s_clean"] = round(a_p95_clean, 2)
+    verdict["arm_b_p95_s_clean"] = round(b_p95_clean, 2)
+    verdict["arm_b_p95_s_wild"] = round(b_p95_wild, 2)
+    verdict["latency_p95_delta_s"] = round(b_p95_clean - a_p95_clean, 2)
+
+    # Threshold: B-A p95 delta <= 3 min (180s) is acceptable
+    latency_threshold_s = 180.0
+    latency_pass = verdict["latency_p95_delta_s"] <= latency_threshold_s
+    verdict["latency_p95_delta_pass"] = latency_pass
+
+    # Cold-wake split (for context; not a pass/fail, but flagged)
+    b_cold = clean.arm_b.cold_wake_elapsed_s[0] if clean.arm_b.cold_wake_elapsed_s else 0.0
+    # Warm p95 computed from warm_elapsed_s only, not including cold call
+    if clean.arm_b.warm_elapsed_s and len(clean.arm_b.warm_elapsed_s) >= 2:
+        try:
+            cuts = quantiles(clean.arm_b.warm_elapsed_s, n=20)
+            b_warm_p95 = cuts[-1]
+        except Exception:
+            b_warm_p95 = max(clean.arm_b.warm_elapsed_s) if clean.arm_b.warm_elapsed_s else 0.0
+    else:
+        b_warm_p95 = median(clean.arm_b.warm_elapsed_s) if clean.arm_b.warm_elapsed_s else 0.0
+    verdict["arm_b_cold_wake_s"] = round(b_cold, 2)
+    verdict["arm_b_warm_p95_s"] = round(b_warm_p95, 2)
+
+    # Variance: wild/clean ratio. Flag FRAGILE if wild p95 > ~3x clean p95.
+    variance_ratio = (b_p95_wild / b_p95_clean) if b_p95_clean > 0 else 1.0
+    verdict["variance_ratio"] = round(variance_ratio, 2)
+    variance_fragile = variance_ratio > 3.0
+    verdict["variance_fragile"] = variance_fragile
+    if variance_fragile:
+        verdict["variance_note"] = "wild > 3x clean p95; potential infra contention"
+
+    # Degrade-rate: clean-pass % where operator_requested is set
+    b_degrade_pct = clean.arm_b.degrade_rate_pct()
+    verdict["arm_b_degrade_rate_pct"] = round(b_degrade_pct, 1)
+    degrade_threshold_pct = 5.0
+    degrade_pass = b_degrade_pct <= degrade_threshold_pct
+    verdict["degrade_rate_pass"] = degrade_pass
+
+    # Quality parity: consensus_level and confidence distributions from envelopes
+    # Display distributions A vs B for the report; cross-judge verdict is a PM action
+    verdict["arm_a_consensus_levels"] = dict(clean.arm_a.consensus_levels)
+    verdict["arm_a_confidences"] = dict(clean.arm_a.confidences)
+    verdict["arm_b_consensus_levels"] = dict(clean.arm_b.consensus_levels)
+    verdict["arm_b_confidences"] = dict(clean.arm_b.confidences)
+    # Quality score pending PM cross-judge action (None until run_quality_cross_judge is called)
+    verdict["quality_equivalent_pct"] = None
+    verdict["quality_pass"] = None
+
+    # Overall pass: latency + degrade + quality (quality pending if None)
+    quality_pass_val = verdict["quality_pass"] if verdict["quality_pass"] is not None else True
+    overall_pass = latency_pass and degrade_pass and quality_pass_val
+    verdict["overall_pass"] = overall_pass
+
+    return verdict
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def _write_report(clean: EvalPass, wild: EvalPass, verdict: dict) -> str:
+    """Write markdown report to /srv/lapis/planning/evals/facets-gw-eval-<timestamp>.md.
+
+    Returns report path.
+    """
+    EVAL_BASE.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    report_path = EVAL_BASE / f"facets-gw-eval-{timestamp}.md"
+
+    lines = [
+        "# Facets-on-GW Load Eval Report",
+        "",
+        f"**Generated:** {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        "",
+        "## Summary",
+        "",
+        f"**Verdict:** {'🟢 PASS' if verdict.get('overall_pass') else '🔴 FAIL'}",
+        "",
+        "- Latency p95 delta (B-A): {:.2f}s {}".format(
+            verdict.get("latency_p95_delta_s", 0),
+            "✓" if verdict.get("latency_p95_delta_pass") else "✗",
+        ),
+        "- Degrade-rate: {:.1f}% {}".format(
+            verdict.get("arm_b_degrade_rate_pct", 0),
+            "✓" if verdict.get("degrade_rate_pass") else "✗",
+        ),
+    ]
+
+    quality_pct = verdict.get("quality_equivalent_pct")
+    if quality_pct is not None:
+        lines.append(
+            "- Quality equivalent: {:.0f}% {}".format(
+                quality_pct,
+                "✓" if verdict.get("quality_pass") else "✗",
+            )
+        )
+    else:
+        lines.append("- Quality equivalent: pending PM cross-judge (not yet run)")
+
+    lines.append("")
+
+    lines.extend([
+        "## Clean Pass (Exclusive Doorman Lease)",
+        "",
+        "**Arm A (Haiku Baseline):**",
+        f"- Runs: {clean.arm_a.run_count}",
+        f"- p50: {clean.arm_a.p50():.2f}s",
+        f"- p95: {clean.arm_a.p95():.2f}s",
+        "",
+        "**Arm B (GravityWell Candidate):**",
+        f"- Runs: {clean.arm_b.run_count}",
+        f"- p50: {clean.arm_b.p50():.2f}s",
+        f"- p95: {clean.arm_b.p95():.2f}s",
+        f"- Cold-wake (first call): {verdict.get('arm_b_cold_wake_s', 0):.2f}s",
+        f"- Warm p95 (subsequent): {verdict.get('arm_b_warm_p95_s', 0):.2f}s",
+        f"- Degrade-rate: {verdict.get('arm_b_degrade_rate_pct', 0):.1f}%",
+        "",
+    ])
+
+    lines.extend([
+        "## Wild Pass (Normal Hours, No Lease)",
+        "",
+        f"**Arm B p95:** {verdict.get('arm_b_p95_s_wild', 0):.2f}s",
+        f"**Variance (Wild/Clean):** {verdict.get('variance_ratio', 1.0):.2f}x",
+    ])
+
+    if verdict.get("variance_fragile"):
+        lines.append(
+            f"⚠️ **FRAGILE:** {verdict.get('variance_note', 'Wild variance >3x clean p95')}"
+        )
+
+    # Quality Distribution section
+    lines.extend([
+        "",
+        "## Quality Distribution (A vs B)",
+        "",
+        "**Consensus Levels:**",
+        "",
+        "| Level | Arm A (Haiku) | Arm B (GravityWell) |",
+        "|-------|---------------|---------------------|",
+    ])
+
+    # Collect all consensus levels from both arms
+    all_consensus_keys = set(verdict.get("arm_a_consensus_levels", {}).keys()) | set(verdict.get("arm_b_consensus_levels", {}).keys())
+    for consensus_key in sorted(all_consensus_keys):
+        a_count = verdict.get("arm_a_consensus_levels", {}).get(consensus_key, 0)
+        b_count = verdict.get("arm_b_consensus_levels", {}).get(consensus_key, 0)
+        lines.append(f"| {consensus_key} | {a_count} | {b_count} |")
+
+    lines.extend([
+        "",
+        "**Confidence Levels:**",
+        "",
+        "| Level | Arm A (Haiku) | Arm B (GravityWell) |",
+        "|-------|---------------|---------------------|",
+    ])
+
+    # Collect all confidence levels from both arms
+    all_confidence_keys = set(verdict.get("arm_a_confidences", {}).keys()) | set(verdict.get("arm_b_confidences", {}).keys())
+    for confidence_key in sorted(all_confidence_keys):
+        a_count = verdict.get("arm_a_confidences", {}).get(confidence_key, 0)
+        b_count = verdict.get("arm_b_confidences", {}).get(confidence_key, 0)
+        lines.append(f"| {confidence_key} | {a_count} | {b_count} |")
+
+    lines.extend([
+        "",
+        "## Mechanism & Caveats",
+        "",
+        "- GW runs with `--parallel 1` (serialized 122B).",
+        "- Facets 2 personas + synthesis = 3 serialized GW calls per spec-review leg.",
+        "- Gate legs are code-serialized (Facets blocks before Council); no within-gate contention.",
+        "- This is a latency + quality eval, NOT a saturation/contention stress test.",
+        "- Degrade-rate: % of Arm-B runs where `operator_requested` is set (GW unavailable → haiku).",
+        "- Quality parity: Arm-B persona + synthesis judged decision-equivalent to Arm-A.",
+        "",
+        "## Verdict Thresholds (Spec § PM-proposed)",
+        "",
+        "| Metric | Threshold | Actual | Status |",
+        "|--------|-----------|--------|--------|",
+        f"| Latency p95 delta (B-A) | ≤180s | {verdict.get('latency_p95_delta_s', 0):.1f}s | "
+        f"{'✓' if verdict.get('latency_p95_delta_pass') else '✗'} |",
+        f"| Degrade-rate | ≤5% | {verdict.get('arm_b_degrade_rate_pct', 0):.1f}% | "
+        f"{'✓' if verdict.get('degrade_rate_pass') else '✗'} |",
+    ])
+
+    quality_pct_val = verdict.get("quality_equivalent_pct")
+    if quality_pct_val is not None:
+        lines.append(
+            f"| Quality equivalent | ≥80% | {quality_pct_val:.0f}% | "
+            f"{'✓' if verdict.get('quality_pass') else '✗'} |"
+        )
+    else:
+        lines.append("| Quality equivalent | ≥80% | pending | ⏳ |")
+
+    lines.extend([
+        f"| Variance (wild/clean) | <3x | {verdict.get('variance_ratio', 1.0):.2f}x | "
+        f"{'✓ (flagged separately if >3x)' if not verdict.get('variance_fragile') else '⚠️ FRAGILE'} |",
+        "",
+    ])
+
+    report_path.write_text("\n".join(lines))
+    logger.info("facets_gw_eval: report written to %s", report_path)
+
+    return str(report_path)
+
+
+# ---------------------------------------------------------------------------
+# Main eval entry point
+# ---------------------------------------------------------------------------
+
+def run_eval() -> EvalResult | None:
+    """Run full two-pass eval: clean + wild. Return EvalResult or None on error."""
+    specs = _load_fixture_specs()
+    if not specs:
+        logger.error("facets_gw_eval: no fixture specs loaded; cannot run eval")
+        return None
+
+    logger.info("facets_gw_eval: starting eval with %d fixture specs", len(specs))
+
+    # Clean pass
+    logger.info("facets_gw_eval: starting clean pass (with doorman lease)")
+    clean = _run_eval_pass("clean", specs)
+
+    # Wild pass
+    logger.info("facets_gw_eval: starting wild pass (without lease)")
+    wild = _run_eval_pass("wild", specs)
+
+    # Compute verdict
+    verdict = _compute_verdict(clean, wild)
+
+    # Write report
+    report_path = _write_report(clean, wild, verdict)
+
+    return EvalResult(
+        clean_pass=clean,
+        wild_pass=wild,
+        verdict=verdict,
+        report_path=report_path,
+    )

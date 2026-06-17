@@ -124,6 +124,15 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
     # so a code-only sync is picked up on the next scheduled fire with no restart.
     # INVARIANT: if a future lapis-pm unit adds Type=simple or Type=notify, it MUST
     # be listed here — code-only syncs will not restart it otherwise.
+    # synapse.service is Type=simple (long-running uvicorn, -m synapse.service on :8401) — a pull alone
+    # leaves the /serve daemon running STALE code. It must be restarted to pick up pulled code. (The
+    # `ground` CLI is `python3 -m synapse.cli` invoked fresh per call and needs no restart, but the daemon
+    # does.) System unit in /etc/systemd/system → restarted via `sudo -n systemctl restart` (the system
+    # branch of _post_land_deploy_hook), not the --user branch. Restart FAILURE is stderr/journal best-
+    # effort like every other unit here (synapse.service has Restart=on-failure as a self-heal backstop);
+    # making restart-failure loud is a cross-cutting concern deferred to
+    # lapis-pm-deploy-restart-gate-on-advance-v0 — see §2.
+    "synapse": ("synapse.service",),
 }
 
 # --user units that import agents_core from /data/agents. Restarted via
@@ -175,12 +184,21 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # topology correct; it does not solve the facets-prod-deploy-gap double-duty-tree
     # structure, which is a separate tracked concern.
     "facets":         [_FACETS_DEPLOY_CLONE],
+    # synapse: central BRIX context-injection substrate (decision/synapse-central-on-brix-2026-05-30).
+    # The serving clone IS /srv/git/synapse-working — synapse.service runs WorkingDirectory there and
+    # the host pip-installs it editable, so a git pull into this tree updates the live import root.
+    # Unlike lapis-pm's split dev/deploy trees, synapse has a SINGLE tree used for both PM-investigation
+    # and runtime. Pull failure → stale runtime → see _POST_LAND_PULL_CRITICAL below.
+    "synapse":        ["/srv/git/synapse-working"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
 # agents-core: failed pull on /data/agents → --user units (doorman, slot) silently
 # run stale code with no signal, which is the exact gap this unit closes.
-_POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core"})
+# synapse: failed pull on /srv/git/synapse-working → the central context-injection
+# substrate (decision/synapse-central-on-brix-2026-05-30) silently serves stale code to
+# every node's UserPromptSubmit hook. Same silent-load-bearing-staleness profile → CRITICAL.
+_POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core", "synapse"})
 
 # Repos whose pull failure emits a LOW-priority notification (not critical, not silent).
 # code-reviewer: timer-oneshot services — stale code is a degraded nightly sweep, not
@@ -328,7 +346,7 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
                                 f"post-land pull failed for {path} "
                                 f"(rc={result.returncode}): {result.stderr[:300]}"
                             ),
-                            title="lapis-pm: deploy pull failed",
+                            title=f"{repo}: deploy pull failed",
                             priority=_P.NORMAL,
                         )
                     except Exception:
@@ -364,7 +382,7 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
                     from agents_core.notify import send_notification, Priority as _P
                     send_notification(
                         message=f"post-land pull errored for {path}: {e}",
-                        title="lapis-pm: deploy pull failed",
+                        title=f"{repo}: deploy pull failed",
                         priority=_P.NORMAL,
                     )
                 except Exception:

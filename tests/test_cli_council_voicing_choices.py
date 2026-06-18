@@ -46,55 +46,25 @@ def test_spec_review_council_voicing_local_accepted(tmp_path):
     assert rc == 0, "local should be accepted"
 
 
-def test_spec_review_council_voicing_haiku_accepted(tmp_path):
-    """--council-voicing haiku is accepted."""
-    spec_file = tmp_path / "spec.md"
-    spec_file.write_text("# Spec: Test\n**Target ID:** `test-id`\n**Repo:** `lapis-pm`\n**Authority:** advisory\n")
-
-    with patch("lapis_pm.cli.cmd_spec_review", return_value=0):
-        rc, _, _ = _run_main(
-            ["spec-review", str(spec_file), "--council-voicing", "haiku"],
-            tmp_path,
-        )
-    assert rc == 0, "haiku should be accepted"
-
-
-def test_spec_review_council_voicing_sonnet_accepted(tmp_path):
-    """--council-voicing sonnet is accepted."""
-    spec_file = tmp_path / "spec.md"
-    spec_file.write_text("# Spec: Test\n**Target ID:** `test-id`\n**Repo:** `lapis-pm`\n**Authority:** advisory\n")
-
-    with patch("lapis_pm.cli.cmd_spec_review", return_value=0):
-        rc, _, _ = _run_main(
-            ["spec-review", str(spec_file), "--council-voicing", "sonnet"],
-            tmp_path,
-        )
-    assert rc == 0, "sonnet should be accepted"
-
-
-def test_spec_review_council_voicing_opus_accepted(tmp_path):
-    """--council-voicing opus is accepted."""
-    spec_file = tmp_path / "spec.md"
-    spec_file.write_text("# Spec: Test\n**Target ID:** `test-id`\n**Repo:** `lapis-pm`\n**Authority:** advisory\n")
-
-    with patch("lapis_pm.cli.cmd_spec_review", return_value=0):
-        rc, _, _ = _run_main(
-            ["spec-review", str(spec_file), "--council-voicing", "opus"],
-            tmp_path,
-        )
-    assert rc == 0, "opus should be accepted"
-
-
 def test_spec_review_council_voicing_invalid_rejected(tmp_path):
-    """--council-voicing with invalid value is rejected."""
+    """--council-voicing with invalid value is rejected; sonnet (paid-model) is now invalid."""
     spec_file = tmp_path / "spec.md"
     spec_file.write_text("# Spec: Test\n**Target ID:** `test-id`\n**Repo:** `lapis-pm`\n**Authority:** advisory\n")
 
+    # Test that a completely invalid value is rejected
     rc, _, err = _run_main(
         ["spec-review", str(spec_file), "--council-voicing", "invalid-voicing"],
         tmp_path,
     )
     assert rc != 0, "invalid voicing should be rejected"
+    assert "invalid choice" in err.lower(), "error should mention invalid choice"
+
+    # Test that sonnet (previously valid paid-model voicing) is now rejected
+    rc, _, err = _run_main(
+        ["spec-review", str(spec_file), "--council-voicing", "sonnet"],
+        tmp_path,
+    )
+    assert rc != 0, "sonnet should be rejected (paid-model voicing removed)"
     assert "invalid choice" in err.lower(), "error should mention invalid choice"
 
 

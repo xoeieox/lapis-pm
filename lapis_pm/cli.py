@@ -1920,9 +1920,9 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument(
         "--council-voicing",
         default="gravitywell",
-        choices=["local", "gravitywell", "haiku", "sonnet", "opus"],
+        choices=["local", "gravitywell"],
         dest="council_voicing",
-        help="Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, zero paid spend; Sonnet fallback if GW is down).",
+        help="Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, zero paid spend). Paid-model voicing removed; entity selection retains its own on_wake_fail fallback.",
     )
     sr.add_argument(
         "--timeout",

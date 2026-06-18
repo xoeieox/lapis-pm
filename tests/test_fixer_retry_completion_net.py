@@ -643,86 +643,25 @@ class TestFindLostFixerRetryDispatches:
 class TestActLostFixerRetryForRetryAgent:
 
     def test_fixer_retry_redispatch_includes_pr_number(self):
-        """Lost fixer_retry re-dispatch passes pr_number to shaper vars."""
+        """Lost fixer_retry re-dispatch is not yet supported — raises NotImplementedError."""
         orig = _fixer_retry_record(gpu_id="gpu-retry-lost", status="failed", pr_number=106)
 
-        fake_res = MagicMock()
-        fake_res.task_id = "gpu-retry-lost-2"
-        fake_res.spec_id = "spec-retry-lost-2"
-
-        captured_vars = {}
-
-        def capture_dispatch(agent_type, tid, intent, vars_=None):
-            captured_vars.update(vars_ or {})
-            return fake_res
-
-        with (
-            patch("lapis_pm.pm_core._SHAPER") as mock_shaper,
-            patch("lapis_pm.pm_core.load_dispatched", return_value=[orig]),
-            patch("lapis_pm.pm_core.save_dispatched"),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.episodic.write_observation"),
-        ):
-            mock_shaper.dispatch.side_effect = capture_dispatch
-            result = pm_core._act_lost_fixer_retry("my-target", orig)
-
-        assert result.startswith("fixer_lost:retrying:dispatch=")
-        assert captured_vars.get("pr_number") == "106"
+        with pytest.raises(NotImplementedError, match="fixer_retry"):
+            pm_core._act_lost_fixer_retry("my-target", orig)
 
     def test_fixer_retry_redispatch_includes_intent_note(self):
-        """Lost fixer_retry dispatch adds a note about prior no-op attempt."""
+        """Lost fixer_retry dispatch is not yet supported — raises NotImplementedError."""
         orig = _fixer_retry_record(gpu_id="gpu-noop", status="failed", pr_number=106)
 
-        fake_res = MagicMock()
-        fake_res.task_id = "gpu-noop-retry"
-        fake_res.spec_id = "spec-noop"
-
-        dispatched_intents = []
-
-        def capture_dispatch(agent_type, tid, intent, vars_=None):
-            dispatched_intents.append(intent)
-            return fake_res
-
-        with (
-            patch("lapis_pm.pm_core._SHAPER") as mock_shaper,
-            patch("lapis_pm.pm_core.load_dispatched", return_value=[orig]),
-            patch("lapis_pm.pm_core.save_dispatched"),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.episodic.write_observation"),
-        ):
-            mock_shaper.dispatch.side_effect = capture_dispatch
+        with pytest.raises(NotImplementedError, match="fixer_retry"):
             pm_core._act_lost_fixer_retry("my-target", orig)
-
-        assert dispatched_intents
-        intent_lower = dispatched_intents[0].lower()
-        assert "no commit" in intent_lower or "no code" in intent_lower or "without pushing" in intent_lower
 
     def test_fixer_retry_redispatch_carries_pr_number_in_record(self):
-        """Lost fixer_retry re-dispatch stores pr_number in the child record (carry-through)."""
+        """Lost fixer_retry re-dispatch is not yet supported — raises NotImplementedError."""
         orig = _fixer_retry_record(gpu_id="gpu-carry-orig", status="failed", pr_number=106)
 
-        fake_res = MagicMock()
-        fake_res.task_id = "gpu-carry-child"
-        fake_res.spec_id = "spec-carry"
-
-        saved_records: list[list] = []
-
-        with (
-            patch("lapis_pm.pm_core._SHAPER") as mock_shaper,
-            patch("lapis_pm.pm_core.load_dispatched", return_value=[orig]),
-            patch("lapis_pm.pm_core.save_dispatched",
-                  side_effect=lambda tid, recs: saved_records.append(list(recs))),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.episodic.write_observation"),
-        ):
-            mock_shaper.dispatch.return_value = fake_res
+        with pytest.raises(NotImplementedError, match="fixer_retry"):
             pm_core._act_lost_fixer_retry("my-target", orig)
-
-        assert saved_records, "save_dispatched was not called"
-        all_records = saved_records[-1]
-        child = next((r for r in all_records if r.get("gpu_id") == "gpu-carry-child"), None)
-        assert child is not None, "Child record not found in saved records"
-        assert child.get("pr_number") == 106
 
 
 # ---------------------------------------------------------------------------
@@ -777,25 +716,11 @@ class TestDepositInvariants:
         mock_deposit.assert_called_once_with(rec, "my-target")
 
     def test_close_slot_not_called_on_first_retry_path(self):
-        """D5: first retry (_act_lost_fixer_retry) does NOT call _close_slot_and_deposit."""
+        """D5: first retry (_act_lost_fixer_retry) with fixer_retry is not yet supported."""
         orig = _fixer_retry_record(gpu_id="gpu-first-retry", status="failed", pr_number=106)
 
-        fake_res = MagicMock()
-        fake_res.task_id = "gpu-first-retry-child"
-        fake_res.spec_id = "spec-first"
-
-        with (
-            patch("lapis_pm.pm_core._SHAPER") as mock_shaper,
-            patch("lapis_pm.pm_core.load_dispatched", return_value=[orig]),
-            patch("lapis_pm.pm_core.save_dispatched"),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.episodic.write_observation"),
-            patch("lapis_pm.pm_core._close_slot_and_deposit") as mock_deposit,
-        ):
-            mock_shaper.dispatch.return_value = fake_res
+        with pytest.raises(NotImplementedError, match="fixer_retry"):
             pm_core._act_lost_fixer_retry("my-target", orig)
-
-        mock_deposit.assert_not_called()
 
     def test_close_slot_called_on_terminal_brief(self):
         """D5: brief-raised (terminal) path calls _close_slot_and_deposit on original_rec."""
@@ -928,22 +853,16 @@ class TestTickBodyAdvanceScenario:
         assert "reviewer_dispatched" in result.decision
 
     def test_tick_retries_lost_fixer_retry_on_first_loss(self):
-        """Tick: no-op fixer_retry (terminal, no advance) → fixer_lost:retrying."""
+        """Tick: no-op fixer_retry lost dispatch is not yet supported."""
         rec = _fixer_retry_record(
             status="failed",
             ts="2026-06-01T09:00:00Z",
         )
 
-        fake_res = MagicMock()
-        fake_res.task_id = "gpu-retry-noop-001"
-        fake_res.spec_id = "spec-retry-noop"
-
         extra = [("lapis_pm.pm_core._SHAPER", {})]
         with _tick_ctx([rec], perceive_result=([], True), extra_patches=extra) as mocks:
-            mocks["lapis_pm.pm_core._SHAPER"].dispatch.return_value = fake_res
-            result = pm_core.tick("my-target")
-
-        assert result.decision.startswith("fixer_lost:retrying:dispatch=")
+            with pytest.raises(NotImplementedError, match="fixer_retry"):
+                pm_core.tick("my-target")
 
     def test_tick_briefs_on_second_loss(self):
         """Tick: no-op fixer_retry + lost_retry_count=1 + terminal child → brief."""

@@ -715,6 +715,187 @@ class TestFacetsDeploy:
         )
 
 
+class TestSynapseDeploy:
+    """Tests for synapse entry in _POST_LAND_PULL and _POST_LAND_RESTART.
+
+    synapse is the central BRIX context-injection substrate. It is unique among
+    the mapped repos in that it has a SINGLE tree (/srv/git/synapse-working)
+    serving both PM investigation and runtime, and the service is Type=simple
+    (long-running daemon) requiring a restart after pull.
+    """
+
+    def test_synapse_in_post_land_pull(self):
+        """synapse must be mapped to /srv/git/synapse-working in _POST_LAND_PULL."""
+        assert "synapse" in pm_core._POST_LAND_PULL
+        assert pm_core._POST_LAND_PULL["synapse"] == ["/srv/git/synapse-working"]
+
+    def test_synapse_in_post_land_restart(self):
+        """synapse must be mapped to synapse.service in _POST_LAND_RESTART."""
+        assert "synapse" in pm_core._POST_LAND_RESTART
+        assert pm_core._POST_LAND_RESTART["synapse"] == ("synapse.service",)
+
+    def test_synapse_in_post_land_pull_critical(self):
+        """synapse must be in _POST_LAND_PULL_CRITICAL (central substrate, silent failure = critical)."""
+        assert "synapse" in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_synapse_not_in_post_land_restart_user(self):
+        """synapse.service is a system unit, not a --user unit — must not be in _RESTART_USER."""
+        assert "synapse" not in pm_core._POST_LAND_RESTART_USER
+
+    def test_synapse_pull_triggers_git_pull_and_system_restart(self):
+        """Landing a synapse PR fires exactly one git pull and one sudo systemctl restart."""
+        pull_calls = []
+        restart_calls = []
+        user_restart_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "sudo" and "restart" in cmd:
+                restart_calls.append(cmd)
+            elif cmd[0] == "systemctl" and "--user" in cmd:
+                user_restart_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                    pm_core._post_land_deploy_hook("synapse")
+
+        assert len(pull_calls) == 1
+        assert pull_calls[0] == [
+            "git", "-C", "/srv/git/synapse-working", "pull", "--ff-only", "origin", "main"
+        ]
+        assert len(restart_calls) == 1
+        assert restart_calls[0] == ["sudo", "-n", "systemctl", "restart", "synapse.service"]
+        assert len(user_restart_calls) == 0, "synapse.service is a system unit, not --user"
+
+    def test_synapse_pull_failure_sends_pushover_normal_priority(self):
+        """A failed synapse pull triggers a Pushover alert with Priority.NORMAL (CRITICAL repo)."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not fast-forward")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("synapse")
+
+        assert len(notify_calls) >= 1, "synapse pull failure must send Pushover (CRITICAL repo)"
+        assert any("deploy pull failed" in c["title"] for c in notify_calls)
+        assert all(c["priority"] == Priority.NORMAL for c in notify_calls)
+
+    def test_synapse_pull_failure_title_contains_synapse(self):
+        """Synapse pull failure title is parameterized and contains 'synapse'."""
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="diverged")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"title": title})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("synapse")
+
+        assert len(notify_calls) >= 1
+        assert any("synapse" in c["title"] for c in notify_calls), (
+            "synapse pull failure title must contain 'synapse' (parameterized per repo)"
+        )
+
+    def test_synapse_restart_failure_does_not_raise(self, capsys):
+        """Non-zero returncode from synapse.service restart is logged to stderr, does not raise."""
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            if cmd[0] == "git" and "pull" in cmd:
+                return _make_completed_process(returncode=0)
+            if cmd[0] == "sudo" and "restart" in cmd:
+                return _make_completed_process(returncode=1, stderr="unit failed to restart")
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                pm_core._post_land_deploy_hook("synapse")  # must not raise
+
+        captured = capsys.readouterr()
+        assert "rc=1" in captured.err or "failed" in captured.err
+
+    def test_synapse_restart_failure_is_stderr_only_not_pushover(self):
+        """synapse restart failure is logged to stderr/journal only (no Pushover).
+
+        This documents the §2 deferral: loud restart-failure signaling is deferred to
+        lapis-pm-deploy-restart-gate-on-advance-v0. Restart failure is stderr/journal
+        best-effort with Restart=on-failure as the self-heal backstop, consistent with
+        all other repos (agents-core included).
+        """
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "pull" in cmd:
+                return _make_completed_process(returncode=0)
+            if cmd[0] == "sudo" and "restart" in cmd:
+                return _make_completed_process(returncode=1, stderr="unit failed")
+            return _make_completed_process(returncode=0)
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"title": title})
+            return True
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch("agents_core.notify.send_notification", fake_notify):
+                    pm_core._post_land_deploy_hook("synapse")
+
+        # No Pushover for restart failure — deferred to lapis-pm-deploy-restart-gate-on-advance-v0
+        assert not any("restart" in c.get("title", "") for c in notify_calls)
+
+    def test_lapis_pm_pull_failure_title_still_contains_lapis_pm(self):
+        """Regression guard: lapis-pm pull failure title is 'lapis-pm: deploy pull failed' after parameterization.
+
+        With the title parameterized as f'{repo}: deploy pull failed', lapis-pm still
+        gets 'lapis-pm: deploy pull failed'. This ensures the parameterization doesn't
+        break the existing lapis-pm test.
+        """
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not ff")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"title": title})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("lapis-pm")
+
+        assert len(notify_calls) >= 1
+        assert any("lapis-pm" in c["title"] for c in notify_calls), (
+            "lapis-pm pull failure title must contain 'lapis-pm' (regression guard after parameterization)"
+        )
+
+
 class TestMergeAndDeploy:
     """Tests for merge_and_deploy choicepoint."""
 

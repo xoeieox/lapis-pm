@@ -563,7 +563,7 @@ def _dispatch_spec_reviewer(
     )
 
 
-def _check_doorman_heartbeat(doorman_host: str = "203.0.113.10", doorman_port: int = 8407) -> bool:
+def _check_doorman_heartbeat(doorman_host: str = "127.0.0.1", doorman_port: int = 8407) -> bool:
     """Check if doorman is reachable via a fast liveness probe.
 
     Returns True if doorman responds; False if unreachable or timeout.
@@ -572,7 +572,7 @@ def _check_doorman_heartbeat(doorman_host: str = "203.0.113.10", doorman_port: i
     try:
         import requests as _requests
         response = _requests.get(
-            f"http://{doorman_host}:{doorman_port}/health",
+            f"http://{doorman_host}:{doorman_port}/healthz",
             timeout=2.0,
         )
         return response.status_code == 200

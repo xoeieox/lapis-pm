@@ -57,6 +57,22 @@ def test_doorman_heartbeat_non_200():
         assert result is False
 
 
+def test_doorman_probe_target_regression():
+    """_check_doorman_heartbeat probes http://127.0.0.1:8407/healthz (not 203.0.113.10 or /health)."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    with patch("requests.get", return_value=mock_response) as mock_get:
+        result = _check_doorman_heartbeat()
+
+    # Verify the correct URL was called
+    mock_get.assert_called_once_with(
+        "http://127.0.0.1:8407/healthz",
+        timeout=2.0,
+    )
+    assert result is True
+
+
 # ---------------------------------------------------------------------------
 # GW stub mechanism
 # ---------------------------------------------------------------------------

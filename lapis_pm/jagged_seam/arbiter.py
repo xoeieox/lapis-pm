@@ -12,6 +12,15 @@ log = logging.getLogger(__name__)
 JAGGED_SEAM_GW_UNAVAILABLE = "JAGGED_SEAM_GW_UNAVAILABLE"
 
 
+def _norm(s: str) -> str:
+    """Normalize a provenance string for matching: collapse whitespace, case-fold.
+
+    Used by _resolve_claim_by_provenance as a fallback when exact match fails.
+    Handles trivial drift (extra whitespace, case differences) without fuzzy matching.
+    """
+    return " ".join(s.split()).casefold()
+
+
 class JaggedSeamGravityWellUnavailable(Exception):
     """GravityWell is unavailable (not serving, doorman unreachable, or wake failed)."""
 
@@ -62,6 +71,7 @@ def overlay(
             state_ref=fear.state_ref,
             items=[],
             skipped_no_axis=True,
+            dropped_provenance_count=0,
         )
 
     # The overlay call routes through call_operator with on_wake_fail="skip".
@@ -131,6 +141,7 @@ If there is no intersection (no places where fear and desire claims are about th
 
         # Build ConstraintSurfaceItem objects with full provenance.
         items: list[ConstraintSurfaceItem] = []
+        dropped_provenance_count = 0
         for item_dict in items_json:
             # Validate schema: no verdict, recommendation, or synthesis fields (AC#2).
             if any(
@@ -152,11 +163,13 @@ If there is no intersection (no places where fear and desire claims are about th
                 log.warning(
                     f"Could not resolve fear provenance {fear_prov!r}; skipping item"
                 )
+                dropped_provenance_count += 1
                 continue
             if desire_claim is None:
                 log.warning(
                     f"Could not resolve desire provenance {desire_prov!r}; skipping item"
                 )
+                dropped_provenance_count += 1
                 continue
 
             items.append(
@@ -174,6 +187,7 @@ If there is no intersection (no places where fear and desire claims are about th
             state_ref=fear.state_ref,
             items=items,
             skipped_no_axis=False,
+            dropped_provenance_count=dropped_provenance_count,
         )
 
     except (json.JSONDecodeError, ValueError) as e:
@@ -204,9 +218,20 @@ def _serialize_pole_output(pole: PoleOutput) -> str:
 def _resolve_claim_by_provenance(pole: PoleOutput, provenance: str) -> PoleClaim | None:
     """Resolve a provenance string back to its PoleClaim in the pole.
 
+    Tries exact match first, then normalized (whitespace/case-insensitive) match.
+    Returns the PoleClaim or None if no match is found.
+
     Simple linear search (O(n) where n is the number of claims).
     """
+    # Try exact match first (unchanged).
     for claim in pole.claims:
         if claim.provenance == provenance:
             return claim
+
+    # On miss, try normalized match: collapse whitespace, case-fold.
+    normalized_prov = _norm(provenance)
+    for claim in pole.claims:
+        if _norm(claim.provenance) == normalized_prov:
+            return claim
+
     return None

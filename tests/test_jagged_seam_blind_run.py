@@ -149,7 +149,7 @@ class TestWithMocking:
 
     def test_full_run_happy_path(self, state_doc_clean, temp_out_dir):
         """Happy path: clean state, GW responds, overlay succeeds."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Mock the three GW calls (fear, desire, control).
@@ -213,7 +213,7 @@ class TestWithMocking:
 
     def test_skipped_no_axis(self, state_doc_clean, temp_out_dir):
         """Overlay with skipped_no_axis=True should set metric_result='not_supported'."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Mock three GW calls.
@@ -255,7 +255,7 @@ class TestWithMocking:
 
     def test_restatement_not_novel(self, state_doc_clean, temp_out_dir):
         """Item marked as restatement should not increment new_variable_count."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Mock three GW calls + verifier.
@@ -310,7 +310,7 @@ class TestWithMocking:
 
     def test_verifier_call_failure_conservative_default(self, state_doc_clean, temp_out_dir):
         """Verifier returning None (GW down) should mark item as NOT novel."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Verifier returns None (GW unavailable).
@@ -363,7 +363,7 @@ class TestWithMocking:
 
     def test_gw_unavailable_on_fear_pass(self, state_doc_clean, temp_out_dir):
         """GW unavailable on fear pass should raise and write skip.yaml."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             # Fear pass returns None (GW down).
             mock_call_op.return_value = None
 
@@ -379,7 +379,7 @@ class TestWithMocking:
 
     def test_artifacts_written(self, state_doc_clean, temp_out_dir):
         """All artifacts should be written to the run directory."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Mock three GW calls.
@@ -439,7 +439,7 @@ class TestWithMocking:
 
     def test_dropped_provenance_count_surfaced(self, state_doc_clean, temp_out_dir):
         """Non-zero dropped_provenance_count should appear in result and artifacts."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Mock three GW calls.
@@ -484,17 +484,18 @@ class TestWithMocking:
 
     def test_operative_shift_capture(self, state_doc_clean, temp_out_dir):
         """Restatement should include the cited source claim text."""
-        with patch("agents_core.llm.call_operator") as mock_call_op:
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
             with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
                 with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
                     # Mock three GW calls + verifier.
+                    # The verifier returns the TEXT of the echoed claim, not a provenance string.
                     mock_call_op.side_effect = [
                         json.dumps(["The enforcement is fragile"]),
                         json.dumps(["Enforcement must be robust"]),
                         json.dumps(["Control 1"]),
                         json.dumps({
                             "novel": False,
-                            "cited_source": "gw:fear-pass[0]",  # Verifier cites the fear-source provenance.
+                            "cited_source": "The enforcement is fragile",  # Verifier returns claim text.
                         }),
                     ]
 
@@ -549,3 +550,109 @@ class TestWithMocking:
                         result["novelty_analysis"][0]["cited_source_text"]
                         == "The enforcement is fragile"
                     )
+
+    def test_verifier_raise_conservative_default(self, state_doc_clean, temp_out_dir):
+        """Verifier raising RuntimeError/Timeout should mark item as NOT novel (no re-raise)."""
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
+            with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
+                with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
+                    # Verifier call raises RuntimeError.
+                    mock_call_op.side_effect = [
+                        json.dumps(["Fear 1"]),
+                        json.dumps(["Desire 1"]),
+                        json.dumps(["Control 1"]),
+                        RuntimeError("Verifier timeout"),  # Call fails.
+                    ]
+
+                    # Mock poles.
+                    mock_fear_pole = MagicMock()
+                    mock_fear_pole.claims = [
+                        PoleClaim("Fear 1", "fear", "gw:fear-pass[0]", "verified"),
+                    ]
+
+                    mock_desire_pole = MagicMock()
+                    mock_desire_pole.claims = [
+                        PoleClaim("Desire 1", "desire", "gw:desire-pass[0]", "verified"),
+                    ]
+
+                    mock_from_prose.side_effect = [
+                        mock_fear_pole,
+                        mock_desire_pole,
+                    ]
+
+                    # Mock surface with one item.
+                    item = ConstraintSurfaceItem(
+                        decision_variable="Some var",
+                        fear_source=mock_fear_pole.claims[0],
+                        desire_source=mock_desire_pole.claims[0],
+                        crossing_type="tension",
+                    )
+
+                    mock_overlay.return_value = ConstraintSurface(
+                        state_ref="zephyr-defederation-teeth-2026-06-17",
+                        items=[item],
+                        skipped_no_axis=False,
+                        dropped_provenance_count=0,
+                    )
+
+                    result = run_blind(
+                        state_doc=str(state_doc_clean),
+                        out_dir=str(temp_out_dir),
+                    )
+
+                    # Conservative default on call failure: NOT novel, no re-raise.
+                    assert result["new_variable_count"] == 0
+                    assert result["novelty_analysis"][0]["novel"] is False
+
+    def test_verifier_uncertain_response_conservative_default(self, state_doc_clean, temp_out_dir):
+        """Verifier returning uncertain/unparseable response should mark item as NOT novel."""
+        with patch("lapis_pm.jagged_seam.blind_run.call_operator") as mock_call_op:
+            with patch("lapis_pm.jagged_seam.blind_run.overlay") as mock_overlay:
+                with patch("lapis_pm.jagged_seam.blind_run.from_prose") as mock_from_prose:
+                    # Verifier returns uncertain response (e.g., "novel": "uncertain").
+                    mock_call_op.side_effect = [
+                        json.dumps(["Fear 1"]),
+                        json.dumps(["Desire 1"]),
+                        json.dumps(["Control 1"]),
+                        json.dumps({"novel": "uncertain", "cited_source": None}),  # Unparseable.
+                    ]
+
+                    # Mock poles.
+                    mock_fear_pole = MagicMock()
+                    mock_fear_pole.claims = [
+                        PoleClaim("Fear 1", "fear", "gw:fear-pass[0]", "verified"),
+                    ]
+
+                    mock_desire_pole = MagicMock()
+                    mock_desire_pole.claims = [
+                        PoleClaim("Desire 1", "desire", "gw:desire-pass[0]", "verified"),
+                    ]
+
+                    mock_from_prose.side_effect = [
+                        mock_fear_pole,
+                        mock_desire_pole,
+                    ]
+
+                    # Mock surface with one item.
+                    item = ConstraintSurfaceItem(
+                        decision_variable="Some var",
+                        fear_source=mock_fear_pole.claims[0],
+                        desire_source=mock_desire_pole.claims[0],
+                        crossing_type="tension",
+                    )
+
+                    mock_overlay.return_value = ConstraintSurface(
+                        state_ref="zephyr-defederation-teeth-2026-06-17",
+                        items=[item],
+                        skipped_no_axis=False,
+                        dropped_provenance_count=0,
+                    )
+
+                    result = run_blind(
+                        state_doc=str(state_doc_clean),
+                        out_dir=str(temp_out_dir),
+                    )
+
+                    # Conservative default on uncertain response: NOT novel.
+                    assert result["new_variable_count"] == 0
+                    assert result["novelty_analysis"][0]["novel"] is False

@@ -21,6 +21,8 @@ from typing import Any, Literal
 
 import yaml
 
+from agents_core.llm import call_operator  # type: ignore[import]
+
 from . import (
     from_prose,
     overlay,
@@ -118,15 +120,6 @@ def run_blind(
         )
 
     log.info("Neutrality check PASSED")
-
-    # Import call_operator here (lazy load, like arbiter).
-    try:
-        from agents_core.llm import call_operator  # type: ignore[import]
-    except ImportError:
-        log.error("agents_core.llm not available — cannot route to operator")
-        raise JaggedSeamGravityWellUnavailable(
-            "agents_core.llm not available"
-        ) from None
 
     # THREE GW PASSES over the SAME state doc (extrospective).
     log.info("Running fear pass (Scout-role constraint)...")
@@ -269,16 +262,8 @@ def run_blind(
             new_variable_count += 1
 
         # Record per-item analysis including the cited source claim text (operative-shift capture).
-        cited_source_text = ""
-        if verification.get("cited_source"):
-            cited_source = verification["cited_source"]
-            # Find the source claim in fear/desire responses.
-            if cited_source in [c.provenance for c in fear_pole.claims]:
-                claim_obj = next(c for c in fear_pole.claims if c.provenance == cited_source)
-                cited_source_text = claim_obj.claim
-            elif cited_source in [c.provenance for c in desire_pole.claims]:
-                claim_obj = next(c for c in desire_pole.claims if c.provenance == cited_source)
-                cited_source_text = claim_obj.claim
+        # The verifier returns the TEXT of the echoed claim, not a provenance string.
+        cited_source_text = verification.get("cited_source") or ""
 
         novelty_analysis.append({
             "decision_variable": item.decision_variable,
@@ -590,8 +575,10 @@ or
         if not isinstance(verdict, dict):
             return {"novel": False, "cited_source": None}
 
+        # Conservative: only accept boolean True, not truthy values.
+        # An uncertain response (e.g., "novel": "uncertain") defaults to NOT novel.
         return {
-            "novel": verdict.get("novel", False),
+            "novel": verdict.get("novel") is True,
             "cited_source": verdict.get("cited_source"),
         }
     except Exception as e:

@@ -86,8 +86,14 @@ class ConstraintSurface:
             poles were thin or had no claims). This is a flag-to-human,
             not a silent success — the consumers (U2/U3 drivers + U4 report)
             MUST render this as a loud flag.
+        dropped_provenance_count: Number of overlay items dropped due to provenance
+            resolution failures (exact or normalized match not found). Non-zero
+            indicates that the model returned provenance strings with trivial drift
+            that the normalized fallback could not resolve. Consumers write this to
+            artifacts for visibility (rather than silently undercounting novelty).
     """
 
     state_ref: str
     items: list[ConstraintSurfaceItem] = field(default_factory=list)
     skipped_no_axis: bool = False
+    dropped_provenance_count: int = 0

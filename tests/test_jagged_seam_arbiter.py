@@ -661,3 +661,462 @@ def test_integration_from_fixtures_end_to_end(
         assert "breaks_observed" in item2.fear_source.provenance
         assert "prec-02" in item2.desire_source.provenance
         assert item2.crossing_type == "shared_dependency"
+
+
+# ---------------------------------------------------------------------------
+# Provenance hardening tests (normalized match + drop counter)
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_normalized_match_resolves_drift():
+    """Normalized match resolves provenance drift (whitespace + case).
+
+    A model response whose fear_source_provenance differs from the real claim's
+    provenance only by case and extra internal whitespace should resolve to the
+    correct PoleClaim via the normalized fallback.
+    """
+    # Real claim: exact provenance
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    # Model response with provenance drifted by case + extra whitespace
+    # (but normalizes to the same value as the real claim)
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "SCOUT:CELL_ID=DEFED-001/DRIFT_SIGNALS[0]",  # All caps, should normalize
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # Should resolve successfully (normalized match finds the claim)
+        assert len(result.items) == 1
+        assert result.items[0].fear_source.provenance == "scout:cell_id=defed-001/drift_signals[0]"
+        assert result.dropped_provenance_count == 0
+
+
+def test_provenance_normalized_match_collapses_whitespace():
+    """Normalized match handles extra internal whitespace."""
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    # Model response with extra internal whitespace
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "scout:cell_id=defed-001/drift_signals[0]   ",  # Trailing space
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # Should resolve successfully
+        assert len(result.items) == 1
+        assert result.dropped_provenance_count == 0
+
+
+def test_provenance_no_false_match():
+    """Provenance that normalizes to nothing still returns None, no false match.
+
+    A provenance that does not normalize-equal any claim should be dropped, not
+    mapped to a wrong claim.
+    """
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim 1",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+            PoleClaim(
+                claim="fear claim 2",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[1]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    # Model response with a provenance that does not match any real claim
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "scout:cell_id=defed-999/drift_signals[99]",  # Non-existent
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # Should drop the item (not match to wrong claim)
+        assert len(result.items) == 0
+        assert result.dropped_provenance_count == 1
+
+
+def test_provenance_drop_counter_fear_unresolvable():
+    """Drop counter increments when fear_source_provenance cannot be resolved."""
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    # Model response with unresolvable fear_source_provenance (good desire)
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "scout:cell_id=nonexistent/drift_signals[0]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # Should drop the item and increment counter
+        assert len(result.items) == 0
+        assert result.dropped_provenance_count == 1
+
+
+def test_provenance_drop_counter_desire_unresolvable():
+    """Drop counter increments when desire_source_provenance cannot be resolved."""
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    # Model response with unresolvable desire_source_provenance (good fear)
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "scout:cell_id=defed-001/drift_signals[0]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=nonexistent]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # Should drop the item and increment counter
+        assert len(result.items) == 0
+        assert result.dropped_provenance_count == 1
+
+
+def test_provenance_drop_counter_multiple_drops():
+    """Drop counter tracks multiple unresolvable items."""
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim 1",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+            PoleClaim(
+                claim="fear claim 2",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[1]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim 1",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+            PoleClaim(
+                claim="desire claim 2",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-02]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    # One resolvable item, two unresolvable items
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "good item",
+                "fear_source_provenance": "scout:cell_id=defed-001/drift_signals[0]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            },
+            {
+                "decision_variable": "bad fear item",
+                "fear_source_provenance": "scout:cell_id=nonexistent/drift_signals[0]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            },
+            {
+                "decision_variable": "bad desire item",
+                "fear_source_provenance": "scout:cell_id=defed-001/drift_signals[1]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=nonexistent]/what_missing",
+                "crossing_type": "tension",
+            },
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # One item should be included, two dropped
+        assert len(result.items) == 1
+        assert result.dropped_provenance_count == 2
+
+
+def test_provenance_drop_counter_zero_when_all_resolvable():
+    """Drop counter is zero when all overlay items are resolvable."""
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "scout:cell_id=defed-001/drift_signals[0]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # All items resolvable
+        assert len(result.items) == 1
+        assert result.dropped_provenance_count == 0
+
+
+def test_provenance_backward_compat_default_zero():
+    """ConstraintSurface defaults dropped_provenance_count to 0 for backward-compat."""
+    # Create a ConstraintSurface without specifying dropped_provenance_count
+    surface = ConstraintSurface(
+        state_ref="test",
+        items=[],
+        skipped_no_axis=False,
+    )
+
+    # Should default to 0
+    assert surface.dropped_provenance_count == 0
+
+
+def test_provenance_backward_compat_existing_tests():
+    """Existing U1 tests still pass (backward-compatible)."""
+    fear = PoleOutput(
+        kind="fear",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="fear claim",
+                kind="fear",
+                provenance="scout:cell_id=defed-001/drift_signals[0]",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    desire = PoleOutput(
+        kind="desire",
+        state_ref="test",
+        claims=[
+            PoleClaim(
+                claim="desire claim",
+                kind="desire",
+                provenance="backcaster:gap[precondition_id=prec-01]/what_missing",
+                fidelity="verified",
+            ),
+        ],
+    )
+
+    canned_response = json.dumps(
+        [
+            {
+                "decision_variable": "test decision variable",
+                "fear_source_provenance": "scout:cell_id=defed-001/drift_signals[0]",
+                "desire_source_provenance": "backcaster:gap[precondition_id=prec-01]/what_missing",
+                "crossing_type": "tension",
+            }
+        ]
+    )
+
+    with patch("agents_core.llm.call_operator") as mock_operator:
+        mock_operator.return_value = canned_response
+
+        result = overlay(fear, desire)
+
+        # Result shape unchanged; dropped_provenance_count is just additive
+        assert isinstance(result, ConstraintSurface)
+        assert len(result.items) == 1
+        assert result.dropped_provenance_count == 0

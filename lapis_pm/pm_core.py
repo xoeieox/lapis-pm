@@ -3868,6 +3868,11 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
     Logs decision=fixer_lost:retrying:dispatch=<id>.
     """
     agent_type = rec.get("agent_type", "fixer")
+    if agent_type == "fixer_retry":
+        raise NotImplementedError(
+            "_act_lost_fixer_retry does not yet support fixer_retry — "
+            "branch derivation from PR head ref is deferred"
+        )
     intent = rec.get("intent", "(no intent)")
     spec_summary = episodic.spec_summary(target_id)
     # For fixer_retry, carry pr_number and note that prior attempt was a no-op
@@ -3885,6 +3890,8 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
         "question": dispatch_intent,
         "pr_number": pr_number_val,
         "slug": rec.get("slug", "forced"),
+        "base_branch": "main",
+        "existing_branch": f"lapis/{target_id}/forced",
     }
     res = _SHAPER.dispatch(agent_type, target_id, dispatch_intent, vars_=vars_)
 

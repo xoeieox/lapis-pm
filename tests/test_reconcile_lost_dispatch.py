@@ -331,6 +331,40 @@ class TestActLostFixerRetry:
 
         assert result.startswith("fixer_lost:retrying:dispatch=")
 
+    def test_vars_includes_base_branch_and_existing_branch(self):
+        """_act_lost_fixer_retry passes base_branch and existing_branch to dispatch."""
+        target_id = "my-target"
+        orig = _fixer_record(gpu_id="gpu-orig-001", status="failed")
+
+        fake_res = MagicMock()
+        fake_res.task_id = "gpu-retry-001"
+        fake_res.spec_id = "spec-retry-001"
+
+        with (
+            patch("lapis_pm.pm_core._SHAPER") as mock_shaper,
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[orig]),
+            patch("lapis_pm.pm_core.save_dispatched"),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            mock_shaper.dispatch.return_value = fake_res
+            pm_core._act_lost_fixer_retry(target_id, orig)
+
+        # Check the dispatch call
+        mock_shaper.dispatch.assert_called_once()
+        call_args = mock_shaper.dispatch.call_args
+        vars_ = call_args.kwargs["vars_"]
+
+        assert vars_["base_branch"] == "main"
+        assert vars_["existing_branch"] == f"lapis/{target_id}/forced"
+
+    def test_fixer_retry_raises_not_implemented(self):
+        """_act_lost_fixer_retry raises NotImplementedError for fixer_retry agent type."""
+        orig = _fixer_record(gpu_id="gpu-orig-001", status="failed", agent_type="fixer_retry")
+
+        with pytest.raises(NotImplementedError, match="fixer_retry"):
+            pm_core._act_lost_fixer_retry("my-target", orig)
+
 
 # ---------------------------------------------------------------------------
 # (c) Second-loss brief: _act_lost_brief + classify path

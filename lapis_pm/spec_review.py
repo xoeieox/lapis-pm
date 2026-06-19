@@ -30,6 +30,7 @@ from typing import Iterator, Literal
 # Import the canonical facets deploy clone path from pm_core (source-enforce coupling).
 # pm_core has no module-level spec_review import, so this is circular-free.
 from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE
+from agents_core.llm import swarm_serving
 
 
 # ---------------------------------------------------------------------------
@@ -61,44 +62,6 @@ _REPO_RE = re.compile(
 
 _POLL_CADENCE_S = 10  # fixed per Invariant 8
 _ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
-
-
-def _swarm_serving(
-    swarm_url: str = "http://127.0.0.1:8000",
-    timeout_s: float = 4.0,
-) -> bool:
-    """Check if swarm is serving via fast liveness probes.
-
-    Probes both /v1/models (200 + non-empty) and /health (200).
-    Returns True only if both succeed within timeout.
-    Used to gate the enqueue so a not-live swarm path costs ~4s probe, not the full poll.
-    """
-    try:
-        import requests as _requests
-        health_resp = _requests.get(
-            f"{swarm_url}/health",
-            timeout=timeout_s / 2,
-        )
-        if health_resp.status_code != 200:
-            return False
-
-        models_resp = _requests.get(
-            f"{swarm_url}/v1/models",
-            timeout=timeout_s / 2,
-        )
-        if models_resp.status_code != 200:
-            return False
-
-        try:
-            models_json = models_resp.json()
-            if not models_json or (isinstance(models_json, dict) and not models_json.get("data")):
-                return False
-        except Exception:
-            return False
-
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -321,10 +284,9 @@ def _dispatch_facets(
         elevator_grounding_poll_timeout_sec = int(
             os.getenv("ELEVATOR_GROUNDING_POLL_TIMEOUT_SEC", "180")
         )
-        swarm_url = os.getenv("SWARM_URL", "http://127.0.0.1:8000")
 
         # Step 0: Readiness pre-check — probe swarm_serving()
-        if not _swarm_serving(swarm_url=swarm_url):
+        if not swarm_serving(timeout=4):
             grounding_path = "inline:swarm-not-serving"
             print(
                 f"[spec-review:elevator-grounding] swarm not serving (pre-check bound to ~4s); "

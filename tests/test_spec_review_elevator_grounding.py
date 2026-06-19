@@ -14,75 +14,6 @@ import pytest
 from lapis_pm import spec_review
 
 
-class TestSwarmServing:
-    """Tests for _swarm_serving() readiness pre-check."""
-
-    def test_swarm_serving_both_endpoints_ok(self):
-        """When both /health and /v1/models return 200 with data, returns True."""
-        with mock.patch("requests.get") as mock_get:
-            # Mock health endpoint
-            health_resp = mock.Mock()
-            health_resp.status_code = 200
-
-            # Mock models endpoint
-            models_resp = mock.Mock()
-            models_resp.status_code = 200
-            models_resp.json.return_value = {"data": [{"id": "model-1"}]}
-
-            mock_get.side_effect = [health_resp, models_resp]
-
-            assert spec_review._swarm_serving() is True
-
-    def test_swarm_serving_health_fails(self):
-        """When /health returns non-200, returns False."""
-        with mock.patch("requests.get") as mock_get:
-            health_resp = mock.Mock()
-            health_resp.status_code = 503
-
-            mock_get.return_value = health_resp
-
-            assert spec_review._swarm_serving() is False
-
-    def test_swarm_serving_models_fails(self):
-        """When /v1/models returns non-200, returns False."""
-        with mock.patch("requests.get") as mock_get:
-            health_resp = mock.Mock()
-            health_resp.status_code = 200
-
-            models_resp = mock.Mock()
-            models_resp.status_code = 502
-
-            mock_get.side_effect = [health_resp, models_resp]
-
-            assert spec_review._swarm_serving() is False
-
-    def test_swarm_serving_models_empty(self):
-        """When /v1/models returns empty data, returns False."""
-        with mock.patch("requests.get") as mock_get:
-            health_resp = mock.Mock()
-            health_resp.status_code = 200
-
-            models_resp = mock.Mock()
-            models_resp.status_code = 200
-            models_resp.json.return_value = {"data": []}
-
-            mock_get.side_effect = [health_resp, models_resp]
-
-            assert spec_review._swarm_serving() is False
-
-    def test_swarm_serving_timeout(self):
-        """When requests timeout, returns False."""
-        with mock.patch("requests.get") as mock_get:
-            mock_get.side_effect = TimeoutError()
-
-            assert spec_review._swarm_serving() is False
-
-    def test_swarm_serving_connection_error(self):
-        """When connection fails, returns False."""
-        with mock.patch("requests.get") as mock_get:
-            mock_get.side_effect = ConnectionError()
-
-            assert spec_review._swarm_serving() is False
 
 
 class TestDispatchFacetsElevatorIntegration:
@@ -151,7 +82,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=True), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=True), \
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
@@ -213,7 +144,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=True), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=True), \
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
@@ -271,7 +202,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=True), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=True), \
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
@@ -332,7 +263,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=True), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=True), \
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
@@ -384,7 +315,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=True), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=True), \
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
@@ -434,7 +365,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=True), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=True), \
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
@@ -484,7 +415,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=False), \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=False), \
         mock.patch("subprocess.run") as mock_run, \
         mock.patch("lapis_pm.spec_review._FACETS_REPO_PATH", str(mock_repo_path)):
 
@@ -517,7 +448,7 @@ class TestDispatchFacetsElevatorIntegration:
                 "FACETS_DISPATCH_DISABLED": "0",
             },
         ), \
-        mock.patch("lapis_pm.spec_review._swarm_serving", return_value=False) as mock_swarm, \
+        mock.patch("lapis_pm.spec_review.swarm_serving", return_value=False) as mock_swarm, \
         mock.patch("requests.post") as mock_post, \
         mock.patch("subprocess.run") as mock_run, \
         mock.patch("lapis_pm.spec_review._FACETS_REPO_PATH", str(mock_repo_path)), \

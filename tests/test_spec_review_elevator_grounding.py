@@ -388,6 +388,7 @@ class TestDispatchFacetsElevatorIntegration:
         mock.patch("requests.post") as mock_post, \
         mock.patch("requests.get") as mock_get, \
         mock.patch("subprocess.run") as mock_run, \
+        mock.patch("time.sleep"), \
         mock.patch("lapis_pm.spec_review._FACETS_REPO_PATH", str(mock_repo_path)):
 
             # Mock enqueue

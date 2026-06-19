@@ -313,7 +313,7 @@ def _dispatch_facets(
 
     # Pre-grounding step: elevator integration (if ELEVATOR_ACTIVE="true")
     grounding_result_file: str | None = None
-    grounding_path: str = "inline:not-attempted"
+    grounding_path: str = "inline:elevator-inactive"
 
     elevator_active = os.getenv("ELEVATOR_ACTIVE") == "true"
     if elevator_active:
@@ -321,9 +321,10 @@ def _dispatch_facets(
         elevator_grounding_poll_timeout_sec = int(
             os.getenv("ELEVATOR_GROUNDING_POLL_TIMEOUT_SEC", "180")
         )
+        swarm_url = os.getenv("SWARM_URL", "http://127.0.0.1:8000")
 
         # Step 0: Readiness pre-check — probe swarm_serving()
-        if not _swarm_serving():
+        if not _swarm_serving(swarm_url=swarm_url):
             grounding_path = "inline:swarm-not-serving"
             print(
                 f"[spec-review:elevator-grounding] swarm not serving (pre-check bound to ~4s); "
@@ -436,6 +437,14 @@ def _dispatch_facets(
                                             file=sys.stderr,
                                         )
                                         break
+                                else:
+                                    grounding_path = f"inline:poll-status-{poll_resp.status_code}"
+                                    print(
+                                        f"[spec-review:elevator-grounding] poll status {poll_resp.status_code}; "
+                                        f"falling back to inline",
+                                        file=sys.stderr,
+                                    )
+                                    break
                             except Exception as e:
                                 grounding_path = f"inline:poll-error({type(e).__name__})"
                                 print(

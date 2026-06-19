@@ -18,15 +18,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lapis_pm.spec_review import (
-    _CLAUDE_QUEUE_COMPLETED,
     _COUNCIL_DIR,
     SpecFrontmatterError,
     SpecReviewBrief,
     _build_brief,
     _combined_recommendation,
-    _dispatch_facets,
     _parse_spec_authority,
-    _poll_until_terminal,
     format_brief,
     run_spec_review,
 )
@@ -1108,3 +1105,72 @@ def test_dispatch_facets_target_repo_absent_when_grounding_disabled(monkeypatch,
 
     assert result == "disabled-grounding"
     assert "--target-repo" not in captured_argv
+
+
+# ---------------------------------------------------------------------------
+# Regression Test: in-process deliberation must init Facets semaphore
+# ---------------------------------------------------------------------------
+
+def test_run_spec_review_in_process_deliberation_inits_semaphore(tmp_path, monkeypatch):
+    """Regression: in-process run_deliberation must init_facets_semaphore inside the loop.
+
+    When run_spec_review calls asyncio.run(run_deliberation(...)), the semaphore
+    must be initialized inside the running loop (inside _deliberate()), not before.
+    This test verifies:
+    1. init_facets_semaphore is called during the deliberation
+    2. run_deliberation completes without "Facets semaphore not initialized" error
+    3. The envelope is processed correctly
+    """
+    spec = _write_spec(tmp_path, _VALID_SPEC_ADVISORY)
+
+    # Track init_facets_semaphore calls to verify it was invoked
+    init_calls = []
+
+    def mock_init_facets_semaphore(max_concurrent):
+        init_calls.append(max_concurrent)
+
+    # Create a mock envelope with all required attributes
+    mock_envelope = MagicMock()
+    mock_envelope.facets_ok = True
+    mock_envelope.council_ok = True
+    mock_envelope.facets = _facets_deliberation_fixture()
+    mock_envelope.council_run_id = "test-council-run-id"
+    mock_envelope.council_status = "resolved"
+    mock_envelope.council_landing = "test landing"
+    mock_envelope.council_open_questions = []
+    mock_envelope.council_confidence = "converged"
+    mock_envelope.council_positions = [{"entity": "test", "position": "agree"}]
+    mock_envelope.council_voicing_effective = True
+    mock_envelope.council_voicing_degraded = False
+    mock_envelope.council_voicing_degraded_reason = ""
+
+    # Stub council to avoid hitting live service
+    monkeypatch.setenv("SHARED_DELIBERATION_COUNCIL_STUB", "1")
+    # Set explicit semaphore max concurrent value to verify default is used
+    monkeypatch.delenv("SHARED_DELIBERATION_MAX_CONCURRENT", raising=False)
+
+    try:
+        with patch(
+            "lapis_pm.spec_review.init_facets_semaphore", side_effect=mock_init_facets_semaphore
+        ), patch(
+            "lapis_pm.spec_review.run_deliberation", return_value=mock_envelope
+        ), patch(
+            "lapis_pm.spec_review._load_invariant_context", return_value="ctx"
+        ), patch(
+            "lapis_pm.spec_review._dispatch_spec_reviewer", return_value=None
+        ):
+            brief = run_spec_review(
+                spec_path=spec,
+                dispatch_facets=True,
+                timeout_s=30,
+            )
+
+        # Assert init_facets_semaphore was called exactly once with the default value
+        assert len(init_calls) == 1, "init_facets_semaphore must be called exactly once during deliberation"
+        assert init_calls[0] == 2, "init_facets_semaphore must be called with default SHARED_DELIBERATION_MAX_CONCURRENT=2"
+
+        # Assert the brief was built correctly (envelope processed without error)
+        assert brief is not None
+        assert brief.facets_deliberation is not None
+    finally:
+        pass

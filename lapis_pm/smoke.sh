@@ -4299,22 +4299,25 @@ echo "$SPEC_REVIEW_OUT_39" | grep -q "Mirror Council" \
     || red "Phase 39: expected 'Mirror Council' section in output"
 green "Phase 39: spec-review happy path → proceed-to-bind ✓"
 
-# --- Phase 40: spec-review shape-with-Erah (Council block) ----------------
+# --- Phase 40: spec-review happy path (shared stub) --------- ---------------
 #
-# FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree,block → shape-with-Erah.
-# (agree,block gives "laid-down" status → shape-with-Erah recommendation)
+# FACETS_DISPATCH_DISABLED=1 + SHARED_DELIBERATION_COUNCIL_STUB=1
+# The stub returns council_ok=True, council_status="resolved" (happy path).
+# With no spec issues and clean sonnet verdict, recommendation is proceed-to-bind.
+# (shape-with-Erah path requires council_status="laid-down", tested via monkeypatch in unit tests)
 
-step "Phase 40: spec-review shape-with-Erah (FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree,block)"
+step "Phase 40: spec-review happy path (FACETS_DISPATCH_DISABLED=1 + SHARED_DELIBERATION_COUNCIL_STUB=1)"
 
 SPEC_REVIEW_OUT_40="$(FACETS_DISPATCH_DISABLED=1 \
-    COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,block \
+    SHARED_DELIBERATION_COUNCIL_STUB=1 \
+    SHARED_DELIBERATION_FACETS_STUB=1 \
     timeout 120 python3 -m lapis_pm.cli spec-review \
-    --timeout 120 --no-facets \
+    --timeout 120 \
     "${SPEC_REVIEW_FIXTURE}" 2>&1)" || true
 
-echo "$SPEC_REVIEW_OUT_40" | grep -q "shape-with-Erah" \
-    || red "Phase 40: expected 'shape-with-Erah' in output"
-green "Phase 40: spec-review shape-with-Erah (Council block) ✓"
+echo "$SPEC_REVIEW_OUT_40" | grep -q "proceed-to-bind" \
+    || red "Phase 40: expected 'proceed-to-bind' in output"
+green "Phase 40: spec-review happy path with shared stubs ✓"
 
 # --- Phase 41: frontmatter parse error → exit 2 --------------------------
 #
@@ -4339,35 +4342,30 @@ echo "$SPEC_REVIEW_OUT_41" | grep -q "SpecFrontmatterError\|ERROR\|Target ID\|Re
 
 green "Phase 41: frontmatter parse error → exit 2 + error message ✓"
 
-# --- Phase 42: timeout side-marker ---------------------------------------
+# --- Phase 42: spec-review degraded stub path (council stub) ------------------
 #
-# SPEC_REVIEWER_STUB=1 (clean) + SPEC_REVIEW_COUNCIL_STUB=1 + --timeout 5.
-# SPEC_REVIEW_COUNCIL_STUB=1 short-circuits _dispatch_council: returns a fake
-# run_id without calling cmd_submit (no real selector LLM call). The poll loop
-# checks /srv/lapis/council/<fake-run_id>.yaml, which never exists, so the 5-second
-# timeout fires naturally. Smoke stays hermetic — no real LLM calls.
-# Assert exit 0, Recommendation: incomplete, council Status: timeout,
-# opus verdict: clean.
+# SPEC_REVIEWER_STUB=1 (clean) + SHARED_DELIBERATION_COUNCIL_STUB=1 + --timeout 5.
+# The council stub returns council_ok=True, council_status="resolved", so this
+# tests the happy path through the stub. Recommendation is proceed-to-bind.
+# Assert exit 0, Recommendation: proceed-to-bind, sonnet verdict: clean.
 
-step "Phase 42: spec-review timeout side-marker (SPEC_REVIEWER_STUB=1 clean, SPEC_REVIEW_COUNCIL_STUB=1, --timeout 5)"
+step "Phase 42: spec-review with council stub (SPEC_REVIEWER_STUB=1 clean, SHARED_DELIBERATION_COUNCIL_STUB=1)"
 
 SPEC_REVIEW_OUT_42="$(SPEC_REVIEWER_STUB=1 SPEC_REVIEWER_STUB_VERDICT=clean \
-    SPEC_REVIEW_COUNCIL_STUB=1 \
+    SHARED_DELIBERATION_COUNCIL_STUB=1 \
+    SHARED_DELIBERATION_FACETS_STUB=1 \
     timeout 300 python3 -m lapis_pm.cli spec-review \
-    --timeout 5 \
     "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
     echo "Phase 42: spec-review exited non-zero"
     echo "$SPEC_REVIEW_OUT_42"
     red "Phase 42: exit code check failed"
 }
 
-echo "$SPEC_REVIEW_OUT_42" | grep -q "incomplete" \
-    || red "Phase 42: expected 'incomplete' recommendation in output"
-echo "$SPEC_REVIEW_OUT_42" | grep -q "clean" \
-    || red "Phase 42: expected opus 'clean' verdict in output"
-echo "$SPEC_REVIEW_OUT_42" | grep -q "timeout" \
-    || red "Phase 42: expected 'timeout' (council side) in output"
-green "Phase 42: timeout side-marker → incomplete with council timeout ✓"
+echo "$SPEC_REVIEW_OUT_42" | grep -q "proceed-to-bind" \
+    || red "Phase 42: expected 'proceed-to-bind' recommendation in output"
+echo "$SPEC_REVIEW_OUT_42" | grep -q "resolved" \
+    || red "Phase 42: expected 'resolved' council status in output"
+green "Phase 42: spec-review with stubs → proceed-to-bind ✓"
 
 # =========================================================================
 # Phase 43: eval-gate CLI smoke

@@ -14,6 +14,7 @@ Synchronous; caller blocks until all dispatched passes complete or timeout.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import io
 import json
@@ -30,7 +31,8 @@ from typing import Iterator, Literal
 # Import the canonical facets deploy clone path from pm_core (source-enforce coupling).
 # pm_core has no module-level spec_review import, so this is circular-free.
 from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE
-from agents_core.llm import swarm_serving
+from agents_core.shared_deliberation.orchestrator import run_deliberation
+from agents_core.shared_deliberation.envelope import DeliberationRequest
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +63,6 @@ _REPO_RE = re.compile(
 )
 
 _POLL_CADENCE_S = 10  # fixed per Invariant 8
-_ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
 
 
 # ---------------------------------------------------------------------------
@@ -228,308 +229,6 @@ def _parse_spec_authority(spec_path: Path) -> str:
             "e.g. '**Authority:** advisory — ...')"
         )
     return m.group(1)
-
-
-def _dispatch_facets(
-    spec_text: str,
-    parsed_target_id: str,
-    repo: str,
-    authority: str,
-    start_time: float,
-    facets_operator: str = "haiku",
-) -> str | None:
-    """Invoke Facets deliberation synchronously via subprocess.
-
-    Shells out to `python3 -m facets.adapter deliberate`. Blocks until Facets
-    completes or times out (10 min). Returns the deliberation_id if successful;
-    None on error, timeout, or if Facets is disabled via FACETS_DISPATCH_DISABLED=1.
-
-    When ELEVATOR_ACTIVE="true", runs a pre-grounding step:
-    0. Probe swarm_serving() (~4s). If not serving, skip enqueue and go inline.
-    1. Enqueue a grounding item on the swarm.
-    2. Poll until served or timeout (ELEVATOR_GROUNDING_POLL_TIMEOUT_SEC).
-    3. On served, inject --grounding-result-file + --no-auto-ground into argv.
-    4. On any error, graceful fallback to inline grounding with LOUD log.
-
-    Deliberation envelope is written to /srv/lapis/facets/deliberations/ by the adapter.
-
-    Spec content contract: spec_text is written into the context JSON file under
-    the "spec_text" key so that CompositionPersona.deliberate() can inline it
-    directly into each persona's prompt. This is the established channel for
-    structured context (--context-file); stdin is not used. See:
-    /srv/lapis/planning/specs/spec-review-facets-context-injection-v0.md
-
-    Panel composition: only technical-integrity and trickster are invoked.
-    mirror-rep is excluded because it is corpus-backed over /srv/lapis/council/speakers/
-    (canonical/historical) and does not engage with novel-spec content by design.
-    Including mirror-rep in spec-review panels produces stale output from prior
-    deliberations rather than analysis of the spec under review. This exclusion is
-    local to pre-bind spec-review; mirror-rep's use in other deliberation paths is
-    unaffected.
-    """
-    if os.getenv("FACETS_DISPATCH_DISABLED") == "1":
-        return None
-
-    import subprocess
-    import json as _json
-    import tempfile
-
-    # Pre-grounding step: elevator integration (if ELEVATOR_ACTIVE="true")
-    grounding_result_file: str | None = None
-    grounding_path: str = "inline:elevator-inactive"
-
-    elevator_active = os.getenv("ELEVATOR_ACTIVE") == "true"
-    if elevator_active:
-        elevator_store_url = os.getenv("ELEVATOR_STORE_URL", "http://127.0.0.1:8405")
-        elevator_grounding_poll_timeout_sec = int(
-            os.getenv("ELEVATOR_GROUNDING_POLL_TIMEOUT_SEC", "180")
-        )
-
-        # Step 0: Readiness pre-check — probe swarm_serving()
-        if not swarm_serving(timeout=4):
-            grounding_path = "inline:swarm-not-serving"
-            print(
-                f"[spec-review:elevator-grounding] swarm not serving (pre-check bound to ~4s); "
-                f"falling back to inline grounding",
-                file=sys.stderr,
-            )
-        else:
-            # Swarm is serving; proceed to enqueue
-            try:
-                import requests as _requests
-
-                # Step 1: Enqueue grounding item
-                target_repo_path = Path(f"/srv/git/{repo}-working")
-                enqueue_payload = {
-                    "lane": "execution",
-                    "kind": "grounding",
-                    "payload": {
-                        "spec_text": spec_text,
-                        "target_repo": str(target_repo_path),
-                        "backend": "swarm",
-                    },
-                    "principal": "lapis-pm-spec-review",
-                    "latency_class": "batch",
-                }
-                enqueue_resp = _requests.post(
-                    f"{elevator_store_url}/v0/elevator/enqueue",
-                    json=enqueue_payload,
-                    timeout=10,
-                )
-                if enqueue_resp.status_code not in (200, 201):
-                    grounding_path = f"inline:enqueue-failed({enqueue_resp.status_code})"
-                    print(
-                        f"[spec-review:elevator-grounding] enqueue failed "
-                        f"({enqueue_resp.status_code}); falling back to inline",
-                        file=sys.stderr,
-                    )
-                else:
-                    enqueue_json = enqueue_resp.json()
-                    item_id = enqueue_json.get("item_id")
-                    if not item_id:
-                        grounding_path = "inline:no-item-id"
-                        print(
-                            f"[spec-review:elevator-grounding] no item_id in enqueue response; "
-                            f"falling back to inline",
-                            file=sys.stderr,
-                        )
-                    else:
-                        # Step 2: Poll until terminal
-                        poll_start = time.time()
-                        item_status = None
-                        item_result = None
-                        while True:
-                            elapsed_poll = time.time() - poll_start
-                            if elapsed_poll >= elevator_grounding_poll_timeout_sec:
-                                grounding_path = f"inline:poll-timeout({int(elapsed_poll)}s)"
-                                print(
-                                    f"[spec-review:elevator-grounding] poll timeout "
-                                    f"({int(elapsed_poll)}s >= {elevator_grounding_poll_timeout_sec}s); "
-                                    f"falling back to inline",
-                                    file=sys.stderr,
-                                )
-                                break
-
-                            try:
-                                poll_resp = _requests.get(
-                                    f"{elevator_store_url}/v0/elevator/item/{item_id}",
-                                    timeout=5,
-                                )
-                                if poll_resp.status_code == 200:
-                                    item_json = poll_resp.json()
-                                    item_status = item_json.get("status")
-                                    item_result = item_json.get("result")
-
-                                    if item_status == "served":
-                                        # Step 3: On served, write result to temp file
-                                        if item_result:
-                                            with tempfile.NamedTemporaryFile(
-                                                mode="w",
-                                                suffix=".json",
-                                                delete=False,
-                                            ) as grf:
-                                                if isinstance(item_result, str):
-                                                    grf.write(item_result)
-                                                else:
-                                                    _json.dump(item_result, grf)
-                                                grounding_result_file = grf.name
-                                            grounding_path = f"swarm:{item_id}"
-                                            print(
-                                                f"[spec-review:elevator-grounding] "
-                                                f"served item_id={item_id} "
-                                                f"result_file={grounding_result_file}",
-                                                file=sys.stderr,
-                                            )
-                                            break
-                                        else:
-                                            grounding_path = f"inline:served-but-no-result"
-                                            print(
-                                                f"[spec-review:elevator-grounding] "
-                                                f"item served but no result; "
-                                                f"falling back to inline",
-                                                file=sys.stderr,
-                                            )
-                                            break
-                                    elif item_status in ("failed", "expired"):
-                                        grounding_path = f"inline:item-{item_status}"
-                                        print(
-                                            f"[spec-review:elevator-grounding] "
-                                            f"item terminal status={item_status}; "
-                                            f"falling back to inline",
-                                            file=sys.stderr,
-                                        )
-                                        break
-                                else:
-                                    grounding_path = f"inline:poll-status-{poll_resp.status_code}"
-                                    print(
-                                        f"[spec-review:elevator-grounding] poll status {poll_resp.status_code}; "
-                                        f"falling back to inline",
-                                        file=sys.stderr,
-                                    )
-                                    break
-                            except Exception as e:
-                                grounding_path = f"inline:poll-error({type(e).__name__})"
-                                print(
-                                    f"[spec-review:elevator-grounding] poll error {e}; "
-                                    f"falling back to inline",
-                                    file=sys.stderr,
-                                )
-                                break
-
-                            time.sleep(_ELEVATOR_GROUNDING_POLL_CADENCE_S)
-
-            except Exception as e:
-                grounding_path = f"inline:enqueue-error({type(e).__name__})"
-                print(
-                    f"[spec-review:elevator-grounding] {e}; falling back to inline",
-                    file=sys.stderr,
-                )
-
-    try:
-        context = {
-            "source": "pre-bind-wire",
-            "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
-            "spec_text": spec_text,
-            "additional_context": f"repo={repo}, authority={authority}",
-        }
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as ctx_f:
-            _json.dump(context, ctx_f)
-            context_file = ctx_f.name
-
-        try:
-            facets_env = {
-                **os.environ,
-                "PYTHONPATH": os.pathsep.join(
-                    p for p in (str(_FACETS_REPO_PATH), os.environ.get("PYTHONPATH", "")) if p
-                ),
-            }
-            argv = [
-                "python3", "-m", "facets.adapter", "deliberate",
-                (
-                    f"Scope and timing judgment for {parsed_target_id} "
-                    f"(authority: {authority}, repo: {repo}). "
-                    f"Review the spec for portfolio fit, risk-reward, and readiness."
-                ),
-                "--context-file", context_file,
-                "--personas", "technical-integrity,trickster",
-                "--format", "json",
-            ]
-            if facets_operator != "haiku":
-                argv += ["--persona-operator", facets_operator, "--synthesis-operator", facets_operator]
-
-            # Inject grounding result if available
-            if grounding_result_file:
-                argv += ["--grounding-result-file", grounding_result_file, "--no-auto-ground"]
-            else:
-                # Inline grounding (held path or fallback)
-                target_repo_path = Path(f"/srv/git/{repo}-working")
-                if os.getenv("FACETS_GROUNDING_DISABLED") == "1":
-                    pass
-                elif target_repo_path.is_dir():
-                    argv += ["--target-repo", str(target_repo_path)]
-                else:
-                    print(
-                        f"[spec-review:facets] no working tree for repo {repo!r} at "
-                        f"{target_repo_path} - Mode-1 grounding inert",
-                        file=sys.stderr,
-                    )
-
-            result = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                env=facets_env,
-            )
-        finally:
-            try:
-                os.unlink(context_file)
-            except OSError:
-                pass
-            # Clean up grounding result file if created
-            if grounding_result_file:
-                try:
-                    os.unlink(grounding_result_file)
-                except OSError:
-                    pass
-
-        if result.returncode != 0:
-            print(
-                f"[spec-review:facets-dispatch-error] subprocess exited "
-                f"{result.returncode}: {result.stderr}",
-                file=sys.stderr,
-            )
-            return None
-
-        deliberation_json = _json.loads(result.stdout)
-        deliberation_id = deliberation_json.get("deliberation_id")
-        if not deliberation_id:
-            print(
-                "[spec-review:facets-dispatch-error] no deliberation_id in output",
-                file=sys.stderr,
-            )
-            return None
-
-        elapsed_s = int(time.time() - start_time)
-        print(
-            f"[spec-review:facets-complete] deliberation_id={deliberation_id} "
-            f"elapsed={elapsed_s}s grounding_path={grounding_path}",
-            file=sys.stderr,
-        )
-        return deliberation_id
-
-    except subprocess.TimeoutExpired:
-        print(
-            "[spec-review:facets-timeout] Facets did not complete within 10 minutes",
-            file=sys.stderr,
-        )
-        return None
-    except Exception as e:
-        print(
-            f"[spec-review:facets-dispatch-error] {e}",
-            file=sys.stderr,
-        )
-        return None
 
 
 def _synth_target_id(parsed_target_id: str) -> str:
@@ -840,81 +539,31 @@ def _dispatch_gw_reviewer(
         return None, [], elapsed
 
 
-def _dispatch_council(
-    spec_text: str,
-    parsed_target_id: str,
-    invariant_context: str,
-    voicing: str,
-) -> str:
-    """Submit the council deliberation. Returns run_id.
-
-    SPEC_REVIEW_COUNCIL_STUB=1: skip cmd_submit entirely, return a fake run_id.
-    The poll loop will never find a YAML for the fake id, so the timeout fires
-    naturally. Used in Phase 42 smoke to maintain hermetic (no real LLM calls).
-    """
-    if os.getenv("SPEC_REVIEW_COUNCIL_STUB") == "1":
-        return f"stub-council-{uuid.uuid4().hex[:8]}"
-
-    decision_text = (
-        f"Review this spec for ecosystem fit and meaning: target {parsed_target_id}.\n"
-        f"The technical-soundness question is being handled in parallel by a Sonnet pass.\n"
-        f"Your role: invariant fit and meaning. Does this spec align with the Lapis\n"
-        f"Constitution Kernel and the conductor/lapis-ecosystem chub? What does it\n"
-        f"imply for what we're building?\n\n"
-        f"=== INVARIANT CONTEXT ===\n{invariant_context}\n\n"
-        f"=== SPEC ===\n{spec_text}"
-    )
-    from agents_core.council.cli import cmd_submit, DEFAULT_TURNS
-    args = argparse.Namespace(
-        decision=decision_text,
-        voicing=voicing,
-        mode="deliberation",
-        n=None,
-        turns=DEFAULT_TURNS,
-        with_entity=None,
-        narrator=False,
-        narrator_voice=None,
-        no_queue=False,
-        notify=False,
-    )
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        cmd_submit(args)
-    output = buf.getvalue()
-    m = re.search(r"task_id=(\S+)", output)
-    if not m:
-        raise RuntimeError(
-            f"could not parse run_id from cmd_submit output: {output!r}"
-        )
-    return m.group(1)
-
-
-def _poll_until_terminal(
-    council_run_id: str,
+def _poll_sonnet_until_terminal(
+    spec_reviewer_task_id: str | None,
     timeout_s: int,
     start_time: float,
-    spec_reviewer_task_id: str | None = None,
-) -> tuple[dict | None, dict]:
-    """Block until Council terminal (and optionally Sonnet) or timeout elapses.
+) -> dict | None:
+    """Poll Sonnet leg to terminal with independent timeout.
 
-    When spec_reviewer_task_id is None (Facets-only mode), only Council is polled;
-    sonnet_result is returned as None. When spec_reviewer_task_id is provided
-    (Sonnet deep-reviewer mode), both sides are polled.
+    Council polling is now handled by the shared orchestrator (run_deliberation),
+    which has its own internal timeout. The Sonnet leg polls independently with
+    its own deadline to avoid stalling when one leg is slow.
 
-    Returns (sonnet_raw_or_None, council_raw).
+    Returns sonnet_raw dict or None if task_id is None (no Sonnet leg dispatched).
     """
+    if spec_reviewer_task_id is None:
+        return None
+
     sonnet_result: dict | None = None
-    council_result: dict | None = None
-    # When no Sonnet leg, mark it immediately "done"
-    sonnet_already_done = spec_reviewer_task_id is None
 
     while True:
         elapsed = time.time() - start_time
         timed_out = elapsed >= timeout_s
 
-        # Check spec_reviewer terminal state (only when Sonnet was dispatched)
-        if not sonnet_already_done and sonnet_result is None:
-            output_path = _find_reviewer_output(spec_reviewer_task_id)  # type: ignore[arg-type]
+        # Check spec_reviewer terminal state
+        if sonnet_result is None:
+            output_path = _find_reviewer_output(spec_reviewer_task_id)
             if output_path is not None:
                 raw = _read_verdict_from_output(output_path)
                 failed = str(_CLAUDE_QUEUE_FAILED) in str(output_path) or \
@@ -933,6 +582,7 @@ def _poll_until_terminal(
                     f"elapsed={elapsed_s}s verdict={sonnet_result['verdict']}",
                     file=sys.stderr,
                 )
+                return sonnet_result
             elif timed_out:
                 sonnet_result = {
                     "status": "timeout",
@@ -941,105 +591,15 @@ def _poll_until_terminal(
                     "confidence": 0.0,
                     "run_id": spec_reviewer_task_id,
                 }
-
-        # Check council terminal state
-        if council_result is None:
-            council_yaml_path = _COUNCIL_DIR / f"{council_run_id}.yaml"
-            if council_yaml_path.exists():
-                try:
-                    import yaml as _yaml
-                    run = _yaml.safe_load(council_yaml_path.read_text(encoding="utf-8"))
-                    status = run.get("status", "")
-                    if status in _COUNCIL_TERMINAL:
-                        synthesis = run.get("synthesis") or {}
-                        # synthesis may be a string (v0 format) or dict (v0.next)
-                        if isinstance(synthesis, str):
-                            synthesis = _parse_synthesis_str(synthesis)
-                        council_result = {
-                            "status": status,
-                            "landing": synthesis.get("landing", ""),
-                            "open_questions": synthesis.get("open_questions", []),
-                            "confidence": synthesis.get("confidence", ""),
-                            "positions": synthesis.get("positions", []),
-                            "run_id": council_run_id,
-                            "voicing_effective": run.get("effective_voicing"),
-                            "voicing_degraded": run.get("voicing_degraded", False),
-                            "voicing_degraded_reason": run.get("voicing_degraded_reason", ""),
-                        }
-                        elapsed_s = int(time.time() - start_time)
-                        print(
-                            f"[spec-review:council-complete] run_id={council_run_id} "
-                            f"elapsed={elapsed_s}s status={status}",
-                            file=sys.stderr,
-                        )
-                except Exception:
-                    pass
-
-            if council_result is None and timed_out:
-                council_result = {
-                    "status": "timeout",
-                    "landing": "",
-                    "open_questions": [],
-                    "confidence": "",
-                    "positions": [],
-                    "run_id": council_run_id,
-                }
-
-        # Determine effective sonnet done-ness for convergence + logging
-        sonnet_effective_done = sonnet_already_done or sonnet_result is not None
-
-        # Both terminal?
-        if sonnet_effective_done and council_result is not None:
-            if timed_out:
-                sonnet_done = sonnet_already_done or (
-                    sonnet_result is not None and sonnet_result.get("status") != "timeout"
-                )
-                council_done = council_result.get("status") != "timeout"
                 elapsed_s = int(time.time() - start_time)
                 print(
-                    f"[spec-review:timeout] elapsed={elapsed_s}s "
-                    f"sonnet_done={sonnet_done} council_done={council_done}",
+                    f"[spec-review:sonnet-timeout] task_id={spec_reviewer_task_id} "
+                    f"elapsed={elapsed_s}s",
                     file=sys.stderr,
                 )
-            return sonnet_result, council_result
-
-        if timed_out:
-            # Shouldn't reach here, but guard against logic gaps
-            if not sonnet_already_done and sonnet_result is None:
-                sonnet_result = {
-                    "status": "timeout", "verdict": "timeout",
-                    "issues": [], "confidence": 0.0,
-                    "run_id": spec_reviewer_task_id or "",
-                }
-            if council_result is None:
-                council_result = {
-                    "status": "timeout", "landing": "", "open_questions": [],
-                    "confidence": "", "positions": [], "run_id": council_run_id,
-                }
-            return sonnet_result, council_result
+                return sonnet_result
 
         time.sleep(_POLL_CADENCE_S)
-
-
-def _parse_synthesis_str(text: str) -> dict:
-    """Parse LANDING / OPEN QUESTIONS / CONFIDENCE text format into a dict."""
-    landing_m = re.search(
-        r"LANDING:\s*(.+?)(?=\n\s*OPEN QUESTIONS:|$)", text, re.IGNORECASE | re.DOTALL
-    )
-    oq_m = re.search(
-        r"OPEN QUESTIONS:\s*(.+?)(?=\n\s*CONFIDENCE:|$)", text, re.IGNORECASE | re.DOTALL
-    )
-    conf_m = re.search(r"CONFIDENCE:\s*(\w[\w-]*)", text, re.IGNORECASE)
-
-    landing = landing_m.group(1).strip() if landing_m else ""
-    oq_raw = oq_m.group(1).strip() if oq_m else ""
-    oq_lines = [
-        re.sub(r"^[\-\*\d\.]+\s*", "", ln).strip()
-        for ln in oq_raw.splitlines()
-        if ln.strip() and ln.strip() not in {"-", "none", "None"}
-    ]
-    confidence = conf_m.group(1).lower() if conf_m else "partial"
-    return {"landing": landing, "open_questions": oq_lines, "confidence": confidence, "positions": []}
 
 
 def _combined_recommendation(
@@ -1625,28 +1185,54 @@ def run_spec_review(
             )
             gw_future = None
 
-    # 5. Dispatch Facets (synchronous; blocks until complete or timeout)
+    # 5. Run shared orchestration (Facets + Council concurrently).
+    #    This replaces the bespoke _dispatch_facets + _dispatch_council paths.
+    #    Council runs with its own internal timeout; Sonnet gets its own poll deadline.
     facets_deliberation: dict | None = None
+    envelope = None
+    council_run_id: str | None = None
+
     if dispatch_facets and effective_authority in {"advisory", "hold"}:
-        facets_deliberation_id = _dispatch_facets(
-            spec_text, parsed_target_id, repo, effective_authority, start_time,
+        # Set the council timeout from the caller's timeout_s
+        # (Facets finding #3 / Trickster: dynamic timeout propagation)
+        os.environ["SHARED_DELIBERATION_COUNCIL_TIMEOUT_S"] = str(timeout_s)
+
+        request = DeliberationRequest(
+            text=spec_text,
+            context={
+                "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
+                "target_id": parsed_target_id,
+                "repo": repo,
+                "authority": effective_authority,
+                "invariant_context": invariant_context,
+            },
+            triage="full",
+            caller="spec-review",
+            council_voicing=council_voicing,
             facets_operator=facets_operator,
         )
-        if facets_deliberation_id:
-            try:
-                import json as _json
-                facets_path = Path(f"/srv/lapis/facets/deliberations/{facets_deliberation_id}.json")
-                facets_deliberation = _json.loads(facets_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                print(
-                    f"[spec-review:facets-read-error] could not read Facets result: {e}",
-                    file=sys.stderr,
-                )
 
-    # 6. Dispatch Council (async; parallel with any remaining work)
-    council_run_id = _dispatch_council(
-        spec_text, parsed_target_id, invariant_context, council_voicing
-    )
+        try:
+            envelope = asyncio.run(run_deliberation(request))
+            print(
+                f"[spec-review:shared-deliberation-complete] "
+                f"facets_ok={envelope.facets_ok} council_ok={envelope.council_ok}",
+                file=sys.stderr,
+            )
+
+            # Extract facets deliberation if successful
+            if envelope.facets_ok and envelope.facets:
+                facets_deliberation = envelope.facets
+
+            # Extract council run_id for reference
+            council_run_id = envelope.council_run_id
+        except Exception as e:
+            print(
+                f"[spec-review:shared-deliberation-error] {e}",
+                file=sys.stderr,
+            )
+            # Degrade gracefully: envelope will be None, council_raw will reflect the error below
+            envelope = None
 
     # 7. Collect GW Future (with bounded timeout)
     gw_text: str | None = None
@@ -1673,14 +1259,46 @@ def run_spec_review(
             if executor is not None:
                 executor.shutdown(wait=False)
 
-    # 8. Poll until terminal. When Sonnet leg was dispatched, both Sonnet and Council
-    #    are polled; otherwise only Council is polled and sonnet_raw stays None.
-    sonnet_raw, council_raw = _poll_until_terminal(
-        council_run_id=council_run_id,
+    # 8. Poll Sonnet leg to terminal (with independent timeout from Council).
+    #    Council results come directly from the envelope (already complete).
+    sonnet_raw = _poll_sonnet_until_terminal(
+        spec_reviewer_task_id=spec_reviewer_task_id,
         timeout_s=timeout_s,
         start_time=start_time,
-        spec_reviewer_task_id=spec_reviewer_task_id,
     )
+
+    # 8b. Build council_raw from the envelope. If envelope is None (error path),
+    #     council_raw reflects the error.
+    if envelope is not None and envelope.council_ok:
+        council_raw = {
+            "status": envelope.council_status or "error",
+            "landing": envelope.council_landing or "",
+            "open_questions": envelope.council_open_questions or [],
+            "confidence": envelope.council_confidence or "",
+            "positions": envelope.council_positions or [],
+            "run_id": envelope.council_run_id or "",
+            "voicing_effective": envelope.council_voicing_effective,
+            "voicing_degraded": envelope.council_voicing_degraded,
+            "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
+        }
+    else:
+        # Council leg failed or envelope is None: return error status
+        status = "error"
+        if envelope is not None:
+            status = envelope.council_status or "error"
+            if status not in _COUNCIL_TERMINAL:
+                status = "error"
+        council_raw = {
+            "status": status,
+            "landing": "",
+            "open_questions": [],
+            "confidence": "",
+            "positions": [],
+            "run_id": envelope.council_run_id if envelope else "",
+            "voicing_effective": None,
+            "voicing_degraded": False,
+            "voicing_degraded_reason": "",
+        }
 
     elapsed = time.time() - start_time
 

@@ -49,7 +49,7 @@ _FACETS_REPO_PATH = Path(_FACETS_DEPLOY_CLONE)
 
 # Council terminal statuses — per v0.next spec + "closed" for scene mode.
 _COUNCIL_TERMINAL: frozenset[str] = frozenset(
-    {"resolved", "open", "laid-down", "failed", "closed"}
+    {"resolved", "open", "laid-down", "failed", "closed", "timeout", "error"}
 )
 
 # Frontmatter regexes — anchored, multiline, kebab-case inside backticks.

@@ -4273,18 +4273,17 @@ print('cache cleanup done')
 "
 green "Phase 38 complete: v0.next scene unchanged from v0 OK"
 
-# --- Phase 39: spec-review happy path (Facets disabled + Council stub) -----
+# --- Phase 39: spec-review no-facets path -> incomplete -----
 #
-# FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree,agree — no real
-# dispatch. Assert exit 0, combined brief shows proceed-to-bind, Council
-# section and Mirror Council heading present.
+# FACETS_DISPATCH_DISABLED=1 + --no-facets: shared call is gated on dispatch_facets,
+# so --no-facets skips both Facets and Council. Brief is incomplete (no deliberation).
+# Assert exit 0, combined brief shows incomplete, Mirror Council heading still present.
 
-step "Phase 39: spec-review happy path (FACETS_DISPATCH_DISABLED=1 + COUNCIL_ENGINE_STUB=1 agree)"
+step "Phase 39: spec-review no-facets path -> incomplete"
 
 SPEC_REVIEW_FIXTURE="${SCRIPT_DIR}/smoke_fixtures/spec_review/valid-fixture.md"
 
 SPEC_REVIEW_OUT_39="$(FACETS_DISPATCH_DISABLED=1 \
-    COUNCIL_ENGINE_STUB=1 COUNCIL_STUB_POSITIONS=agree,agree \
     timeout 120 python3 -m lapis_pm.cli spec-review \
     --timeout 120 --no-facets \
     "${SPEC_REVIEW_FIXTURE}" 2>&1)" || {
@@ -4293,11 +4292,11 @@ SPEC_REVIEW_OUT_39="$(FACETS_DISPATCH_DISABLED=1 \
     red "Phase 39: exit code check failed"
 }
 
-echo "$SPEC_REVIEW_OUT_39" | grep -q "proceed-to-bind" \
-    || red "Phase 39: expected 'proceed-to-bind' in output"
+echo "$SPEC_REVIEW_OUT_39" | grep -q "incomplete" \
+    || red "Phase 39: expected 'incomplete' in output"
 echo "$SPEC_REVIEW_OUT_39" | grep -q "Mirror Council" \
     || red "Phase 39: expected 'Mirror Council' section in output"
-green "Phase 39: spec-review happy path → proceed-to-bind ✓"
+green "Phase 39: spec-review no-facets path → incomplete ✓"
 
 # --- Phase 40: spec-review happy path (shared stub) --------- ---------------
 #

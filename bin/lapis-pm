@@ -10,4 +10,8 @@ if [ -f /data/agents/config/conductor.env ]; then
     set +a
 fi
 
+# cwd-immune import resolution: stop python3 -m from prepending the caller's cwd to
+# sys.path, so lapis_pm always resolves via the editable finder (the #116 deploy clone
+# /srv/git/lapis-pm), never a stale /srv/lapis/lapis-pm when invoked from there.
+export PYTHONSAFEPATH=1
 exec /usr/bin/python3 -m lapis_pm.cli "$@"

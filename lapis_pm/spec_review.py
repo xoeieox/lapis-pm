@@ -31,7 +31,10 @@ from typing import Iterator, Literal
 # Import the canonical facets deploy clone path from pm_core (source-enforce coupling).
 # pm_core has no module-level spec_review import, so this is circular-free.
 from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE
-from agents_core.shared_deliberation.orchestrator import run_deliberation
+from agents_core.shared_deliberation.orchestrator import (
+    run_deliberation,
+    init_facets_semaphore,
+)
 from agents_core.shared_deliberation.envelope import DeliberationRequest
 
 
@@ -1213,7 +1216,11 @@ def run_spec_review(
         )
 
         try:
-            envelope = asyncio.run(run_deliberation(request))
+            async def _deliberate():
+                init_facets_semaphore(int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2")))
+                return await run_deliberation(request)
+
+            envelope = asyncio.run(_deliberate())
             print(
                 f"[spec-review:shared-deliberation-complete] "
                 f"facets_ok={envelope.facets_ok} council_ok={envelope.council_ok}",

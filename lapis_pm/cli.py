@@ -1475,6 +1475,64 @@ def cmd_facets_gw_eval(args) -> int:
         return 1
 
 
+def cmd_batched_fixer_eval(args) -> int:
+    """Handle `lapis-pm batched-fixer-eval` subcommand."""
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    from . import batched_fixer_eval as bfe
+    from dataclasses import asdict
+
+    phase = args.phase
+    run_id = args.run_id
+    mock_mode = args.mock
+
+    try:
+        result = bfe.run_eval(phase=phase, run_id=run_id, mock_mode=mock_mode)
+        if result is None:
+            if phase == "build-corpus":
+                print("Corpus built and frozen. PM must ratify before run phase.", file=sys.stderr)
+                return 0
+            else:
+                print("ERROR: eval failed (check logs for details)", file=sys.stderr)
+                return 1
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("Batched-Fixer Patch-Quality Eval - Summary")
+        print("=" * 70)
+        print(f"Run ID: {result.run_id}")
+        print(f"Generated: {result.generated_at}")
+        print(f"Served model: {result.served_model_id} ({result.served_model_backend})")
+        print()
+        if result.tier_metrics:
+            for tier in ["T1", "T2", "T3"]:
+                if tier in result.tier_metrics:
+                    print(f"{tier}:")
+                    for n, metrics in result.tier_metrics[tier].items():
+                        print(f"  N={n}: success={metrics.execute_success_rate:.1%} "
+                              f"({metrics.execute_success_ci[0]:.1%}-{metrics.execute_success_ci[1]:.1%}), "
+                              f"→ {metrics.routing_recommendation}")
+        print()
+        if result.report_path:
+            print(f"Report: {result.report_path}")
+        print("=" * 70)
+
+        if args.json:
+            print(json.dumps(asdict(result), ensure_ascii=False, indent=2, default=str))
+
+        return 0
+
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def cmd_trajectory_rollup(args) -> int:
     """Handle `lapis-pm trajectory-rollup` subcommand."""
     import logging
@@ -1911,6 +1969,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit verdict as JSON (in addition to markdown report).",
     )
     fge.set_defaults(func=cmd_facets_gw_eval)
+
+    # ------------------------------------------------------------------
+    # batched-fixer-eval — patch-quality eval harness (H5/U4)
+    # ------------------------------------------------------------------
+    bfe = sub.add_parser(
+        "batched-fixer-eval",
+        help="Batched-fixer patch-quality eval: best-of-N Coder-Next vs paid claude-p on real fixes.",
+    )
+    bfe.add_argument(
+        "phase",
+        choices=["build-corpus", "run", "report"],
+        help="Eval phase: build-corpus (extract + freeze fixtures), run (generate + select candidates), report (aggregate).",
+    )
+    bfe.add_argument(
+        "--run-id",
+        default=None,
+        help="Run ID (default: YYYYMMDD-HHMMSS).",
+    )
+    bfe.add_argument(
+        "--mock",
+        action="store_true",
+        default=False,
+        help="Mock mode: use canned swarm completions, no GW dependency.",
+    )
+    bfe.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit result as JSON (in addition to markdown report).",
+    )
+    bfe.set_defaults(func=cmd_batched_fixer_eval)
 
     sr = sub.add_parser(
         "spec-review",

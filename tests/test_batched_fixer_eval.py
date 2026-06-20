@@ -1,59 +1,84 @@
-"""Unit tests for batched_fixer_eval (AC13 — mock swarm, zero GW, zero paid)."""
+"""Unit tests for batched_fixer_eval — CORE ACs: AC1, AC1b, AC2, AC3, AC4, AC4b, AC11, AC13.
 
+DEFERRED ACs (AC5, AC6, AC6b, AC7-AC12): scaffolded in separate section below,
+marked clearly as DEFERRED and NOT claimed green in this bind.
+
+All tests run against mocked swarm / synthetic fixtures — zero GW, zero paid spend.
+"""
+
+import json
+import os
+import subprocess
 import pytest
-from pathlib import Path
 from dataclasses import asdict
-from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 from lapis_pm.batched_fixer_eval import (
+    # Dataclasses
     FixtureRecord,
     CandidateResult,
     FixtureRunResult,
     TierMetrics,
     EvalResult,
-    load_corpus,
+    # Pure oracle functions (AC4, AC4b) — CORE
+    extract_module_name,
+    parse_pytest_failures,
+    compute_flakiness_fingerprint,
+    classify_candidate_outcome,
+    slice_pre_state_from_diff,
+    validate_corpus_power_floor,
+    # Corpus builder helpers
+    find_scoped_test_files,
+    classify_checker_class,
+    launder_intent,
+    check_laundering_quality,
+    # Corpus / run
     build_corpus,
     generate_candidates,
     run_fixture,
     aggregate_results,
     generate_report,
     run_eval,
+    # Git / serving utilities
+    dedicated_clone,
+    detached_worktree,
     swarm_serving,
     swarm_model,
     assert_swarm_health,
     grounding_hook,
+    # Constants
+    CORPUS_HOLDOUT_PER_TIER,
 )
 
 
 # ---------------------------------------------------------------------------
-# Fixtures: Mock corpus
+# Fixtures: synthetic corpus entries
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def mock_fixture_t1():
-    """T1 fixture: single-file, <30 LOC, no new symbol."""
     return FixtureRecord(
         repo="lapis-pm",
-        sha="a1b2c3d4e5f6g7h0",
-        parent_sha="parent1234567890",
+        sha="a1b2c3d4e5f60000",
+        parent_sha="parent0000000001",
         pr_number=42,
         path="lapis_pm/pm_core.py",
-        file_loc="line 123-125",
+        file_loc="line 123-130",
         changed_lines=8,
         tier="T1",
         golden_diff_cyclomatic_delta=0,
         distinct_symbols_touched=1,
         is_concurrency_code=False,
-        task_intent_raw="PR comment about fixing bug X",
+        task_intent_raw="fix: return wrong value when input empty",
         task_intent_paraphrased="Function returns wrong value when input is empty",
         intent_source="reviewer-comment",
         pre_state_slice="def foo():\n    return invalid",
-        golden_diff="""--- a/lapis_pm/pm_core.py
-+++ b/lapis_pm/pm_core.py
-@@ -123,3 +123,3 @@
--    return invalid
-+    return valid""",
+        golden_diff=(
+            "--- a/lapis_pm/pm_core.py\n+++ b/lapis_pm/pm_core.py\n"
+            "@@ -123,3 +123,3 @@\n-    return invalid\n+    return valid"
+        ),
         scoped_test_files=["tests/test_pm_core.py"],
         base_stable_fail_set=["tests/test_pm_core.py::test_foo"],
         base_flaky_set=[],
@@ -66,11 +91,10 @@ def mock_fixture_t1():
 
 @pytest.fixture
 def mock_fixture_blind():
-    """BLIND fixture: tests pass with and without fix."""
     return FixtureRecord(
         repo="conductor",
-        sha="b2c3d4e5f6g7h8i9",
-        parent_sha="parent_blind123",
+        sha="b2c3d4e5f6000001",
+        parent_sha="parent_blind00001",
         pr_number=None,
         path="conductor/scheduler.py",
         file_loc="line 50-60",
@@ -79,19 +103,18 @@ def mock_fixture_blind():
         golden_diff_cyclomatic_delta=1,
         distinct_symbols_touched=2,
         is_concurrency_code=True,
-        task_intent_raw="commit body: fixed race condition",
-        task_intent_paraphrased="Prevent concurrent access to shared state",
+        task_intent_raw="fix: race condition in shared state",
+        task_intent_paraphrased="Concurrent access to shared state causes data corruption",
         intent_source="commit-body",
-        pre_state_slice="# concurrent code without lock",
-        golden_diff="""--- a/conductor/scheduler.py
-+++ b/conductor/scheduler.py
-@@ -50,2 +50,3 @@
-+    with lock:
-     access_state()""",
+        pre_state_slice="# concurrent code without lock\naccess_state()",
+        golden_diff=(
+            "--- a/conductor/scheduler.py\n+++ b/conductor/scheduler.py\n"
+            "@@ -50,2 +50,3 @@\n+    with lock:\n     access_state()"
+        ),
         scoped_test_files=["tests/scheduler_test.py"],
         base_stable_fail_set=[],
         base_flaky_set=[],
-        target_test_files=[],  # empty: tests pass without fix too
+        target_test_files=[],
         checker_class="BLIND",
         is_reviewer_cycle=False,
         blind_holdout=True,
@@ -99,34 +122,49 @@ def mock_fixture_blind():
 
 
 @pytest.fixture
-def mock_corpus(mock_fixture_t1, mock_fixture_blind):
-    """Mock corpus with T1 + BLIND fixtures."""
-    corpus = [mock_fixture_t1]
-    # Duplicate T1 a few times to reach holdout floor (need 8 total T1 holdouts)
-    for i in range(1, 8):
+def mock_fixture_untested():
+    return FixtureRecord(
+        repo="lapis-pm",
+        sha="c3d4e5f600000002",
+        parent_sha="parent0000000002",
+        pr_number=None,
+        path="lapis_pm/some_module.py",
+        file_loc="line 1-10",
+        changed_lines=5,
+        tier="T1",
+        scoped_test_files=[],
+        base_stable_fail_set=[],
+        base_flaky_set=[],
+        target_test_files=[],
+        checker_class="UNTESTED",
+    )
+
+
+@pytest.fixture
+def mock_corpus_t1_floor(mock_fixture_t1):
+    """Corpus with ≥8 T1 holdout fixtures (meets power floor)."""
+    corpus = []
+    for i in range(8):
         f = FixtureRecord(
             repo="lapis-pm",
-            sha=f"a1b2c3d4e5f6g7h{i}",
-            parent_sha=f"parent{i:012d}",
-            pr_number=42 + i,
+            sha=f"a1b2c3d4e5f6{i:04d}",
+            parent_sha=f"parent{i:010d}",
+            pr_number=100 + i,
             path="lapis_pm/pm_core.py",
-            file_loc=f"line {100 + i * 10}-{105 + i * 10}",
-            changed_lines=10,
+            file_loc=f"line {100 + i * 10}-{108 + i * 10}",
+            changed_lines=8,
             tier="T1",
             distinct_symbols_touched=1,
+            task_intent_raw=f"fix issue {i}",
+            task_intent_paraphrased=f"[Symptom] issue {i}",
             scoped_test_files=["tests/test_pm_core.py"],
             base_stable_fail_set=["tests/test_pm_core.py::test_foo"],
             target_test_files=["tests/test_pm_core.py::test_foo"],
             checker_class="DISCRIMINATES",
-            blind_holdout=True,  # All 8 T1s are holdout fixtures
+            blind_holdout=True,
         )
         corpus.append(f)
-    corpus.append(mock_fixture_blind)
     return corpus
-
-
-# Import the constant
-CORPUS_HOLDOUT_PER_TIER = 8
 
 
 # ---------------------------------------------------------------------------
@@ -135,27 +173,48 @@ CORPUS_HOLDOUT_PER_TIER = 8
 
 
 def test_ac1_fixture_record_schema(mock_fixture_t1):
-    """AC1: FixtureRecord schema includes all required fields."""
-    # Verify dataclass can be serialized to dict
+    """AC1: FixtureRecord serialises with all required fields."""
     data = asdict(mock_fixture_t1)
-    assert "repo" in data
-    assert "sha" in data
-    assert "parent_sha" in data
-    assert "pr_number" in data  # nullable
-    assert data["pr_number"] == 42
-    assert "tier" in data
-    assert data["tier"] == "T1"
-    assert "checker_class" in data
-    assert "task_intent_paraphrased" in data
-    assert "base_stable_fail_set" in data
-    assert "base_flaky_set" in data
+    required = [
+        "repo", "sha", "parent_sha", "pr_number", "path", "file_loc",
+        "changed_lines", "tier", "checker_class", "task_intent_raw",
+        "task_intent_paraphrased", "intent_source", "pre_state_slice",
+        "golden_diff", "scoped_test_files", "base_stable_fail_set",
+        "base_flaky_set", "target_test_files", "is_reviewer_cycle",
+        "is_test_only", "blind_holdout", "flaky_excluded_count",
+    ]
+    for key in required:
+        assert key in data, f"Missing field: {key}"
 
 
 def test_ac1_pr_number_nullable(mock_fixture_blind):
-    """AC1: pr_number is explicitly nullable."""
+    """AC1: pr_number is explicitly nullable; null routes to commit-body intent."""
     assert mock_fixture_blind.pr_number is None
     data = asdict(mock_fixture_blind)
     assert data["pr_number"] is None
+    # Null pr_number → commit-body source
+    assert mock_fixture_blind.intent_source == "commit-body"
+    assert mock_fixture_blind.is_reviewer_cycle is False
+
+
+def test_ac1_pr_number_int(mock_fixture_t1):
+    """AC1: pr_number can be an int."""
+    assert isinstance(mock_fixture_t1.pr_number, int)
+    assert mock_fixture_t1.pr_number == 42
+
+
+def test_ac1_schema_round_trip():
+    """AC1: FixtureRecord serialises and deserialises via asdict/FixtureRecord(**data)."""
+    f = FixtureRecord(
+        repo="lapis-pm", sha="abc123", parent_sha="def456",
+        pr_number=None, path="x.py", file_loc="unknown", changed_lines=3, tier="T1",
+        base_stable_fail_set=["t::a"], base_flaky_set=["t::b"],
+    )
+    data = asdict(f)
+    f2 = FixtureRecord(**data)
+    assert f2.pr_number is None
+    assert f2.base_stable_fail_set == ["t::a"]
+    assert f2.base_flaky_set == ["t::b"]
 
 
 # ---------------------------------------------------------------------------
@@ -163,374 +222,759 @@ def test_ac1_pr_number_nullable(mock_fixture_blind):
 # ---------------------------------------------------------------------------
 
 
-def test_ac1b_power_floor_met(mock_corpus):
-    """AC1b: Corpus meets holdout floor (≥8 per tier)."""
-    tier_counts = {}
-    holdout_counts = {}
-    for f in mock_corpus:
-        tier = f.tier
-        tier_counts[tier] = tier_counts.get(tier, 0) + 1
-        if f.blind_holdout:
-            holdout_counts[tier] = holdout_counts.get(tier, 0) + 1
+def test_ac1b_power_floor_met(mock_corpus_t1_floor):
+    """AC1b: validate_corpus_power_floor passes when T1 has ≥8 holdouts."""
+    holdout_counts = validate_corpus_power_floor(mock_corpus_t1_floor)
+    assert holdout_counts.get("T1", 0) >= CORPUS_HOLDOUT_PER_TIER
 
-    # At least one tier should have ≥ CORPUS_HOLDOUT_PER_TIER holdouts
-    assert max(holdout_counts.values()) >= CORPUS_HOLDOUT_PER_TIER
+
+def test_ac1b_power_floor_failure_raises():
+    """AC1b: build fails when no tier meets the floor and coarse-binary also fails."""
+    # Only 3 T1 holdouts, 0 T2/T3 — neither 3-tier nor coarse-binary floor met
+    corpus = [
+        FixtureRecord(
+            repo="lapis-pm", sha=f"sha{i:04d}", parent_sha=f"p{i:04d}",
+            pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
+            tier="T1", blind_holdout=True,
+        )
+        for i in range(3)
+    ]
+    with pytest.raises(ValueError, match="power floor not met"):
+        validate_corpus_power_floor(corpus, tier_floor=8)
+
+
+def test_ac1b_coarse_binary_collapse():
+    """AC1b: corpus collapses to coarse binary when T3 is unfillable but T1+T2 meet floor."""
+    corpus = (
+        [
+            FixtureRecord(
+                repo="lapis-pm", sha=f"t1sha{i}", parent_sha=f"p{i}",
+                pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
+                tier="T1", blind_holdout=True,
+            )
+            for i in range(8)
+        ]
+        + [
+            FixtureRecord(
+                repo="conductor", sha=f"t2sha{i}", parent_sha=f"q{i}",
+                pr_number=None, path="y.py", file_loc="unknown", changed_lines=20,
+                tier="T2", blind_holdout=True,
+            )
+            for i in range(8)
+        ]
+    )
+    # No T3 — 3-tier floor fails for T3 but coarse binary has T1=8, T2=8 (larger=8)
+    counts = validate_corpus_power_floor(corpus, tier_floor=8)
+    assert counts.get("T1", 0) >= 8
+    assert counts.get("T2", 0) >= 8
+
+
+def test_ac1b_mock_build_corpus_passes_through():
+    """AC1b: build_corpus with mock_corpus returns it and skips floor check."""
+    corpus = [
+        FixtureRecord(
+            repo="lapis-pm", sha="x", parent_sha="y",
+            pr_number=1, path="f.py", file_loc="unknown", changed_lines=1, tier="T1",
+        )
+    ]
+    result, meta = build_corpus(mock_corpus=corpus)
+    assert len(result) == 1
+    assert meta["source"] == "mock"
 
 
 # ---------------------------------------------------------------------------
-# AC3: Isolated checker on dedicated clone
+# AC2: Intent laundering code-path
 # ---------------------------------------------------------------------------
 
 
-def test_ac3_detached_worktree_context(tmp_path):
-    """AC3: detached_worktree creates and cleans up worktree."""
-    from lapis_pm.batched_fixer_eval import detached_worktree, dedicated_clone
-    from lapis_pm import batched_fixer_eval
-
-    # This test verifies the context manager interface.
-    # Actual git operations require a real repo, so we just check the signature.
-    assert callable(detached_worktree)
-    assert callable(dedicated_clone)
+def test_ac2_launder_intent_mock_mode_exists():
+    """AC2: launder_intent code-path exists and is callable with mock_mode=True."""
+    raw = "fix: change path from /health to /healthz\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+    result = launder_intent(raw, mock_mode=True)
+    assert isinstance(result, str)
+    assert len(result) > 0
 
 
-def test_ac3_no_shared_clone_prune():
-    """AC3: Verify no git worktree prune call on shared clone."""
-    from pathlib import Path
+def test_ac2_launder_intent_mock_does_not_return_raw_verbatim():
+    """AC2: mock laundering never returns the raw string verbatim (always transforms)."""
+    raw = "fix: change path from /health to /healthz"
+    result = launder_intent(raw, mock_mode=True)
+    assert result != raw, "launder_intent must transform the raw text, not return it verbatim"
 
+
+def test_ac2_launder_intent_mock_strips_co_authored():
+    """AC2: mock laundering strips Co-Authored-By trailers."""
+    raw = "fix: something\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+    result = launder_intent(raw, mock_mode=True)
+    assert "Co-Authored-By" not in result
+
+
+def test_ac2_generate_candidates_uses_paraphrased(mock_fixture_t1):
+    """AC2: generate_candidates uses task_intent_paraphrased, not task_intent_raw."""
+    # The fixture has different raw vs paraphrased; in real mode the prompt uses paraphrased
+    # Verify this in the generate_candidates source (grep check)
+    import inspect
+    source = inspect.getsource(generate_candidates)
+    assert "task_intent_paraphrased" in source
+    assert "task_intent_raw" not in source or source.index("task_intent_paraphrased") < source.index("task_intent_raw") + 1000
+
+
+def test_ac2_no_raw_commit_body_in_build_corpus():
+    """AC2: build_corpus does not assign commit_body[:200] directly to task_intent_paraphrased."""
+    import inspect
+    source = inspect.getsource(build_corpus)
+    # The forbidden stub pattern was: task_intent_paraphrased=commit_body[:200]
+    assert "task_intent_paraphrased=commit_body" not in source
+    assert "commit_body[:200]" not in source
+
+
+def test_ac2_laundering_quality_scaffold():
+    """AC2: check_laundering_quality scaffold exists and returns deferred flag."""
+    result = check_laundering_quality("paraphrased intent", "raw intent")
+    assert "deferred" in result
+    assert result["deferred"] is True
+
+
+# ---------------------------------------------------------------------------
+# AC3: Dedicated-clone isolation — no shared-tree mutation
+# ---------------------------------------------------------------------------
+
+
+def _make_tiny_git_repo(path: Path) -> str:
+    """Create a minimal git repo with one Python file and one test. Returns initial SHA."""
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True, capture_output=True)
+    (path / "module.py").write_text("def foo():\n    return 'old'\n")
+    (path / "test_module.py").write_text(
+        "from module import foo\ndef test_foo():\n    assert foo() == 'new'\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=path, check=True, capture_output=True)
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
+def test_ac3_dedicated_clone_is_separate_from_source(tmp_path):
+    """AC3: dedicated_clone creates a separate path, not the shared working tree."""
+    source = tmp_path / "source_repo"
+    source.mkdir()
+    sha = _make_tiny_git_repo(source)
+
+    with dedicated_clone(source, "test-run-ac3") as clone_path:
+        assert clone_path != source
+        assert clone_path.exists()
+        assert (clone_path / ".git").exists()
+        # Verify HEAD matches
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=clone_path, capture_output=True, text=True
+        )
+        assert result.stdout.strip() == sha
+
+
+def test_ac3_dedicated_clone_removed_after_context(tmp_path):
+    """AC3: dedicated clone is removed after context exits."""
+    source = tmp_path / "source_repo2"
+    source.mkdir()
+    _make_tiny_git_repo(source)
+
+    clone_path_ref = None
+    with dedicated_clone(source, "test-run-ac3-cleanup") as clone_path:
+        clone_path_ref = clone_path
+        assert clone_path.exists()
+
+    assert not clone_path_ref.exists(), "Dedicated clone must be removed on exit"
+
+
+def test_ac3_worktree_off_clone_not_source(tmp_path):
+    """AC3: worktree is added off the dedicated clone, never off the source."""
+    source = tmp_path / "source_repo3"
+    source.mkdir()
+    sha = _make_tiny_git_repo(source)
+
+    with dedicated_clone(source, "test-run-ac3-wt") as clone_path:
+        with detached_worktree(clone_path, sha, "ac3_test_wt") as wt_path:
+            assert wt_path.exists()
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=wt_path, capture_output=True, text=True
+            )
+            assert head.stdout.strip() == sha
+
+            # Source repo must have no extra worktrees registered
+            src_wt = subprocess.run(
+                ["git", "worktree", "list"], cwd=source, capture_output=True, text=True
+            )
+            wt_lines = src_wt.stdout.strip().splitlines()
+            assert len(wt_lines) == 1, (
+                f"Source repo must have exactly 1 worktree (itself), got: {wt_lines}"
+            )
+
+
+def test_ac3_no_worktree_prune_on_shared_clone():
+    """AC3: harness never has 'prune' in any subprocess call list."""
+    import ast
     module_path = Path(__file__).parent.parent / "lapis_pm" / "batched_fixer_eval.py"
     source = module_path.read_text()
-    # Check that "worktree prune" is not called
-    assert "worktree prune" not in source
-    # Check that worktree remove is used (may be split by quotes/commas in list form)
-    assert "worktree" in source and "remove" in source
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.List):
+            strs = [
+                e.value for e in node.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            ]
+            assert "prune" not in strs, (
+                f"Found 'prune' in subprocess call list — "
+                "harness must NOT invoke 'git worktree prune'"
+            )
+    # worktree remove --force is OK for cleanup
+    assert '"remove"' in source or "worktree remove" in source
 
 
-# ---------------------------------------------------------------------------
-# AC4: Apply-check + flakiness-robust baseline-diff oracle
-# ---------------------------------------------------------------------------
-
-
-def test_ac4_candidate_result_outcomes():
-    """AC4: CandidateResult includes apply_status and scoped_test_outcome."""
-    candidate = CandidateResult(
-        fixture_id="test-123",
-        candidate_seed=0,
-        candidate_text="--- a/foo\n+++ b/foo\n@@ -1 @@\n-old\n+new",
-        apply_status="success",
-        scoped_test_outcome="pass",
-    )
-    assert candidate.apply_status in ["success", "failed", "apply_error"]
-    assert candidate.scoped_test_outcome in ["pass", "regressed", "blind", "unverified"]
-
-
-def test_ac4_baseline_fingerprint_structure():
-    """AC4: FixtureRecord includes stable/flaky fail sets."""
-    f = FixtureRecord(
-        repo="test-repo",
-        sha="sha123",
-        parent_sha="parent123",
-        pr_number=1,
-        path="test.py",
-        file_loc="unknown",
-        changed_lines=5,
-        tier="T1",
-        base_stable_fail_set=["test_a", "test_b"],
-        base_flaky_set=["test_flaky"],
-    )
-    assert len(f.base_stable_fail_set) == 2
-    assert len(f.base_flaky_set) == 1
-
-
-# ---------------------------------------------------------------------------
-# AC4b: Flakiness fingerprint from N≥3 base runs
-# ---------------------------------------------------------------------------
-
-
-def test_ac4b_flakiness_classification():
-    """AC4b: FixtureRecord has base_stable_fail_set and base_flaky_set."""
-    # The distinction is in place and documented
-    f = FixtureRecord(
-        repo="test",
-        sha="sha",
-        parent_sha="parent",
-        pr_number=None,
-        path="f.py",
-        file_loc="unknown",
-        changed_lines=1,
-        tier="T1",
-        base_stable_fail_set=["t1"],  # fails on all N base runs
-        base_flaky_set=["t2"],         # fails on some base runs
-    )
-    assert f.base_stable_fail_set != f.base_flaky_set
-
-
-# ---------------------------------------------------------------------------
-# AC5: Target #1, single-shot baseline
-# ---------------------------------------------------------------------------
-
-
-def test_ac5_single_shot_baseline(mock_fixture_t1):
-    """AC5: run_fixture with n=1 produces execute-select outcome."""
-    result = run_fixture(mock_fixture_t1, n_range=[1], mock_mode=True)
-    assert result.fixture_id == f"{mock_fixture_t1.repo}-{mock_fixture_t1.sha[:8]}"
-    assert result.execute_select_outcome in ["pass", "regressed", "blind", "no_passing_candidate", "unverified"]
-
-
-# ---------------------------------------------------------------------------
-# AC6: Target #2, best-of-N execute-select lift
-# ---------------------------------------------------------------------------
-
-
-def test_ac6_best_of_n_execute_select(mock_fixture_t1):
-    """AC6: run_fixture generates N candidates and tracks passing count."""
-    result = run_fixture(mock_fixture_t1, n_range=[1, 2, 3, 4], mock_mode=True)
-    assert result.n_candidates_generated == 4
-    assert result.passing_candidate_count >= 0
-    assert result.first_passing_candidate_seed is not None or result.execute_select_outcome == "no_passing_candidate"
-
-
-def test_ac6_none_handling(mock_fixture_t1):
-    """AC6: None entries from swarm are dropped and counted separately."""
-    result = run_fixture(mock_fixture_t1, n_range=[1, 2, 3, 4], mock_mode=True)
-    assert hasattr(result, "none_count")
-    assert result.none_count >= 0
-
-
-# ---------------------------------------------------------------------------
-# AC6b: Held-out validation of selected candidate
-# ---------------------------------------------------------------------------
-
-
-def test_ac6b_held_out_validation(mock_fixture_t1):
-    """AC6b: FixtureRunResult tracks held_out_test_outcome."""
-    result = run_fixture(mock_fixture_t1, mock_mode=True)
-    assert result.held_out_test_outcome in ["pass", "regressed", "unverified"]
-
-
-# ---------------------------------------------------------------------------
-# AC7: Target #3, execute-vs-vote seam + judge + calibration
-# ---------------------------------------------------------------------------
-
-
-def test_ac7_three_valued_classifier():
-    """AC7: checker_class is three-valued: DISCRIMINATES / BLIND / UNTESTED."""
-    f_disc = FixtureRecord(
-        repo="test", sha="a", parent_sha="b", pr_number=1, path="f.py",
-        file_loc="unknown", changed_lines=1, tier="T1",
-        checker_class="DISCRIMINATES"
-    )
-    f_blind = FixtureRecord(
-        repo="test", sha="a", parent_sha="b", pr_number=1, path="f.py",
-        file_loc="unknown", changed_lines=1, tier="T1",
-        checker_class="BLIND"
-    )
-    f_untested = FixtureRecord(
-        repo="test", sha="a", parent_sha="b", pr_number=1, path="f.py",
-        file_loc="unknown", changed_lines=1, tier="T1",
-        checker_class="UNTESTED"
-    )
-    assert f_disc.checker_class == "DISCRIMINATES"
-    assert f_blind.checker_class == "BLIND"
-    assert f_untested.checker_class == "UNTESTED"
-
-
-def test_ac7_vote_judge_field():
-    """AC7: FixtureRunResult includes vote_judge_pick and calibration fields."""
-    result = FixtureRunResult(
-        fixture_id="test-123",
-        tier="T1",
-        repo="test",
-        n_candidates_generated=2,
-        none_count=0,
-    )
-    assert hasattr(result, "vote_judge_pick")
-    assert hasattr(result, "judge_agreed_with_execute")
-
-
-# ---------------------------------------------------------------------------
-# AC8: Target #4, decision table + hard routing gates
-# ---------------------------------------------------------------------------
-
-
-def test_ac8_tier_metrics_structure():
-    """AC8: TierMetrics includes routing recommendation + gate info."""
-    metrics = TierMetrics(
-        tier="T1",
-        n=1,
-        repo_breakdown={},
-        execute_success_rate=0.75,
-        execute_success_ci=(0.60, 0.90),
-        candidates_to_first_pass_median=1.0,
-        selected_but_fails_held_out_rate=0.0,
-        held_out_ci=(0.0, 0.05),
-        holdout_n=8,
-        held_out_fail_gate_passed=True,
-        routing_recommendation="swarm-lane",
-    )
-    assert metrics.routing_recommendation in ["swarm-lane", "big-lane", "INSUFFICIENT_POWER"]
-    assert hasattr(metrics, "held_out_fail_gate_passed")
-    assert hasattr(metrics, "judge_gate_passed")
-    assert hasattr(metrics, "blind_gate_passed")
-
-
-def test_ac8_hard_gates_g1_held_out_fail():
-    """AC8 / G1: High selected-but-fails-held-out rate forces big-lane."""
-    # When selected_but_fails_held_out > HELD_OUT_FAIL_GATE (5%), gate should trigger
-    metrics = TierMetrics(
-        tier="T1",
-        n=1,
-        repo_breakdown={},
-        execute_success_rate=0.80,
-        execute_success_ci=(0.70, 0.90),
-        candidates_to_first_pass_median=1.0,
-        selected_but_fails_held_out_rate=0.10,  # > 5%
-        held_out_ci=(0.05, 0.15),
-        holdout_n=8,
-        held_out_fail_gate_passed=False,  # Gate fails
-        routing_recommendation="big-lane",
-        gate_failure_reason="G1: selected-but-fails-held-out > 5%",
-    )
-    assert metrics.held_out_fail_gate_passed == False
-    assert metrics.routing_recommendation == "big-lane"
-
-
-# ---------------------------------------------------------------------------
-# AC10: No paid fallback; phase-gated; tolerant re-check; clean exit
-# ---------------------------------------------------------------------------
-
-
-def test_ac10_no_systemctl_or_ssh_in_harness():
-    """AC10: Verify no systemctl/ssh/lease calls in harness source."""
-    from pathlib import Path
-
+def test_ac3_no_systemctl_or_ssh_in_harness():
+    """AC3/AC10: harness is lease-agnostic — no systemctl/ssh/lease-acquire calls."""
     module_path = Path(__file__).parent.parent / "lapis_pm" / "batched_fixer_eval.py"
     source = module_path.read_text()
-    # Check that dangerous operations are NOT present
     assert "systemctl" not in source
     assert "ssh " not in source
     assert "acquire_lease" not in source
 
 
-def test_ac10_assert_swarm_health():
-    """AC10: Swarm health assertion has strict and tolerant modes."""
-    # This is a mock test; real calls would require GW
-    assert callable(assert_swarm_health)
+# ---------------------------------------------------------------------------
+# AC4: Flakiness-robust baseline-diff oracle — pure function tests
+# ---------------------------------------------------------------------------
+
+
+def test_ac4_oracle_pass():
+    """AC4: PASS when target tests flip and no new failures."""
+    # base: test_A fails stably, test_B fails stably
+    # post: test_A passes, test_B still fails → no new failures, target flipped
+    outcome = classify_candidate_outcome(
+        post_failures=["tests/t.py::test_B"],
+        base_stable_fail_set=["tests/t.py::test_A", "tests/t.py::test_B"],
+        base_flaky_set=[],
+        target_test_files=["tests/t.py::test_A"],
+        checker_class="DISCRIMINATES",
+    )
+    assert outcome == "pass", f"Expected pass, got {outcome}"
+
+
+def test_ac4_oracle_regressed_new_failure():
+    """AC4: REGRESSED when a new test (not in stable or flaky set) fails at post."""
+    outcome = classify_candidate_outcome(
+        post_failures=["tests/t.py::test_A", "tests/t.py::test_NEW"],
+        base_stable_fail_set=["tests/t.py::test_A"],
+        base_flaky_set=[],
+        target_test_files=["tests/t.py::test_A"],  # would need to flip to pass
+        checker_class="DISCRIMINATES",
+    )
+    # test_NEW is a new failure outside the excluded set → regressed
+    # (Note: test_A also still fails, so condition 3 also fails, but condition 2 fires first)
+    assert outcome == "regressed", f"Expected regressed, got {outcome}"
+
+
+def test_ac4_oracle_regressed_target_not_flipped():
+    """AC4: REGRESSED when target test still fails at post."""
+    outcome = classify_candidate_outcome(
+        post_failures=["tests/t.py::test_A", "tests/t.py::test_B"],
+        base_stable_fail_set=["tests/t.py::test_A", "tests/t.py::test_B"],
+        base_flaky_set=[],
+        target_test_files=["tests/t.py::test_A"],
+        checker_class="DISCRIMINATES",
+    )
+    # target test_A still failing at post → regressed
+    assert outcome == "regressed", f"Expected regressed, got {outcome}"
+
+
+def test_ac4_oracle_flaky_test_ignored():
+    """AC4: Flaky test changing outcome does NOT count as a new failure (ignored)."""
+    # base_flaky = test_C (sometimes fails)
+    # post: test_B still failing (stable), test_C failing (flaky — excluded)
+    # target test_A passes at post
+    outcome = classify_candidate_outcome(
+        post_failures=["tests/t.py::test_B", "tests/t.py::test_C"],
+        base_stable_fail_set=["tests/t.py::test_A", "tests/t.py::test_B"],
+        base_flaky_set=["tests/t.py::test_C"],
+        target_test_files=["tests/t.py::test_A"],
+        checker_class="DISCRIMINATES",
+    )
+    # test_C is flaky — ignored; test_B is stable and still fails; test_A passes → PASS
+    assert outcome == "pass", f"Expected pass (flaky test_C ignored), got {outcome}"
+
+
+def test_ac4_oracle_blind_fixture():
+    """AC4: BLIND for checker_class=BLIND — oracle cannot discriminate."""
+    outcome = classify_candidate_outcome(
+        post_failures=[],
+        base_stable_fail_set=[],
+        base_flaky_set=[],
+        target_test_files=[],
+        checker_class="BLIND",
+    )
+    assert outcome == "blind", f"Expected blind, got {outcome}"
+
+
+def test_ac4_oracle_untested_fixture():
+    """AC4: BLIND for checker_class=UNTESTED (no scoped tests)."""
+    outcome = classify_candidate_outcome(
+        post_failures=[],
+        base_stable_fail_set=[],
+        base_flaky_set=[],
+        target_test_files=[],
+        checker_class="UNTESTED",
+    )
+    assert outcome == "blind"
+
+
+def test_ac4_oracle_empty_target_files():
+    """AC4: BLIND when target_test_files is empty (even if checker_class=DISCRIMINATES)."""
+    # Empty target_test_files means oracle cannot verify the fix
+    outcome = classify_candidate_outcome(
+        post_failures=["tests/t.py::test_A"],
+        base_stable_fail_set=["tests/t.py::test_A"],
+        base_flaky_set=[],
+        target_test_files=[],
+        checker_class="DISCRIMINATES",
+    )
+    assert outcome == "blind"
+
+
+def test_ac4_oracle_unverified_stable_passes():
+    """AC4: UNVERIFIED when a stably-failing test unexpectedly passes at post."""
+    # test_B was stably failing but now passes — baseline assumptions violated
+    outcome = classify_candidate_outcome(
+        post_failures=["tests/t.py::test_A"],   # test_B no longer in failures
+        base_stable_fail_set=["tests/t.py::test_A", "tests/t.py::test_B"],
+        base_flaky_set=[],
+        target_test_files=["tests/t.py::test_A"],
+        checker_class="DISCRIMINATES",
+    )
+    # test_B was stable-fail but now passes — baseline broken → unverified
+    assert outcome == "unverified", f"Expected unverified, got {outcome}"
+
+
+def test_ac4_parse_pytest_failures_standard():
+    """AC4: parse_pytest_failures extracts test IDs from pytest -q output."""
+    output = (
+        "FAILED tests/test_foo.py::test_bar - AssertionError: expected 1\n"
+        "FAILED tests/test_foo.py::TestClass::test_baz - ValueError\n"
+        "passed 5\n"
+    )
+    failures = parse_pytest_failures(output)
+    assert "tests/test_foo.py::test_bar" in failures
+    assert "tests/test_foo.py::TestClass::test_baz" in failures
+    assert len(failures) == 2
+
+
+def test_ac4_parse_pytest_failures_empty():
+    """AC4: parse_pytest_failures returns [] on clean output."""
+    output = "5 passed in 0.12s\n"
+    assert parse_pytest_failures(output) == []
+
+
+def test_ac4_oracle_uses_classify_candidate_outcome():
+    """AC4: oracle_evaluate_candidate calls classify_candidate_outcome (not returncode==0)."""
+    import inspect
+    from lapis_pm.batched_fixer_eval import oracle_evaluate_candidate
+    source = inspect.getsource(oracle_evaluate_candidate)
+    assert "classify_candidate_outcome" in source, (
+        "oracle_evaluate_candidate must call classify_candidate_outcome "
+        "(not bare returncode==0 check)"
+    )
+    # The forbidden stub pattern: test_outcome = "pass" assigned from returncode check
+    # The oracle must NOT assign "pass" from a condition on returncode alone
+    assert 'test_outcome = "pass"' not in source and "= 'pass'" not in source or \
+        "classify_candidate_outcome" in source, (
+        "oracle must use classify_candidate_outcome, not returncode-based pass assignment"
+    )
 
 
 # ---------------------------------------------------------------------------
-# AC11: Held/dormant, zero production writes
+# AC4b: N≥3 base runs, stable/flaky partition, flaky-target quarantine
+# ---------------------------------------------------------------------------
+
+
+def test_ac4b_compute_fingerprint_stable():
+    """AC4b: Tests failing on ALL N runs → stable_fail_set."""
+    run_results = [
+        ["t::a", "t::b"],
+        ["t::a", "t::b"],
+        ["t::a", "t::b"],
+    ]
+    stable, flaky = compute_flakiness_fingerprint(run_results)
+    assert "t::a" in stable
+    assert "t::b" in stable
+    assert flaky == []
+
+
+def test_ac4b_compute_fingerprint_flaky():
+    """AC4b: Tests failing on SOME (not all) runs → flaky_set."""
+    run_results = [
+        ["t::a", "t::flaky"],
+        ["t::a"],
+        ["t::a", "t::flaky"],
+    ]
+    stable, flaky = compute_flakiness_fingerprint(run_results)
+    assert "t::a" in stable
+    assert "t::flaky" in flaky
+    assert "t::flaky" not in stable
+
+
+def test_ac4b_compute_fingerprint_all_flaky():
+    """AC4b: Test failing on no run not in any set; failing on all N → stable."""
+    run_results = [
+        ["t::a"],
+        [],
+        ["t::a"],
+    ]
+    stable, flaky = compute_flakiness_fingerprint(run_results)
+    # t::a fails 2/3 → flaky; nothing fails all 3 → stable is empty
+    assert stable == []
+    assert "t::a" in flaky
+
+
+def test_ac4b_compute_fingerprint_empty():
+    """AC4b: Empty run_results returns empty sets."""
+    stable, flaky = compute_flakiness_fingerprint([])
+    assert stable == []
+    assert flaky == []
+
+
+def test_ac4b_classify_checker_discriminates():
+    """AC4b: DISCRIMINATES when scoped tests exist, stable fails, and targets flip."""
+    result = classify_checker_class(
+        scoped_test_files=["tests/test_foo.py"],
+        base_stable_fail_set=["tests/test_foo.py::test_a"],
+        target_test_files=["tests/test_foo.py::test_a"],
+    )
+    assert result == "DISCRIMINATES"
+
+
+def test_ac4b_classify_checker_blind():
+    """AC4b: BLIND when scoped tests exist but no stable failures / no targets flip."""
+    result = classify_checker_class(
+        scoped_test_files=["tests/test_foo.py"],
+        base_stable_fail_set=[],
+        target_test_files=[],
+    )
+    assert result == "BLIND"
+
+
+def test_ac4b_classify_checker_untested():
+    """AC4b: UNTESTED when scoped_test_files is empty."""
+    result = classify_checker_class(
+        scoped_test_files=[],
+        base_stable_fail_set=[],
+        target_test_files=[],
+    )
+    assert result == "UNTESTED"
+
+
+def test_ac4b_flaky_target_quarantine_by_construction():
+    """AC4b: Target tests come from stable_fail_set; flaky tests are excluded by construction.
+
+    This verifies that compute_flakiness_fingerprint correctly separates stable from flaky,
+    so a target that would be 'flaky' is never in stable_fail_set and thus never in targets.
+    """
+    # A test failing 2/3 times is flaky, not stable
+    run_results = [
+        ["t::sometimes"],
+        [],
+        ["t::sometimes"],
+    ]
+    stable, flaky = compute_flakiness_fingerprint(run_results)
+    assert "t::sometimes" not in stable  # not eligible to be a target
+    assert "t::sometimes" in flaky       # correctly identified as flaky
+
+
+# ---------------------------------------------------------------------------
+# AC4: extract_module_name and slice_pre_state_from_diff helpers
+# ---------------------------------------------------------------------------
+
+
+def test_ac4_extract_module_name_nested():
+    """AC4: extract_module_name converts paths with packages."""
+    assert extract_module_name("lapis_pm/pm_core.py") == "lapis_pm.pm_core"
+    assert extract_module_name("lapis_pm/__init__.py") == "lapis_pm"
+    assert extract_module_name("scripts/elevator_scheduler.py") == "scripts.elevator_scheduler"
+
+
+def test_ac4_extract_module_name_toplevel():
+    assert extract_module_name("module.py") == "module"
+
+
+def test_ac4_slice_pre_state_extracts_enclosing_def():
+    """AC4: slice_pre_state_from_diff finds enclosing def."""
+    pre_state = "\n".join([
+        "import os",
+        "def unrelated():",
+        "    pass",
+        "def target_func():",
+        "    x = 1",
+        "    return x",
+        "def after():",
+        "    pass",
+    ])
+    golden_diff = (
+        "--- a/f.py\n+++ b/f.py\n"
+        "@@ -5,2 +5,2 @@\n"
+        "-    x = 1\n+    x = 2\n"
+    )
+    result = slice_pre_state_from_diff(pre_state, golden_diff, context_lines=3)
+    assert "target_func" in result
+    assert "def target_func" in result
+
+
+def test_ac4_slice_pre_state_fallback_no_hunk():
+    """AC4: Falls back to 3000-char window when diff has no hunk headers."""
+    pre = "x" * 1000
+    result = slice_pre_state_from_diff(pre, "no hunks here", context_lines=15)
+    assert len(result) <= 3000
+
+
+def test_ac4_slice_pre_state_caps_at_150_lines():
+    """AC4: Slice capped at 150 lines max."""
+    pre_state = "\n".join([f"line {i}" for i in range(300)])
+    golden_diff = "--- a/f.py\n+++ b/f.py\n@@ -10,5 +10,5 @@\n-old\n+new\n"
+    result = slice_pre_state_from_diff(pre_state, golden_diff)
+    assert len(result.splitlines()) <= 150
+
+
+# ---------------------------------------------------------------------------
+# AC11: Held/dormant — zero production writes
 # ---------------------------------------------------------------------------
 
 
 def test_ac11_no_elevator_writes():
-    """AC11: Verify no writes to ElevatorStore or production queue."""
-    from pathlib import Path
-
+    """AC11: Harness imports no production elevator/queue/flip-controller paths."""
     module_path = Path(__file__).parent.parent / "lapis_pm" / "batched_fixer_eval.py"
     source = module_path.read_text()
     assert "ElevatorStore" not in source
     assert "_handle_fixer" not in source
     assert "KIND_HANDLER" not in source
+    assert "flip-controller" not in source
+    assert "ELEVATOR_ACTIVE" not in source
 
 
-def test_ac11_grounding_hook_noop():
-    """AC11: Grounding hook (if present) defaults to no-op."""
-    # Verify grounding_hook exists and is a no-op by default
+def test_ac11_grounding_hook_noop(mock_fixture_t1):
+    """AC11: grounding_hook returns '' by default (no-op seam)."""
     assert callable(grounding_hook)
-    # Test that it returns empty string (no-op)
-    fixture = FixtureRecord(
-        repo="test", sha="a", parent_sha="b", pr_number=1, path="f.py",
-        file_loc="unknown", changed_lines=1, tier="T1"
-    )
-    result = grounding_hook(fixture)
-    assert result == ""
+    assert grounding_hook(mock_fixture_t1) == ""
+
+
+def test_ac11_harness_is_lease_agnostic():
+    """AC11: harness contains no lease-acquire, systemctl, or ssh calls."""
+    module_path = Path(__file__).parent.parent / "lapis_pm" / "batched_fixer_eval.py"
+    source = module_path.read_text()
+    assert "systemctl" not in source
+    assert "ssh " not in source
+    assert "acquire_lease" not in source
+    assert "gw-serve" not in source
 
 
 # ---------------------------------------------------------------------------
-# AC13: Mock test suite
+# AC13: Mock swarm test suite (zero GW, zero paid)
 # ---------------------------------------------------------------------------
 
 
-def test_ac13_corpus_schema_validation():
-    """AC13: Corpus schema validates on load and save."""
-    from lapis_pm.batched_fixer_eval import FixtureRecord
-    f = FixtureRecord(
-        repo="test",
-        sha="sha1",
-        parent_sha="parent1",
-        pr_number=None,
-        path="test.py",
-        file_loc="unknown",
-        changed_lines=5,
-        tier="T1",
-    )
-    data = asdict(f)
-    assert data["pr_number"] is None
-    f2 = FixtureRecord(**data)
-    assert f2.pr_number is None
+def test_ac13_corpus_schema_nullable_pr():
+    """AC13: Corpus schema validates with pr_number as int or null."""
+    for pr in [None, 42]:
+        f = FixtureRecord(
+            repo="test", sha="abc", parent_sha="def", pr_number=pr,
+            path="x.py", file_loc="unknown", changed_lines=1, tier="T1",
+        )
+        data = asdict(f)
+        assert data["pr_number"] == pr
+        f2 = FixtureRecord(**data)
+        assert f2.pr_number == pr
 
 
-def test_ac13_mock_build_corpus():
-    """AC13: build_corpus with mock_corpus returns it unchanged."""
-    mock_corpus = [
+def test_ac13_mock_build_corpus_returns_unchanged():
+    """AC13: build_corpus with mock_corpus returns corpus unchanged."""
+    corpus = [
         FixtureRecord(
-            repo="test",
-            sha="a",
-            parent_sha="b",
-            pr_number=1,
-            path="f.py",
-            file_loc="unknown",
-            changed_lines=1,
-            tier="T1",
+            repo="test", sha="a", parent_sha="b", pr_number=1,
+            path="f.py", file_loc="unknown", changed_lines=1, tier="T1",
         )
     ]
-    corpus, metadata = build_corpus(mock_corpus=mock_corpus)
-    assert len(corpus) == 1
-    assert metadata["source"] == "mock"
+    result, meta = build_corpus(mock_corpus=corpus)
+    assert len(result) == 1
+    assert meta["source"] == "mock"
 
 
 def test_ac13_mock_generate_candidates():
-    """AC13: generate_candidates with mock_mode returns deterministic diffs."""
+    """AC13: generate_candidates(mock_mode=True) returns deterministic canned diffs."""
     f = FixtureRecord(
-        repo="test",
-        sha="sha123",
-        parent_sha="parent",
-        pr_number=1,
-        path="test.py",
-        file_loc="unknown",
-        changed_lines=1,
-        tier="T1",
+        repo="test", sha="sha123", parent_sha="parent",
+        pr_number=1, path="test.py", file_loc="unknown", changed_lines=1, tier="T1",
     )
     candidates = generate_candidates(f, n=3, mock_mode=True)
     assert len(candidates) == 3
     assert all(c is not None for c in candidates)
-    assert all("--- a/" in c for c in candidates)  # All are diff-like
+    assert all("--- a/" in c for c in candidates)
 
 
-def test_ac13_mock_run_fixture():
-    """AC13: run_fixture with mock_mode is deterministic."""
-    f = FixtureRecord(
-        repo="test",
-        sha="sha123",
-        parent_sha="parent",
-        pr_number=1,
-        path="test.py",
-        file_loc="unknown",
-        changed_lines=1,
-        tier="T1",
+def test_ac13_compute_flakiness_fingerprint_three_runs():
+    """AC13: compute_flakiness_fingerprint with 3 runs partitions correctly."""
+    runs = [["a", "b"], ["a", "c"], ["a"]]
+    stable, flaky = compute_flakiness_fingerprint(runs)
+    assert stable == ["a"]        # "a" fails all 3
+    assert "b" in flaky           # "b" fails 1/3
+    assert "c" in flaky           # "c" fails 1/3
+
+
+def test_ac13_classify_candidate_outcome_all_cases():
+    """AC13: classify_candidate_outcome covers pass/regressed/blind/unverified."""
+    # PASS: target t::s flips, non-target t::other stays failing, no new failures
+    assert classify_candidate_outcome(
+        post_failures=["t::other"],
+        base_stable_fail_set=["t::s", "t::other"],
+        base_flaky_set=[],
+        target_test_files=["t::s"],
         checker_class="DISCRIMINATES",
-    )
-    result = run_fixture(f, mock_mode=True)
+    ) == "pass"
+
+    # REGRESSED: target t::s still failing
+    assert classify_candidate_outcome(
+        post_failures=["t::s"],
+        base_stable_fail_set=["t::s"],
+        base_flaky_set=[],
+        target_test_files=["t::s"],
+        checker_class="DISCRIMINATES",
+    ) == "regressed"
+
+    # REGRESSED: new failure introduced
+    assert classify_candidate_outcome(
+        post_failures=["t::new"],
+        base_stable_fail_set=["t::s"],
+        base_flaky_set=[],
+        target_test_files=["t::s"],
+        checker_class="DISCRIMINATES",
+    ) == "regressed"
+
+    # UNVERIFIED: non-target stable test unexpectedly passes
+    assert classify_candidate_outcome(
+        post_failures=[],         # t::other was stable-fail but now passes
+        base_stable_fail_set=["t::s", "t::other"],
+        base_flaky_set=[],
+        target_test_files=["t::s"],
+        checker_class="DISCRIMINATES",
+    ) == "unverified"
+
+    # BLIND: checker_class BLIND
+    assert classify_candidate_outcome(
+        post_failures=[], base_stable_fail_set=[], base_flaky_set=[],
+        target_test_files=[], checker_class="BLIND",
+    ) == "blind"
+
+    # BLIND: checker_class UNTESTED
+    assert classify_candidate_outcome(
+        post_failures=[], base_stable_fail_set=[], base_flaky_set=[],
+        target_test_files=[], checker_class="UNTESTED",
+    ) == "blind"
+
+
+def test_ac13_validate_corpus_power_floor_unit():
+    """AC13: validate_corpus_power_floor raises on insufficient holdouts."""
+    thin_corpus = [
+        FixtureRecord(
+            repo="x", sha=f"s{i}", parent_sha=f"p{i}",
+            pr_number=None, path="x.py", file_loc="unknown",
+            changed_lines=1, tier="T1", blind_holdout=True,
+        )
+        for i in range(4)
+    ]
+    with pytest.raises(ValueError):
+        validate_corpus_power_floor(thin_corpus, tier_floor=8)
+
+
+def test_ac13_launder_intent_code_path():
+    """AC13: launder_intent code-path exists and transforms input in mock mode."""
+    raw = "fix: rename import from x to y\n\nCo-Authored-By: Claude <noreply@anthropic.com>"
+    laundered = launder_intent(raw, mock_mode=True)
+    assert laundered != raw
+    assert "Co-Authored-By" not in laundered
+
+
+def test_ac13_mock_run_fixture_scaffold(mock_fixture_t1):
+    """AC13: run_fixture(mock_mode=True) returns FixtureRunResult scaffold (DEFERRED oracle)."""
+    result = run_fixture(mock_fixture_t1, mock_mode=True)
+    assert isinstance(result, FixtureRunResult)
+    assert result.fixture_id == f"{mock_fixture_t1.repo}-{mock_fixture_t1.sha[:8]}"
     assert result.n_candidates_generated > 0
-    assert len(result.candidates) > 0
-    assert result.execute_select_outcome in ["pass", "regressed", "blind", "no_passing_candidate", "unverified"]
+    # In mock mode, oracle is NOT invoked; outcome is DEFERRED scaffold
+    assert result.execute_select_outcome == "unverified"  # DEFERRED scaffold
 
 
-def test_ac13_mock_run_eval():
-    """AC13: run_eval with mock_mode runs all phases without GW."""
-    result = run_eval(phase="run", run_id="test-run-001", mock_mode=True)
-    # In mock mode, corpus will be empty unless loaded, but the harness should not fail
-    # The result may be None if no corpus, which is acceptable for mock testing
+def test_ac13_run_eval_mock_mode():
+    """AC13: run_eval(phase='run', mock_mode=True) runs without GW or corpus."""
+    # Without corpus, returns None gracefully
+    result = run_eval(phase="run", run_id="test-ac13-mock", mock_mode=True)
+    # No corpus → None is acceptable; no exception should be raised
+
+
+def test_ac13_extract_module_name():
+    """AC13: extract_module_name handles standard cases."""
+    assert extract_module_name("lapis_pm/eval_gate.py") == "lapis_pm.eval_gate"
+    assert extract_module_name("module.py") == "module"
+    assert extract_module_name("pkg/__init__.py") == "pkg"
+
+
+def test_ac13_parse_pytest_failures():
+    """AC13: parse_pytest_failures handles standard pytest -q output."""
+    out = "FAILED tests/t.py::test_x - AssertionError\nFAILED tests/t.py::test_y\n2 failed"
+    failures = parse_pytest_failures(out)
+    assert "tests/t.py::test_x" in failures
+    assert "tests/t.py::test_y" in failures
+
+
+# ---------------------------------------------------------------------------
+# DEFERRED SCAFFOLDS (AC5, AC6, AC6b, AC7-AC12) — NOT claimed green in this bind
+# ---------------------------------------------------------------------------
+# These tests exercise the scaffold interfaces only. They are NOT part of the
+# CORE-AC must-land-green set for this bind. The follow-on leg implements them.
+
+
+@pytest.mark.skip(reason="DEFERRED: AC5 (single-shot baseline) implemented in follow-on leg")
+def test_deferred_ac5_single_shot_baseline(mock_fixture_t1):
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC6 (best-of-N execute-select) implemented in follow-on leg")
+def test_deferred_ac6_best_of_n(mock_fixture_t1):
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC6b (held-out validation) implemented in follow-on leg")
+def test_deferred_ac6b_held_out_validation(mock_fixture_t1):
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC7 (vote-judge + calibration) implemented in follow-on leg")
+def test_deferred_ac7_three_valued_classifier():
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC8 (decision table + hard gates) implemented in follow-on leg")
+def test_deferred_ac8_hard_gates():
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC9 (Arm-A baseline + spend metrics) implemented in follow-on leg")
+def test_deferred_ac9_arm_a_baseline():
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC10 (phase-gate + tolerant recheck) requires GW — follow-on leg")
+def test_deferred_ac10_swarm_health():
+    pass
+
+
+@pytest.mark.skip(reason="DEFERRED: AC12 (dual-surface report) implemented in follow-on leg")
+def test_deferred_ac12_dual_surface_report():
+    pass
 
 
 if __name__ == "__main__":

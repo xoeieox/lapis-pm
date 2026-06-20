@@ -142,6 +142,7 @@ class RefinerRefineResult:
     proposals: list[Proposal] = field(default_factory=list)
     gw_skipped: bool = False
     prompt_hash: str = ""
+    manifest_hash: str = ""
     salience_map_path: str = ""
 
 
@@ -286,10 +287,9 @@ def _compute_saturation(
     elif below_threshold and is_concave and len(fat_nights) >= 1:
         curve.verdict = "true_exhaustion"
         curve.confidence = "low"
-    elif marginal_list[-1] < _SATURATION_THRESHOLD * 3 or below_threshold:
-        curve.verdict = "thin_plateau"
-        curve.confidence = "high" if fat_nights else "low"
     else:
+        # Fat nights exist but not certifiably exhausted → still active.
+        # thin_plateau (no fat nights) is handled by the early return above.
         curve.verdict = "active"
         curve.confidence = "high"
 
@@ -811,30 +811,56 @@ def refiner_refine(
 
     results: list[RefinerRefineResult] = []
 
-    def _call_gw(prompt: str) -> str | None:
+    def _call_gw(prompt: str) -> tuple[str | None, list]:
         if call_operator is None:
-            return None
+            return None, []
         prov_out: list[Any] = []
-        return call_operator(
+        text = call_operator(
             "gravitywell",
             prompt=prompt,
             on_wake_fail="skip",
             _provenance_out=prov_out,
         )
+        return text, prov_out
+
+    def _manifest_hash_for(
+        proposals: list[Proposal],
+        prompt_hash: str,
+        effective_operator: str,
+        spec_id: str,
+    ) -> str:
+        payload = json.dumps({
+            "agent_id": "lapis-refiner/refine",
+            "effective_operator": effective_operator,
+            "prompt_hash": prompt_hash,
+            "proposals": [
+                {"action": p.action, "target": p.target, "rank": p.rank}
+                for p in proposals
+            ],
+            "spec_id": spec_id,
+        }, sort_keys=True)
+        return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
     # Scout refine
     if scout_observe is not None:
         prompt = _build_scout_prompt(scout_observe)
         prompt_hash = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
-        response = _call_gw(prompt)
+        response, prov_out = _call_gw(prompt)
+        effective_operator = prov_out[-1][1] if prov_out else "gravitywell"
         proposals, gw_skipped = _parse_proposals(
             response, scout_observe.spec_id, scout_observe.saturation
+        )
+        for p in proposals:
+            p.provenance["effective_operator"] = effective_operator
+        manifest_hash = _manifest_hash_for(
+            proposals, prompt_hash, effective_operator, scout_observe.spec_id
         )
         result = RefinerRefineResult(
             spec_id=scout_observe.spec_id,
             proposals=proposals,
             gw_skipped=gw_skipped,
             prompt_hash=prompt_hash,
+            manifest_hash=manifest_hash,
         )
         salience_path = output_root / f"{scout_observe.spec_id}_salience.md"
         salience_path.write_text(_render_scout_salience(scout_observe, result))
@@ -845,13 +871,20 @@ def refiner_refine(
     if backcaster_result is not None:
         prompt = _build_backcaster_prompt(backcaster_result)
         prompt_hash = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
-        response = _call_gw(prompt)
+        response, prov_out = _call_gw(prompt)
+        effective_operator = prov_out[-1][1] if prov_out else "gravitywell"
         proposals, gw_skipped = _parse_proposals(response, "backcaster", None)
+        for p in proposals:
+            p.provenance["effective_operator"] = effective_operator
+        manifest_hash = _manifest_hash_for(
+            proposals, prompt_hash, effective_operator, "backcaster"
+        )
         result = RefinerRefineResult(
             spec_id="backcaster",
             proposals=proposals,
             gw_skipped=gw_skipped,
             prompt_hash=prompt_hash,
+            manifest_hash=manifest_hash,
         )
         salience_path = output_root / "backcaster_salience.md"
         salience_path.write_text(_render_backcaster_salience(backcaster_result, result))
@@ -949,6 +982,7 @@ def _render_scout_salience(
         "---",
         f"*agent_id: lapis-refiner/observe + lapis-refiner/refine*",
         f"*prompt_hash: {refine.prompt_hash}*",
+        f"*manifest_hash: {refine.manifest_hash}*",
     ]
     return "\n".join(lines)
 
@@ -1037,5 +1071,6 @@ def _render_backcaster_salience(
         "---",
         f"*agent_id: lapis-refiner/observe + lapis-refiner/refine*",
         f"*prompt_hash: {refine.prompt_hash}*",
+        f"*manifest_hash: {refine.manifest_hash}*",
     ]
     return "\n".join(lines)

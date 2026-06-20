@@ -277,6 +277,31 @@ class TestSaturationCurve:
         curve = _compute_saturation("test", night_to_new, night_to_cells, nights)
         assert curve.verdict == "active"
 
+    def test_active_fat_nights_high_early_marginals_zero_last(self) -> None:
+        """Fat nights with high early marginals and zero last-night marginal → active, NOT thin_plateau.
+
+        Regression for the condition-3 bug: last-night marginal < 0.15 was
+        incorrectly matching thin_plateau even for fat-night specs with a rich
+        discovery history (e.g. grants-runway 6.67/3.33/0.67/0.0).
+        """
+        nights = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"]
+        # High early marginals, zero on the last night (fat throughout)
+        night_to_new = {
+            "2026-06-01": 100,
+            "2026-06-02": 50,
+            "2026-06-03": 10,
+            "2026-06-04": 0,
+        }
+        night_to_cells = {n: 15 for n in nights}  # all fat (≥ _FAT_BATCH_MIN_CELLS)
+        curve = _compute_saturation("test", night_to_new, night_to_cells, nights)
+        # Curve is concave but NOT below_threshold for recent nights (10/15=0.67 >> 0.05)
+        # Must be 'active', never 'thin_plateau'
+        assert curve.verdict == "active", (
+            f"Expected 'active' for fat-night spec with high early marginals; "
+            f"got {curve.verdict!r} (confidence={curve.confidence!r}). "
+            f"marginal_per_cell={curve.marginal_per_cell}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC3 — cells_observed_in populated
@@ -713,6 +738,67 @@ class TestProvenance:
         assert "lapis-refiner/observe" in content
         assert "lapis-refiner/refine" in content
         assert "prompt_hash" in content
+
+    def test_manifest_hash_populated_in_refine_result(self, tmp_path: Path) -> None:
+        """AC8: manifest_hash is computed and stored on RefinerRefineResult."""
+        output_root = tmp_path / "out"
+        observe = RefinerObserveResult(
+            spec_id="my-spec", total_traces=2, valid_traces=2, clusters=[]
+        )
+
+        with patch("agents_core.llm.call_operator") as mock_call:
+            mock_call.return_value = json.dumps([
+                {"action": "deepen", "target": "my-spec", "rationale": "r", "rank": 1}
+            ])
+            results = refiner_refine(observe, None, output_root=output_root)
+
+        mh = results[0].manifest_hash
+        assert mh.startswith("sha256:"), f"manifest_hash should be sha256:... got {mh!r}"
+        assert len(mh) == 71, f"Expected 'sha256:' + 64 hex chars; got len={len(mh)}"
+        assert re.match(r"^sha256:[0-9a-f]{64}$", mh)
+
+    def test_manifest_hash_in_salience_map(self, tmp_path: Path) -> None:
+        """AC8: manifest_hash appears in the rendered salience map file."""
+        output_root = tmp_path / "out"
+        observe = RefinerObserveResult(
+            spec_id="prov-spec", total_traces=1, valid_traces=1, clusters=[]
+        )
+
+        with patch("agents_core.llm.call_operator") as mock_call:
+            mock_call.return_value = "[]"
+            results = refiner_refine(observe, None, output_root=output_root)
+
+        content = Path(results[0].salience_map_path).read_text()
+        assert "manifest_hash" in content
+        assert results[0].manifest_hash in content
+
+    def test_prov_out_effective_operator_surfaced_in_proposal_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        """AC8: prov_out effective operator from call_operator surfaces in proposal provenance."""
+        output_root = tmp_path / "out"
+        observe = RefinerObserveResult(
+            spec_id="my-spec", total_traces=2, valid_traces=2, clusters=[]
+        )
+
+        def _side_effect(*args, **kwargs):
+            prov_out = kwargs.get("_provenance_out")
+            if prov_out is not None:
+                prov_out.append(("success", "gravitywell"))
+            return json.dumps([
+                {"action": "deepen", "target": "my-spec", "rationale": "r", "rank": 1}
+            ])
+
+        with patch("agents_core.llm.call_operator", side_effect=_side_effect):
+            results = refiner_refine(observe, None, output_root=output_root)
+
+        proposals = results[0].proposals
+        assert proposals, "Expected at least one proposal"
+        prov = proposals[0].provenance
+        assert "effective_operator" in prov, (
+            f"prov_out effective_operator not surfaced in proposal provenance: {prov}"
+        )
+        assert prov["effective_operator"] == "gravitywell"
 
 
 # ---------------------------------------------------------------------------

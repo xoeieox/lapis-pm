@@ -250,38 +250,33 @@ def test_timeout_raises_and_sends_pushover(tmp_path):
     def mock_send_notification(message, title, priority):
         notify_calls.append({"message": message, "title": title, "priority": priority})
 
+    mock_priority = MagicMock()
+    mock_priority.NORMAL = "normal"
     with patch.dict(os.environ, {"SPEC_REVIEW_LOCK_TIMEOUT": "3"}):
-        with patch(
-            "lapis_pm.spec_review.send_notification",
-            side_effect=mock_send_notification,
-            create=True,
+        with patch.dict(
+            "sys.modules",
+            {"agents_core.notify": MagicMock(
+                send_notification=mock_send_notification,
+                Priority=mock_priority,
+            )},
         ):
-            # Inline the notify import patch at the module level
-            mock_priority = MagicMock()
-            mock_priority.NORMAL = "normal"
-            with patch.dict(
-                "sys.modules",
-                {"agents_core.notify": MagicMock(
-                    send_notification=mock_send_notification,
-                    Priority=mock_priority,
-                )},
-            ):
-                with pytest.raises(RuntimeError, match="lock-timeout"):
-                    with _spec_review_lock(
-                        Path("/waiter-spec.md"),
-                        _lock_path_override=lock_file,
-                    ):
-                        pass  # should never reach here
+            with pytest.raises(RuntimeError, match="lock-timeout"):
+                with _spec_review_lock(
+                    Path("/waiter-spec.md"),
+                    _lock_path_override=lock_file,
+                ):
+                    pass  # should never reach here
 
     # Release and clean up
     os.write(release_w, b"\x01")
     os.close(release_w)
     proc.join(timeout=3)
 
-    # Holder process must still be alive at abort time (not killed)
-    # (proc.exitcode is None if still running, or returncode if exited)
-    # We just verify the RuntimeError was raised — holder-untouched is implicit
-    # (we never sent SIGKILL; holder exited naturally after release_w write).
+    # AC4: notification was sent with NORMAL priority
+    assert len(notify_calls) == 1, f"expected 1 Pushover call; got {len(notify_calls)}"
+    assert notify_calls[0]["priority"] == "normal", (
+        f"expected priority='normal'; got {notify_calls[0]['priority']!r}"
+    )
 
 
 def test_timeout_does_not_proceed(tmp_path):

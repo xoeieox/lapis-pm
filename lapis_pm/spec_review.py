@@ -16,10 +16,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 import uuid
@@ -66,6 +68,7 @@ _REPO_RE = re.compile(
 )
 
 _POLL_CADENCE_S = 10  # fixed per Invariant 8
+_SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT = 900  # seconds; longer than a normal ~12-min review
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1069,142 @@ could not extract a JSON verdict from the output. See chain-sibling \
 
 
 # ---------------------------------------------------------------------------
+# Cross-session spec-review serialization lock
+# ---------------------------------------------------------------------------
+
+def _spec_review_lock_path() -> Path:
+    """Canonical cross-session lock path derived from os.getuid().
+
+    Aborts with RuntimeError if /run/user/<uid> is absent — that is a fatal
+    config error, not a fallback opportunity. A divergent path would silently
+    defeat the mutual exclusion guarantee.
+    """
+    uid = os.getuid()
+    run_user_dir = Path(f"/run/user/{uid}")
+    if not run_user_dir.is_dir():
+        raise RuntimeError(
+            f"[spec-review:lock-fatal] /run/user/{uid} does not exist — "
+            f"fatal config error; cannot derive canonical lock path. "
+            f"Ensure systemd user runtime dir is present (loginctl enable-linger)."
+        )
+    return run_user_dir / "lapis-pm-spec-review.lock"
+
+
+def _read_lock_holder(fd: int) -> str:
+    """Read holder identity written by the lock acquirer. Advisory — may race with writer."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, 4096)
+        if not data:
+            return "(no holder identity written yet)"
+        info = json.loads(data.decode())
+        return (
+            f"pid={info.get('pid', '?')} "
+            f"spec={info.get('spec_path', '?')} "
+            f"started_at={info.get('started_at', '?')} "
+            f"host={info.get('host', '?')}"
+        )
+    except Exception:
+        return "(unable to read holder identity)"
+
+
+@contextlib.contextmanager
+def _spec_review_lock(
+    spec_path: Path,
+    *,
+    _lock_path_override: Path | None = None,
+) -> Iterator[None]:
+    """Cross-session exclusive advisory flock serializing spec-review GW dispatch.
+
+    Lock path: /run/user/<uid>/lapis-pm-spec-review.lock (canonical, no fallback).
+    Serializes within BRIX — sufficient since spec-review runs on BRIX.
+    Auto-queues waiters up to SPEC_REVIEW_LOCK_TIMEOUT seconds (default 900).
+    Fail-CLOSED on timeout: a still-held lock means a live hung holder; abort + NORMAL
+    Pushover alert. Never proceed degraded, never kill the holder (PID-reuse risk).
+
+    Superseded when the H5 elevator organ activates and spec-review submits through it.
+    Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
+    """
+    lock_path = (
+        _lock_path_override
+        if _lock_path_override is not None
+        else _spec_review_lock_path()
+    )
+    timeout_s = int(
+        os.environ.get("SPEC_REVIEW_LOCK_TIMEOUT", str(_SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT))
+    )
+
+    print(f"[spec-review:lock] lock_path={lock_path}", file=sys.stderr)
+
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout_s
+        logged_waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                pass
+
+            if not logged_waiting:
+                holder_desc = _read_lock_holder(fd)
+                print(
+                    f"[spec-review:lock-queued] queued behind active review — {holder_desc}",
+                    file=sys.stderr,
+                )
+                logged_waiting = True
+
+            if time.monotonic() >= deadline:
+                # Lock still held past timeout: holder is alive and hung (a crashed holder
+                # auto-releases via kernel flock, so still-blocked => live hang). Fail CLOSED.
+                holder_desc = _read_lock_holder(fd)
+                msg = (
+                    f"[spec-review:lock-timeout] lock held for >{timeout_s}s by a live "
+                    f"process (hung holder: {holder_desc}). Aborting review of {spec_path}. "
+                    f"Do NOT delete {lock_path} — kernel owns lock state. "
+                    f"Investigate and clear the hung process, then re-run."
+                )
+                print(msg, file=sys.stderr)
+                try:
+                    from agents_core.notify import send_notification, Priority as _P
+                    send_notification(
+                        message=msg,
+                        title="spec-review: lock timeout — hung holder",
+                        priority=_P.NORMAL,
+                    )
+                except Exception as _notify_err:
+                    print(
+                        f"[spec-review:lock-timeout-notify-error] {_notify_err}",
+                        file=sys.stderr,
+                    )
+                raise RuntimeError(msg)
+
+            time.sleep(2)
+
+        # Acquired. Write holder identity so any waiting caller can name us in its log.
+        holder_data = json.dumps({
+            "pid": os.getpid(),
+            "spec_path": str(spec_path),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "host": socket.gethostname(),
+        }).encode()
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, holder_data)
+
+        print(f"[spec-review:lock-acquired] acquired spec_path={spec_path}", file=sys.stderr)
+        yield
+    finally:
+        # Closing the fd releases the flock at the kernel level.
+        # Process death also releases it, so stale locks never wedge.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -1130,182 +1269,187 @@ def run_spec_review(
     # 4. Load invariant context
     invariant_context = _load_invariant_context(repo)
 
-    # 4b. Sonnet deep-reviewer leg: dispatch async BEFORE the Facets block so it runs
-    #     concurrently with Facets' blocking subprocess. Always-on for advisory/hold;
-    #     reference-only (never moves the recommendation). Intentional — do not remove.
-    spec_reviewer_task_id: str | None = None
-    sonnet_disabled = (not sonnet_reviewer) or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
-    do_sonnet = (not sonnet_disabled) and effective_authority in {"advisory", "hold"}
-    if do_sonnet:
-        synth_target_id = _synth_target_id(parsed_target_id)
-        try:
-            spec_reviewer_task_id = _dispatch_spec_reviewer(
-                spec_text=spec_text,
-                synth_target_id=synth_target_id,
-                parsed_target_id=parsed_target_id,
-                repo=repo,
-                invariant_context=invariant_context,
-            ).task_id
-            print(
-                f"[spec-review:sonnet-reviewer] dispatched reference Sonnet pass "
-                f"task_id={spec_reviewer_task_id}",
-                file=sys.stderr,
-            )
-        except Exception as e:
-            # Sonnet leg is reference-only; never let its dispatch failure abort the gate.
-            print(
-                f"[spec-review:sonnet-reviewer-dispatch-error] {e} — continuing Facets-only",
-                file=sys.stderr,
-            )
-            spec_reviewer_task_id = None
+    # Cross-session exclusive lock: serializes concurrent GW-dispatch across sessions
+    # to prevent GW lane contention. Auto-queues up to SPEC_REVIEW_LOCK_TIMEOUT (900s);
+    # fail-CLOSED on timeout (hung holder). Superseded when the H5 elevator organ activates.
+    # Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
+    with _spec_review_lock(spec_path):
+        # 4b. Sonnet deep-reviewer leg: dispatch async BEFORE the Facets block so it runs
+        #     concurrently with Facets' blocking subprocess. Always-on for advisory/hold;
+        #     reference-only (never moves the recommendation). Intentional — do not remove.
+        spec_reviewer_task_id: str | None = None
+        sonnet_disabled = (not sonnet_reviewer) or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
+        do_sonnet = (not sonnet_disabled) and effective_authority in {"advisory", "hold"}
+        if do_sonnet:
+            synth_target_id = _synth_target_id(parsed_target_id)
+            try:
+                spec_reviewer_task_id = _dispatch_spec_reviewer(
+                    spec_text=spec_text,
+                    synth_target_id=synth_target_id,
+                    parsed_target_id=parsed_target_id,
+                    repo=repo,
+                    invariant_context=invariant_context,
+                ).task_id
+                print(
+                    f"[spec-review:sonnet-reviewer] dispatched reference Sonnet pass "
+                    f"task_id={spec_reviewer_task_id}",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                # Sonnet leg is reference-only; never let its dispatch failure abort the gate.
+                print(
+                    f"[spec-review:sonnet-reviewer-dispatch-error] {e} — continuing Facets-only",
+                    file=sys.stderr,
+                )
+                spec_reviewer_task_id = None
 
-    # 4c. GW reference leg: submit to ThreadPoolExecutor BEFORE Facets block so it runs
-    #     in parallel. Always-on for advisory/hold; reference-only (never moves the
-    #     recommendation). Bounded timeout + doorman pre-flight so it NEVER stalls the gate.
-    gw_future = None
-    executor = None
-    gw_run_id = str(uuid.uuid4())[:8]
-    do_gw = effective_authority in {"advisory", "hold"}
-    if do_gw:
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            gw_future = executor.submit(
-                _dispatch_gw_reviewer,
-                spec_text=spec_text,
-                synth_target_id=gw_run_id,
-                parsed_target_id=parsed_target_id,
-                repo=repo,
-                run_id=gw_run_id,
-            )
-            print(
-                f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
-                file=sys.stderr,
-            )
-        except Exception as e:
-            print(
-                f"[spec-review:gw-reviewer-submit-error] {e}",
-                file=sys.stderr,
-            )
-            gw_future = None
+        # 4c. GW reference leg: submit to ThreadPoolExecutor BEFORE Facets block so it runs
+        #     in parallel. Always-on for advisory/hold; reference-only (never moves the
+        #     recommendation). Bounded timeout + doorman pre-flight so it NEVER stalls the gate.
+        gw_future = None
+        executor = None
+        gw_run_id = str(uuid.uuid4())[:8]
+        do_gw = effective_authority in {"advisory", "hold"}
+        if do_gw:
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                gw_future = executor.submit(
+                    _dispatch_gw_reviewer,
+                    spec_text=spec_text,
+                    synth_target_id=gw_run_id,
+                    parsed_target_id=parsed_target_id,
+                    repo=repo,
+                    run_id=gw_run_id,
+                )
+                print(
+                    f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(
+                    f"[spec-review:gw-reviewer-submit-error] {e}",
+                    file=sys.stderr,
+                )
+                gw_future = None
 
-    # 5. Run shared orchestration (Facets + Council concurrently).
-    #    This replaces the bespoke _dispatch_facets + _dispatch_council paths.
-    #    Council runs with its own internal timeout; Sonnet gets its own poll deadline.
-    facets_deliberation: dict | None = None
-    envelope = None
-    council_run_id: str | None = None
+        # 5. Run shared orchestration (Facets + Council concurrently).
+        #    This replaces the bespoke _dispatch_facets + _dispatch_council paths.
+        #    Council runs with its own internal timeout; Sonnet gets its own poll deadline.
+        facets_deliberation: dict | None = None
+        envelope = None
+        council_run_id: str | None = None
 
-    if dispatch_facets and effective_authority in {"advisory", "hold"}:
-        # Set the council timeout from the caller's timeout_s
-        # (Facets finding #3 / Trickster: dynamic timeout propagation)
-        os.environ["SHARED_DELIBERATION_COUNCIL_TIMEOUT_S"] = str(timeout_s)
+        if dispatch_facets and effective_authority in {"advisory", "hold"}:
+            # Set the council timeout from the caller's timeout_s
+            # (Facets finding #3 / Trickster: dynamic timeout propagation)
+            os.environ["SHARED_DELIBERATION_COUNCIL_TIMEOUT_S"] = str(timeout_s)
 
-        request = DeliberationRequest(
-            text=spec_text,
-            context={
-                "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
-                "target_id": parsed_target_id,
-                "repo": repo,
-                "authority": effective_authority,
-                "invariant_context": invariant_context,
-            },
-            triage="full",
-            caller="spec-review",
-            council_voicing=council_voicing,
-            facets_operator=facets_operator,
+            request = DeliberationRequest(
+                text=spec_text,
+                context={
+                    "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
+                    "target_id": parsed_target_id,
+                    "repo": repo,
+                    "authority": effective_authority,
+                    "invariant_context": invariant_context,
+                },
+                triage="full",
+                caller="spec-review",
+                council_voicing=council_voicing,
+                facets_operator=facets_operator,
+            )
+
+            try:
+                async def _deliberate():
+                    init_facets_semaphore(int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2")))
+                    return await run_deliberation(request)
+
+                envelope = asyncio.run(_deliberate())
+                print(
+                    f"[spec-review:shared-deliberation-complete] "
+                    f"facets_ok={envelope.facets_ok} council_ok={envelope.council_ok}",
+                    file=sys.stderr,
+                )
+
+                # Extract facets deliberation if successful
+                if envelope.facets_ok and envelope.facets:
+                    facets_deliberation = envelope.facets
+
+                # Extract council run_id for reference
+                council_run_id = envelope.council_run_id
+            except Exception as e:
+                print(
+                    f"[spec-review:shared-deliberation-error] {e}",
+                    file=sys.stderr,
+                )
+                # Degrade gracefully: envelope will be None, council_raw will reflect the error below
+                envelope = None
+
+        # 7. Collect GW Future (with bounded timeout)
+        gw_text: str | None = None
+        gw_transcript: list[dict] = []
+        gw_elapsed: float = 0.0
+        if gw_future is not None:
+            try:
+                gw_text, gw_transcript, gw_elapsed = gw_future.result(timeout=300)
+            except FuturesTimeoutError:
+                print(
+                    f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
+                    file=sys.stderr,
+                )
+                gw_text = None
+                gw_elapsed = 300.0
+            except Exception as e:
+                print(
+                    f"[spec-review:gw-reviewer-collect-error] {e}",
+                    file=sys.stderr,
+                )
+                gw_text = None
+            finally:
+                # Clean up executor to prevent thread pool leak
+                if executor is not None:
+                    executor.shutdown(wait=False)
+
+        # 8. Poll Sonnet leg to terminal (with independent timeout from Council).
+        #    Council results come directly from the envelope (already complete).
+        sonnet_raw = _poll_sonnet_until_terminal(
+            spec_reviewer_task_id=spec_reviewer_task_id,
+            timeout_s=timeout_s,
+            start_time=start_time,
         )
 
-        try:
-            async def _deliberate():
-                init_facets_semaphore(int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2")))
-                return await run_deliberation(request)
-
-            envelope = asyncio.run(_deliberate())
-            print(
-                f"[spec-review:shared-deliberation-complete] "
-                f"facets_ok={envelope.facets_ok} council_ok={envelope.council_ok}",
-                file=sys.stderr,
-            )
-
-            # Extract facets deliberation if successful
-            if envelope.facets_ok and envelope.facets:
-                facets_deliberation = envelope.facets
-
-            # Extract council run_id for reference
-            council_run_id = envelope.council_run_id
-        except Exception as e:
-            print(
-                f"[spec-review:shared-deliberation-error] {e}",
-                file=sys.stderr,
-            )
-            # Degrade gracefully: envelope will be None, council_raw will reflect the error below
-            envelope = None
-
-    # 7. Collect GW Future (with bounded timeout)
-    gw_text: str | None = None
-    gw_transcript: list[dict] = []
-    gw_elapsed: float = 0.0
-    if gw_future is not None:
-        try:
-            gw_text, gw_transcript, gw_elapsed = gw_future.result(timeout=300)
-        except FuturesTimeoutError:
-            print(
-                f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
-                file=sys.stderr,
-            )
-            gw_text = None
-            gw_elapsed = 300.0
-        except Exception as e:
-            print(
-                f"[spec-review:gw-reviewer-collect-error] {e}",
-                file=sys.stderr,
-            )
-            gw_text = None
-        finally:
-            # Clean up executor to prevent thread pool leak
-            if executor is not None:
-                executor.shutdown(wait=False)
-
-    # 8. Poll Sonnet leg to terminal (with independent timeout from Council).
-    #    Council results come directly from the envelope (already complete).
-    sonnet_raw = _poll_sonnet_until_terminal(
-        spec_reviewer_task_id=spec_reviewer_task_id,
-        timeout_s=timeout_s,
-        start_time=start_time,
-    )
-
-    # 8b. Build council_raw from the envelope. If envelope is None (error path),
-    #     council_raw reflects the error.
-    if envelope is not None and envelope.council_ok:
-        council_raw = {
-            "status": envelope.council_status or "error",
-            "landing": envelope.council_landing or "",
-            "open_questions": envelope.council_open_questions or [],
-            "confidence": envelope.council_confidence or "",
-            "positions": envelope.council_positions or [],
-            "run_id": envelope.council_run_id or "",
-            "voicing_effective": envelope.council_voicing_effective,
-            "voicing_degraded": envelope.council_voicing_degraded,
-            "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
-        }
-    else:
-        # Council leg failed or envelope is None: return error status
-        status = "error"
-        if envelope is not None:
-            status = envelope.council_status or "error"
-            if status not in _COUNCIL_TERMINAL:
-                status = "error"
-        council_raw = {
-            "status": status,
-            "landing": "",
-            "open_questions": [],
-            "confidence": "",
-            "positions": [],
-            "run_id": envelope.council_run_id if envelope else "",
-            "voicing_effective": None,
-            "voicing_degraded": False,
-            "voicing_degraded_reason": "",
-        }
+        # 8b. Build council_raw from the envelope. If envelope is None (error path),
+        #     council_raw reflects the error.
+        if envelope is not None and envelope.council_ok:
+            council_raw = {
+                "status": envelope.council_status or "error",
+                "landing": envelope.council_landing or "",
+                "open_questions": envelope.council_open_questions or [],
+                "confidence": envelope.council_confidence or "",
+                "positions": envelope.council_positions or [],
+                "run_id": envelope.council_run_id or "",
+                "voicing_effective": envelope.council_voicing_effective,
+                "voicing_degraded": envelope.council_voicing_degraded,
+                "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
+            }
+        else:
+            # Council leg failed or envelope is None: return error status
+            status = "error"
+            if envelope is not None:
+                status = envelope.council_status or "error"
+                if status not in _COUNCIL_TERMINAL:
+                    status = "error"
+            council_raw = {
+                "status": status,
+                "landing": "",
+                "open_questions": [],
+                "confidence": "",
+                "positions": [],
+                "run_id": envelope.council_run_id if envelope else "",
+                "voicing_effective": None,
+                "voicing_degraded": False,
+                "voicing_degraded_reason": "",
+            }
 
     elapsed = time.time() - start_time
 

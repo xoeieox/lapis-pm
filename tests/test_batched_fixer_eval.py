@@ -21,6 +21,7 @@ from lapis_pm.batched_fixer_eval import (
     swarm_serving,
     swarm_model,
     assert_swarm_health,
+    grounding_hook,
 )
 
 
@@ -434,11 +435,15 @@ def test_ac11_no_elevator_writes():
 
 def test_ac11_grounding_hook_noop():
     """AC11: Grounding hook (if present) defaults to no-op."""
-    # Verify grounding_hook exists and can be called
-    from lapis_pm.batched_fixer_eval import run_fixture
-    # The hook is exposed as a seam (to be implemented later)
-    # For now, just verify run_fixture doesn't wire it
-    assert callable(run_fixture)
+    # Verify grounding_hook exists and is a no-op by default
+    assert callable(grounding_hook)
+    # Test that it returns empty string (no-op)
+    fixture = FixtureRecord(
+        repo="test", sha="a", parent_sha="b", pr_number=1, path="f.py",
+        file_loc="unknown", changed_lines=1, tier="T1"
+    )
+    result = grounding_hook(fixture)
+    assert result == ""
 
 
 # ---------------------------------------------------------------------------

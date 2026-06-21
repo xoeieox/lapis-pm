@@ -3,15 +3,24 @@
 observe leg: pure-CPU, zero spend
   - validity-filters traces (quarantine-and-measure, never delete)
   - semantic-clusters break signatures via fastembed nomic-embed-text-v1.5
+    (mean-updated centroids — order-stable, principled)
   - populates cells_observed_in per cluster
   - computes per-scaffold saturation curve (marginal-new-clusters per cell by night)
-  - backcaster analog: gap clustering, histogram drift, never-firing categories
+  - backcaster analog: gap clustering at prose-density threshold (default 0.65),
+    collapse-ratio instrumented, histogram drift, never-firing categories
 
 refine leg: GW-122B local, zero paid
   - reads landscape, emits ranked proposals with provenance
   - structural retire gate: cannot emit retire without fat-batch-confirmed concave curve
   - on_wake_fail='skip' → degrades to observe-only when GW down
   - writes salience map to /srv/lapis/scout/refiner/
+
+calibration folds (refiner-autonomy-calibration-v0):
+  B1: mean-updated centroids in _greedy_cluster (vs fixed first-member)
+  B2: Backcaster gap clustering at separate prose_cos_threshold (0.65 default);
+      collapse-ratio instrumented + sanity floor flags under/over-collapse
+  B3: systemic_failure_nights requires ≥3 cells all-degenerate;
+      thin nights (< 3 cells) recorded in thin_nights, not systemic
 
 propose-only: no scaffold YAML is mutated, no timer touched.
 """
@@ -41,11 +50,21 @@ REFINER_OUTPUT_ROOT = Path("/srv/lapis/scout/refiner")
 _COS_THRESHOLDS = (0.70, 0.80, 0.90)
 _DEFAULT_COS_THRESHOLD = 0.80
 
+# Backcaster gap texts are long prose — cluster looser than short break signatures
+_DEFAULT_PROSE_COS_THRESHOLD = 0.65
+
 # Fat-batch: night must have at least this many distinct cells to count as fat
 _FAT_BATCH_MIN_CELLS = 10
 
 # True-exhaustion: marginal-new-clusters-per-cell below this on a fat night
 _SATURATION_THRESHOLD = 0.05
+
+# B3: minimum cell count for a night to flag as systemic-failure (not thin)
+_SYSTEMIC_NIGHT_MIN_CELLS = 3
+
+# B2: sanity floors for gap collapse ratio (raw_gaps / clusters)
+_COLLAPSE_RATIO_FLOOR = 2.0   # below this = under-collapse (sparse signal)
+_COLLAPSE_RATIO_CEIL = 50.0   # above this = over-collapse (signal dilution)
 
 # Retire gate error text (used in re-routed proposal rationale)
 _RETIRE_GATE_MSG = (
@@ -100,7 +119,11 @@ class RefinerObserveResult:
     quarantined: list[QuarantineRecord] = field(default_factory=list)
     degenerate_frequency: float = 0.0
     systemic_failure_nights: list[str] = field(default_factory=list)
+    # B3: nights with < _SYSTEMIC_NIGHT_MIN_CELLS cells all-degenerate (not flagged systemic)
+    thin_nights: list[str] = field(default_factory=list)
     clusters: list[ClusterRecord] = field(default_factory=list)
+    # B1: raw unique signature count before clustering (for collapse ratio)
+    raw_unique_count: int = 0
     cluster_counts_by_threshold: dict[str, int] = field(default_factory=dict)
     saturation: SaturationCurve | None = None
     optional_step_classification: dict[str, str] = field(default_factory=dict)
@@ -121,7 +144,14 @@ class BackcasterObserveResult:
     quarantined: list[QuarantineRecord] = field(default_factory=list)
     degenerate_frequency: float = 0.0
     systemic_failure_nights: list[str] = field(default_factory=list)
+    # B3: nights with < _SYSTEMIC_NIGHT_MIN_CELLS runs all-degenerate
+    thin_nights: list[str] = field(default_factory=list)
     gap_clusters: list[BackcasterGapCluster] = field(default_factory=list)
+    # B2: gap clustering instrumentation
+    gap_raw_count: int = 0           # raw what_missing texts before clustering
+    gap_collapse_ratio: float = 0.0  # raw_gaps / clusters (higher = more collapse)
+    gap_threshold_used: float = 0.0  # prose_cos_threshold used
+    gap_sanity_warning: str = ""     # non-empty if collapse is out of sanity range
     histogram_drift: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     never_firing_categories: list[str] = field(default_factory=list)
     unsourced_summary: dict[str, int] = field(default_factory=dict)
@@ -173,7 +203,12 @@ def _greedy_cluster(
 ) -> list[list[int]]:
     """Greedy cosine clustering over pre-embedded texts.
 
-    Returns list of index-lists (one per cluster, centroid = first element).
+    Uses mean-updated (running-centroid) clustering: a member is judged against the
+    cluster's evolving center, not an arbitrary first element. Order-stable and the
+    principled choice — produces tighter clusters and lower cluster counts than
+    fixed-first-member centroids (B1 calibration fix).
+
+    Returns list of index-lists (one per cluster).
     """
     clusters: list[list[int]] = []
     centroids: list[list[float]] = []
@@ -182,11 +217,14 @@ def _greedy_cluster(
         for j, centroid in enumerate(centroids):
             if _cosine(emb, centroid) >= threshold:
                 clusters[j].append(i)
+                # Update centroid to running mean of all members
+                n = len(clusters[j])
+                centroids[j] = [(c * (n - 1) + e) / n for c, e in zip(centroid, emb)]
                 matched = True
                 break
         if not matched:
             clusters.append([i])
-            centroids.append(emb)
+            centroids.append(list(emb))
     return clusters
 
 
@@ -384,19 +422,29 @@ def refiner_observe(
     valid_count = total_traces - len(quarantined)
     degen_freq = len(quarantined) / max(total_traces, 1)
 
-    # Systemic failure nights: nights where valid cell count is 0 but quarantine > 0
+    # Systemic failure nights (B3): nights where ALL cells degenerated AND ≥ min-cell floor.
+    # Below the floor, record as thin (insufficient cell count), not systemic.
     all_nights_seen: set[str] = set(night_to_cells.keys()) | {
         q.night for q in quarantined if q.night != "unknown"
     }
-    night_to_degen: dict[str, int] = defaultdict(int)
+    night_to_degen: dict[str, set[str]] = defaultdict(set)
     for q in quarantined:
         if q.night != "unknown":
-            night_to_degen[q.night] += 1
+            # Use run_path as proxy for unique degenerate cell-unit (not a real cell_id here,
+            # but sufficient for counting distinct degenerate runs per night)
+            night_to_degen[q.night].add(q.run_path)
 
-    systemic_nights: list[str] = [
-        n for n in sorted(all_nights_seen)
-        if len(night_to_cells.get(n, set())) == 0 and night_to_degen.get(n, 0) > 0
-    ]
+    systemic_nights: list[str] = []
+    thin_nights: list[str] = []
+    for n in sorted(all_nights_seen):
+        valid_cells = len(night_to_cells.get(n, set()))
+        degen_count = len(night_to_degen.get(n, set()))
+        if valid_cells == 0 and degen_count > 0:
+            # All runs that night were degenerate — check cell-count floor
+            if degen_count >= _SYSTEMIC_NIGHT_MIN_CELLS:
+                systemic_nights.append(n)
+            else:
+                thin_nights.append(n)
 
     # Short-circuit: no valid breaks
     if not sig_index:
@@ -407,9 +455,12 @@ def refiner_observe(
             quarantined=quarantined,
             degenerate_frequency=degen_freq,
             systemic_failure_nights=systemic_nights,
+            thin_nights=thin_nights,
+            raw_unique_count=0,
         )
 
     unique_sigs = list(sig_index.keys())
+    raw_unique_count = len(unique_sigs)
     embeddings = _embed_texts(unique_sigs)
 
     # Cluster at multiple thresholds for calibration report
@@ -484,7 +535,9 @@ def refiner_observe(
         quarantined=quarantined,
         degenerate_frequency=degen_freq,
         systemic_failure_nights=systemic_nights,
+        thin_nights=thin_nights,
         clusters=cluster_records,
+        raw_unique_count=raw_unique_count,
         cluster_counts_by_threshold=threshold_counts,
         saturation=sat,
         optional_step_classification=opt_class,
@@ -500,12 +553,15 @@ def backcaster_observe(
     runs_root: Path | None = None,
     goal_filter: str | None = None,
     cos_threshold: float = _DEFAULT_COS_THRESHOLD,
+    prose_cos_threshold: float = _DEFAULT_PROSE_COS_THRESHOLD,
 ) -> BackcasterObserveResult:
     """Validity-filtered landscape over backcaster runs.
 
     Covers:
     - validity filter + quarantine (all-zero histograms, empty gaps)
-    - semantic gap clustering (what_missing texts)
+    - semantic gap clustering at prose_cos_threshold (default 0.65, looser than Scout
+      signature threshold because what_missing texts are long prose — B2 calibration)
+    - collapse-ratio instrumentation: raw_gaps / clusters, with sanity floor warnings
     - histogram drift per goal
     - never-firing category detection
     - unsourced precondition counts
@@ -585,19 +641,28 @@ def backcaster_observe(
     valid_count = total_runs - len(quarantined)
     degen_freq = len(quarantined) / max(total_runs, 1)
 
-    # Systemic failure nights: all runs that night were degenerate
+    # Systemic failure nights (B3): all runs that night degenerate AND ≥ min-cell floor.
+    # Backcaster "cells" = individual runs. Below the floor: thin/insufficient.
     all_nights: set[str] = set(night_valid.keys()) | set(night_degen.keys())
-    systemic_nights: list[str] = [
-        n for n in sorted(all_nights - {"unknown"})
-        if night_valid.get(n, 0) == 0 and night_degen.get(n, 0) > 0
-    ]
+    systemic_nights: list[str] = []
+    thin_nights_bc: list[str] = []
+    for n in sorted(all_nights - {"unknown"}):
+        if night_valid.get(n, 0) == 0 and night_degen.get(n, 0) > 0:
+            if night_degen[n] >= _SYSTEMIC_NIGHT_MIN_CELLS:
+                systemic_nights.append(n)
+            else:
+                thin_nights_bc.append(n)
 
-    # Gap semantic clustering
+    # Gap semantic clustering (B2): use prose_cos_threshold (looser than Scout threshold).
+    # Long what_missing texts need a looser cut — cos≥0.80 barely clusters them.
     gap_clusters: list[BackcasterGapCluster] = []
+    gap_raw_count = len(valid_gaps)
+    gap_collapse_ratio = 0.0
+    gap_sanity_warning = ""
     if valid_gaps:
         gap_texts = [g["what_missing"] for g in valid_gaps]
         gap_embeddings = _embed_texts(gap_texts)
-        raw_clusters = _greedy_cluster(gap_texts, gap_embeddings, threshold=cos_threshold)
+        raw_clusters = _greedy_cluster(gap_texts, gap_embeddings, threshold=prose_cos_threshold)
         for ci, member_idxs in enumerate(sorted(raw_clusters, key=lambda x: -len(x))):
             members = [valid_gaps[i] for i in member_idxs]
             centroid = gap_texts[member_idxs[0]]
@@ -609,6 +674,19 @@ def backcaster_observe(
                 goal_slugs=goal_slugs,
                 run_ids=run_ids,
             ))
+        # Instrument collapse ratio
+        n_gap_clusters = len(gap_clusters)
+        gap_collapse_ratio = gap_raw_count / max(n_gap_clusters, 1)
+        if gap_collapse_ratio < _COLLAPSE_RATIO_FLOOR:
+            gap_sanity_warning = (
+                f"under-collapse: ratio={gap_collapse_ratio:.1f} < floor={_COLLAPSE_RATIO_FLOOR} "
+                f"— threshold may be too tight; try lowering prose_cos_threshold"
+            )
+        elif gap_collapse_ratio > _COLLAPSE_RATIO_CEIL:
+            gap_sanity_warning = (
+                f"over-collapse: ratio={gap_collapse_ratio:.1f} > ceil={_COLLAPSE_RATIO_CEIL} "
+                f"— distinct gaps may be merging; consider raising prose_cos_threshold"
+            )
 
     # Never-firing categories: always 0 across all valid runs
     cat_ever_nonzero: dict[str, bool] = {}
@@ -628,7 +706,12 @@ def backcaster_observe(
         quarantined=quarantined,
         degenerate_frequency=degen_freq,
         systemic_failure_nights=systemic_nights,
+        thin_nights=thin_nights_bc,
         gap_clusters=gap_clusters,
+        gap_raw_count=gap_raw_count,
+        gap_collapse_ratio=gap_collapse_ratio,
+        gap_threshold_used=prose_cos_threshold,
+        gap_sanity_warning=gap_sanity_warning,
         histogram_drift=dict(histogram_drift),
         never_firing_categories=never_firing,
         unsourced_summary=dict(unsourced_summary),
@@ -793,11 +876,14 @@ def refiner_refine(
     backcaster_result: BackcasterObserveResult | None,
     *,
     output_root: Path | None = None,
+    observe_only: bool = False,
 ) -> list[RefinerRefineResult]:
     """Emit ranked proposals via GW-122B.
 
     propose-only: no scaffold YAML is mutated, no timer touched.
     Degrades to observe-only (gw_skipped=True) when GW is unreachable.
+
+    observe_only=True: skip the GW refine leg entirely (pure-CPU run).
     """
     try:
         from agents_core.llm import call_operator  # type: ignore[import]
@@ -812,7 +898,7 @@ def refiner_refine(
     results: list[RefinerRefineResult] = []
 
     def _call_gw(prompt: str) -> tuple[str | None, list]:
-        if call_operator is None:
+        if call_operator is None or observe_only:
             return None, []
         prov_out: list[Any] = []
         text = call_operator(
@@ -934,6 +1020,13 @@ def _render_scout_salience(
             "",
         ]
 
+    if observe.thin_nights:
+        lines += [
+            "## Thin Nights (< 3 cells degenerate, not flagged systemic)",
+            *(f"- {n}" for n in observe.thin_nights),
+            "",
+        ]
+
     if observe.quarantined:
         lines += [
             "## Quarantine Log",
@@ -991,21 +1084,36 @@ def _render_backcaster_salience(
     observe: BackcasterObserveResult,
     refine: RefinerRefineResult,
 ) -> str:
+    threshold_used = observe.gap_threshold_used or _DEFAULT_PROSE_COS_THRESHOLD
+    collapse_info = (
+        f"{observe.gap_raw_count} raw → {len(observe.gap_clusters)} clusters "
+        f"(ratio={observe.gap_collapse_ratio:.1f}×, cos≥{threshold_used})"
+        if observe.gap_raw_count > 0 else f"cos≥{threshold_used}"
+    )
     lines = [
         "# Backcaster Salience Map",
         f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
         "",
         "## Landscape Summary",
         f"- Valid runs: {observe.valid_runs} / {observe.total_runs}",
-        f"- Gap clusters: {len(observe.gap_clusters)} (cos≥{_DEFAULT_COS_THRESHOLD})",
+        f"- Gap clusters: {len(observe.gap_clusters)} ({collapse_info})",
         f"- Quarantined: {len(observe.quarantined)} runs (retained, measured)",
         "",
     ]
+    if observe.gap_sanity_warning:
+        lines += [f"> **Gap clustering sanity:** {observe.gap_sanity_warning}", ""]
 
     if observe.systemic_failure_nights:
         lines += [
             "## Systemic Failure Nights",
             *(f"- {n}" for n in observe.systemic_failure_nights),
+            "",
+        ]
+
+    if observe.thin_nights:
+        lines += [
+            "## Thin Nights (insufficient runs, not flagged systemic)",
+            *(f"- {n}" for n in observe.thin_nights),
             "",
         ]
 

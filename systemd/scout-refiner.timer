@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Scout Refiner at 06:30 America/Los_Angeles (after scout-night 01:00 + backcaster-night 03:00 both land)
+
+# HELD — do NOT enable until a manual `lapis-pm scout refiner` run confirms the digest
+# line actually appears in Active Work.md. Enable with:
+#   sudo systemctl enable --now scout-refiner.timer
+#   sudo cp systemd/scout-refiner.service /etc/systemd/system/
+#   sudo cp systemd/scout-refiner.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target

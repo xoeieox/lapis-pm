@@ -1821,6 +1821,39 @@ def build_parser() -> argparse.ArgumentParser:
     sc_dig.set_defaults(func=cmd_scout)
 
     # ------------------------------------------------------------------
+    # scout refiner — autonomy loop (observe→refine→salience)
+    # ------------------------------------------------------------------
+    sc_ref = sc_sub.add_parser(
+        "refiner",
+        help=(
+            "Semantic observe→refine loop over active Scout scaffolds + Backcaster goals. "
+            "Writes dated salience maps and injects a summary into Active Work.md."
+        ),
+    )
+    sc_ref.add_argument(
+        "--observe-only",
+        dest="observe_only",
+        action="store_true",
+        default=False,
+        help="Pure-CPU pass — skip the GW refine leg (no proposals, just landscape).",
+    )
+    sc_ref.add_argument(
+        "--spec",
+        default=None,
+        metavar="ID",
+        help="Restrict to one scaffold spec ID (matches digest's --spec shape).",
+    )
+    sc_ref.add_argument(
+        "--cos-threshold",
+        dest="cos_threshold",
+        type=float,
+        default=0.80,
+        metavar="F",
+        help="Override default 0.80 cosine threshold for Scout signature clustering.",
+    )
+    sc_ref.set_defaults(func=cmd_scout)
+
+    # ------------------------------------------------------------------
     # scout night — night-queue orchestrator
     # ------------------------------------------------------------------
     sc_night = sc_sub.add_parser(

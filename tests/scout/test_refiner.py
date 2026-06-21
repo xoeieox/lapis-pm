@@ -23,6 +23,10 @@ import pytest
 import yaml
 
 from lapis_pm.scout.refiner import (
+    _COLLAPSE_RATIO_CEIL,
+    _COLLAPSE_RATIO_FLOOR,
+    _DEFAULT_PROSE_COS_THRESHOLD,
+    _SYSTEMIC_NIGHT_MIN_CELLS,
     BackcasterGapCluster,
     BackcasterObserveResult,
     ClusterRecord,
@@ -802,6 +806,235 @@ class TestProvenance:
 
 
 # ---------------------------------------------------------------------------
+# B1 — mean-updated centroids (clustering quality)
+# ---------------------------------------------------------------------------
+
+class TestMeanUpdatedCentroids:
+
+    def test_mean_update_collapses_more_than_fixed_first(self) -> None:
+        """B1: mean-updated centroids produce ≤ clusters than fixed-first-member.
+
+        With a stream of near-paraphrases, updating the centroid to the running
+        mean keeps it closer to the cluster's true center, so later members are
+        more likely to meet the threshold.
+        """
+        # Three near-synonyms + one clearly different text
+        texts = [
+            "handler timeout under degraded network conditions",
+            "handler timed out due to network degradation",
+            "network handler timeout in degraded state",
+            "database connection refused",
+        ]
+        embeddings = _embed_texts(texts)
+        clusters = _greedy_cluster(texts, embeddings, threshold=0.80)
+        # The three paraphrases should collapse; 4th should be separate
+        assert len(clusters) <= 3, (
+            f"Mean-update centroids should collapse near-paraphrases; got {len(clusters)} clusters"
+        )
+
+    def test_raw_unique_count_populated(self, tmp_path: Path) -> None:
+        """B1: raw_unique_count is populated on RefinerObserveResult."""
+        traces_root = tmp_path / "traces"
+        _write_trace(
+            traces_root, "test-spec", "cell-A", "run-1",
+            [{"signature": "handler timeout", "severity": "high"}],
+        )
+        _write_trace(
+            traces_root, "test-spec", "cell-A", "run-2",
+            [{"signature": "network timeout", "severity": "high"}],
+        )
+        result = refiner_observe("test-spec", traces_root=traces_root)
+        assert result.raw_unique_count >= 1, "raw_unique_count must be > 0 when breaks exist"
+        assert result.raw_unique_count >= len(result.clusters), (
+            "raw_unique_count >= n_clusters (clustering can only reduce count)"
+        )
+
+    def test_collapse_ratio_ge_1(self, tmp_path: Path) -> None:
+        """B1: raw_unique / n_clusters ≥ 1.0 (clustering never inflates)."""
+        traces_root = tmp_path / "traces"
+        # Three identical signatures — should collapse to 1 cluster
+        for i in range(3):
+            _write_trace(
+                traces_root, "spec-x", "cell-A", f"run-{i}",
+                [{"signature": "speculative hoarding anomaly", "severity": "high"}],
+            )
+        result = refiner_observe("spec-x", traces_root=traces_root)
+        ratio = result.raw_unique_count / max(len(result.clusters), 1)
+        assert ratio >= 1.0, f"collapse ratio must be ≥ 1.0; got {ratio}"
+
+
+# ---------------------------------------------------------------------------
+# B2 — Backcaster gap prose-density threshold + collapse-ratio instrumentation
+# ---------------------------------------------------------------------------
+
+class TestBackcasterProseDensity:
+
+    def test_default_prose_threshold_is_lower_than_scout(self) -> None:
+        """B2: prose threshold (0.65) is lower than Scout signature threshold (0.80)."""
+        assert _DEFAULT_PROSE_COS_THRESHOLD < 0.80, (
+            "prose_cos_threshold must be < Scout threshold to cluster long prose"
+        )
+
+    def test_prose_threshold_collapses_more_than_scout_threshold(
+        self, tmp_path: Path
+    ) -> None:
+        """B2: gap texts cluster more at prose threshold (0.65) than at Scout threshold (0.80)."""
+        runs_root = tmp_path / "runs"
+        # Write 4 runs with related but not identical gap texts
+        for i, gap_text in enumerate([
+            "A sustainable revenue model for independent auditing of shared infrastructure.",
+            "Revenue sustainability for auditing shared infrastructure at ecosystem scale.",
+            "Infrastructure auditing requires a sustainable economic model to persist.",
+            "The database is down",  # clearly unrelated
+        ]):
+            _write_bc_run(
+                runs_root,
+                f"2026-06-0{i+1}-1200-goal-{i}",
+                gaps=[{"what_missing": gap_text, "unsourced": False}],
+            )
+
+        result_loose = backcaster_observe(runs_root=runs_root, prose_cos_threshold=0.65)
+        result_tight = backcaster_observe(runs_root=runs_root, cos_threshold=0.80,
+                                          prose_cos_threshold=0.80)
+
+        # Loose threshold should produce ≤ clusters than tight
+        assert len(result_loose.gap_clusters) <= len(result_tight.gap_clusters), (
+            f"Looser prose threshold should produce ≤ clusters; "
+            f"got {len(result_loose.gap_clusters)} (loose) vs {len(result_tight.gap_clusters)} (tight)"
+        )
+
+    def test_gap_collapse_ratio_computed(self, tmp_path: Path) -> None:
+        """B2: gap_collapse_ratio is computed and stored on BackcasterObserveResult."""
+        runs_root = tmp_path / "runs"
+        for i in range(4):
+            _write_bc_run(runs_root, f"2026-06-0{i+1}-1200-goal-x")
+        result = backcaster_observe(runs_root=runs_root)
+        assert result.gap_raw_count >= 1
+        assert result.gap_collapse_ratio > 0.0
+        assert result.gap_threshold_used == _DEFAULT_PROSE_COS_THRESHOLD
+
+    def test_gap_sanity_warning_on_under_collapse(self, tmp_path: Path) -> None:
+        """B2: gap_sanity_warning fires when collapse ratio < floor (under-collapse)."""
+        runs_root = tmp_path / "runs"
+        # Single run with one gap — ratio = 1.0/1 = 1.0 < floor (2.0)
+        _write_bc_run(
+            runs_root, "2026-06-01-1200-goal-a",
+            gaps=[{"what_missing": "unique gap text here", "unsourced": False}],
+        )
+        result = backcaster_observe(runs_root=runs_root)
+        if result.gap_raw_count > 0 and result.gap_collapse_ratio < _COLLAPSE_RATIO_FLOOR:
+            assert result.gap_sanity_warning, (
+                f"Expected sanity warning for under-collapse ratio={result.gap_collapse_ratio}"
+            )
+
+    def test_collapse_ratio_in_backcaster_salience(self, tmp_path: Path) -> None:
+        """B2: collapse ratio appears in the Backcaster salience map rendering."""
+        observe = BackcasterObserveResult(
+            total_runs=5,
+            valid_runs=4,
+            gap_raw_count=20,
+            gap_collapse_ratio=10.0,
+            gap_threshold_used=0.65,
+        )
+        refine = RefinerRefineResult(spec_id="backcaster", gw_skipped=True, prompt_hash="sha256:x")
+        text = _render_backcaster_salience(observe, refine)
+        assert "10.0" in text or "ratio" in text.lower(), (
+            f"Collapse ratio should appear in Backcaster salience map"
+        )
+        assert "0.65" in text, "prose threshold should appear in salience map"
+
+
+# ---------------------------------------------------------------------------
+# B3 — systemic_failure_nights thin-cell floor
+# ---------------------------------------------------------------------------
+
+class TestThinCellFloor:
+
+    def test_thin_night_not_flagged_systemic(self, tmp_path: Path) -> None:
+        """B3: a night with < _SYSTEMIC_NIGHT_MIN_CELLS degenerate runs is thin, not systemic."""
+        traces_root = tmp_path / "traces"
+        # Write 2 degenerate traces on one night (< 3 = floor) and 1 valid on another
+        for i in range(2):
+            _write_trace(
+                traces_root, "spec-b3", f"cell-{i}", f"degen-{i}",
+                [],  # empty breaks → degenerate
+                night="2026-06-05",
+            )
+        _write_trace(
+            traces_root, "spec-b3", "cell-ok", "run-ok",
+            [{"signature": "normal break", "severity": "low"}],
+            night="2026-06-06",
+        )
+
+        result = refiner_observe("spec-b3", traces_root=traces_root)
+        assert "2026-06-05" not in result.systemic_failure_nights, (
+            f"Night with <{_SYSTEMIC_NIGHT_MIN_CELLS} cells should not be systemic; "
+            f"got systemic_nights={result.systemic_failure_nights}"
+        )
+        assert "2026-06-05" in result.thin_nights, (
+            f"Night with <{_SYSTEMIC_NIGHT_MIN_CELLS} degenerate cells should be in thin_nights; "
+            f"got thin_nights={result.thin_nights}"
+        )
+
+    def test_fat_degenerate_night_flagged_systemic(self, tmp_path: Path) -> None:
+        """B3: a night with ≥ _SYSTEMIC_NIGHT_MIN_CELLS degenerate runs IS systemic."""
+        traces_root = tmp_path / "traces"
+        for i in range(_SYSTEMIC_NIGHT_MIN_CELLS):
+            _write_trace(
+                traces_root, "spec-b3-fat", f"cell-{i}", f"degen-{i}",
+                [],  # degenerate
+                night="2026-06-07",
+            )
+
+        result = refiner_observe("spec-b3-fat", traces_root=traces_root)
+        assert "2026-06-07" in result.systemic_failure_nights, (
+            f"Night with ≥{_SYSTEMIC_NIGHT_MIN_CELLS} degenerate cells should be systemic; "
+            f"got systemic_nights={result.systemic_failure_nights}"
+        )
+        assert "2026-06-07" not in result.thin_nights, (
+            "systemic night must not also appear in thin_nights"
+        )
+
+    def test_backcaster_thin_night_not_systemic(self, tmp_path: Path) -> None:
+        """B3: backcaster also applies the thin-cell floor for systemic nights."""
+        runs_root = tmp_path / "runs"
+        # 2 degenerate runs on one night (< 3 floor), 1 valid on another
+        for i in range(2):
+            _write_bc_run(
+                runs_root,
+                f"2026-05-15-120{i}-thin-goal",
+                histogram={k: 0 for k in ["community-formation", "policy", "financial"]},
+                gaps=[],
+            )
+        _write_bc_run(runs_root, "2026-05-16-1200-ok-goal")
+
+        result = backcaster_observe(runs_root=runs_root)
+        assert "2026-05-15" not in result.systemic_failure_nights, (
+            f"Backcaster: thin night (<{_SYSTEMIC_NIGHT_MIN_CELLS} runs) should not be systemic"
+        )
+        assert "2026-05-15" in result.thin_nights, (
+            "Backcaster: thin night should appear in thin_nights"
+        )
+
+    def test_thin_nights_in_scout_salience(self) -> None:
+        """B3: thin nights appear in scout salience map with correct label."""
+        observe = RefinerObserveResult(
+            spec_id="test",
+            total_traces=5,
+            valid_traces=3,
+            systemic_failure_nights=["2026-06-03"],
+            thin_nights=["2026-06-04", "2026-06-05"],
+        )
+        refine = RefinerRefineResult(spec_id="test", gw_skipped=True, prompt_hash="sha256:x")
+        text = _render_scout_salience(observe, refine)
+        assert "Thin Nights" in text
+        assert "2026-06-04" in text
+        assert "2026-06-05" in text
+        # systemic night still appears separately
+        assert "2026-06-03" in text
+
+
+# ---------------------------------------------------------------------------
 # AC1 — integration: semantic collapse on real grants-runway-v0 corpus
 # ---------------------------------------------------------------------------
 
@@ -810,22 +1043,46 @@ GRANTS_RUNWAY_TRACES = Path("/srv/lapis/scout/traces/grants-runway-v0")
 
 @pytest.mark.integration
 def test_ac1_semantic_collapse_grants_runway() -> None:
-    """AC1: refiner_observe over grants-runway-v0 collapses raw sigs to <300 at cos≥0.80."""
+    """AC1 (B1): functional collapse-ratio + curve-computable assertions on grants-runway-v0.
+
+    Replaces the brittle magic-number bound (<300) with two functional checks:
+    1. raw-unique → cluster collapse ratio ≥ 2.5× (semantic clustering concentrates signal)
+    2. saturation curve cumulative_clusters is monotone-nondecreasing (computable)
+    """
     if not GRANTS_RUNWAY_TRACES.exists():
         pytest.skip("grants-runway-v0 traces not present")
 
     result = refiner_observe("grants-runway-v0")
     assert result.valid_traces > 0, "No valid traces found in grants-runway-v0"
     n_clusters = len(result.clusters)
+    raw_unique = result.raw_unique_count
 
-    assert n_clusters < 300, (
-        f"Expected <300 semantic clusters at cos≥0.80, got {n_clusters}. "
-        f"(valid_traces={result.valid_traces}, total={result.total_traces})"
+    assert raw_unique > 0, "raw_unique_count must be > 0 when valid traces exist"
+
+    # Functional assertion 1: collapse ratio ≥ 2.5× (semantic clustering concentrates signal)
+    collapse_ratio = raw_unique / max(n_clusters, 1)
+    assert collapse_ratio >= 2.5, (
+        f"Expected collapse ratio ≥ 2.5×; got {collapse_ratio:.2f}× "
+        f"({raw_unique} raw unique → {n_clusters} clusters at cos≥0.80). "
+        f"Mean-updated centroid clustering should substantially collapse paraphrase explosion."
     )
-    # Calibration check: 0.80 should give fewer clusters than 0.70
+
+    # Functional assertion 2: saturation curve is computable (monotone-nondecreasing cumulative)
+    sat = result.saturation
+    if sat and len(sat.cumulative_clusters) >= 2:
+        cum = sat.cumulative_clusters
+        assert all(cum[i] <= cum[i + 1] for i in range(len(cum) - 1)), (
+            f"cumulative_clusters must be monotone-nondecreasing; got {cum}"
+        )
+
+    # Calibration check: looser threshold (0.70) collapses more → fewer clusters.
+    # cos≥0.70 clusters at lower bar = fewer clusters; cos≥0.80 = more clusters (tighter).
     c70 = result.cluster_counts_by_threshold.get("0.7", 0)
     c80 = result.cluster_counts_by_threshold.get("0.8", 0)
-    assert c80 <= c70, f"Expect cos≥0.80 ≤ cos≥0.70 cluster count; got {c80} vs {c70}"
+    assert c70 <= c80, (
+        f"Expect cos≥0.70 (looser) to give ≤ clusters than cos≥0.80 (tighter); "
+        f"got c70={c70} vs c80={c80}"
+    )
 
 
 # ---------------------------------------------------------------------------

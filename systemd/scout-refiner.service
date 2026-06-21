@@ -1,0 +1,21 @@
+[Unit]
+Description=Scout Refiner — nightly observe→refine→salience pass over Scout + Backcaster corpora
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/data/agents
+ExecStart=/usr/local/bin/wake-and-run /usr/local/bin/lapis-pm scout refiner
+Environment=PYTHONPATH=/home/user/.local/lib/python3.12/site-packages
+Environment=LAPIS_SCOUT_HEALTH_URL=http://203.0.113.12:8081/health
+EnvironmentFile=/data/agents/config/conductor.env
+TimeoutStartSec=14400
+
+# Refine leg routes through call_operator('gravitywell', on_wake_fail='skip').
+# If GW is down the run degrades to observe-only (gw_skipped=True) — never blocks.
+# Zero paid spend; propose-only invariant preserved (no scaffold YAML mutated).
+
+[Install]
+WantedBy=multi-user.target

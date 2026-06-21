@@ -69,6 +69,36 @@ _REPO_RE = re.compile(
 
 _POLL_CADENCE_S = 10  # fixed per Invariant 8
 _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT = 900  # seconds; longer than a normal ~12-min review
+_ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
+
+
+def _swarm_serving(
+    swarm_url: str = "http://127.0.0.1:8000",
+    timeout_s: float = 4.0,
+) -> bool:
+    """Check if swarm is serving via fast liveness probes.
+
+    Probes /health (200) and /v1/models (200 + non-empty data).
+    Returns True only if both succeed within timeout.
+    Gates the enqueue so a not-live swarm path costs ~4s probe, not the full poll.
+    """
+    try:
+        import requests as _requests
+        health_resp = _requests.get(f"{swarm_url}/health", timeout=timeout_s / 2)
+        if health_resp.status_code != 200:
+            return False
+        models_resp = _requests.get(f"{swarm_url}/v1/models", timeout=timeout_s / 2)
+        if models_resp.status_code != 200:
+            return False
+        try:
+            models_json = models_resp.json()
+            if not models_json or (isinstance(models_json, dict) and not models_json.get("data")):
+                return False
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1344,6 +1374,203 @@ def run_spec_review(
             # (Facets finding #3 / Trickster: dynamic timeout propagation)
             os.environ["SHARED_DELIBERATION_COUNCIL_TIMEOUT_S"] = str(timeout_s)
 
+            # Pre-grounding step: elevator integration (ELEVATOR_ACTIVE-gated).
+            # Runs BEFORE DeliberationRequest construction; outcome sets grounding_result_file.
+            # Held path (ELEVATOR_ACTIVE != "true"): grounding_result_file=None, no enqueue.
+            import tempfile as _tempfile
+            grounding_result_file: str | None = None
+            _grounding_tmp: str | None = None  # track for cleanup
+            grounding_path: str = "inline:not-attempted"
+
+            elevator_active = os.getenv("ELEVATOR_ACTIVE") == "true"
+            if elevator_active:
+                elevator_store_url = os.getenv("ELEVATOR_STORE_URL", "http://127.0.0.1:8405")
+                elevator_poll_timeout_sec = int(
+                    os.getenv("ELEVATOR_GROUNDING_POLL_TIMEOUT_SEC", "180")
+                )
+                elevator_claim_deadline_sec = int(
+                    os.getenv("ELEVATOR_GROUNDING_CLAIM_DEADLINE_SEC", "75")
+                )
+
+                # Step 0: Readiness pre-check — probe _swarm_serving() (~4s).
+                if not _swarm_serving():
+                    grounding_path = "inline:swarm-not-serving"
+                    print(
+                        "[spec-review:elevator-grounding] swarm not serving (pre-check ~4s); "
+                        "falling back to inline grounding",
+                        file=sys.stderr,
+                    )
+                else:
+                    try:
+                        import requests as _requests
+
+                        # Step 1: Enqueue grounding item.
+                        target_repo_path = f"/srv/git/{repo}-working"
+                        enqueue_payload = {
+                            "lane": "execution",
+                            "kind": "grounding",
+                            "payload": {
+                                "spec_text": spec_text,
+                                "target_repo": target_repo_path,
+                                "backend": "swarm",
+                            },
+                            "principal": "lapis-pm-spec-review",
+                            "latency_class": "batch",
+                        }
+                        enqueue_resp = _requests.post(
+                            f"{elevator_store_url}/v0/elevator/enqueue",
+                            json=enqueue_payload,
+                            timeout=10,
+                        )
+                        if enqueue_resp.status_code not in (200, 201):
+                            grounding_path = f"inline:enqueue-failed({enqueue_resp.status_code})"
+                            print(
+                                f"[spec-review:elevator-grounding] enqueue failed "
+                                f"({enqueue_resp.status_code}); falling back to inline",
+                                file=sys.stderr,
+                            )
+                        else:
+                            item_id = enqueue_resp.json().get("item_id")
+                            if not item_id:
+                                grounding_path = "inline:no-item-id"
+                                print(
+                                    "[spec-review:elevator-grounding] no item_id in enqueue response; "
+                                    "falling back to inline",
+                                    file=sys.stderr,
+                                )
+                            else:
+                                # Step 2: Poll with two deadlines.
+                                # Claim-progress deadline (AC5b): if item stays pending >
+                                # elevator_claim_deadline_sec, fall back immediately — guards
+                                # against an up-but-dead handler that would hang the full poll.
+                                poll_start = time.time()
+                                first_claim_seen = False
+                                while True:
+                                    elapsed = time.time() - poll_start
+                                    if elapsed >= elevator_poll_timeout_sec:
+                                        grounding_path = f"inline:poll-timeout({int(elapsed)}s)"
+                                        print(
+                                            f"[spec-review:elevator-grounding] poll timeout "
+                                            f"({int(elapsed)}s >= {elevator_poll_timeout_sec}s); "
+                                            "falling back to inline",
+                                            file=sys.stderr,
+                                        )
+                                        break
+                                    try:
+                                        poll_resp = _requests.get(
+                                            f"{elevator_store_url}/v0/elevator/item/{item_id}",
+                                            timeout=5,
+                                        )
+                                        if poll_resp.status_code == 200:
+                                            item_json = poll_resp.json()
+                                            item_status = item_json.get("status")
+                                            if item_status not in ("pending",):
+                                                first_claim_seen = True
+                                            if item_status == "served":
+                                                # Step 3: write-and-verify result file.
+                                                item_result = item_json.get("result")
+                                                if not item_result:
+                                                    grounding_path = "inline:grounding-empty"
+                                                    print(
+                                                        f"[spec-review:elevator-grounding] "
+                                                        f"item_id={item_id} served but result empty; "
+                                                        "falling back to inline",
+                                                        file=sys.stderr,
+                                                    )
+                                                else:
+                                                    try:
+                                                        import json as _json
+                                                        with _tempfile.NamedTemporaryFile(
+                                                            mode="w",
+                                                            suffix=".json",
+                                                            delete=False,
+                                                        ) as grf:
+                                                            if isinstance(item_result, str):
+                                                                grf.write(item_result)
+                                                            else:
+                                                                _json.dump(item_result, grf)
+                                                            _grounding_tmp = grf.name
+                                                        # Verify file exists and is non-empty.
+                                                        tmp_path_obj = Path(_grounding_tmp)
+                                                        if not tmp_path_obj.exists() or tmp_path_obj.stat().st_size == 0:
+                                                            grounding_path = "inline:grounding-write-failed"
+                                                            print(
+                                                                f"[spec-review:elevator-grounding] "
+                                                                f"temp file verify failed for item_id={item_id}; "
+                                                                "falling back to inline",
+                                                                file=sys.stderr,
+                                                            )
+                                                            _grounding_tmp = None
+                                                        else:
+                                                            grounding_result_file = _grounding_tmp
+                                                            grounding_path = f"swarm:{item_id}"
+                                                            print(
+                                                                f"[spec-review:elevator-grounding] "
+                                                                f"served item_id={item_id} "
+                                                                f"grounding_path={grounding_path}",
+                                                                file=sys.stderr,
+                                                            )
+                                                    except Exception as write_err:
+                                                        grounding_path = "inline:grounding-write-failed"
+                                                        print(
+                                                            f"[spec-review:elevator-grounding] "
+                                                            f"write/verify failed ({write_err}); "
+                                                            "falling back to inline",
+                                                            file=sys.stderr,
+                                                        )
+                                                        _grounding_tmp = None
+                                                break
+                                            elif item_status in ("failed", "expired"):
+                                                grounding_path = f"inline:item-{item_status}"
+                                                print(
+                                                    f"[spec-review:elevator-grounding] "
+                                                    f"item terminal status={item_status}; "
+                                                    "falling back to inline",
+                                                    file=sys.stderr,
+                                                )
+                                                break
+                                            # Check claim-progress deadline (AC5b).
+                                            elif not first_claim_seen and elapsed >= elevator_claim_deadline_sec:
+                                                grounding_path = "inline:swarm-stall-unclaimed"
+                                                print(
+                                                    f"[spec-review:elevator-grounding] "
+                                                    f"item_id={item_id} still pending after "
+                                                    f"{int(elapsed)}s (claim deadline "
+                                                    f"{elevator_claim_deadline_sec}s); "
+                                                    "falling back to inline grounding_path=inline:swarm-stall-unclaimed",
+                                                    file=sys.stderr,
+                                                )
+                                                break
+                                        else:
+                                            grounding_path = f"inline:poll-http-{poll_resp.status_code}"
+                                            print(
+                                                f"[spec-review:elevator-grounding] "
+                                                f"poll HTTP {poll_resp.status_code}; "
+                                                "falling back to inline",
+                                                file=sys.stderr,
+                                            )
+                                            break
+                                    except Exception as poll_err:
+                                        grounding_path = f"inline:poll-error({type(poll_err).__name__})"
+                                        print(
+                                            f"[spec-review:elevator-grounding] poll error {poll_err}; "
+                                            "falling back to inline",
+                                            file=sys.stderr,
+                                        )
+                                        break
+                                    time.sleep(_ELEVATOR_GROUNDING_POLL_CADENCE_S)
+                    except Exception as enq_err:
+                        grounding_path = f"inline:enqueue-error({type(enq_err).__name__})"
+                        print(
+                            f"[spec-review:elevator-grounding] {enq_err}; falling back to inline",
+                            file=sys.stderr,
+                        )
+
+                print(
+                    f"[spec-review:elevator-grounding] grounding_path={grounding_path}",
+                    file=sys.stderr,
+                )
+
             request = DeliberationRequest(
                 text=spec_text,
                 context={
@@ -1357,6 +1584,7 @@ def run_spec_review(
                 caller="spec-review",
                 council_voicing=council_voicing,
                 facets_operator=facets_operator,
+                grounding_result_file=grounding_result_file,
             )
 
             try:
@@ -1384,6 +1612,13 @@ def run_spec_review(
                 )
                 # Degrade gracefully: envelope will be None, council_raw will reflect the error below
                 envelope = None
+            finally:
+                # Clean up grounding temp file if one was created.
+                if _grounding_tmp:
+                    try:
+                        os.unlink(_grounding_tmp)
+                    except OSError:
+                        pass
 
         # 7. Collect GW Future (with bounded timeout)
         gw_text: str | None = None

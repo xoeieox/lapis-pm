@@ -1,6 +1,6 @@
 """Tests for elevator-based grounding producer in run_spec_review.
 
-Covers AC1-AC8 for lapis-pm-spec-review-grounding-on-swarm-v1.
+Covers AC1-AC9 for lapis-pm-spec-review-grounding-on-swarm-v1.
 Implementation: ELEVATOR_ACTIVE-gated pre-grounding step in run_spec_review,
 before DeliberationRequest construction. Sets grounding_result_file= on the
 request (not argv injection — H4 migration removed _dispatch_facets).
@@ -91,42 +91,6 @@ def mock_infra(monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
-# _swarm_serving unit tests
-# ---------------------------------------------------------------------------
-
-class TestSwarmServing:
-    def test_both_endpoints_ok(self):
-        with mock.patch("requests.get") as mock_get:
-            health = mock.Mock()
-            health.status_code = 200
-            models = mock.Mock()
-            models.status_code = 200
-            models.json.return_value = {"data": [{"id": "m1"}]}
-            mock_get.side_effect = [health, models]
-            assert spec_review._swarm_serving() is True
-
-    def test_health_fails(self):
-        with mock.patch("requests.get") as mock_get:
-            health = mock.Mock()
-            health.status_code = 503
-            mock_get.return_value = health
-            assert spec_review._swarm_serving() is False
-
-    def test_models_empty(self):
-        with mock.patch("requests.get") as mock_get:
-            health = mock.Mock()
-            health.status_code = 200
-            models = mock.Mock()
-            models.status_code = 200
-            models.json.return_value = {"data": []}
-            mock_get.side_effect = [health, models]
-            assert spec_review._swarm_serving() is False
-
-    def test_connection_error(self):
-        with mock.patch("requests.get", side_effect=ConnectionError()):
-            assert spec_review._swarm_serving() is False
-
 
 # ---------------------------------------------------------------------------
 # Integration: elevator grounding via run_spec_review
@@ -144,7 +108,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: swarm_serving)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: swarm_serving)
 
         post_mock = mock.Mock(return_value=enqueue_resp) if enqueue_resp else mock.Mock()
 
@@ -203,7 +167,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -241,7 +205,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -282,7 +246,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -316,7 +280,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -350,7 +314,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -385,7 +349,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -416,7 +380,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -452,7 +416,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -490,7 +454,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         enqueue_resp = mock.Mock()
         enqueue_resp.status_code = 201
@@ -521,7 +485,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: False)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: False)
 
         with mock.patch("requests.post", mock.Mock()):
             spec_review.run_spec_review(
@@ -545,7 +509,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: False)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: False)
 
         post_mock = mock.Mock()
         with mock.patch("requests.post", post_mock):
@@ -572,7 +536,7 @@ class TestElevatorGroundingV1:
             return _happy_envelope()
 
         monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
-        monkeypatch.setattr("lapis_pm.spec_review._swarm_serving", lambda: True)
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
 
         with mock.patch("requests.post", side_effect=ConnectionError("refused")):
             brief = spec_review.run_spec_review(
@@ -583,3 +547,45 @@ class TestElevatorGroundingV1:
 
         assert captured[0].grounding_result_file is None
         assert brief is not None
+
+
+# ---------------------------------------------------------------------------
+# AC9 — canonical probe symbol test
+# ---------------------------------------------------------------------------
+
+class TestAC9CanonicalProbe:
+    """AC9: The gate calls agents_core.llm.swarm_serving (not a local reimplementation)."""
+
+    def test_ac9_gate_uses_canonical_swarm_serving(self, spec_fixture, monkeypatch):
+        """AC9: Patch agents_core.llm.swarm_serving; confirm the gate honors it."""
+        monkeypatch.setenv("ELEVATOR_ACTIVE", "true")
+        monkeypatch.setenv("ELEVATOR_STORE_URL", "http://test-store:8405")
+
+        probe_called = []
+
+        def fake_swarm_serving():
+            probe_called.append(True)
+            return False  # fallback path — just need to confirm probe was invoked
+
+        # Patch the symbol as imported into spec_review (the canonical import site).
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", fake_swarm_serving)
+
+        def mock_deliberation(request):
+            return _happy_envelope()
+
+        monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_deliberation)
+
+        with mock.patch("requests.post", mock.Mock()):
+            spec_review.run_spec_review(
+                spec_path=spec_fixture,
+                dispatch_facets=True,
+                authority="advisory",
+            )
+
+        assert probe_called, "Gate did not call swarm_serving — canonical probe not wired"
+
+    def test_ac9_no_local_swarm_serving_function(self):
+        """AC9: No hand-rolled _swarm_serving() exists on the spec_review module."""
+        assert not hasattr(spec_review, "_swarm_serving"), (
+            "_swarm_serving() still exists on spec_review — must use canonical agents_core.llm.swarm_serving"
+        )

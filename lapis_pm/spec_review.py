@@ -38,6 +38,7 @@ from agents_core.shared_deliberation.orchestrator import (
     init_facets_semaphore,
 )
 from agents_core.shared_deliberation.envelope import DeliberationRequest
+from agents_core.llm import swarm_serving
 
 
 # ---------------------------------------------------------------------------
@@ -71,34 +72,6 @@ _POLL_CADENCE_S = 10  # fixed per Invariant 8
 _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT = 900  # seconds; longer than a normal ~12-min review
 _ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
 
-
-def _swarm_serving(
-    swarm_url: str = "http://127.0.0.1:8000",
-    timeout_s: float = 4.0,
-) -> bool:
-    """Check if swarm is serving via fast liveness probes.
-
-    Probes /health (200) and /v1/models (200 + non-empty data).
-    Returns True only if both succeed within timeout.
-    Gates the enqueue so a not-live swarm path costs ~4s probe, not the full poll.
-    """
-    try:
-        import requests as _requests
-        health_resp = _requests.get(f"{swarm_url}/health", timeout=timeout_s / 2)
-        if health_resp.status_code != 200:
-            return False
-        models_resp = _requests.get(f"{swarm_url}/v1/models", timeout=timeout_s / 2)
-        if models_resp.status_code != 200:
-            return False
-        try:
-            models_json = models_resp.json()
-            if not models_json or (isinstance(models_json, dict) and not models_json.get("data")):
-                return False
-        except Exception:
-            return False
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1392,8 +1365,8 @@ def run_spec_review(
                     os.getenv("ELEVATOR_GROUNDING_CLAIM_DEADLINE_SEC", "75")
                 )
 
-                # Step 0: Readiness pre-check — probe _swarm_serving() (~4s).
-                if not _swarm_serving():
+                # Step 0: Readiness pre-check — canonical probe (~4s, SWARM_URL/GW_URL-aware).
+                if not swarm_serving():
                     grounding_path = "inline:swarm-not-serving"
                     print(
                         "[spec-review:elevator-grounding] swarm not serving (pre-check ~4s); "

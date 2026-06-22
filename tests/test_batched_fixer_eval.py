@@ -1014,40 +1014,63 @@ def test_ach1_mock_mode_skips_probe(tmp_path, monkeypatch):
     assert probe_called == [], "mock mode must not call launder_intent with mock_mode=False"
 
 
-def test_ach2_launder_status_fallback_counted(monkeypatch):
-    """AC-H2: build_corpus tracks laundering_total and laundering_fallback_count."""
+def test_ach2_launder_status_fallback_counted(monkeypatch, tmp_path):
+    """AC-H2: build_corpus behaviorally tracks laundering_total and laundering_fallback_count.
+
+    Drives the real extraction loop via a tiny git repo with 5 fix commits so the
+    laundering counters (lines ~1108-1110 of batched_fixer_eval.py) are actually exercised.
+    """
     import lapis_pm.batched_fixer_eval as bfe
+
+    # Build a tiny git repo with N fix commits that pass all corpus-extraction filters.
+    fake_repo = tmp_path / "fake_repo"
+    fake_repo.mkdir()
+    subprocess.run(["git", "init", str(fake_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=fake_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=fake_repo, check=True, capture_output=True)
+    (fake_repo / "module.py").write_text("def foo():\n    return 'init'\n")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=fake_repo, check=True, capture_output=True)
+
+    n_fix_commits = 5
+    for i in range(n_fix_commits):
+        # Enough changed lines (>2) to pass the trivial-drop filter; unique content per
+        # commit so the MD5-dedup step doesn't squash them.
+        content = f"def foo():\n    return '{i}'\n" + "".join(f"# v{i}_{j}\n" for j in range(4))
+        (fake_repo / "module.py").write_text(content)
+        subprocess.run(["git", "add", "."], cwd=fake_repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"fix: broken behavior revision {i}"],
+            cwd=fake_repo, check=True, capture_output=True,
+        )
+
+    # Redirect repos: only fake_repo (conductor path nonexistent → skipped).
+    monkeypatch.setattr(bfe, "LAPIS_PM_REPO", fake_repo)
+    monkeypatch.setattr(bfe, "CONDUCTOR_REPO", tmp_path / "nonexistent")
 
     call_count = [0]
 
     def _mixed_launder(raw, mock_mode=False):
         call_count[0] += 1
-        # Even calls succeed (gw), odd calls fall back
+        # Even calls → gw, odd calls → fallback
         if call_count[0] % 2 == 0:
             return f"[GW] {raw[:50]}", "gw"
         return raw, "fallback"
 
-    # Patch at the module level so build_corpus's inner closure picks it up
     monkeypatch.setattr(bfe, "launder_intent", _mixed_launder)
 
-    # Build a minimal mock corpus (3 fixtures) via mock_corpus path to bypass git
-    fixtures = [
-        FixtureRecord(
-            repo="lapis-pm", sha=f"sha{i:04d}", parent_sha=f"p{i:04d}",
-            pr_number=None, path="x.py", file_loc="unknown", changed_lines=5, tier="T1",
-            task_intent_raw=f"raw {i}", task_intent_paraphrased=f"[Symptom] {i}",
-        )
-        for i in range(3)
-    ]
-    result, meta = bfe.build_corpus(mock_corpus=fixtures)
-    # mock_corpus path returns immediately — laundering is not called here
-    assert meta["source"] == "mock"
-    # Now verify the metadata keys exist in a real (non-mock-corpus) build via inspection
-    import inspect
-    src = inspect.getsource(bfe.build_corpus)
-    assert "laundering_total" in src
-    assert "laundering_fallback_count" in src
-    assert "launder_status" in src
+    _, meta = bfe.build_corpus(skip_base_runs=True)
+
+    # All 5 fix commits must reach the laundering step.
+    assert meta["laundering_total"] == n_fix_commits, (
+        f"Expected laundering_total={n_fix_commits}, got {meta['laundering_total']}"
+    )
+    # Odd-numbered calls (1, 3, 5) return "fallback" → 3 out of 5.
+    expected_fallbacks = (n_fix_commits + 1) // 2
+    assert meta["laundering_fallback_count"] == expected_fallbacks, (
+        f"Expected laundering_fallback_count={expected_fallbacks}, got {meta['laundering_fallback_count']}"
+    )
+    assert call_count[0] == n_fix_commits
 
 
 def test_ach2_fallback_warning_printed_to_stderr(monkeypatch, capsys, tmp_path):

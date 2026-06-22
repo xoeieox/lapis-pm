@@ -82,6 +82,7 @@ def _run(argv: list[str], targets_dir: Path) -> tuple[int, str, str]:
         patch("lapis_pm.cli.episodic.spec", return_value=None),
         patch("lapis_pm.cli.episodic.write_spec", return_value=None),
         patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
         redirect_stdout(out_buf),
         redirect_stderr(err_buf),
     ):

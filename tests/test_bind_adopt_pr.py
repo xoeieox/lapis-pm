@@ -69,6 +69,8 @@ def _run_bind(
         patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
         patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
         patch("lapis_pm.cli.emit_decision_kickoff", return_value=None),
+        # Mock existence probe so tests don't depend on Forgejo connectivity.
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
     ]
     if fake_pr_data is not None:
         ctx_patches.append(patch("agents_core.forgejo.get_pr", return_value=fake_pr_data))

@@ -592,13 +592,15 @@ def slice_pre_state_from_diff(
 def validate_corpus_power_floor(
     corpus: list[FixtureRecord],
     tier_floor: int = CORPUS_HOLDOUT_PER_TIER,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Validate corpus meets the holdout power floor.
 
-    Checks 3-tier floor (≥tier_floor per T1/T2/T3) first.
-    Falls back to coarse binary (small=T1 vs larger=T2+T3).
+    Checks strict 3-tier floor first (ALL of {T1,T2,T3} present AND each ≥ floor).
+    A corpus missing any tier routes to coarse binary (T1 vs T2+T3).
     Raises ValueError if neither floor is satisfiable.
-    Returns per-tier holdout counts on success (AC1b).
+
+    Returns per-tier holdout counts plus "_shape" key ("3-tier" or "coarse-binary").
+    Callers should treat "_shape" as metadata; tier keys are the holdout counts.
     """
     holdout_by_tier: dict[str, int] = defaultdict(int)
     for f in corpus:
@@ -606,14 +608,17 @@ def validate_corpus_power_floor(
             holdout_by_tier[f.tier] += 1
 
     present_tiers = {f.tier for f in corpus}
+    required_tiers = {"T1", "T2", "T3"}
 
-    # 3-tier floor check
-    three_tier_ok = all(
-        holdout_by_tier.get(t, 0) >= tier_floor
-        for t in present_tiers
-    )
-    if three_tier_ok and present_tiers:
-        return dict(holdout_by_tier)
+    # Strict 3-tier floor: ALL three tiers must be present AND each meet the floor.
+    # A corpus missing any tier is NOT reported 3-tier regardless of per-tier counts.
+    if (
+        present_tiers >= required_tiers
+        and all(holdout_by_tier.get(t, 0) >= tier_floor for t in required_tiers)
+    ):
+        result = dict(holdout_by_tier)
+        result["_shape"] = "3-tier"
+        return result
 
     # Coarse binary: T1 (small-single-file) vs T2+T3 (larger/cross-cutting)
     small_n = holdout_by_tier.get("T1", 0)
@@ -623,7 +628,9 @@ def validate_corpus_power_floor(
             "3-tier floor not met; collapsed to coarse binary (T1=%d, T2+T3=%d)",
             small_n, larger_n,
         )
-        return dict(holdout_by_tier)
+        result = dict(holdout_by_tier)
+        result["_shape"] = "coarse-binary"
+        return result
 
     raise ValueError(
         f"Corpus power floor not met: holdouts by tier = {dict(holdout_by_tier)}, "
@@ -799,11 +806,14 @@ def classify_checker_class(
 def launder_intent(
     task_intent_raw: str,
     mock_mode: bool = False,
-) -> str:
+) -> tuple[str, Literal["gw", "fallback", "mock"]]:
     """Rewrite task intent as a from-symptom description with solution-naming stripped.
 
     Real mode: calls call_operator('gravitywell', ...) — zero paid, local 122B.
     Mock mode (AC2 testing / CI): returns a stub paraphrase without calling GW.
+
+    Returns (paraphrased, status) where status is "gw", "fallback", or "mock".
+    Callers must track status to detect contamination (raw-body fallback = contaminated).
 
     The harness ALWAYS feeds task_intent_paraphrased (never raw commit body) to the
     fixer model. This code-path must exist even when the call is mocked (AC2).
@@ -812,7 +822,8 @@ def launder_intent(
         # MOCK: strip Co-Authored-By trailers and obvious solution-naming; never return raw verbatim
         cleaned = re.sub(r"\nCo-Authored-By:.*", "", task_intent_raw, flags=re.DOTALL).strip()
         cleaned = re.sub(r"PR #\d+", "", cleaned).strip()
-        return f"[Symptom] {cleaned[:200]}" if cleaned else "[Symptom: unspecified]"
+        paraphrased = f"[Symptom] {cleaned[:200]}" if cleaned else "[Symptom: unspecified]"
+        return paraphrased, "mock"
 
     try:
         from agents_core.llm import call_operator
@@ -826,11 +837,13 @@ def launder_intent(
             "Rewritten symptom description (no solution-naming):"
         )
         result = call_operator("gravitywell", prompt)
-        return result.strip() if result else task_intent_raw
+        paraphrased = result.strip() if result else task_intent_raw
+        return paraphrased, "gw"
     except Exception as exc:
         logger.warning("Intent laundering failed: %s; using cleaned raw", exc)
         cleaned = re.sub(r"\nCo-Authored-By:.*", "", task_intent_raw, flags=re.DOTALL).strip()
-        return cleaned[:500] if cleaned else task_intent_raw
+        paraphrased = cleaned[:500] if cleaned else task_intent_raw
+        return paraphrased, "fallback"
 
 
 def check_laundering_quality(
@@ -912,6 +925,8 @@ def build_corpus(
         "flaky_target_quarantine_count": 0,
         "flaky_excluded_count_lapis_pm": 0,
         "flaky_excluded_count_conductor": 0,
+        "laundering_total": 0,
+        "laundering_fallback_count": 0,
     }
 
     repos = [
@@ -1087,9 +1102,12 @@ def build_corpus(
                         is_reviewer_cycle = False
 
                     # Intent laundering (code-path always exists; call mocked in CI)
-                    task_intent_paraphrased = launder_intent(
+                    task_intent_paraphrased, launder_status = launder_intent(
                         task_intent_raw, mock_mode=launder_mock_mode
                     )
+                    metadata["laundering_total"] += 1
+                    if launder_status == "fallback":
+                        metadata["laundering_fallback_count"] += 1
 
                     # Scoped test files (grep importers of changed symbols)
                     scoped_test_files = find_scoped_test_files(repo_path, path)
@@ -1536,6 +1554,20 @@ def generate_report(
 
 
 # ---------------------------------------------------------------------------
+# Corpus manifest helper
+# ---------------------------------------------------------------------------
+
+
+def _write_corpus_manifest(metadata: dict[str, Any]) -> None:
+    """Write corpus metadata to _manifest.json in CORPUS_DIR for ratification checkpoint."""
+    CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_path = CORPUS_DIR / "_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
+    logger.info("Corpus manifest written: %s", manifest_path)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -1558,8 +1590,36 @@ def run_eval(
 
     try:
         if phase == "build-corpus":
+            # Startup probe: verify GW laundering is live before building anything (real mode only).
+            # A down or wrong-mode GW causes every fixture to silently use raw-body intent
+            # (contaminated). Fail loud before building, not after.
+            if not mock_mode:
+                _, probe_status = launder_intent("probe", mock_mode=False)
+                if probe_status == "fallback":
+                    raise RuntimeError(
+                        "GW not serving big-122B — intent-laundering would silently degrade to "
+                        "raw-body (contaminated) intent. Wake GW and run `gw-serve big`, confirm "
+                        "doorman /status serving:true, then re-run build-corpus."
+                    )
+
             corpus, metadata = build_corpus(launder_mock_mode=mock_mode)
-            validate_corpus_power_floor(corpus)
+
+            floor_result = validate_corpus_power_floor(corpus)
+            corpus_shape = floor_result.pop("_shape", "unknown")
+            metadata["corpus_shape"] = corpus_shape
+
+            # Surface contamination loudly — a buried logger.warning is not enough.
+            fallback_count = metadata.get("laundering_fallback_count", 0)
+            if fallback_count > 0:
+                total = metadata.get("laundering_total", 0)
+                print(
+                    f"\n⚠ CONTAMINATED CORPUS: {fallback_count}/{total} fixtures used "
+                    f"raw-body intent (laundering fallback). The PM checkpoint must require "
+                    f"this be 0; re-run with GW serving big.",
+                    file=sys.stderr,
+                )
+
+            _write_corpus_manifest(metadata)
             save_corpus(corpus)
             logger.info("Corpus built: %d fixtures, metadata: %s", len(corpus), metadata)
             return None
@@ -1599,6 +1659,8 @@ def run_eval(
             logger.warning("Report phase is DEFERRED (AC12) — implemented in follow-on leg")
             return None
 
+    except RuntimeError:
+        raise
     except Exception as exc:
         logger.exception("Eval phase %s failed: %s", phase, exc)
         return None

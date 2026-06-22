@@ -111,9 +111,10 @@ def cmd_bind(args) -> int:
     _adopted_pr_number: int | None = getattr(args, "adopt_pr", None)
     _adopted_head_branch: str = ""
     if _adopted_pr_number is not None:
+        _adopt_repo_name, _adopt_owner = pm_core._repo_owner(args.repo)
         try:
             from agents_core.forgejo import get_pr as _get_pr
-            _adopted_pr_data = _get_pr(args.repo, _adopted_pr_number)
+            _adopted_pr_data = _get_pr(_adopt_repo_name, _adopted_pr_number, owner=_adopt_owner)
         except Exception as e:
             print(
                 f"ERROR: failed to fetch PR #{_adopted_pr_number} from {args.repo!r}: {e}",
@@ -132,10 +133,10 @@ def cmd_bind(args) -> int:
         _pr_base_repo = (
             (_adopted_pr_data.get("base") or {}).get("repo") or {}
         ).get("name", "")
-        if _pr_base_repo and _pr_base_repo != args.repo:
+        if _pr_base_repo and _pr_base_repo != _adopt_repo_name:
             print(
                 f"ERROR: PR #{_adopted_pr_number} base repo is {_pr_base_repo!r} "
-                f"but --repo is {args.repo!r}",
+                f"but --repo resolves to {_adopt_repo_name!r}",
                 file=sys.stderr,
             )
             return 2
@@ -148,6 +149,30 @@ def cmd_bind(args) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    # Probe that the repo resolves under its owner before mutating any state (Defect B guard).
+    _bind_repo_name, _bind_owner = pm_core._repo_owner(args.repo)
+    try:
+        from agents_core.forgejo import get_open_prs as _forgejo_probe
+        _forgejo_probe(_bind_repo_name, owner=_bind_owner)
+    except Exception as _probe_err:
+        import httpx as _httpx
+        if isinstance(_probe_err, _httpx.HTTPStatusError) and _probe_err.response.status_code == 404:
+            _resolved = f"{_bind_owner or 'Erah'}/{_bind_repo_name}"
+            print(
+                f"ERROR: repo '{_resolved}' not found on Forgejo. "
+                f"If this repo lives under an org, bind with the full "
+                f"'<org>/{_bind_repo_name}' (e.g. 'lapis/{_bind_repo_name}'), "
+                f"not the bare name. Bind aborted; nothing was written.",
+                file=sys.stderr,
+            )
+            return 2
+        # Connectivity error (not 404) — warn and proceed so offline BRIX does not block binds.
+        print(
+            f"WARNING: could not verify repo existence (Forgejo unreachable): "
+            f"{_probe_err}; proceeding",
+            file=sys.stderr,
+        )
 
     store = TargetStore()
 

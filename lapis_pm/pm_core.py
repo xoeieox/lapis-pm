@@ -73,6 +73,10 @@ except Exception:
 # registry.yaml crashes the daemon immediately, not at first dispatch.
 _SHAPER = Shaper(Path(__file__).parent / "registry.yaml")
 
+# Targets for which a config-404 (repo-unresolved) signal has already been
+# emitted this process lifetime. Prevents per-tick spam on persistent mis-binding.
+_repo_unresolved_signalled: set[str] = set()
+
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 COMPLETED_DIR = Path("/srv/lapis/gpu-queue/completed")
@@ -2409,6 +2413,26 @@ def _perceive_prs(
         repo_name, owner = _repo_owner(repo)
         prs = get_open_prs(repo_name, owner=owner)
     except Exception as e:
+        try:
+            import httpx as _httpx
+            _is_404 = isinstance(e, _httpx.HTTPStatusError) and e.response.status_code == 404
+        except Exception:
+            _is_404 = False
+        if _is_404:
+            # Config-level 404: the bound repo does not resolve. Emit a distinct loud
+            # signal once per process lifetime so the daemon does not silently loop.
+            if target_id not in _repo_unresolved_signalled:
+                _repo_unresolved_signalled.add(target_id)
+                _resolved = f"{owner or 'Erah'}/{repo_name}"
+                episodic.write_observation(
+                    target_id,
+                    f"[REPO-UNRESOLVED] PR fetch returned 404 for {_resolved!r} — "
+                    f"this repo does not exist under its resolved owner. "
+                    f"Rebind with the correct '<org>/repo' form to fix: "
+                    f"`lapis-pm bind {target_id} --force --repo lapis/{repo_name}`",
+                    extra_tags=["pm:error", "pm:repo-unresolved"],
+                )
+            return [], False
         episodic.write_observation(
             target_id, f"PR fetch failed for {repo}: {e}",
             extra_tags=["pm:error"],

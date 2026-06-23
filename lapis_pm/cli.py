@@ -606,6 +606,7 @@ def cmd_unbind(args) -> int:
     target.unbind_pm()
     target.save()
     pm_core.clear_classified_prs(args.target_id)
+    pm_core.clear_outstanding_brief(args.target_id, reason="unbind")
     print(f"Unbound {args.target_id}")
     return 0
 

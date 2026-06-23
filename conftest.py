@@ -22,9 +22,13 @@ import site as _site
 # /data/slots/slots.db. Set only if a test runner hasn't already pinned them.
 _test_substrate_dir = tempfile.mkdtemp(prefix="lapis-pm-test-substrate-")
 # Unconditional set — silently no-op'ing on already-exported vars risks writes to
-# /data/zephyr/attribution.db and /data/slots/slots.db (the production DBs).
+# /data/zephyr/attribution.db, /data/slots/slots.db, and /data/memory/mem.db.
 os.environ["ZEPHYR_ATTRIBUTION_DB"] = os.path.join(_test_substrate_dir, "attribution.db")
 os.environ["SLOTS_DB_PATH"] = os.path.join(_test_substrate_dir, "slots.db")
+# MEM_DB_PATH must be set before agents_core.mem is first imported (it resolves
+# DB_PATH at module load time). Setting it here — before sys.path manipulation and
+# any pytest import — mirrors the ZEPHYR_ATTRIBUTION_DB / SLOTS_DB_PATH pattern.
+os.environ["MEM_DB_PATH"] = os.path.join(_test_substrate_dir, "mem.db")
 
 _site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
 
@@ -101,3 +105,23 @@ def _clear_tick_corr_cache():
     pm_core._tick_corr_cache.clear()
     yield
     pm_core._tick_corr_cache.clear()
+
+
+@_pytest.fixture(autouse=True)
+def _isolate_comment_store(monkeypatch, tmp_path):
+    """Redirect lapis_pm.episodic._store to a per-test tmp CommentStore.
+
+    Without this, any code path that calls episodic.write_observation / write_dispatch /
+    write_result / etc. (all delegate to _store()) writes to the production
+    /srv/lapis/targets/comments/ directory. Tests that exercise _set_brief_outstanding with
+    a synthesis-failed brief are the canonical leaker (pm:synthesis-failed observations
+    for my-target). This autouse fixture ensures every test gets an isolated store.
+    """
+    try:
+        from agents_core.comments import CommentStore
+        from lapis_pm import episodic
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(episodic, "_store", lambda: CommentStore(root=tmp_path))
+    yield

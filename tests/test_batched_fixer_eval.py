@@ -1501,6 +1501,64 @@ def test_aco2_verify_fail_first_blind_when_test_passes_at_parent(tmp_path):
     assert is_flaky is False
 
 
+def test_aco2_verify_fail_first_error_first_discriminates(tmp_path):
+    """AC-W2: verify_fail_first returns (True, True, False) when test ERRORS on unpatched source.
+
+    A co-committed test importing a new symbol (absent at parent) raises ImportError during
+    collection. Error-tolerant fail-first treats collection error as the fail-first signal:
+    the test cannot pass without the fix.
+    """
+    import subprocess as sp
+    from lapis_pm.batched_fixer_eval import verify_fail_first, dedicated_clone
+
+    repo = tmp_path / "repo_error_first"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    # Parent: source.py without get_new
+    (repo / "source.py").write_text("def get_value():\n    return 'old'\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    parent_sha = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Test diff: imports get_new (ImportError at parent, passes after source fix)
+    golden_test_diff = (
+        "diff --git a/test_source.py b/test_source.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/test_source.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+from source import get_new\n"
+        "+def test_get_new():\n"
+        "+    assert get_new() == 'fixed'\n"
+    )
+    golden_source_diff = (
+        "diff --git a/source.py b/source.py\n"
+        "--- a/source.py\n"
+        "+++ b/source.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " def get_value():\n"
+        "     return 'old'\n"
+        "+def get_new():\n"
+        "+    return 'fixed'\n"
+    )
+    golden_test_ids = ["test_source.py::test_get_new"]
+
+    with dedicated_clone(repo, "test-ff-error") as clone_path:
+        ff_confirmed, sanity_pass, is_flaky = verify_fail_first(
+            clone_path, parent_sha, golden_test_diff, golden_source_diff,
+            golden_test_ids, n=3,
+        )
+
+    assert ff_confirmed is True, "ImportError on unpatched source must confirm fail-first (error-tolerant)"
+    assert sanity_pass is True, "Test must pass after source fix applied"
+    assert is_flaky is False
+
+
 # AC-O3: co-committed test execute oracle
 
 @pytest.fixture
@@ -1851,6 +1909,96 @@ def test_aco3_classify_golden_blind_no_ids():
         golden_test_ids=[],
     )
     assert outcome == "blind"
+
+
+# ---------------------------------------------------------------------------
+# AC-W3: real-git build corpus extraction guard
+# ---------------------------------------------------------------------------
+
+
+def test_acw3_build_corpus_real_git_extraction(tmp_path):
+    """AC-W3: build_corpus populates golden_test_diff/golden_test_ids from real git extraction,
+    and error-tolerant fail-first classifies the error-first fix+test commit as DISCRIMINATES.
+
+    Closes the synthetic-fixture gap: exercises the EXTRACTION path (git show +
+    split_diff_by_type + extract_test_ids_from_diff) and the full classify path end-to-end.
+    Prior to this fix, golden_test_diff was empty for all 50 corpus fixtures because the
+    extraction was never exercised by a real-git test.
+    """
+    import subprocess as sp
+
+    repo = tmp_path / "repo_acw3"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    # Initial commit: source only
+    (repo / "source.py").write_text("def get_value():\n    return 'old'\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+    # Commit 1: fix + co-committed test (test imports get_new → ImportError at parent → DISCRIMINATES)
+    (repo / "source.py").write_text(
+        "def get_value():\n    return 'old'\n\ndef get_new():\n    return 'fixed'\n"
+    )
+    (repo / "test_source.py").write_text(
+        "from source import get_new\ndef test_get_new():\n    assert get_new() == 'fixed'\n"
+    )
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(
+        ["git", "commit", "-m", "fix: add get_new with co-committed test"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+    # Commit 2: source-only fix (→ UNTESTED)
+    (repo / "source.py").write_text(
+        "def get_value():\n    return 'old'\n\ndef get_new():\n    return 'fixed'\n"
+        "\ndef helper():\n    pass\n"
+    )
+    sp.run(["git", "add", "source.py"], cwd=repo, check=True, capture_output=True)
+    sp.run(
+        ["git", "commit", "-m", "fix: add helper function"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+    corpus, _meta = build_corpus(
+        repos=[(repo, "test-repo")],
+        launder_mock_mode=True,
+        skip_base_runs=False,
+        target_size=100,
+    )
+
+    fix_test_fixtures = [f for f in corpus if f.golden_test_diff]
+    source_only_fixtures = [f for f in corpus if not f.golden_test_diff]
+
+    # Extraction: golden_test_diff and golden_test_ids populated from real git commit
+    assert fix_test_fixtures, "Extraction must populate golden_test_diff for fix+test commit"
+    ft = fix_test_fixtures[0]
+    assert "test_source.py" in ft.golden_test_diff, (
+        f"golden_test_diff must contain the test file hunk; got: {ft.golden_test_diff[:200]!r}"
+    )
+    assert ft.golden_test_ids == ["test_source.py::test_get_new"], (
+        f"Wrong golden_test_ids: {ft.golden_test_ids}"
+    )
+    assert ft.golden_source_diff, "golden_source_diff must be non-empty"
+
+    # Error-tolerant fail-first: ImportError on unpatched → DISCRIMINATES (AC-W2)
+    assert ft.fail_first_confirmed is True, (
+        "ImportError on unpatched source must confirm fail-first"
+    )
+    assert ft.checker_class == "DISCRIMINATES", (
+        f"Error-first fix+test must classify DISCRIMINATES; got {ft.checker_class!r}"
+    )
+
+    # Source-only commit: no test fields, UNTESTED
+    assert source_only_fixtures, "Source-only commit must appear in corpus"
+    so = source_only_fixtures[0]
+    assert so.golden_test_diff == "", "Source-only commit must have empty golden_test_diff"
+    assert so.golden_test_ids == [], "Source-only commit must have empty golden_test_ids"
+    assert so.checker_class == "UNTESTED", (
+        f"Source-only commit must be UNTESTED; got {so.checker_class!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -853,6 +853,12 @@ def run_scoped_tests_once(
             timeout=timeout,
         )
         failures = parse_pytest_failures(result.stdout + result.stderr)
+        if result.returncode in (2, 4) and not failures:
+            # Pytest exited without individual test results: returncode 2 = interrupted
+            # (collection error on file), returncode 4 = no collectors found for the
+            # specified node ID (also a collection/import error). Both mean the test
+            # cannot be run without the fix (e.g. ImportError for a new symbol).
+            return [], "collection-error"
         return failures, "ran"
     except subprocess.TimeoutExpired:
         logger.warning("Test run timed out in %s", wt_path)
@@ -955,6 +961,12 @@ def verify_fail_first(
                 failures, outcome = run_scoped_tests_once(wt_path, golden_test_ids)
                 if outcome in ("timeout", "error"):
                     logger.warning("verify_fail_first: run %d outcome %r; skipping", i, outcome)
+                    continue
+                if outcome == "collection-error":
+                    # Import/collection error on unpatched source: the test cannot be
+                    # collected without the fix. Treat all golden tests as "failed" —
+                    # error-or-fail on unpatched source is the fail-first signal (AC-W2).
+                    step1_results.append(list(golden_test_ids))
                     continue
                 step1_results.append(failures)
         except Exception as exc:
@@ -1142,6 +1154,7 @@ def build_corpus(
     mock_corpus: Optional[list[FixtureRecord]] = None,
     launder_mock_mode: bool = False,
     skip_base_runs: bool = False,
+    repos: Optional[list[tuple[Path, str]]] = None,
 ) -> tuple[list[FixtureRecord], dict[str, Any]]:
     """Build the frozen fixture corpus from git history.
 
@@ -1174,10 +1187,11 @@ def build_corpus(
         "laundering_fallback_count": 0,
     }
 
-    repos = [
-        (LAPIS_PM_REPO, "lapis-pm"),
-        (CONDUCTOR_REPO, "conductor"),
-    ]
+    if repos is None:
+        repos = [
+            (LAPIS_PM_REPO, "lapis-pm"),
+            (CONDUCTOR_REPO, "conductor"),
+        ]
 
     seen_diffs: set[str] = set()
     fix_pattern = re.compile(r"^fix[\(\:\s]", re.IGNORECASE)

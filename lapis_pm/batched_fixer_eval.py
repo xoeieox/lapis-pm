@@ -715,11 +715,24 @@ def validate_corpus_power_floor(
     )
 
 
+def _source_diff_changed_lines(diff: str) -> int:
+    """Count added+removed lines in a source diff (excludes hunk/file headers)."""
+    return sum(
+        1 for line in diff.splitlines()
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    )
+
+
 def validate_discriminates_power_floor(
     corpus: list[FixtureRecord],
     floor: int = CORPUS_HOLDOUT_PER_TIER,
 ) -> dict[str, Any]:
-    """Check DISCRIMINATES holdout counts per coarse bucket (T1 vs T2+T3).
+    """Check DISCRIMINATES holdout counts per coarse bucket (small vs larger).
+
+    Bucketing is by source-diff changed-line count (≤30 = 'small', >30 = 'larger').
+    This is independent of the T1/T2/T3 tier system, which maps file count, not change
+    size — co-committed fix+test commits always have len(changed_files)==2 (one source +
+    one test file) and would all land in T2, making the T1 small-bucket structurally empty.
 
     Raises ValueError (loud fail) if either bucket has fewer than floor
     DISCRIMINATES holdout fixtures. Resolution is PM/Erah's call (spec §AC-O5):
@@ -727,22 +740,25 @@ def validate_discriminates_power_floor(
 
     Returns per_tier_discriminates_counts and per_bucket_holdout_discriminates.
     """
-    per_tier: dict[str, int] = defaultdict(int)
-    per_tier_holdout: dict[str, int] = defaultdict(int)
+    _SOURCE_SIZE_THRESHOLD = 30
+
+    per_bucket: dict[str, int] = defaultdict(int)
+    per_bucket_holdout: dict[str, int] = defaultdict(int)
 
     for f in corpus:
         if f.checker_class == "DISCRIMINATES":
-            per_tier[f.tier] += 1
+            bucket = "small" if _source_diff_changed_lines(f.golden_source_diff) <= _SOURCE_SIZE_THRESHOLD else "larger"
+            per_bucket[bucket] += 1
             if f.blind_holdout:
-                per_tier_holdout[f.tier] += 1
+                per_bucket_holdout[bucket] += 1
 
-    small_holdout = per_tier_holdout.get("T1", 0)
-    larger_holdout = per_tier_holdout.get("T2", 0) + per_tier_holdout.get("T3", 0)
+    small_holdout = per_bucket_holdout.get("small", 0)
+    larger_holdout = per_bucket_holdout.get("larger", 0)
 
     if small_holdout < floor or larger_holdout < floor:
         raise ValueError(
-            f"DISCRIMINATES holdout floor not met: T1={small_holdout}, "
-            f"T2+T3={larger_holdout}, floor={floor}. "
+            f"DISCRIMINATES holdout floor not met: small={small_holdout}, "
+            f"larger={larger_holdout}, floor={floor}. "
             f"Resolution (PM/Erah decision required): "
             f"(a) relax extraction caps / widen commit window, "
             f"(b) pull additional repos, or "
@@ -750,8 +766,8 @@ def validate_discriminates_power_floor(
         )
 
     return {
-        "per_tier_discriminates_counts": dict(per_tier),
-        "per_bucket_holdout_discriminates": {"T1": small_holdout, "T2+T3": larger_holdout},
+        "per_tier_discriminates_counts": dict(per_bucket),
+        "per_bucket_holdout_discriminates": {"small": small_holdout, "larger": larger_holdout},
     }
 
 
@@ -946,6 +962,16 @@ def verify_fail_first(
 
     if not step1_results:
         logger.warning("verify_fail_first: all step1 runs failed")
+        return False, False, False
+
+    if len(step1_results) < n:
+        # Fewer than N runs completed (timeouts/errors consumed some slots).
+        # A flakiness fingerprint over <N samples cannot reliably distinguish
+        # stable-fail from flaky — quarantine by refusing to confirm fail-first.
+        logger.warning(
+            "verify_fail_first: only %d/%d step1 runs completed; quarantining fixture",
+            len(step1_results), n,
+        )
         return False, False, False
 
     stable, flaky = compute_flakiness_fingerprint(step1_results)
@@ -1503,12 +1529,20 @@ def generate_candidates(
         f"Current code:\n```\n{fixture.pre_state_slice}\n```\n\n"
         "Emit a unified diff in a ```diff ... ``` fence. Minimal changes only."
     )
-    # Leak guard (AC-O4): golden test must never appear in candidate prompt.
+    # Leak guard (AC-O4, spec §1.4): golden test diff AND node IDs must never appear
+    # in the candidate prompt. Checking both prevents a future regression that injects
+    # node IDs without the full diff text.
     if fixture.golden_test_diff and fixture.golden_test_diff.strip() in prompt:
         raise RuntimeError(
             f"Leak guard violated: golden_test_diff content in candidate prompt "
             f"for {fixture.sha[:8]}. The oracle's test must never be shown to the candidate."
         )
+    for tid in fixture.golden_test_ids:
+        if tid and tid in prompt:
+            raise RuntimeError(
+                f"Leak guard violated: golden_test_id {tid!r} found in candidate prompt "
+                f"for {fixture.sha[:8]}. Oracle test node IDs must never be shown to the candidate."
+            )
     system = (
         "You are a code fixer. Emit only a unified diff in a ```diff``` fenced block. "
         "No explanations."

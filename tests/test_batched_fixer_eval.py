@@ -1704,13 +1704,23 @@ def test_aco4_mock_candidates_dont_contain_test_source():
 # AC-O5: DISCRIMINATES power floor
 
 def test_aco5_validate_discriminates_floor_passes():
-    """AC-O5: validate_discriminates_power_floor passes when T1 and T2+T3 each have ≥8."""
+    """AC-O5: validate_discriminates_power_floor passes when small and larger each have ≥8.
+
+    Bucketing is by golden_source_diff changed-line count (≤30 = 'small', >30 = 'larger'),
+    not by T1/T2/T3 tier — co-committed fix+test commits are always T2 (two files), so the
+    old T1 bucket would be structurally empty.
+    """
+    # 'small' fixtures: golden_source_diff with ≤30 changed lines
+    small_diff = "--- a/x.py\n+++ b/x.py\n@@ -1,1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    # 'larger' fixtures: golden_source_diff with >30 changed lines
+    larger_diff = "--- a/y.py\n+++ b/y.py\n@@ -1,1 +1,35 @@\n" + "".join(f"+l{j}\n" for j in range(35))
     corpus = []
     for i in range(8):
         corpus.append(FixtureRecord(
             repo="lapis-pm", sha=f"d1{i:06d}", parent_sha=f"p{i}",
             pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
-            tier="T1", checker_class="DISCRIMINATES", blind_holdout=True,
+            tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=small_diff,
             golden_test_diff="--- /dev/null\n+++ b/t.py\n+def test_x(): pass\n",
             golden_test_ids=["t.py::test_x"], fail_first_confirmed=True,
         ))
@@ -1719,12 +1729,13 @@ def test_aco5_validate_discriminates_floor_passes():
             repo="conductor", sha=f"d2{i:06d}", parent_sha=f"q{i}",
             pr_number=None, path="y.py", file_loc="unknown", changed_lines=15,
             tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=larger_diff,
             golden_test_diff="--- /dev/null\n+++ b/t.py\n+def test_y(): pass\n",
             golden_test_ids=["t.py::test_y"], fail_first_confirmed=True,
         ))
     result = validate_discriminates_power_floor(corpus, floor=8)
-    assert result["per_bucket_holdout_discriminates"]["T1"] >= 8
-    assert result["per_bucket_holdout_discriminates"]["T2+T3"] >= 8
+    assert result["per_bucket_holdout_discriminates"]["small"] >= 8
+    assert result["per_bucket_holdout_discriminates"]["larger"] >= 8
 
 
 def test_aco5_validate_discriminates_floor_raises_below_floor():
@@ -1744,7 +1755,7 @@ def test_aco5_validate_discriminates_floor_raises_below_floor():
 
 def test_aco5_manifest_has_discriminates_fields(monkeypatch, tmp_path):
     """AC-O5: _write_corpus_manifest includes per_tier_discriminates_counts and
-    per_bucket_holdout_discriminates when called from run_eval."""
+    per_bucket_holdout_discriminates (with 'small'/'larger' keys) when called from run_eval."""
     import lapis_pm.batched_fixer_eval as bfe
 
     captured = {}
@@ -1752,27 +1763,31 @@ def test_aco5_manifest_has_discriminates_fields(monkeypatch, tmp_path):
     def _capture_manifest(meta):
         captured.update(meta)
 
+    # 'small': ≤30 changed lines in golden_source_diff; 'larger': >30
+    small_diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    larger_diff = "--- a/y.py\n+++ b/y.py\n@@ -1 +1,35 @@\n" + "".join(f"+l{j}\n" for j in range(35))
+
     disc_corpus = []
     for i in range(8):
         disc_corpus.append(FixtureRecord(
             repo="lapis-pm", sha=f"dm{i:06d}", parent_sha=f"p{i}",
             pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
-            tier="T1", checker_class="DISCRIMINATES", blind_holdout=True,
-            fail_first_confirmed=True,
+            tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=small_diff, fail_first_confirmed=True,
         ))
     for i in range(8):
         disc_corpus.append(FixtureRecord(
             repo="conductor", sha=f"dn{i:06d}", parent_sha=f"q{i}",
             pr_number=None, path="y.py", file_loc="unknown", changed_lines=15,
             tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
-            fail_first_confirmed=True,
+            golden_source_diff=larger_diff, fail_first_confirmed=True,
         ))
 
     monkeypatch.setattr(bfe, "build_corpus", lambda **kw: (disc_corpus, {
         "laundering_total": 0, "laundering_fallback_count": 0,
     }))
     monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {
-        "T1": 8, "T2": 8, "_shape": "coarse-binary",
+        "T2": 16, "_shape": "coarse-binary",
     })
     monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
     monkeypatch.setattr(bfe, "_write_corpus_manifest", _capture_manifest)
@@ -1781,8 +1796,8 @@ def test_aco5_manifest_has_discriminates_fields(monkeypatch, tmp_path):
 
     assert "per_tier_discriminates_counts" in captured
     assert "per_bucket_holdout_discriminates" in captured
-    assert captured["per_bucket_holdout_discriminates"]["T1"] == 8
-    assert captured["per_bucket_holdout_discriminates"]["T2+T3"] == 8
+    assert captured["per_bucket_holdout_discriminates"]["small"] == 8
+    assert captured["per_bucket_holdout_discriminates"]["larger"] == 8
 
 
 def test_aco5_build_fails_loud_when_discriminates_below_floor(monkeypatch, capsys):

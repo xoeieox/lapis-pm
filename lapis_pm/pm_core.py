@@ -229,6 +229,12 @@ _DEPLOY_CURRENCY_COOLDOWN_SECS = 3600  # alert at most once per hour
 # Checked once at module load so tests can patch the env before import.
 _DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
 
+# Bounded deferral for in-flight fixers before restarting claude-queue-runner.
+# Tunable without a code change via LAPIS_RESTART_DEFER_MAX_S env var.
+RESTART_DEFER_MAX_S: int = int(os.environ.get("LAPIS_RESTART_DEFER_MAX_S", "1800"))
+_CLAUDE_QUEUE_ACTIVE_DIR = Path("/srv/lapis/claude-queue/active")
+_RESTART_PENDING_DIR = Path("/srv/lapis/lapis-state/restart-pending")
+
 
 def _ensure_head_branch_deleted(repo: str, pr_number: int, *, owner: str | None = None) -> None:
     """Ensure the head branch of a PR is deleted, idempotently.
@@ -312,7 +318,7 @@ def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> No
         print(f"[post-land-pull] deploy log write failed: {e}", file=sys.stderr)
 
 
-def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> None:
+def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bool:
     """Git-pull each working clone mapped to `repo`.
 
     The tick runs from the deploy clone (/srv/git/lapis-pm) via cwd-precedence;
@@ -321,16 +327,22 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
     A successful pull that advances HEAD appends a dated provenance line to the
     deploy log.
 
+    Returns True if HEAD advanced on at least one mapped path (the caller uses this
+    to gate service restarts so a no-op idempotent pull doesn't trigger a needless
+    restart). Returns False when HEAD was already current, the pull failed, or repo
+    is not mapped.
+
     Best-effort. Never raises. Uses --ff-only so a diverged clone fails
     loudly rather than silently creating a merge commit.
     """
     if repo is None:
-        return
+        return False
     paths = _POST_LAND_PULL.get(repo)
     if not paths:
-        return
+        return False
     is_critical_repo = repo in _POST_LAND_PULL_CRITICAL
     is_low_signal_repo = repo in _POST_LAND_PULL_LOW_SIGNAL
+    any_advanced = False
     for path in paths:
         pre_head = ""
         try:
@@ -389,6 +401,7 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
                     post_result.stdout.strip() if post_result.returncode == 0 else ""
                 )
                 if post_head and post_head != pre_head:
+                    any_advanced = True
                     _write_deploy_log(path, pre_head[:8], post_head[:8], trigger)
         except (subprocess.TimeoutExpired, OSError) as e:
             print(f"[post-land-pull] pull {path} errored: {e}", file=sys.stderr)
@@ -415,6 +428,74 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> No
                     )
                 except Exception:
                     pass
+    return any_advanced
+
+
+def _count_inflight_fixers() -> int:
+    """Count active fixer dispatches from the claude-queue active/ dir. Best-effort."""
+    try:
+        return sum(1 for p in _CLAUDE_QUEUE_ACTIVE_DIR.iterdir() if p.suffix == ".yaml")
+    except OSError:
+        return 0
+
+
+def _read_restart_pending(repo: str) -> dict | None:
+    """Read the pending-restart marker for repo. Returns None if absent or unreadable."""
+    path = _RESTART_PENDING_DIR / f"{repo}.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_restart_pending(
+    repo: str,
+    units: tuple[str, ...],
+    first_deferred_at: str,
+) -> None:
+    """Write the pending-restart marker for repo. Best-effort."""
+    try:
+        _RESTART_PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        path = _RESTART_PENDING_DIR / f"{repo}.json"
+        path.write_text(json.dumps({
+            "repo": repo,
+            "units": list(units),
+            "first_deferred_at": first_deferred_at,
+            "post_head": "",
+        }))
+    except OSError as e:
+        print(
+            f"[post-land-deploy] WARNING: failed to write restart-pending marker for {repo}: {e}",
+            file=sys.stderr,
+        )
+
+
+def _clear_restart_pending(repo: str) -> None:
+    """Remove the pending-restart marker for repo. Best-effort."""
+    try:
+        (_RESTART_PENDING_DIR / f"{repo}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _issue_system_restart(unit: str) -> None:
+    """Run `sudo -n systemctl restart <unit>`. Logs failure to stderr; best-effort."""
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", unit],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            print(
+                f"[post-land-deploy] restart {unit} failed "
+                f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                file=sys.stderr,
+            )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(
+            f"[post-land-deploy] restart {unit} errored: {e}",
+            file=sys.stderr,
+        )
 
 
 def _check_deploy_currency() -> None:
@@ -493,10 +574,16 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
     are logged to stderr. Never raises — landing must complete even if the
     pull or restart fails.
 
-    Idempotent at the systemd level: `systemctl restart` of an
-    already-running unit is a clean SIGTERM + restart; the runner drains
-    in-flight tasks per its existing shutdown handler (claude_queue_runner.py
-    lines 520-541), bounded by `TimeoutStopSec=900`.
+    HEAD-advance gate: restarts are only issued when git pull actually advances
+    HEAD. A no-op pull (already current) logs a one-line noop and skips restart,
+    eliminating the double-restart class on idempotent backstop ticks.
+
+    In-flight deferral (claude-queue-runner only): if fixers are in-flight when
+    HEAD advances, the claude-queue-runner restart is deferred via a persistent
+    marker under _RESTART_PENDING_DIR. Subsequent ticks fire it once the queue
+    drains. The deferral is bounded by RESTART_DEFER_MAX_S (default 30 min); at
+    the deadline a restart is forced anyway, and a CRITICAL-severity alert fires.
+    Interrupted fixers are recoverable via the existing lost-fixer-retry path.
     """
     if _DEPLOY_HOOK_DISABLED:
         print(
@@ -505,71 +592,158 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
             file=sys.stderr,
         )
         return
-    _post_land_git_pull(repo, trigger=trigger)
+
+    head_advanced = _post_land_git_pull(repo, trigger=trigger)
     if not repo:
         return
+
     units = _POST_LAND_RESTART.get(repo)
     if units:
-        for unit in units:
-            try:
-                result = subprocess.run(
-                    ["sudo", "-n", "systemctl", "restart", unit],
-                    capture_output=True, text=True, timeout=60,
-                )
-                if result.returncode != 0:
+        # Only claude-queue-runner defers while fixers are in-flight;
+        # all other units (gpu-queue-runner, synapse, etc.) restart immediately on advance.
+        deferred_units = tuple(u for u in units if u == "claude-queue-runner.service")
+        immediate_units = tuple(u for u in units if u != "claude-queue-runner.service")
+
+        if deferred_units:
+            # In-flight-aware path: check for an existing pending-restart marker first.
+            # Guard: don't stack a new restart while a pending marker is live.
+            pending = _read_restart_pending(repo)
+
+            if pending:
+                inflight = _count_inflight_fixers()
+                try:
+                    first_dt = datetime.fromisoformat(pending["first_deferred_at"])
+                    elapsed = (datetime.now(first_dt.tzinfo) - first_dt).total_seconds()
+                except Exception:
+                    elapsed = RESTART_DEFER_MAX_S + 1  # parse failure → treat as budget exceeded
+                pend_units = tuple(pending.get("units", deferred_units))
+
+                if inflight == 0 or elapsed >= RESTART_DEFER_MAX_S:
+                    if inflight > 0:
+                        msg = (
+                            f"defer budget exceeded ({elapsed:.0f}s/{RESTART_DEFER_MAX_S}s); "
+                            f"forcing restart of {list(pend_units)} with {inflight} in-flight — "
+                            f"interrupted fixers will be re-dispatched via lost-fixer-retry"
+                        )
+                        print(f"[post-land-deploy] CRITICAL: {msg}", file=sys.stderr)
+                        try:
+                            from agents_core.notify import send_notification, Priority as _P
+                            send_notification(
+                                message=msg,
+                                title=f"{repo}: restart defer budget exceeded",
+                                priority=_P.HIGH,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        print(
+                            f"[post-land-deploy] deferred restart now firing: "
+                            f"{list(pend_units)} (queue idle, {elapsed:.0f}s after deferral)",
+                            file=sys.stderr,
+                        )
+                    for unit in pend_units:
+                        _issue_system_restart(unit)
+                    _clear_restart_pending(repo)
+                else:
                     print(
-                        f"[post-land-deploy] restart {unit} failed "
-                        f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                        f"[post-land-deploy] deferring {list(pend_units)} restart: "
+                        f"{inflight} fixers in-flight "
+                        f"({elapsed:.0f}s / {RESTART_DEFER_MAX_S}s)",
                         file=sys.stderr,
                     )
-            except (subprocess.TimeoutExpired, OSError) as e:
+                # A pending marker is live: do not add a new one even if HEAD advanced.
+
+            elif not head_advanced:
                 print(
-                    f"[post-land-deploy] restart {unit} errored: {e}",
+                    f"[post-land-deploy] noop: HEAD unchanged, "
+                    f"skipping {list(units)} restart",
                     file=sys.stderr,
                 )
 
-    user_units = _POST_LAND_RESTART_USER.get(repo)
-    if user_units:
-        xdg = os.environ.get("XDG_RUNTIME_DIR")
-        if not xdg:
-            print(
-                f"[post-land-deploy] XDG_RUNTIME_DIR unset — cannot reach user bus, "
-                f"skipping user-unit restarts: {list(user_units)}",
-                file=sys.stderr,
-            )
-        else:
-            for unit in user_units:
-                try:
-                    result = subprocess.run(
-                        ["systemctl", "--user", "restart", unit],
-                        capture_output=True, text=True, timeout=60,
-                    )
-                    if result.returncode != 0:
-                        print(
-                            f"[post-land-deploy] user-unit restart {unit} failed "
-                            f"rc={result.returncode}: {result.stderr.strip()[:200]}",
-                            file=sys.stderr,
-                        )
-                except (subprocess.TimeoutExpired, OSError) as e:
+            else:
+                # HEAD advanced, no pending marker: restart immediate units now.
+                for unit in immediate_units:
+                    _issue_system_restart(unit)
+
+                # Deferred units: restart now if queue idle, else write marker.
+                inflight = _count_inflight_fixers()
+                if inflight == 0:
+                    for unit in deferred_units:
+                        _issue_system_restart(unit)
+                else:
+                    first_deferred_at = _now_iso()
+                    _write_restart_pending(repo, deferred_units, first_deferred_at)
                     print(
-                        f"[post-land-deploy] user-unit restart {unit} errored: {e}",
+                        f"[post-land-deploy] deferring {list(deferred_units)} restart: "
+                        f"{inflight} fixers in-flight "
+                        f"(deferred 0s / {RESTART_DEFER_MAX_S}s)",
                         file=sys.stderr,
                     )
-                    continue
-                # Post-restart liveness (best-effort). Runs whether restart rc was 0 or non-0.
-                try:
-                    active = subprocess.run(
-                        ["systemctl", "--user", "is-active", unit],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    if active.stdout.strip() != "active":
+
+        else:
+            # No deferred units (e.g., synapse): simple HEAD-advance gate.
+            if not head_advanced:
+                print(
+                    f"[post-land-deploy] noop: HEAD unchanged, "
+                    f"skipping {list(units)} restart",
+                    file=sys.stderr,
+                )
+            else:
+                for unit in immediate_units:
+                    _issue_system_restart(unit)
+
+    user_units = _POST_LAND_RESTART_USER.get(repo)
+    if user_units:
+        if not head_advanced:
+            # HEAD unchanged: skip user-unit restarts.
+            # Noop already logged in system units block above (if units non-empty).
+            if not units:
+                print(
+                    f"[post-land-deploy] noop: HEAD unchanged, "
+                    f"skipping {list(user_units)} restart",
+                    file=sys.stderr,
+                )
+        else:
+            xdg = os.environ.get("XDG_RUNTIME_DIR")
+            if not xdg:
+                print(
+                    f"[post-land-deploy] XDG_RUNTIME_DIR unset — cannot reach user bus, "
+                    f"skipping user-unit restarts: {list(user_units)}",
+                    file=sys.stderr,
+                )
+            else:
+                for unit in user_units:
+                    try:
+                        result = subprocess.run(
+                            ["systemctl", "--user", "restart", unit],
+                            capture_output=True, text=True, timeout=60,
+                        )
+                        if result.returncode != 0:
+                            print(
+                                f"[post-land-deploy] user-unit restart {unit} failed "
+                                f"rc={result.returncode}: {result.stderr.strip()[:200]}",
+                                file=sys.stderr,
+                            )
+                    except (subprocess.TimeoutExpired, OSError) as e:
                         print(
-                            f"[post-land-deploy] user unit {unit} not active after restart "
-                            f"(state={active.stdout.strip()!r})",
+                            f"[post-land-deploy] user-unit restart {unit} errored: {e}",
                             file=sys.stderr,
                         )
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
+                        continue
+                    # Post-restart liveness (best-effort). Runs whether restart rc was 0 or non-0.
+                    try:
+                        active = subprocess.run(
+                            ["systemctl", "--user", "is-active", unit],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        if active.stdout.strip() != "active":
+                            print(
+                                f"[post-land-deploy] user unit {unit} not active after restart "
+                                f"(state={active.stdout.strip()!r})",
+                                file=sys.stderr,
+                            )
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
 
 
 def _read_fixer_meta(spec_id: str) -> dict | None:

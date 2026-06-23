@@ -1,5 +1,6 @@
 """Unit tests for _post_land_deploy_hook in pm_core."""
 
+import json
 import subprocess
 import sys
 from io import StringIO
@@ -17,16 +18,39 @@ def _make_completed_process(returncode=0, stderr="", stdout=""):
     )
 
 
+def _advancing_fake_run(extra=None):
+    """Return a fake_run that makes each git pull advance HEAD (pre != post SHA)."""
+    revparse_count = {}
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "git" and "rev-parse" in cmd:
+            path = cmd[2]
+            revparse_count[path] = revparse_count.get(path, 0) + 1
+            sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+            return _make_completed_process(returncode=0, stdout=sha)
+        if extra:
+            return extra(cmd, **kwargs)
+        return _make_completed_process(returncode=0, stdout="active")
+
+    return fake_run
+
+
 class TestPostLandDeployHook:
     """Tests for _post_land_deploy_hook."""
 
     def test_mapped_repo_fires_restart_per_unit(self, capsys):
-        """Mapped repo causes git pull (both paths) then system + user restarts."""
+        """Mapped repo causes git pull (both paths) then system + user restarts when HEAD advances."""
         pull_calls = []
         sudo_restart_calls = []
         user_restart_calls = []
+        revparse_count = {}
 
         def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "git" and "pull" in cmd:
                 pull_calls.append(cmd)
             elif cmd[0] == "sudo":
@@ -38,15 +62,18 @@ class TestPostLandDeployHook:
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
                 with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("agents-core")
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            pm_core._post_land_deploy_hook("agents-core")
 
         assert len(pull_calls) == 2
         pull_paths = [c[2] for c in pull_calls]
         assert "/srv/git/agents-core-working" in pull_paths
         assert "/data/agents" in pull_paths
+        restart_units = {c[4] for c in sudo_restart_calls if "restart" in c}
         assert len(sudo_restart_calls) == 2
-        assert sudo_restart_calls[0] == ["sudo", "-n", "systemctl", "restart", "claude-queue-runner.service"]
-        assert sudo_restart_calls[1] == ["sudo", "-n", "systemctl", "restart", "gpu-queue-runner.service"]
+        assert "claude-queue-runner.service" in restart_units
+        assert "gpu-queue-runner.service" in restart_units
         assert len(user_restart_calls) == 2
         assert user_restart_calls[0] == ["systemctl", "--user", "restart", "doorman-server.service"]
         assert user_restart_calls[1] == ["systemctl", "--user", "restart", "slot-server.service"]
@@ -66,18 +93,26 @@ class TestPostLandDeployHook:
         mock_run.assert_not_called()
 
     def test_restart_failure_does_not_raise(self, capsys):
-        """Non-zero returncode is logged to stderr but does not raise."""
+        """Non-zero returncode from restart is logged to stderr but does not raise."""
+        revparse_count = {}
+
         def fake_run(cmd, **kwargs):
             if "rev-parse" in cmd:
-                return _make_completed_process(returncode=0, stdout="abc12345")
-            return _make_completed_process(returncode=1, stderr="Failed to restart unit")
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "sudo" and "restart" in cmd:
+                return _make_completed_process(returncode=1, stderr="Failed to restart unit")
+            return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                pm_core._post_land_deploy_hook("agents-core")  # must not raise
+                with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                        pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
-        # The pull fails (rc=1) and the restart also fails — both are logged
         assert "rc=1" in captured.err
 
     def test_timeout_does_not_raise(self, capsys):
@@ -96,8 +131,14 @@ class TestPostLandDeployHook:
         """User-unit restarts must use `systemctl --user restart`, never sudo."""
         sudo_calls = []
         user_calls = []
+        revparse_count = {}
 
         def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "sudo":
                 sudo_calls.append(cmd)
             elif cmd[0] == "systemctl" and "--user" in cmd:
@@ -107,7 +148,9 @@ class TestPostLandDeployHook:
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
                 with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("agents-core")
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            pm_core._post_land_deploy_hook("agents-core")
 
         restart_user = [c for c in user_calls if "restart" in c]
         assert len(restart_user) == 2
@@ -122,7 +165,14 @@ class TestPostLandDeployHook:
 
     def test_user_unit_restart_failure_logged_does_not_raise(self, capsys):
         """Non-zero rc from a user-unit restart is logged to stderr and does not raise."""
+        revparse_count = {}
+
         def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "systemctl" and "--user" in cmd and "restart" in cmd:
                 return _make_completed_process(returncode=1, stderr="unit failed")
             if cmd[0] == "systemctl" and "--user" in cmd and "is-active" in cmd:
@@ -132,7 +182,9 @@ class TestPostLandDeployHook:
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
                 with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("agents-core")  # must not raise
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
         assert "rc=1" in captured.err or "failed" in captured.err
@@ -167,8 +219,14 @@ class TestPostLandDeployHook:
         """XDG_RUNTIME_DIR unset → no systemctl --user calls issued, loud error logged."""
         user_calls = []
         sudo_calls = []
+        revparse_count = {}
 
         def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "systemctl" and "--user" in cmd:
                 user_calls.append(cmd)
             elif cmd[0] == "sudo":
@@ -179,7 +237,9 @@ class TestPostLandDeployHook:
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
                 with patch.dict("os.environ", env_without_xdg, clear=True):
-                    pm_core._post_land_deploy_hook("agents-core")
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            pm_core._post_land_deploy_hook("agents-core")
 
         assert len(user_calls) == 0, "No systemctl --user calls when XDG_RUNTIME_DIR unset"
         assert len(sudo_calls) == 2, "System-unit restarts still fire"
@@ -188,7 +248,14 @@ class TestPostLandDeployHook:
 
     def test_user_unit_not_active_after_restart_logs_loudly(self, capsys):
         """If is-active returns non-active after restart, loud stderr log, no raise."""
+        revparse_count = {}
+
         def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "systemctl" and "--user" in cmd and "is-active" in cmd:
                 return _make_completed_process(returncode=3, stdout="failed\n")
             return _make_completed_process(returncode=0, stdout="active")
@@ -196,7 +263,9 @@ class TestPostLandDeployHook:
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
                 with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("agents-core")  # must not raise
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
         assert "not active after restart" in captured.err
@@ -268,8 +337,14 @@ class TestPostLandGitPull:
             pm_core._post_land_git_pull(None)
         mock_run.assert_not_called()
 
-    def test_pull_failure_does_not_block_restart(self):
-        """A failing git pull must not prevent subsequent system or user-unit restarts."""
+    def test_pull_failure_skips_restart(self, capsys):
+        """A failing git pull means HEAD did not advance, so no restart is issued.
+
+        Under the HEAD-advance gate, a pull failure is treated as a no-op: the
+        deploy hook does not know whether new code exists, so it conservatively
+        skips the restart. The pull failure is still logged/alerted via the existing
+        path; the noop is logged to stderr.
+        """
         sudo_calls = []
         user_restart_calls = []
 
@@ -287,16 +362,15 @@ class TestPostLandGitPull:
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
                 with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("agents-core")
+                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                        pm_core._post_land_deploy_hook("agents-core")
 
-        assert len(sudo_calls) == 2
-        assert sudo_calls[0] == ["sudo", "-n", "systemctl", "restart", "claude-queue-runner.service"]
-        assert sudo_calls[1] == ["sudo", "-n", "systemctl", "restart", "gpu-queue-runner.service"]
-        # user restarts: 2 restart + 2 is-active liveness checks
+        # Pull failed → HEAD unchanged → restart must be skipped
+        assert len(sudo_calls) == 0, "No restart when pull failed (HEAD did not advance)"
         restart_cmds = [c for c in user_restart_calls if "restart" in c]
-        assert len(restart_cmds) == 2
-        assert restart_cmds[0] == ["systemctl", "--user", "restart", "doorman-server.service"]
-        assert restart_cmds[1] == ["systemctl", "--user", "restart", "slot-server.service"]
+        assert len(restart_cmds) == 0, "No user-unit restart when pull failed"
+        captured = capsys.readouterr()
+        assert "noop" in captured.err or "HEAD unchanged" in captured.err or "rc=1" in captured.err
 
     def test_pull_ff_only_in_all_args(self):
         """--ff-only is present in the git pull call for lapis-pm."""
@@ -747,8 +821,14 @@ class TestSynapseDeploy:
         pull_calls = []
         restart_calls = []
         user_restart_calls = []
+        revparse_count = {}
 
         def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "git" and "pull" in cmd:
                 pull_calls.append(cmd)
             elif cmd[0] == "sudo" and "restart" in cmd:
@@ -821,9 +901,14 @@ class TestSynapseDeploy:
 
     def test_synapse_restart_failure_does_not_raise(self, capsys):
         """Non-zero returncode from synapse.service restart is logged to stderr, does not raise."""
+        revparse_count = {}
+
         def fake_run(cmd, **kwargs):
             if cmd[0] == "git" and "rev-parse" in cmd:
-                return _make_completed_process(returncode=0, stdout="abc12345")
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
             if cmd[0] == "git" and "pull" in cmd:
                 return _make_completed_process(returncode=0)
             if cmd[0] == "sudo" and "restart" in cmd:
@@ -1254,3 +1339,212 @@ class TestPostLandDeployHookTrigger:
 
         contents = log_file.read_text()
         assert "synced" not in contents  # no new entry when already current
+
+
+class TestHeadAdvanceGate:
+    """Tests for the HEAD-advance gate and in-flight-aware deferral."""
+
+    def _make_advancing_run(self, pull_calls=None, sudo_calls=None):
+        """Return a fake_run that advances HEAD on pull."""
+        revparse_count = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "pre111sha" if revparse_count[path] == 1 else "post222sha"
+                return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "pull" in cmd:
+                if pull_calls is not None:
+                    pull_calls.append(cmd)
+                return _make_completed_process(returncode=0)
+            if cmd[0] == "sudo" and "restart" in cmd:
+                if sudo_calls is not None:
+                    sudo_calls.append(cmd)
+                return _make_completed_process(returncode=0)
+            return _make_completed_process(returncode=0, stdout="active")
+
+        return fake_run
+
+    def test_noop_pull_skips_restart_and_logs(self, capsys):
+        """No-op pull (HEAD unchanged) must not invoke systemctl restart and logs noop."""
+        sudo_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="sameshasha")
+            if cmd[0] == "sudo":
+                sudo_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                    pm_core._post_land_deploy_hook("agents-core")
+
+        assert len(sudo_calls) == 0, "No restart when HEAD unchanged"
+        captured = capsys.readouterr()
+        assert "noop" in captured.err
+        assert "HEAD unchanged" in captured.err
+
+    def test_head_advance_idle_queue_restarts_now(self, capsys):
+        """HEAD advance + idle queue → both units restart immediately."""
+        sudo_calls = []
+        fake_run = self._make_advancing_run(sudo_calls=sudo_calls)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                        with patch.object(pm_core, "_write_restart_pending") as mock_write:
+                            pm_core._post_land_deploy_hook("agents-core")
+
+        restart_units = [c[4] for c in sudo_calls if "restart" in c]
+        assert "claude-queue-runner.service" in restart_units
+        assert "gpu-queue-runner.service" in restart_units
+        mock_write.assert_not_called()
+
+    def test_head_advance_busy_queue_defers_claude_runner(self, capsys, tmp_path):
+        """HEAD advance + busy queue → claude-queue-runner deferred, marker written."""
+        sudo_calls = []
+        written = {}
+        fake_run = self._make_advancing_run(sudo_calls=sudo_calls)
+
+        def fake_write(repo, units, first_deferred_at):
+            written["repo"] = repo
+            written["units"] = units
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_count_inflight_fixers", return_value=3):
+                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                        with patch.object(pm_core, "_write_restart_pending", side_effect=fake_write):
+                            with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                                pm_core._post_land_deploy_hook("agents-core")
+
+        # gpu-queue-runner should restart immediately; claude-queue-runner is deferred
+        restart_units = [c[4] for c in sudo_calls if "restart" in c]
+        assert "gpu-queue-runner.service" in restart_units
+        assert "claude-queue-runner.service" not in restart_units
+        assert written.get("repo") == "agents-core"
+        assert "claude-queue-runner.service" in written.get("units", [])
+        captured = capsys.readouterr()
+        assert "deferring" in captured.err
+        assert "in-flight" in captured.err
+
+    def test_deferred_then_idle_fires_restart(self, capsys):
+        """Pending marker + idle queue → deferred restart fires, marker cleared."""
+        from datetime import datetime, timezone, timedelta
+        sudo_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="sameshasha")
+            if cmd[0] == "sudo" and "restart" in cmd:
+                sudo_calls.append(cmd)
+                return _make_completed_process(returncode=0)
+            return _make_completed_process(returncode=0)
+
+        first_deferred_at = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        pending = {
+            "repo": "agents-core",
+            "units": ["claude-queue-runner.service"],
+            "first_deferred_at": first_deferred_at,
+            "post_head": "",
+        }
+
+        cleared = {}
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                    with patch.object(pm_core, "_read_restart_pending", return_value=pending):
+                        with patch.object(pm_core, "_clear_restart_pending",
+                                          side_effect=lambda r: cleared.update({"repo": r})):
+                            pm_core._post_land_deploy_hook("agents-core")
+
+        restart_units = [c[4] for c in sudo_calls if "restart" in c]
+        assert "claude-queue-runner.service" in restart_units
+        assert cleared.get("repo") == "agents-core"
+        captured = capsys.readouterr()
+        assert "deferred restart now firing" in captured.err
+
+    def test_defer_budget_exceeded_restarts_anyway(self, capsys):
+        """Pending marker + busy queue + budget exceeded → forced restart + CRITICAL alert."""
+        from datetime import datetime, timezone, timedelta
+        sudo_calls = []
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="sameshasha")
+            if cmd[0] == "sudo" and "restart" in cmd:
+                sudo_calls.append(cmd)
+                return _make_completed_process(returncode=0)
+            return _make_completed_process(returncode=0)
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"title": title, "priority": priority, "message": message})
+            return True
+
+        # First deferred 31 minutes ago (past the 1800s default)
+        first_deferred_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=pm_core.RESTART_DEFER_MAX_S + 60)
+        ).isoformat()
+        pending = {
+            "repo": "agents-core",
+            "units": ["claude-queue-runner.service"],
+            "first_deferred_at": first_deferred_at,
+            "post_head": "",
+        }
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_count_inflight_fixers", return_value=2):
+                    with patch.object(pm_core, "_read_restart_pending", return_value=pending):
+                        with patch.object(pm_core, "_clear_restart_pending"):
+                            with patch("agents_core.notify.send_notification", fake_notify):
+                                pm_core._post_land_deploy_hook("agents-core")
+
+        restart_units = [c[4] for c in sudo_calls if "restart" in c]
+        assert "claude-queue-runner.service" in restart_units, "Must restart at budget deadline"
+        assert len(notify_calls) == 1
+        assert "budget exceeded" in notify_calls[0]["title"] or "budget exceeded" in notify_calls[0]["message"]
+        captured = capsys.readouterr()
+        assert "CRITICAL" in captured.err
+        assert "budget exceeded" in captured.err
+
+    def test_no_duplicate_stacking_while_pending(self, capsys):
+        """Two ticks with pending marker + busy queue → no new marker, no extra restart."""
+        from datetime import datetime, timezone, timedelta
+        sudo_calls = []
+        write_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="sameshasha")
+            if cmd[0] == "sudo" and "restart" in cmd:
+                sudo_calls.append(cmd)
+                return _make_completed_process(returncode=0)
+            return _make_completed_process(returncode=0)
+
+        first_deferred_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        pending = {
+            "repo": "agents-core",
+            "units": ["claude-queue-runner.service"],
+            "first_deferred_at": first_deferred_at,
+            "post_head": "",
+        }
+
+        for _ in range(2):
+            with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=5):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=pending):
+                            with patch.object(pm_core, "_write_restart_pending",
+                                              side_effect=lambda *a, **kw: write_calls.append(a)):
+                                with patch.object(pm_core, "_clear_restart_pending"):
+                                    pm_core._post_land_deploy_hook("agents-core")
+
+        assert len(sudo_calls) == 0, "No restart while pending marker is live and queue busy"
+        assert len(write_calls) == 0, "No new marker written while live marker exists"

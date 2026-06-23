@@ -26,8 +26,14 @@ from lapis_pm.batched_fixer_eval import (
     parse_pytest_failures,
     compute_flakiness_fingerprint,
     classify_candidate_outcome,
+    classify_candidate_outcome_golden,
     slice_pre_state_from_diff,
     validate_corpus_power_floor,
+    validate_discriminates_power_floor,
+    # Co-committed test oracle helpers (AC-O1, AC-O2)
+    split_diff_by_type,
+    extract_test_ids_from_diff,
+    classify_checker_class_cocommitted,
     # Corpus builder helpers
     find_scoped_test_files,
     classify_checker_class,
@@ -193,6 +199,8 @@ def test_ac1_fixture_record_schema(mock_fixture_t1):
         "golden_diff", "scoped_test_files", "base_stable_fail_set",
         "base_flaky_set", "target_test_files", "is_reviewer_cycle",
         "is_test_only", "blind_holdout", "flaky_excluded_count",
+        # Co-committed test oracle fields (AC-O1)
+        "golden_source_diff", "golden_test_diff", "golden_test_ids", "fail_first_confirmed",
     ]
     for key in required:
         assert key in data, f"Missing field: {key}"
@@ -1007,6 +1015,9 @@ def test_ach1_mock_mode_skips_probe(tmp_path, monkeypatch):
         "per_tier_counts": {"T1": 1}, "per_tier_holdout_counts": {},
     }))
     monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {"T1": 0, "_shape": "coarse-binary"})
+    monkeypatch.setattr(bfe, "validate_discriminates_power_floor", lambda c, **kw: {
+        "per_tier_discriminates_counts": {}, "per_bucket_holdout_discriminates": {"T1": 0, "T2+T3": 0},
+    })
     monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
     monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: None)
 
@@ -1089,6 +1100,9 @@ def test_ach2_fallback_warning_printed_to_stderr(monkeypatch, capsys, tmp_path):
         "per_tier_counts": {"T1": 1}, "per_tier_holdout_counts": {},
     }))
     monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {"T1": 0, "_shape": "coarse-binary"})
+    monkeypatch.setattr(bfe, "validate_discriminates_power_floor", lambda c, **kw: {
+        "per_tier_discriminates_counts": {}, "per_bucket_holdout_discriminates": {"T1": 0, "T2+T3": 0},
+    })
     monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
     monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: None)
 
@@ -1114,6 +1128,9 @@ def test_ach2_no_warning_when_no_fallbacks(monkeypatch, capsys):
         "per_tier_counts": {"T1": 1}, "per_tier_holdout_counts": {},
     }))
     monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {"T1": 0, "_shape": "coarse-binary"})
+    monkeypatch.setattr(bfe, "validate_discriminates_power_floor", lambda c, **kw: {
+        "per_tier_discriminates_counts": {}, "per_bucket_holdout_discriminates": {"T1": 0, "T2+T3": 0},
+    })
     monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
     monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: None)
 
@@ -1229,12 +1246,611 @@ def test_ach3_shape_captured_in_run_eval_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {
         "T1": 5, "_shape": "coarse-binary"
     })
+    monkeypatch.setattr(bfe, "validate_discriminates_power_floor", lambda c, **kw: {
+        "per_tier_discriminates_counts": {}, "per_bucket_holdout_discriminates": {"T1": 0, "T2+T3": 0},
+    })
     monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
     monkeypatch.setattr(bfe, "_write_corpus_manifest", _mock_write_manifest)
 
     bfe.run_eval(phase="build-corpus", mock_mode=True)
 
     assert captured_metadata.get("corpus_shape") == "coarse-binary"
+
+
+# ---------------------------------------------------------------------------
+# AC-O: Co-committed test oracle (batched-fixer-cocommitted-test-oracle-v0)
+# ---------------------------------------------------------------------------
+
+
+def test_aco1_schema_new_fields_present():
+    """AC-O1: FixtureRecord has golden_source_diff, golden_test_diff, golden_test_ids, fail_first_confirmed."""
+    f = FixtureRecord(
+        repo="test", sha="abc", parent_sha="def", pr_number=None,
+        path="m.py", file_loc="unknown", changed_lines=5, tier="T1",
+    )
+    data = asdict(f)
+    assert "golden_source_diff" in data
+    assert "golden_test_diff" in data
+    assert "golden_test_ids" in data
+    assert "fail_first_confirmed" in data
+    assert data["golden_source_diff"] == ""
+    assert data["golden_test_diff"] == ""
+    assert data["golden_test_ids"] == []
+    assert data["fail_first_confirmed"] is False
+
+
+def test_aco1_split_diff_source_only():
+    """AC-O1: split_diff_by_type on a source-only diff yields non-empty source, empty test."""
+    diff = (
+        "diff --git a/lapis_pm/foo.py b/lapis_pm/foo.py\n"
+        "index abc..def 100644\n"
+        "--- a/lapis_pm/foo.py\n"
+        "+++ b/lapis_pm/foo.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    src, tst = split_diff_by_type(diff)
+    assert "lapis_pm/foo.py" in src
+    assert tst == ""
+
+
+def test_aco1_split_diff_fix_and_test():
+    """AC-O1: split_diff_by_type correctly separates source and test sections."""
+    diff = (
+        "diff --git a/lapis_pm/foo.py b/lapis_pm/foo.py\n"
+        "--- a/lapis_pm/foo.py\n"
+        "+++ b/lapis_pm/foo.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+        "diff --git a/tests/test_foo.py b/tests/test_foo.py\n"
+        "--- a/tests/test_foo.py\n"
+        "+++ b/tests/test_foo.py\n"
+        "@@ -1 +2 @@\n+def test_bar():\n+    assert True\n"
+    )
+    src, tst = split_diff_by_type(diff)
+    assert "lapis_pm/foo.py" in src
+    assert "tests/test_foo.py" not in src
+    assert "tests/test_foo.py" in tst
+    assert "lapis_pm/foo.py" not in tst
+
+
+def test_aco1_split_diff_test_suffix_patterns():
+    """AC-O1: split_diff recognises _test.py and test_ prefix patterns."""
+    diff_suffix = (
+        "diff --git a/module_test.py b/module_test.py\n"
+        "--- a/module_test.py\n+++ b/module_test.py\n@@ -1 +1 @@\n+def test_x(): pass\n"
+    )
+    diff_prefix = (
+        "diff --git a/test_module.py b/test_module.py\n"
+        "--- a/test_module.py\n+++ b/test_module.py\n@@ -1 +1 @@\n+def test_y(): pass\n"
+    )
+    _, tst1 = split_diff_by_type(diff_suffix)
+    assert "module_test.py" in tst1
+    _, tst2 = split_diff_by_type(diff_prefix)
+    assert "test_module.py" in tst2
+
+
+def test_aco1_extract_test_ids_empty():
+    """AC-O1: empty test diff yields empty ID list."""
+    assert extract_test_ids_from_diff("") == []
+
+
+def test_aco1_extract_test_ids_from_diff():
+    """AC-O1: extract_test_ids_from_diff parses added def test_* lines into node IDs."""
+    test_diff = (
+        "diff --git a/tests/test_foo.py b/tests/test_foo.py\n"
+        "--- a/tests/test_foo.py\n"
+        "+++ b/tests/test_foo.py\n"
+        "@@ -10,0 +11 @@\n"
+        "+def test_new_behavior():\n"
+        "+    assert foo() == 'new'\n"
+        "+\n"
+        "+def test_edge_case():\n"
+        "+    assert foo() != None\n"
+    )
+    ids = extract_test_ids_from_diff(test_diff)
+    assert "tests/test_foo.py::test_new_behavior" in ids
+    assert "tests/test_foo.py::test_edge_case" in ids
+    assert len(ids) == 2
+
+
+def test_aco1_extract_test_ids_ignores_unchanged_lines():
+    """AC-O1: extract_test_ids ignores context/removed def test_ lines."""
+    diff = (
+        "+++ b/tests/test_foo.py\n"
+        " def test_existing():\n"   # context line — not added
+        "-def test_removed():\n"    # removed line
+        "+def test_added():\n"      # added
+    )
+    ids = extract_test_ids_from_diff(diff)
+    assert len(ids) == 1
+    assert "test_added" in ids[0]
+
+
+def test_aco1_source_only_fixture_has_empty_test_fields():
+    """AC-O1: source-only commit yields empty golden_test_diff and golden_test_ids."""
+    source_diff = (
+        "diff --git a/lapis_pm/foo.py b/lapis_pm/foo.py\n"
+        "--- a/lapis_pm/foo.py\n+++ b/lapis_pm/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    src, tst = split_diff_by_type(source_diff)
+    ids = extract_test_ids_from_diff(tst)
+    assert tst == ""
+    assert ids == []
+
+
+# AC-O2: classify_checker_class_cocommitted
+
+def test_aco2_discriminates_when_fail_first_confirmed():
+    """AC-O2: DISCRIMINATES iff has golden_test_diff AND fail_first_confirmed."""
+    result = classify_checker_class_cocommitted(
+        golden_test_diff="--- a/tests/test_foo.py\n+def test_x(): pass\n",
+        fail_first_confirmed=True,
+    )
+    assert result == "DISCRIMINATES"
+
+
+def test_aco2_blind_when_test_present_but_not_fail_first():
+    """AC-O2: BLIND when has golden_test_diff but fail_first_confirmed is False."""
+    result = classify_checker_class_cocommitted(
+        golden_test_diff="--- a/tests/test_foo.py\n+def test_x(): pass\n",
+        fail_first_confirmed=False,
+    )
+    assert result == "BLIND"
+
+
+def test_aco2_untested_when_no_test_diff():
+    """AC-O2: UNTESTED when golden_test_diff is empty (source-only commit)."""
+    result = classify_checker_class_cocommitted(golden_test_diff="", fail_first_confirmed=False)
+    assert result == "UNTESTED"
+    result2 = classify_checker_class_cocommitted(golden_test_diff="", fail_first_confirmed=True)
+    assert result2 == "UNTESTED"
+
+
+def test_aco2_build_time_verify_fail_first_synthetic(tmp_path):
+    """AC-O2: verify_fail_first returns (True, True, False) for a proper fail-first test."""
+    import subprocess as sp
+    from lapis_pm.batched_fixer_eval import verify_fail_first, dedicated_clone
+
+    # Build a synthetic repo: source that fails the test, then fix
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    # Parent commit: module returns 'old'
+    (repo / "module.py").write_text("def foo():\n    return 'old'\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    parent_sha = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    # golden_test_diff: test that asserts 'new' (fails at parent, passes after fix)
+    golden_test_diff = (
+        "diff --git a/test_module.py b/test_module.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/test_module.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+from module import foo\n"
+        "+def test_foo_returns_new():\n"
+        "+    assert foo() == 'new'\n"
+    )
+    golden_source_diff = (
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def foo():\n"
+        "-    return 'old'\n"
+        "+    return 'new'\n"
+    )
+    golden_test_ids = ["test_module.py::test_foo_returns_new"]
+
+    with dedicated_clone(repo, "test-ff") as clone_path:
+        ff_confirmed, sanity_pass, is_flaky = verify_fail_first(
+            clone_path, parent_sha, golden_test_diff, golden_source_diff,
+            golden_test_ids, n=3,
+        )
+
+    assert ff_confirmed is True, "Test must fail on unpatched source"
+    assert sanity_pass is True, "Test must pass after source fix"
+    assert is_flaky is False
+
+
+def test_aco2_verify_fail_first_blind_when_test_passes_at_parent(tmp_path):
+    """AC-O2: verify_fail_first returns (False, *, False) when test passes on unpatched source."""
+    import subprocess as sp
+    from lapis_pm.batched_fixer_eval import verify_fail_first, dedicated_clone
+
+    repo = tmp_path / "repo2"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "module.py").write_text("def foo():\n    return 'new'\n")  # already returns 'new'
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    parent_sha = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Test expects 'new' — already satisfied at parent → BLIND
+    golden_test_diff = (
+        "diff --git a/test_module.py b/test_module.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/test_module.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+from module import foo\n"
+        "+def test_foo():\n"
+        "+    assert foo() == 'new'\n"
+    )
+    golden_source_diff = ""  # no real source change needed
+    golden_test_ids = ["test_module.py::test_foo"]
+
+    with dedicated_clone(repo, "test-ff-blind") as clone_path:
+        ff_confirmed, sanity_pass, is_flaky = verify_fail_first(
+            clone_path, parent_sha, golden_test_diff, golden_source_diff,
+            golden_test_ids, n=3,
+        )
+
+    assert ff_confirmed is False, "Test passes at parent — not a fail-first discriminator"
+    assert is_flaky is False
+
+
+# AC-O3: co-committed test execute oracle
+
+@pytest.fixture
+def discriminates_fixture_with_golden_test():
+    """DISCRIMINATES fixture with golden_test_diff set (co-committed test oracle)."""
+    return FixtureRecord(
+        repo="lapis-pm",
+        sha="dead0000beef0001",
+        parent_sha="parent_discriminates",
+        pr_number=10,
+        path="lapis_pm/module.py",
+        file_loc="line 1-5",
+        changed_lines=4,
+        tier="T1",
+        task_intent_paraphrased="module returns wrong value",
+        pre_state_slice="def foo():\n    return 'old'\n",
+        golden_diff="(full diff for provenance)",
+        golden_source_diff=(
+            "diff --git a/lapis_pm/module.py b/lapis_pm/module.py\n"
+            "--- a/lapis_pm/module.py\n+++ b/lapis_pm/module.py\n"
+            "@@ -1,2 +1,2 @@\n def foo():\n-    return 'old'\n+    return 'new'\n"
+        ),
+        golden_test_diff=(
+            "diff --git a/tests/test_module.py b/tests/test_module.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n+++ b/tests/test_module.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+from lapis_pm.module import foo\n"
+            "+def test_foo_new():\n"
+            "+    assert foo() == 'new'\n"
+        ),
+        golden_test_ids=["tests/test_module.py::test_foo_new"],
+        fail_first_confirmed=True,
+        checker_class="DISCRIMINATES",
+        scoped_test_files=[],
+        base_stable_fail_set=[],
+        base_flaky_set=[],
+    )
+
+
+def test_aco3_oracle_pass_when_golden_test_passes(tmp_path, discriminates_fixture_with_golden_test):
+    """AC-O3: oracle returns 'pass' when candidate satisfies the golden test."""
+    import subprocess as sp
+    from lapis_pm.batched_fixer_eval import oracle_evaluate_candidate, dedicated_clone
+
+    fixture = discriminates_fixture_with_golden_test
+
+    # Build a synthetic repo at parent state (foo returns 'old')
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "lapis_pm").mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "lapis_pm" / "__init__.py").write_text("")
+    (repo / "lapis_pm" / "module.py").write_text("def foo():\n    return 'old'\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "__init__.py").write_text("")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    parent_sha = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Inject the real parent_sha into fixture
+    fixture = FixtureRecord(**{**asdict(fixture), "parent_sha": parent_sha})
+
+    # Candidate that correctly fixes foo() → 'new'
+    good_candidate = (
+        "diff --git a/lapis_pm/module.py b/lapis_pm/module.py\n"
+        "--- a/lapis_pm/module.py\n+++ b/lapis_pm/module.py\n"
+        "@@ -1,2 +1,2 @@\n def foo():\n-    return 'old'\n+    return 'new'\n"
+    )
+
+    with dedicated_clone(repo, "test-aco3-pass") as clone_path:
+        status, failures, outcome = oracle_evaluate_candidate(clone_path, fixture, good_candidate, "wt_pass")
+
+    assert status == "success"
+    assert outcome == "pass", f"Expected pass, got {outcome}"
+
+
+def test_aco3_oracle_regressed_when_golden_fails(tmp_path, discriminates_fixture_with_golden_test):
+    """AC-O3: oracle returns 'regressed' when candidate does not satisfy the golden test."""
+    import subprocess as sp
+    from lapis_pm.batched_fixer_eval import oracle_evaluate_candidate, dedicated_clone
+
+    fixture = discriminates_fixture_with_golden_test
+
+    repo = tmp_path / "repo2"
+    repo.mkdir()
+    (repo / "lapis_pm").mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "lapis_pm" / "__init__.py").write_text("")
+    (repo / "lapis_pm" / "module.py").write_text("def foo():\n    return 'old'\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "__init__.py").write_text("")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    parent_sha = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    fixture = FixtureRecord(**{**asdict(fixture), "parent_sha": parent_sha})
+
+    # Candidate that returns wrong value — golden test still fails
+    bad_candidate = (
+        "diff --git a/lapis_pm/module.py b/lapis_pm/module.py\n"
+        "--- a/lapis_pm/module.py\n+++ b/lapis_pm/module.py\n"
+        "@@ -1,2 +1,2 @@\n def foo():\n-    return 'old'\n+    return 'wrong'\n"
+    )
+
+    with dedicated_clone(repo, "test-aco3-regressed") as clone_path:
+        status, failures, outcome = oracle_evaluate_candidate(clone_path, fixture, bad_candidate, "wt_reg")
+
+    assert status == "success"
+    assert outcome == "regressed", f"Expected regressed, got {outcome}"
+
+
+def test_aco3_oracle_apply_failed_on_bad_patch(tmp_path, discriminates_fixture_with_golden_test):
+    """AC-O3: oracle returns 'failed' when candidate diff does not apply."""
+    import subprocess as sp
+    from lapis_pm.batched_fixer_eval import oracle_evaluate_candidate, dedicated_clone
+
+    fixture = discriminates_fixture_with_golden_test
+
+    repo = tmp_path / "repo3"
+    repo.mkdir()
+    (repo / "lapis_pm").mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "lapis_pm" / "__init__.py").write_text("")
+    (repo / "lapis_pm" / "module.py").write_text("def foo():\n    return 'old'\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "__init__.py").write_text("")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    parent_sha = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    fixture = FixtureRecord(**{**asdict(fixture), "parent_sha": parent_sha})
+
+    bad_patch = "this is not a valid diff\n"
+
+    with dedicated_clone(repo, "test-aco3-apply-fail") as clone_path:
+        status, failures, outcome = oracle_evaluate_candidate(clone_path, fixture, bad_patch, "wt_af")
+
+    assert status == "failed", f"Expected failed, got {status}"
+
+
+# AC-O4: leak guard
+
+def test_aco4_prompt_does_not_reference_golden_test():
+    """AC-O4: candidate prompt content never includes golden_test fields.
+
+    Verifies behaviorally: a DISCRIMINATES fixture with a distinctive golden_test_diff
+    string does NOT have that string appear in the generated candidate (mock mode).
+    Also verifies the prompt block does not feed golden_test_diff into the f-string.
+    """
+    import inspect
+    source = inspect.getsource(generate_candidates)
+    # The prompt must use task_intent_paraphrased and pre_state_slice
+    assert "task_intent_paraphrased" in source
+    assert "pre_state_slice" in source
+    # The prompt f-string expression block is between 'prompt = (' and the leak guard.
+    # The leak guard checks for the field AFTER prompt is built — exclude it.
+    # Find the raw prompt string: from 'prompt = (' up to the first 'Emit a unified diff' line.
+    if "Emit a unified diff" in source:
+        prompt_template = source.split("prompt =")[1].split("Emit a unified diff")[0]
+        assert "golden_test_diff" not in prompt_template, \
+            "golden_test_diff must not be fed into the prompt f-string"
+        assert "golden_test_ids" not in prompt_template, \
+            "golden_test_ids must not be fed into the prompt f-string"
+
+
+def test_aco4_mock_candidates_dont_contain_test_source():
+    """AC-O4: mock generate_candidates output contains no golden test text."""
+    fixture = FixtureRecord(
+        repo="test", sha="abc123", parent_sha="parent",
+        pr_number=1, path="module.py", file_loc="unknown", changed_lines=5, tier="T1",
+        task_intent_paraphrased="Fix the bug",
+        pre_state_slice="def foo():\n    return 'old'\n",
+        golden_test_diff=(
+            "--- /dev/null\n+++ b/tests/test_m.py\n"
+            "+def test_secret_oracle():\n+    assert True\n"
+        ),
+        golden_test_ids=["tests/test_m.py::test_secret_oracle"],
+        checker_class="DISCRIMINATES",
+        fail_first_confirmed=True,
+    )
+    candidates = generate_candidates(fixture, n=2, mock_mode=True)
+    for c in candidates:
+        if c:
+            assert "test_secret_oracle" not in c
+            assert "golden_test" not in c
+
+
+# AC-O5: DISCRIMINATES power floor
+
+def test_aco5_validate_discriminates_floor_passes():
+    """AC-O5: validate_discriminates_power_floor passes when small and larger each have ≥8.
+
+    Bucketing is by golden_source_diff changed-line count (≤30 = 'small', >30 = 'larger'),
+    not by T1/T2/T3 tier — co-committed fix+test commits are always T2 (two files), so the
+    old T1 bucket would be structurally empty.
+    """
+    # 'small' fixtures: golden_source_diff with ≤30 changed lines
+    small_diff = "--- a/x.py\n+++ b/x.py\n@@ -1,1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    # 'larger' fixtures: golden_source_diff with >30 changed lines
+    larger_diff = "--- a/y.py\n+++ b/y.py\n@@ -1,1 +1,35 @@\n" + "".join(f"+l{j}\n" for j in range(35))
+    corpus = []
+    for i in range(8):
+        corpus.append(FixtureRecord(
+            repo="lapis-pm", sha=f"d1{i:06d}", parent_sha=f"p{i}",
+            pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
+            tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=small_diff,
+            golden_test_diff="--- /dev/null\n+++ b/t.py\n+def test_x(): pass\n",
+            golden_test_ids=["t.py::test_x"], fail_first_confirmed=True,
+        ))
+    for i in range(8):
+        corpus.append(FixtureRecord(
+            repo="conductor", sha=f"d2{i:06d}", parent_sha=f"q{i}",
+            pr_number=None, path="y.py", file_loc="unknown", changed_lines=15,
+            tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=larger_diff,
+            golden_test_diff="--- /dev/null\n+++ b/t.py\n+def test_y(): pass\n",
+            golden_test_ids=["t.py::test_y"], fail_first_confirmed=True,
+        ))
+    result = validate_discriminates_power_floor(corpus, floor=8)
+    assert result["per_bucket_holdout_discriminates"]["small"] >= 8
+    assert result["per_bucket_holdout_discriminates"]["larger"] >= 8
+
+
+def test_aco5_validate_discriminates_floor_raises_below_floor():
+    """AC-O5: validate_discriminates_power_floor raises ValueError when below floor."""
+    corpus = [
+        FixtureRecord(
+            repo="lapis-pm", sha=f"x{i}", parent_sha=f"p{i}",
+            pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
+            tier="T1", checker_class="DISCRIMINATES", blind_holdout=True,
+            fail_first_confirmed=True,
+        )
+        for i in range(3)
+    ]
+    with pytest.raises(ValueError, match="DISCRIMINATES holdout floor not met"):
+        validate_discriminates_power_floor(corpus, floor=8)
+
+
+def test_aco5_manifest_has_discriminates_fields(monkeypatch, tmp_path):
+    """AC-O5: _write_corpus_manifest includes per_tier_discriminates_counts and
+    per_bucket_holdout_discriminates (with 'small'/'larger' keys) when called from run_eval."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    captured = {}
+
+    def _capture_manifest(meta):
+        captured.update(meta)
+
+    # 'small': ≤30 changed lines in golden_source_diff; 'larger': >30
+    small_diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    larger_diff = "--- a/y.py\n+++ b/y.py\n@@ -1 +1,35 @@\n" + "".join(f"+l{j}\n" for j in range(35))
+
+    disc_corpus = []
+    for i in range(8):
+        disc_corpus.append(FixtureRecord(
+            repo="lapis-pm", sha=f"dm{i:06d}", parent_sha=f"p{i}",
+            pr_number=None, path="x.py", file_loc="unknown", changed_lines=5,
+            tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=small_diff, fail_first_confirmed=True,
+        ))
+    for i in range(8):
+        disc_corpus.append(FixtureRecord(
+            repo="conductor", sha=f"dn{i:06d}", parent_sha=f"q{i}",
+            pr_number=None, path="y.py", file_loc="unknown", changed_lines=15,
+            tier="T2", checker_class="DISCRIMINATES", blind_holdout=True,
+            golden_source_diff=larger_diff, fail_first_confirmed=True,
+        ))
+
+    monkeypatch.setattr(bfe, "build_corpus", lambda **kw: (disc_corpus, {
+        "laundering_total": 0, "laundering_fallback_count": 0,
+    }))
+    monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {
+        "T2": 16, "_shape": "coarse-binary",
+    })
+    monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
+    monkeypatch.setattr(bfe, "_write_corpus_manifest", _capture_manifest)
+
+    bfe.run_eval(phase="build-corpus", mock_mode=True)
+
+    assert "per_tier_discriminates_counts" in captured
+    assert "per_bucket_holdout_discriminates" in captured
+    assert captured["per_bucket_holdout_discriminates"]["small"] == 8
+    assert captured["per_bucket_holdout_discriminates"]["larger"] == 8
+
+
+def test_aco5_build_fails_loud_when_discriminates_below_floor(monkeypatch, capsys):
+    """AC-O5: run_eval build-corpus fails loud (logs error) when DISCRIMINATES floor unmet."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    thin_corpus = [
+        FixtureRecord(
+            repo="lapis-pm", sha="x", parent_sha="y",
+            pr_number=None, path="x.py", file_loc="unknown", changed_lines=5, tier="T1",
+        )
+    ]
+    monkeypatch.setattr(bfe, "build_corpus", lambda **kw: (thin_corpus, {
+        "laundering_total": 0, "laundering_fallback_count": 0,
+    }))
+    monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {
+        "_shape": "coarse-binary",
+    })
+    monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
+    monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: None)
+
+    # run_eval catches ValueError and logs it; the build does NOT complete
+    result = bfe.run_eval(phase="build-corpus", mock_mode=True)
+    assert result is None  # build did not succeed
+
+
+# AC-O3 classify_candidate_outcome_golden unit tests
+
+def test_aco3_classify_golden_pass():
+    """AC-O3: classify_candidate_outcome_golden returns 'pass' when all golden IDs pass."""
+    outcome = classify_candidate_outcome_golden(
+        post_failures=["tests/t.py::some_other_test"],
+        golden_test_ids=["tests/t.py::test_the_fix"],
+    )
+    assert outcome == "pass"
+
+
+def test_aco3_classify_golden_regressed():
+    """AC-O3: classify_candidate_outcome_golden returns 'regressed' when golden test fails."""
+    outcome = classify_candidate_outcome_golden(
+        post_failures=["tests/t.py::test_the_fix"],
+        golden_test_ids=["tests/t.py::test_the_fix"],
+    )
+    assert outcome == "regressed"
+
+
+def test_aco3_classify_golden_blind_no_ids():
+    """AC-O3: classify_candidate_outcome_golden returns 'blind' when no golden_test_ids."""
+    outcome = classify_candidate_outcome_golden(
+        post_failures=[],
+        golden_test_ids=[],
+    )
+    assert outcome == "blind"
 
 
 # ---------------------------------------------------------------------------

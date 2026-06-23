@@ -112,6 +112,11 @@ class FixtureRecord:
     is_test_only: bool = False
     blind_holdout: bool = False
     flaky_excluded_count: int = 0
+    # Co-committed test oracle fields (batched-fixer-cocommitted-test-oracle-v0)
+    golden_source_diff: str = ""
+    golden_test_diff: str = ""
+    golden_test_ids: list[str] = field(default_factory=list)
+    fail_first_confirmed: bool = False
 
 
 @dataclass
@@ -491,6 +496,77 @@ def compute_flakiness_fingerprint(
     return stable, flaky
 
 
+def split_diff_by_type(diff: str) -> tuple[str, str]:
+    """Split a unified diff into (source_diff, test_diff) by file path.
+
+    Test files: paths with a 'tests' directory component, ending '_test.py',
+    or basename starting 'test_'.
+    """
+    source_parts: list[str] = []
+    test_parts: list[str] = []
+
+    for section in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE):
+        if not section.strip():
+            continue
+        m = re.match(r"diff --git a/(\S+)", section)
+        if m:
+            fpath = m.group(1)
+            basename = fpath.rsplit("/", 1)[-1]
+            path_parts = fpath.split("/")
+            is_test = (
+                "tests" in path_parts
+                or basename.startswith("test_")
+                or basename.endswith("_test.py")
+            )
+            if is_test:
+                test_parts.append(section)
+                continue
+        source_parts.append(section)
+
+    return "".join(source_parts), "".join(test_parts)
+
+
+def extract_test_ids_from_diff(test_diff: str) -> list[str]:
+    """Extract pytest node IDs from added def test_* lines in a test diff.
+
+    Returns IDs like ['tests/test_foo.py::test_bar'] for each added test function.
+    """
+    if not test_diff:
+        return []
+
+    ids: list[str] = []
+    current_file: Optional[str] = None
+
+    for line in test_diff.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:].strip()
+        elif line.startswith("+") and not line.startswith("+++") and current_file:
+            stripped = line[1:].lstrip()
+            m = re.match(r"def (test_\w+)\s*\(", stripped)
+            if m:
+                ids.append(f"{current_file}::{m.group(1)}")
+
+    return ids
+
+
+def classify_candidate_outcome_golden(
+    post_failures: list[str],
+    golden_test_ids: list[str],
+) -> Literal["pass", "regressed", "blind"]:
+    """Grade a candidate by the co-committed golden test: PASS iff all golden tests pass.
+
+    Used as the positive discriminator in the co-committed-test oracle (AC-O3).
+    Regression guard (scoped_test_files) is handled separately in oracle_evaluate_candidate.
+    Returns 'blind' when no golden_test_ids (BLIND/UNTESTED fixtures).
+    """
+    if not golden_test_ids:
+        return "blind"
+    post_set = set(post_failures)
+    if any(tid in post_set for tid in golden_test_ids):
+        return "regressed"
+    return "pass"
+
+
 def classify_candidate_outcome(
     post_failures: list[str],
     base_stable_fail_set: list[str],
@@ -639,6 +715,62 @@ def validate_corpus_power_floor(
     )
 
 
+def _source_diff_changed_lines(diff: str) -> int:
+    """Count added+removed lines in a source diff (excludes hunk/file headers)."""
+    return sum(
+        1 for line in diff.splitlines()
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    )
+
+
+def validate_discriminates_power_floor(
+    corpus: list[FixtureRecord],
+    floor: int = CORPUS_HOLDOUT_PER_TIER,
+) -> dict[str, Any]:
+    """Check DISCRIMINATES holdout counts per coarse bucket (small vs larger).
+
+    Bucketing is by source-diff changed-line count (≤30 = 'small', >30 = 'larger').
+    This is independent of the T1/T2/T3 tier system, which maps file count, not change
+    size — co-committed fix+test commits always have len(changed_files)==2 (one source +
+    one test file) and would all land in T2, making the T1 small-bucket structurally empty.
+
+    Raises ValueError (loud fail) if either bucket has fewer than floor
+    DISCRIMINATES holdout fixtures. Resolution is PM/Erah's call (spec §AC-O5):
+    relax extraction caps, pull more repos, or accept DIRECTIONAL-ONLY status.
+
+    Returns per_tier_discriminates_counts and per_bucket_holdout_discriminates.
+    """
+    _SOURCE_SIZE_THRESHOLD = 30
+
+    per_bucket: dict[str, int] = defaultdict(int)
+    per_bucket_holdout: dict[str, int] = defaultdict(int)
+
+    for f in corpus:
+        if f.checker_class == "DISCRIMINATES":
+            bucket = "small" if _source_diff_changed_lines(f.golden_source_diff) <= _SOURCE_SIZE_THRESHOLD else "larger"
+            per_bucket[bucket] += 1
+            if f.blind_holdout:
+                per_bucket_holdout[bucket] += 1
+
+    small_holdout = per_bucket_holdout.get("small", 0)
+    larger_holdout = per_bucket_holdout.get("larger", 0)
+
+    if small_holdout < floor or larger_holdout < floor:
+        raise ValueError(
+            f"DISCRIMINATES holdout floor not met: small={small_holdout}, "
+            f"larger={larger_holdout}, floor={floor}. "
+            f"Resolution (PM/Erah decision required): "
+            f"(a) relax extraction caps / widen commit window, "
+            f"(b) pull additional repos, or "
+            f"(c) accept DIRECTIONAL-ONLY DISCRIMINATES set — never silent."
+        )
+
+    return {
+        "per_tier_discriminates_counts": dict(per_bucket),
+        "per_bucket_holdout_discriminates": {"small": small_holdout, "larger": larger_holdout},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Corpus builder helpers (AC1, AC2, AC4b) — CORE, local git only
 # ---------------------------------------------------------------------------
@@ -785,6 +917,100 @@ def run_base_tests_n_times(
     return stable_fail_set, flaky_set, target_test_files
 
 
+def verify_fail_first(
+    clone_path: Path,
+    parent_sha: str,
+    golden_test_diff: str,
+    golden_source_diff: str,
+    golden_test_ids: list[str],
+    n: int = FLAKE_RUN_COUNT,
+) -> tuple[bool, bool, bool]:
+    """Verify the fail-first property for a co-committed test (AC-O2).
+
+    Step 1: Apply golden_test_diff to parent tree; run golden_test_ids N≥3 times.
+            Tests MUST fail consistently → fail_first_confirmed.
+    Step 2: Also apply golden_source_diff; run once → tests MUST pass (sanity).
+
+    Returns (fail_first_confirmed, sanity_pass, is_flaky).
+    fail_first_confirmed=True only when all golden_test_ids fail on EVERY step-1 run.
+    is_flaky=True when any golden test is inconsistent (some fail, some pass) — fixture quarantined.
+    """
+    if not golden_test_ids or not golden_test_diff:
+        return False, False, False
+
+    # Step 1: run golden tests N times at parent + test diff
+    step1_results: list[list[str]] = []
+    for i in range(n):
+        try:
+            with detached_worktree(clone_path, parent_sha, f"ff_s1_{i}") as wt_path:
+                r = subprocess.run(
+                    ["git", "apply"],
+                    input=golden_test_diff,
+                    cwd=wt_path,
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode != 0:
+                    logger.warning("verify_fail_first: golden_test_diff apply failed (run %d): %s", i, r.stderr[:200])
+                    return False, False, False
+                failures, outcome = run_scoped_tests_once(wt_path, golden_test_ids)
+                if outcome in ("timeout", "error"):
+                    logger.warning("verify_fail_first: run %d outcome %r; skipping", i, outcome)
+                    continue
+                step1_results.append(failures)
+        except Exception as exc:
+            logger.warning("verify_fail_first: step1 run %d error: %s", i, exc)
+
+    if not step1_results:
+        logger.warning("verify_fail_first: all step1 runs failed")
+        return False, False, False
+
+    if len(step1_results) < n:
+        # Fewer than N runs completed (timeouts/errors consumed some slots).
+        # A flakiness fingerprint over <N samples cannot reliably distinguish
+        # stable-fail from flaky — quarantine by refusing to confirm fail-first.
+        logger.warning(
+            "verify_fail_first: only %d/%d step1 runs completed; quarantining fixture",
+            len(step1_results), n,
+        )
+        return False, False, False
+
+    stable, flaky = compute_flakiness_fingerprint(step1_results)
+    # All golden tests must fail on EVERY run (be in stable_fail_set)
+    fail_first_confirmed = all(tid in stable for tid in golden_test_ids)
+    is_flaky = any(tid in flaky for tid in golden_test_ids)
+
+    if not fail_first_confirmed:
+        return False, False, is_flaky
+
+    # Step 2: apply both diffs, verify golden tests now pass (sanity)
+    sanity_pass = False
+    try:
+        with detached_worktree(clone_path, parent_sha, "ff_s2_sanity") as wt_path:
+            r1 = subprocess.run(
+                ["git", "apply"], input=golden_test_diff,
+                cwd=wt_path, capture_output=True, text=True, timeout=10,
+            )
+            if r1.returncode != 0:
+                logger.warning("verify_fail_first: sanity - test diff apply failed")
+                return fail_first_confirmed, False, is_flaky
+            r2 = subprocess.run(
+                ["git", "apply"], input=golden_source_diff,
+                cwd=wt_path, capture_output=True, text=True, timeout=10,
+            )
+            if r2.returncode != 0:
+                logger.warning("verify_fail_first: sanity - source diff apply failed")
+                return fail_first_confirmed, False, is_flaky
+            failures, outcome = run_scoped_tests_once(wt_path, golden_test_ids)
+            if outcome == "ran":
+                sanity_pass = not any(tid in set(failures) for tid in golden_test_ids)
+            else:
+                logger.warning("verify_fail_first: sanity run outcome %r", outcome)
+    except Exception as exc:
+        logger.warning("verify_fail_first: sanity step error: %s", exc)
+
+    return fail_first_confirmed, sanity_pass, is_flaky
+
+
 def classify_checker_class(
     scoped_test_files: list[str],
     base_stable_fail_set: list[str],
@@ -799,6 +1025,25 @@ def classify_checker_class(
     if not scoped_test_files:
         return "UNTESTED"
     if target_test_files:
+        return "DISCRIMINATES"
+    return "BLIND"
+
+
+def classify_checker_class_cocommitted(
+    golden_test_diff: str,
+    fail_first_confirmed: bool,
+) -> Literal["DISCRIMINATES", "BLIND", "UNTESTED"]:
+    """Classify using the co-committed test oracle (AC-O2).
+
+    DISCRIMINATES: has a co-committed test AND fail_first_confirmed (test fails on
+                   unpatched source, passes with fix applied).
+    BLIND: has a co-committed test but fails the fail-first check (test passes on
+           unpatched source — does not exercise the fix).
+    UNTESTED: no co-committed test (source-only commit).
+    """
+    if not golden_test_diff:
+        return "UNTESTED"
+    if fail_first_confirmed:
         return "DISCRIMINATES"
     return "BLIND"
 
@@ -1068,15 +1313,18 @@ def build_corpus(
                     )
                     pre_state = pre_result.stdout if pre_result.returncode == 0 else ""
 
-                    # Golden diff
-                    gd_result = subprocess.run(
-                        ["git", "show", "--format=", sha, "--", path],
+                    # Full diff for provenance + co-committed test split
+                    fd_result = subprocess.run(
+                        ["git", "show", "--format=", sha],
                         cwd=repo_path, capture_output=True, text=True, timeout=10,
                     )
-                    golden_diff = gd_result.stdout
+                    full_diff = fd_result.stdout
+                    golden_source_diff, golden_test_diff = split_diff_by_type(full_diff)
+                    golden_diff = full_diff  # kept for provenance
+                    golden_test_ids = extract_test_ids_from_diff(golden_test_diff)
 
-                    # Proper pre-state slice using diff hunk headers
-                    pre_state_slice = slice_pre_state_from_diff(pre_state, golden_diff)
+                    # Pre-state slice uses source-only diff hunk headers
+                    pre_state_slice = slice_pre_state_from_diff(pre_state, golden_source_diff or golden_diff)
 
                     # Tier classification
                     if len(changed_files) == 2 or total_changed > 30:
@@ -1089,7 +1337,7 @@ def build_corpus(
                         tier = "T3"
 
                     # Difficulty signals (best-effort)
-                    signals = _compute_difficulty_signals(golden_diff, pre_state)
+                    signals = _compute_difficulty_signals(golden_source_diff or golden_diff, pre_state)
 
                     # Intent: use reviewer comment if pr_number resolved, else commit body
                     if pr_number is not None:
@@ -1109,10 +1357,10 @@ def build_corpus(
                     if launder_status == "fallback":
                         metadata["laundering_fallback_count"] += 1
 
-                    # Scoped test files (grep importers of changed symbols)
+                    # Scoped test files (for regression guard baseline)
                     scoped_test_files = find_scoped_test_files(repo_path, path)
 
-                    # N≥3 base runs for flakiness fingerprint
+                    # N≥3 base runs for regression guard fingerprint (base_stable_fail_set)
                     base_stable_fail_set: list[str] = []
                     base_flaky_set: list[str] = []
                     target_test_files: list[str] = []
@@ -1132,27 +1380,40 @@ def build_corpus(
                                 n=FLAKE_RUN_COUNT,
                             )
                             flaky_excluded = len(base_flaky_set)
+                        except Exception as exc:
+                            logger.warning("Base runs failed for %s: %s", sha[:8], exc)
 
-                            # Quarantine if target tests are flaky (should not happen by construction
-                            # since target_test_files come from stable_fail_set, but sanity-check)
-                            if any(t in base_flaky_set for t in target_test_files):
+                    # Fail-first verification for co-committed test oracle (AC-O2)
+                    fail_first_confirmed = False
+                    ff_is_flaky = False
+                    if golden_test_diff and golden_test_ids and clone_path_inner and not skip_base_runs:
+                        try:
+                            ff_confirmed, ff_sanity, ff_is_flaky = verify_fail_first(
+                                clone_path_inner,
+                                parent_sha,
+                                golden_test_diff,
+                                golden_source_diff,
+                                golden_test_ids,
+                                n=FLAKE_RUN_COUNT,
+                            )
+                            fail_first_confirmed = ff_confirmed and ff_sanity
+                            if ff_is_flaky:
                                 logger.warning(
-                                    "Fixture %s has flaky target tests — quarantining", sha[:8]
+                                    "Fixture %s has flaky golden tests — quarantining (AC-O2)", sha[:8]
                                 )
                                 metadata["flaky_target_quarantine_count"] += 1
                                 continue
-
                         except Exception as exc:
-                            logger.warning("Base runs failed for %s: %s", sha[:8], exc)
+                            logger.warning("Fail-first verification failed for %s: %s", sha[:8], exc)
 
                     if repo_name == "lapis-pm":
                         metadata["flaky_excluded_count_lapis_pm"] += flaky_excluded
                     else:
                         metadata["flaky_excluded_count_conductor"] += flaky_excluded
 
-                    # Classify checker_class
-                    checker_class = classify_checker_class(
-                        scoped_test_files, base_stable_fail_set, target_test_files
+                    # Classify checker_class using co-committed test oracle (AC-O2)
+                    checker_class = classify_checker_class_cocommitted(
+                        golden_test_diff, fail_first_confirmed
                     )
 
                     fixture = FixtureRecord(
@@ -1172,6 +1433,10 @@ def build_corpus(
                         intent_source=intent_source,
                         pre_state_slice=pre_state_slice,
                         golden_diff=golden_diff,
+                        golden_source_diff=golden_source_diff,
+                        golden_test_diff=golden_test_diff,
+                        golden_test_ids=golden_test_ids,
+                        fail_first_confirmed=fail_first_confirmed,
                         scoped_test_files=scoped_test_files,
                         base_stable_fail_set=base_stable_fail_set,
                         base_flaky_set=base_flaky_set,
@@ -1264,6 +1529,20 @@ def generate_candidates(
         f"Current code:\n```\n{fixture.pre_state_slice}\n```\n\n"
         "Emit a unified diff in a ```diff ... ``` fence. Minimal changes only."
     )
+    # Leak guard (AC-O4, spec §1.4): golden test diff AND node IDs must never appear
+    # in the candidate prompt. Checking both prevents a future regression that injects
+    # node IDs without the full diff text.
+    if fixture.golden_test_diff and fixture.golden_test_diff.strip() in prompt:
+        raise RuntimeError(
+            f"Leak guard violated: golden_test_diff content in candidate prompt "
+            f"for {fixture.sha[:8]}. The oracle's test must never be shown to the candidate."
+        )
+    for tid in fixture.golden_test_ids:
+        if tid and tid in prompt:
+            raise RuntimeError(
+                f"Leak guard violated: golden_test_id {tid!r} found in candidate prompt "
+                f"for {fixture.sha[:8]}. Oracle test node IDs must never be shown to the candidate."
+            )
     system = (
         "You are a code fixer. Emit only a unified diff in a ```diff``` fenced block. "
         "No explanations."
@@ -1301,41 +1580,96 @@ def oracle_evaluate_candidate(
     candidate_text: str,
     wt_suffix: str,
 ) -> tuple[Literal["success", "failed", "apply_error"], list[str], Literal["pass", "regressed", "blind", "unverified"]]:
-    """Apply a candidate diff and evaluate it using the flakiness-robust oracle.
+    """Apply a candidate diff and evaluate it using the appropriate oracle.
+
+    For DISCRIMINATES fixtures with a co-committed test (golden_test_diff non-empty):
+      uses the golden-test oracle (AC-O3): apply test diff + candidate, run golden_test_ids,
+      plus regression guard on scoped_test_files.
+    For BLIND/UNTESTED or legacy DISCRIMINATES fixtures (no golden_test_diff):
+      uses the flakiness-robust baseline-diff oracle (AC4).
 
     Returns (apply_status, post_failures, scoped_test_outcome).
-    NEVER uses returncode==0 as the pass criterion (AC4 requirement).
+    NEVER uses returncode==0 as the pass criterion.
     """
     with detached_worktree(clone_path, fixture.parent_sha, wt_suffix) as wt_path:
-        # Apply-check gate
+
+        if fixture.checker_class == "DISCRIMINATES" and fixture.golden_test_diff:
+            # Co-committed test oracle path (AC-O3)
+
+            # Step 1: inject the golden test (fail-first baseline is fail_first_confirmed)
+            r_test = subprocess.run(
+                ["git", "apply"],
+                input=fixture.golden_test_diff,
+                cwd=wt_path, capture_output=True, text=True, timeout=10,
+            )
+            if r_test.returncode != 0:
+                return "apply_error", [], "unverified"
+
+            # Step 2: apply-check candidate source diff
+            check = subprocess.run(
+                ["git", "apply", "--check"],
+                input=candidate_text,
+                cwd=wt_path, capture_output=True, text=True, timeout=10,
+            )
+            if check.returncode != 0:
+                return "failed", [], "unverified"
+
+            # Step 3: apply candidate source diff
+            apply = subprocess.run(
+                ["git", "apply"],
+                input=candidate_text,
+                cwd=wt_path, capture_output=True, text=True, timeout=10,
+            )
+            if apply.returncode != 0:
+                return "apply_error", [], "unverified"
+
+            # Step 4: run golden test IDs
+            golden_failures, g_outcome = run_scoped_tests_once(
+                wt_path, fixture.golden_test_ids, timeout=PR_EVAL_TIMEOUT_S
+            )
+            if g_outcome in ("timeout", "error"):
+                return "success", [], "unverified"
+
+            golden_outcome = classify_candidate_outcome_golden(
+                post_failures=golden_failures,
+                golden_test_ids=fixture.golden_test_ids,
+            )
+            if golden_outcome == "regressed":
+                return "success", golden_failures, "regressed"
+
+            # Step 5: regression guard — no new non-flaky scoped failures
+            if fixture.scoped_test_files:
+                scoped_failures, s_outcome = run_scoped_tests_once(
+                    wt_path, fixture.scoped_test_files, timeout=PR_EVAL_TIMEOUT_S
+                )
+                if s_outcome == "ran":
+                    excluded = set(fixture.base_stable_fail_set) | set(fixture.base_flaky_set) | set(fixture.golden_test_ids)
+                    new_failures = set(scoped_failures) - excluded
+                    if new_failures:
+                        return "success", list(scoped_failures), "regressed"
+
+            return "success", golden_failures, "pass"
+
+        # Legacy / BLIND / UNTESTED path (AC4)
         check = subprocess.run(
             ["git", "apply", "--check"],
             input=candidate_text,
-            cwd=wt_path,
-            capture_output=True,
-            text=True,
-            timeout=10,
+            cwd=wt_path, capture_output=True, text=True, timeout=10,
         )
         if check.returncode != 0:
             return "failed", [], "unverified"
 
-        # Apply patch
         apply = subprocess.run(
             ["git", "apply"],
             input=candidate_text,
-            cwd=wt_path,
-            capture_output=True,
-            text=True,
-            timeout=10,
+            cwd=wt_path, capture_output=True, text=True, timeout=10,
         )
         if apply.returncode != 0:
             return "apply_error", [], "unverified"
 
-        # If no scoped tests, oracle cannot discriminate
         if not fixture.scoped_test_files:
             return "success", [], "blind"
 
-        # Run scoped tests
         post_failures, outcome = run_scoped_tests_once(
             wt_path, fixture.scoped_test_files, timeout=PR_EVAL_TIMEOUT_S
         )
@@ -1345,7 +1679,6 @@ def oracle_evaluate_candidate(
         if outcome == "error":
             return "success", [], "unverified"
 
-        # Classify using flakiness-robust baseline-diff (AC4)
         test_outcome = classify_candidate_outcome(
             post_failures=post_failures,
             base_stable_fail_set=fixture.base_stable_fail_set,
@@ -1608,7 +1941,7 @@ def run_eval(
             corpus_shape = floor_result.pop("_shape", "unknown")
             metadata["corpus_shape"] = corpus_shape
 
-            # Surface contamination loudly — a buried logger.warning is not enough.
+            # Surface contamination loudly before any floor checks.
             fallback_count = metadata.get("laundering_fallback_count", 0)
             if fallback_count > 0:
                 total = metadata.get("laundering_total", 0)
@@ -1618,6 +1951,13 @@ def run_eval(
                     f"this be 0; re-run with GW serving big.",
                     file=sys.stderr,
                 )
+
+            # DISCRIMINATES power floor check (AC-O5): fails loud if <8 per coarse bucket.
+            # ValueError propagates as a logged failure; the shortfall message is the directive
+            # to the PM/Erah — resolution is their call (see spec §AC-O5).
+            disc_floor = validate_discriminates_power_floor(corpus)
+            metadata["per_tier_discriminates_counts"] = disc_floor["per_tier_discriminates_counts"]
+            metadata["per_bucket_holdout_discriminates"] = disc_floor["per_bucket_holdout_discriminates"]
 
             _write_corpus_manifest(metadata)
             save_corpus(corpus)

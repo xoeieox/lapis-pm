@@ -86,6 +86,10 @@ CLAUDE_QUEUE_COMPLETED_DIR = Path("/srv/lapis/claude-queue/completed")
 CLAUDE_QUEUE_FAILED_DIR = Path("/srv/lapis/claude-queue/failed")
 MAX_DISPATCH_RETRIES = 2
 
+# Agent types that count as "initial fixer" for dispatch guards, lost-fixer
+# detection, and concurrency checks. A single constant so all sites stay in sync.
+_INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
+
 # Review-gate loop constants
 REVIEW_GATE_THRESHOLD = 40          # Opus reviewer calls before soft-pause
 REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
@@ -1175,9 +1179,9 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     # Guard: initial fixer must not fire for adopted targets.
     # The adopted PR already exists; the first action should be a reviewer dispatch.
     _adopted_pr_num = target.data.get("adopted_pr_number")
-    if agent_type == "fixer" and isinstance(_adopted_pr_num, int):
+    if agent_type in _INITIAL_FIXER_TYPES and isinstance(_adopted_pr_num, int):
         existing_dispatches = load_dispatched(target_id)
-        if not any(r.get("agent_type") == "fixer" for r in existing_dispatches):
+        if not any(r.get("agent_type") in _INITIAL_FIXER_TYPES for r in existing_dispatches):
             raise ValueError(
                 f"target {target_id!r} has an adopted PR "
                 f"(#{_adopted_pr_num}) — "
@@ -1185,7 +1189,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
             )
 
     # L1.D1: Extend initial-fixer guard to check for open lapis/<tid>/ PRs
-    if agent_type == "fixer" and target.pm_repo:
+    if agent_type in _INITIAL_FIXER_TYPES and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -1208,11 +1212,11 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
             print(f"[L1.D1-forgejo-warning] {target_id}: open-PR scan failed; proceeding with dispatch", file=sys.stderr)
 
     # L1.D3: Target-level concurrency guard for initial fixers
-    if agent_type == "fixer":
+    if agent_type in _INITIAL_FIXER_TYPES:
         existing_dispatches = load_dispatched(target_id)
         for record in existing_dispatches:
             if (record.get("status") == "pending" and
-                record.get("agent_type") in ("fixer", "fixer_retry")):
+                record.get("agent_type") in _INITIAL_FIXER_TYPES + ("fixer_retry",)):
                 gpu_id = record.get("gpu_id", "unknown")
                 rec_agent = record.get("agent_type", "unknown")
                 raise ValueError(
@@ -1226,7 +1230,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     base_branch = "main"
     slug = "forced"
     # L1.D2: Widen open-PR/canonical-branch reuse lookup to include fixer (not just fixer_retry)
-    if agent_type in ("fixer", "fixer_retry") and target.pm_repo:
+    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry",) and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -1272,7 +1276,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     try:
         from .router_portfolio import emit_decision_dispatch as _emit_dispatch
         dispatched = load_dispatched(target_id)
-        if agent_type == "fixer":
+        if agent_type in _INITIAL_FIXER_TYPES:
             frag = "kickoff" if len(dispatched) == 1 else "tick"
         elif agent_type == "reviewer":
             frag = "review-cycle"
@@ -3571,6 +3575,9 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
         # Already-satisfied verdict check: fixer may write a machine-readable
         # verdict sidecar instead of opening a PR (lapis-pm-fixer-already-done-verdict).
         # Check before confabulation so a valid verdict is never marked confabulated.
+        # fixer_local is intentionally excluded: the GW engine signals completion via
+        # empty-diff/concluded=False rather than writing a verdict sidecar. Its no-PR
+        # failure mode is caught by _find_lost_fixer_dispatches, not this path.
         _fixer_spec_id = rec.get("spec_id") if rec.get("agent_type") == "fixer" else None
         if _fixer_spec_id and not is_failure:
             _verdict_raw = _read_fixer_verdict(_fixer_spec_id)
@@ -3956,7 +3963,7 @@ def _find_lost_fixer_dispatches(
     needs_brief: list[tuple[dict, dict | None]] = []
 
     for rec in records:
-        if rec.get("agent_type") not in ("fixer", "fixer_retry"):
+        if rec.get("agent_type") not in _INITIAL_FIXER_TYPES + ("fixer_retry",):
             continue
         if rec.get("parent_gpu_id"):
             continue  # Only classify originals, not retry children
@@ -4042,7 +4049,7 @@ def _find_lost_fixer_dispatches(
         retry_child: dict | None = next(
             (r for r in records
              if r.get("parent_gpu_id") == orig_gpu_id
-             and r.get("agent_type") == "fixer"),
+             and r.get("agent_type") in _INITIAL_FIXER_TYPES),
             None,
         )
         # Never preempt a live fixer (child pending = retry in flight)

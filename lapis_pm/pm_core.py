@@ -96,6 +96,11 @@ REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
 _SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
 _SYNTH_FAIL_THRESHOLD = 3
 
+# Agent types that count as an "initial fixer" for guard and lost-fixer purposes.
+# A local fixer dispatched via the GW engine is still an initial fixer — it opens
+# its own PR via U2a's deterministic wrapper just as fixer does via claude -p.
+_INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
+
 # Cycle budgets per authority level (number of reviewer dispatches before exhausted)
 _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
     "advisory": 2,
@@ -1175,9 +1180,9 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     # Guard: initial fixer must not fire for adopted targets.
     # The adopted PR already exists; the first action should be a reviewer dispatch.
     _adopted_pr_num = target.data.get("adopted_pr_number")
-    if agent_type == "fixer" and isinstance(_adopted_pr_num, int):
+    if agent_type in _INITIAL_FIXER_TYPES and isinstance(_adopted_pr_num, int):
         existing_dispatches = load_dispatched(target_id)
-        if not any(r.get("agent_type") == "fixer" for r in existing_dispatches):
+        if not any(r.get("agent_type") in _INITIAL_FIXER_TYPES for r in existing_dispatches):
             raise ValueError(
                 f"target {target_id!r} has an adopted PR "
                 f"(#{_adopted_pr_num}) — "
@@ -1185,7 +1190,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
             )
 
     # L1.D1: Extend initial-fixer guard to check for open lapis/<tid>/ PRs
-    if agent_type == "fixer" and target.pm_repo:
+    if agent_type in _INITIAL_FIXER_TYPES and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -1208,7 +1213,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
             print(f"[L1.D1-forgejo-warning] {target_id}: open-PR scan failed; proceeding with dispatch", file=sys.stderr)
 
     # L1.D3: Target-level concurrency guard for initial fixers
-    if agent_type == "fixer":
+    if agent_type in _INITIAL_FIXER_TYPES:
         existing_dispatches = load_dispatched(target_id)
         for record in existing_dispatches:
             if (record.get("status") == "pending" and
@@ -1226,7 +1231,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     base_branch = "main"
     slug = "forced"
     # L1.D2: Widen open-PR/canonical-branch reuse lookup to include fixer (not just fixer_retry)
-    if agent_type in ("fixer", "fixer_retry") and target.pm_repo:
+    if agent_type in (*_INITIAL_FIXER_TYPES, "fixer_retry") and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -1272,7 +1277,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     try:
         from .router_portfolio import emit_decision_dispatch as _emit_dispatch
         dispatched = load_dispatched(target_id)
-        if agent_type == "fixer":
+        if agent_type in _INITIAL_FIXER_TYPES:
             frag = "kickoff" if len(dispatched) == 1 else "tick"
         elif agent_type == "reviewer":
             frag = "review-cycle"
@@ -3956,7 +3961,7 @@ def _find_lost_fixer_dispatches(
     needs_brief: list[tuple[dict, dict | None]] = []
 
     for rec in records:
-        if rec.get("agent_type") not in ("fixer", "fixer_retry"):
+        if rec.get("agent_type") not in (*_INITIAL_FIXER_TYPES, "fixer_retry"):
             continue
         if rec.get("parent_gpu_id"):
             continue  # Only classify originals, not retry children
@@ -4042,7 +4047,7 @@ def _find_lost_fixer_dispatches(
         retry_child: dict | None = next(
             (r for r in records
              if r.get("parent_gpu_id") == orig_gpu_id
-             and r.get("agent_type") == "fixer"),
+             and r.get("agent_type") in _INITIAL_FIXER_TYPES),
             None,
         )
         # Never preempt a live fixer (child pending = retry in flight)

@@ -86,6 +86,10 @@ CLAUDE_QUEUE_COMPLETED_DIR = Path("/srv/lapis/claude-queue/completed")
 CLAUDE_QUEUE_FAILED_DIR = Path("/srv/lapis/claude-queue/failed")
 MAX_DISPATCH_RETRIES = 2
 
+# Agent types that count as "initial fixer" for dispatch guards, lost-fixer
+# detection, and concurrency checks. A single constant so all sites stay in sync.
+_INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
+
 # Review-gate loop constants
 REVIEW_GATE_THRESHOLD = 40          # Opus reviewer calls before soft-pause
 REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
@@ -95,11 +99,6 @@ REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
 # Synth-fail counter constants
 _SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
 _SYNTH_FAIL_THRESHOLD = 3
-
-# Agent types that count as an "initial fixer" for guard and lost-fixer purposes.
-# A local fixer dispatched via the GW engine is still an initial fixer — it opens
-# its own PR via U2a's deterministic wrapper just as fixer does via claude -p.
-_INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 
 # Cycle budgets per authority level (number of reviewer dispatches before exhausted)
 _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
@@ -1217,7 +1216,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         existing_dispatches = load_dispatched(target_id)
         for record in existing_dispatches:
             if (record.get("status") == "pending" and
-                record.get("agent_type") in ("fixer", "fixer_retry")):
+                record.get("agent_type") in _INITIAL_FIXER_TYPES + ("fixer_retry",)):
                 gpu_id = record.get("gpu_id", "unknown")
                 rec_agent = record.get("agent_type", "unknown")
                 raise ValueError(
@@ -1231,7 +1230,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
     base_branch = "main"
     slug = "forced"
     # L1.D2: Widen open-PR/canonical-branch reuse lookup to include fixer (not just fixer_retry)
-    if agent_type in (*_INITIAL_FIXER_TYPES, "fixer_retry") and target.pm_repo:
+    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry",) and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -3576,6 +3575,9 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
         # Already-satisfied verdict check: fixer may write a machine-readable
         # verdict sidecar instead of opening a PR (lapis-pm-fixer-already-done-verdict).
         # Check before confabulation so a valid verdict is never marked confabulated.
+        # fixer_local is intentionally excluded: the GW engine signals completion via
+        # empty-diff/concluded=False rather than writing a verdict sidecar. Its no-PR
+        # failure mode is caught by _find_lost_fixer_dispatches, not this path.
         _fixer_spec_id = rec.get("spec_id") if rec.get("agent_type") == "fixer" else None
         if _fixer_spec_id and not is_failure:
             _verdict_raw = _read_fixer_verdict(_fixer_spec_id)
@@ -3961,7 +3963,7 @@ def _find_lost_fixer_dispatches(
     needs_brief: list[tuple[dict, dict | None]] = []
 
     for rec in records:
-        if rec.get("agent_type") not in (*_INITIAL_FIXER_TYPES, "fixer_retry"):
+        if rec.get("agent_type") not in _INITIAL_FIXER_TYPES + ("fixer_retry",):
             continue
         if rec.get("parent_gpu_id"):
             continue  # Only classify originals, not retry children

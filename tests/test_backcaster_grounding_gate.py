@@ -51,7 +51,7 @@ def _make_stub_returns():
             reversibility="high",
         ),
     ]
-    return (preconditions, "hash-decomp"), (gaps, [], "hash-gap"), (components, "hash-derive", 0)
+    return (preconditions, "hash-decomp", False), (gaps, [], "hash-gap"), (components, "hash-derive", 0)
 
 
 # Patch targets

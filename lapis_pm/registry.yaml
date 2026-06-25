@@ -49,6 +49,8 @@ agents:
 
       {spec_summary}
 
+      {intent_block}
+
       ## Role invariant
 
       You are a PURE JUDGE. Read the diff and return a verdict. Do NOT write
@@ -107,6 +109,8 @@ agents:
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
       {spec_summary}
+
+      {intent_block}
 
       ## Role invariant
 
@@ -233,6 +237,8 @@ agents:
       Spec:
       {spec_summary}
 
+      {intent_block}
+
       ## Mem check first (before editing code)
 
       Load relevant context from mem:
@@ -336,6 +342,8 @@ agents:
       Spec:
       {spec_summary}
 
+      {intent_block}
+
       ## Role invariant
 
       You are a PURE IMPLEMENTER. Fix the listed issues and push to the
@@ -390,6 +398,8 @@ agents:
 
       Spec:
       {spec_summary}
+
+      {intent_block}
 
       ## Mem check first (before reading files)
 

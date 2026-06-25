@@ -62,7 +62,7 @@ except Exception:
     _ClaudeQueue = None  # type: ignore
 
 from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
-from . import episodic, brief, authority
+from . import episodic, brief, authority, intent_artifact as _intent_artifact
 
 try:
     from . import eval_gate as _eval_gate
@@ -859,6 +859,42 @@ def _reset_synth_fail_count(target_id: str) -> None:
     _mem().delete(_SYNTH_FAIL_KEY.format(target_id))
 
 
+def _check_calcification(target_id: str) -> None:
+    """Track consecutive dispatches with unresolved intent voids.
+
+    Emits an advisory observation every CALCIFICATION_THRESHOLD dispatches
+    (3, 6, 9, ...) where the intent artifact for target_id still has VOIDs.
+    Resets when the artifact is absent or void-free.
+    """
+    content = _intent_artifact.load(target_id)
+    key = f"{_intent_artifact.VOID_DISPATCH_KEY_PREFIX}/{target_id}"
+    mem = _mem()
+    if not content or not _intent_artifact.has_voids(content):
+        mem.delete(key)
+        return
+    rec = mem.get(key)
+    count = 0
+    if rec:
+        try:
+            count = int(rec.get("content", "0"))
+        except (ValueError, TypeError):
+            count = 0
+    count += 1
+    mem.set(key, str(count), tags=["lapis-pm", "intent-void"])
+    if count % _intent_artifact.CALCIFICATION_THRESHOLD == 0:
+        n_voids = _intent_artifact.void_field_count(content)
+        episodic.write_observation(
+            target_id,
+            (
+                f"[intent-calcification-advisory] {n_voids} VOID field(s) in the intent "
+                f"artifact for {target_id} have persisted across {count} consecutive worker "
+                f"dispatches. These voids are machine-un-fillable. Erah should resolve them "
+                f"or explicitly acknowledge them to prevent silent calcification into assumed intent."
+            ),
+            extra_tags=["pm:intent-void", "pm:calcification-advisory"],
+        )
+
+
 REVIEW_STATE_KEY_PREFIX = "pm/review-state/"
 
 
@@ -1256,6 +1292,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "slug": slug,
         "existing_branch": existing_branch,
         "base_branch": base_branch,
+        "intent_block": _intent_artifact.dispatch_block(target_id),
     }
     res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
     append_dispatched(target_id, {
@@ -1268,6 +1305,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "status": "pending",
         "retry_count": 0,
     })
+    _check_calcification(target_id)
     episodic.write_dispatch(
         target_id,
         f"Forced dispatch: {agent_type} → {res.task_id}\nIntent: {intent}",
@@ -3063,6 +3101,7 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
         "question": intent,
         "pr_number": dispatch_record.get("pr_number", ""),
         "slug": dispatch_record.get("slug", "retry"),
+        "intent_block": _intent_artifact.dispatch_block(target_id),
     }
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
     new_record = {
@@ -3077,6 +3116,7 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
         "parent_gpu_id": dispatch_record.get("gpu_id"),
     }
     append_dispatched(target_id, new_record)
+    _check_calcification(target_id)
     episodic.write_retry(
         target_id,
         f"Retry #{new_record['retry_count']} dispatched: {agent_type} → {res.task_id}\n"
@@ -3146,6 +3186,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "prior_review": prior_review_text,
         "existing_branch": existing_branch,
         "base_branch": base_branch,
+        "intent_block": _intent_artifact.dispatch_block(target_id),
     }
 
     # Get the diff for the reviewer prompt
@@ -3239,6 +3280,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
         "slug": f"pr{pr_number}-fix-c{cycle}",
         "existing_branch": pr_branch,
         "question": f"fix reviewer issues on PR #{pr_number}",
+        "intent_block": _intent_artifact.dispatch_block(target_id),
     }
 
     user_prompt = (
@@ -3249,6 +3291,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
     )
 
     res = _SHAPER.dispatch("fixer_retry", target_id, user_prompt, vars_=vars_)
+    _check_calcification(target_id)
 
     record = {
         "gpu_id": res.task_id,
@@ -4097,8 +4140,10 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
         "slug": rec.get("slug", "forced"),
         "base_branch": "main",
         "existing_branch": f"lapis/{target_id}/forced",
+        "intent_block": _intent_artifact.dispatch_block(target_id),
     }
     res = _SHAPER.dispatch(agent_type, target_id, dispatch_intent, vars_=vars_)
+    _check_calcification(target_id)
 
     orig_gpu_id = rec.get("gpu_id", "?")
     new_record: dict = {

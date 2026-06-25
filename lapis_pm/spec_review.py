@@ -467,6 +467,7 @@ def _dispatch_gw_reviewer(
     parsed_target_id: str,
     repo: str,
     run_id: str,
+    gw_principal: str | None = None,
 ) -> tuple[str | None, list[dict], float]:
     """Dispatch and run the GW reference reviewer synchronously.
 
@@ -524,6 +525,7 @@ def _dispatch_gw_reviewer(
             return_transcript=True,
             work_id=run_id,
             timeout=300,
+            principal=gw_principal,
         )
         elapsed = time.time() - start_time
         if text is not None:
@@ -1312,6 +1314,7 @@ def run_spec_review(
         gw_future = None
         executor = None
         gw_run_id = str(uuid.uuid4())[:8]
+        gw_principal = f"gw-gate-{uuid.uuid4().hex[:12]}"
         do_gw = effective_authority in {"advisory", "hold"}
         if do_gw:
             executor = ThreadPoolExecutor(max_workers=1)
@@ -1323,6 +1326,7 @@ def run_spec_review(
                     parsed_target_id=parsed_target_id,
                     repo=repo,
                     run_id=gw_run_id,
+                    gw_principal=gw_principal,
                 )
                 print(
                     f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
@@ -1558,6 +1562,7 @@ def run_spec_review(
                 council_voicing=council_voicing,
                 facets_operator=facets_operator,
                 grounding_result_file=grounding_result_file,
+                gw_principal=gw_principal,
             )
 
             try:

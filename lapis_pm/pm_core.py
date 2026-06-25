@@ -1449,6 +1449,11 @@ def _set_brief_outstanding(
             _post_write_sweep_brief(target_id, b.comment_id)
         else:
             set_outstanding_brief(target_id, b.comment_id)
+        try:
+            from . import brief_gem as _brief_gem
+            _brief_gem.deposit_brief_gem(target_id, b)
+        except Exception as _bg_exc:
+            logger.warning("brief-gem deposit failed (non-fatal): %s", _bg_exc)
         return True
 
     fail_n = _inc_synth_fail_count(target_id)
@@ -1463,6 +1468,11 @@ def _set_brief_outstanding(
             _post_write_sweep_brief(target_id, b.comment_id)
         else:
             set_outstanding_brief(target_id, b.comment_id)
+        try:
+            from . import brief_gem as _brief_gem
+            _brief_gem.deposit_brief_gem(target_id, b)
+        except Exception as _bg_exc:
+            logger.warning("brief-gem deposit failed (non-fatal): %s", _bg_exc)
         return True
 
     logger.warning(
@@ -4797,6 +4807,16 @@ def tick_all() -> list[TickResult]:
             count,
             REVIEW_GATE_THRESHOLD,
         )
+
+    # Decided-gem reconciler: process brief-gems Erah has decided on the Desk.
+    # Runs once per tick_all (cross-target). Fail-soft — never blocks target processing.
+    try:
+        from . import brief_gem as _brief_gem
+        _gem_actions = _brief_gem.reconcile_decided_gems()
+        if _gem_actions:
+            logger.info("[brief-gem:reconcile] %s", "; ".join(_gem_actions))
+    except Exception as _bg_exc:
+        logger.warning("[brief-gem:reconcile] failed (non-fatal): %s", _bg_exc)
 
     store = TargetStore()
     bound = [t for t in store.load_all() if t.pm_bound]

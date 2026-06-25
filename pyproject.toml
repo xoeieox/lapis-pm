@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "agents-core",
     "archetypes-core",
+    "httpx",
     "pyyaml",
 ]
 

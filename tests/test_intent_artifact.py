@@ -1,9 +1,9 @@
-"""Tests for intent_artifact module (spec: intent-layer-harvest-v0)."""
+"""Tests for intent_artifact module and calcification monitor (spec: intent-layer-harvest-v0)."""
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
@@ -136,6 +136,151 @@ def test_dispatch_block_void_count_accurate(tmp_path):
 
 
 # --- registry template render (integration: vars_ injection) ---
+
+def test_dispatch_block_strips_frontmatter(tmp_path):
+    intent_dir = tmp_path / "intent"
+    intent_dir.mkdir()
+    (intent_dir / "my-target.md").write_text(CLEAN_CONTENT)
+    with patch.object(intent_artifact, "INTENT_DIR", intent_dir):
+        block = intent_artifact.dispatch_block("my-target")
+    # Frontmatter fields must not appear in the injected block
+    assert "target_id:" not in block
+    assert "author:" not in block
+    assert "ratified:" not in block
+    assert "supersedes:" not in block
+    # Body content must be present
+    assert "problem:" in block
+    assert "purpose:" in block
+
+
+# --- _check_calcification (pm_core) ---
+
+def _make_mem_mock(existing_count: str | None = None) -> MagicMock:
+    """Build a MemoryStore mock with get/set/delete stubs."""
+    m = MagicMock()
+    if existing_count is None:
+        m.get.return_value = None
+    else:
+        m.get.return_value = {"content": existing_count}
+    return m
+
+
+def test_check_calcification_no_artifact():
+    """No artifact → delete counter, no episodic write."""
+    from lapis_pm.pm_core import _check_calcification
+
+    mem = _make_mem_mock()
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=None),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+    ):
+        _check_calcification("t1")
+
+    mem.delete.assert_called_once()
+    mock_obs.assert_not_called()
+
+
+def test_check_calcification_void_free_artifact():
+    """Artifact present but void-free → delete counter, no episodic write."""
+    from lapis_pm.pm_core import _check_calcification
+
+    mem = _make_mem_mock(existing_count="2")
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=CLEAN_CONTENT),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+    ):
+        _check_calcification("t1")
+
+    mem.delete.assert_called_once()
+    mock_obs.assert_not_called()
+
+
+def test_check_calcification_increments_counter():
+    """Each dispatch with voids increments the counter."""
+    from lapis_pm.pm_core import _check_calcification
+
+    mem = _make_mem_mock(existing_count="1")
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation"),
+    ):
+        _check_calcification("t1")
+
+    # Counter was 1, should be written as "2"
+    mem.set.assert_called_once()
+    args = mem.set.call_args
+    assert args[0][1] == "2"
+
+
+def test_check_calcification_threshold_fires_at_3():
+    """Advisory is written when count reaches the calcification threshold (3)."""
+    from lapis_pm.pm_core import _check_calcification
+
+    # Counter is at 2 — next call brings it to 3, which is threshold
+    mem = _make_mem_mock(existing_count="2")
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+    ):
+        _check_calcification("t1")
+
+    mock_obs.assert_called_once()
+    obs_text = mock_obs.call_args[0][1]
+    assert "calcification" in obs_text
+    assert "3" in obs_text  # count appears in the message
+
+
+def test_check_calcification_no_alert_below_threshold():
+    """No advisory before count reaches a multiple of CALCIFICATION_THRESHOLD."""
+    from lapis_pm.pm_core import _check_calcification
+
+    # Counter is at 0 — becomes 1, no alert
+    mem = _make_mem_mock(existing_count=None)
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+    ):
+        _check_calcification("t1")
+
+    mock_obs.assert_not_called()
+
+
+def test_check_calcification_fires_again_at_6():
+    """Alert fires at every multiple of threshold (6, 9, …)."""
+    from lapis_pm.pm_core import _check_calcification
+
+    mem = _make_mem_mock(existing_count="5")
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+    ):
+        _check_calcification("t1")
+
+    mock_obs.assert_called_once()
+
+
+def test_check_calcification_episodic_tags():
+    """Advisory observation carries the correct extra_tags."""
+    from lapis_pm.pm_core import _check_calcification
+
+    mem = _make_mem_mock(existing_count="2")
+    with (
+        patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
+        patch("lapis_pm.pm_core._mem", return_value=mem),
+        patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+    ):
+        _check_calcification("t1")
+
+    extra_tags = mock_obs.call_args[1].get("extra_tags", mock_obs.call_args[0][2] if len(mock_obs.call_args[0]) > 2 else [])
+    assert "pm:intent-void" in extra_tags
+    assert "pm:calcification-advisory" in extra_tags
+
 
 def test_registry_templates_accept_intent_block():
     """Smoke: all worker templates render without KeyError when intent_block is empty."""

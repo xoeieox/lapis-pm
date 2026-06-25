@@ -29,6 +29,17 @@ def _path(target_id: str) -> Path:
     return INTENT_DIR / f"{target_id}.md"
 
 
+def _strip_frontmatter(content: str) -> str:
+    """Strip YAML frontmatter (--- ... ---) from content, returning only the body."""
+    lines = content.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return content
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == "---":
+            return "".join(lines[i + 1:]).lstrip("\n")
+    return content
+
+
 def load(target_id: str) -> str | None:
     """Return the intent artifact content, or None if absent."""
     try:
@@ -70,4 +81,5 @@ def dispatch_block(target_id: str) -> str:
             "> and FLAG it back to Erah. VOIDs are advisory-only and never block\n"
             "> implementation work."
         )
-    return f"## Target intent\n\n{content.strip()}{void_note}"
+    body = _strip_frontmatter(content)
+    return f"## Target intent\n\n{body.strip()}{void_note}"

@@ -3251,6 +3251,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
             f"pm:reviewer:pr={pr_number}:cycle={cycle}:verdict=pending",
         ],
     )
+    _check_calcification(target_id)
     return f"action:reviewer_dispatched:pr={pr_number}:cycle={cycle}"
 
 

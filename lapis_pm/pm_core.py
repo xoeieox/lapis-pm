@@ -3044,6 +3044,20 @@ def _act_merge(target_id: str, payload: dict) -> str:
     return f"action:auto_merge:pr={cls.pr_number}"
 
 
+def _auto_resolve_record(target_id: str, pr_number: int) -> None:
+    """Write audit trail after a conservative auto-resolve (observation + mem key)."""
+    episodic.write_observation(
+        target_id,
+        f"Auto-resolved (conservative): merged PR #{pr_number} — reviewer clean, advisory, no held paths",
+        extra_tags=["pm:auto-resolved", f"pm:pr={pr_number}"],
+    )
+    _mem().set(
+        f"pm/auto-resolved/{target_id}/{pr_number}",
+        f"merged PR #{pr_number} at advisory-clean auto-resolve",
+        tags=["lapis-pm", "pm:auto-resolved"],
+    )
+
+
 def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     cls: authority.PRClassification = payload["classification"]
     if hold:
@@ -3061,6 +3075,30 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             effective_trigger = "advisory-screen-issue"
         else:
             effective_trigger = "advisory-clean"
+
+    # Conservative auto-resolve: merge unambiguous advisory-clean PRs without a gem.
+    # Predicate is deterministic (no LLM). On any merge failure, falls through to
+    # the normal brief/gem path — never swallows a brief.
+    if not hold and effective_trigger == "advisory-clean":
+        from . import auto_resolve as _ar
+        _ar_target = TargetStore().get(target_id)
+        if _ar_target is not None:
+            _should, _merge_opt = _ar.should_auto_resolve(
+                cls, _ar_target, _ar_target.pm_repo or "",
+            )
+            if _should:
+                try:
+                    brief._act_merge_pr(target_id, cls.pr_number)
+                    _auto_resolve_record(target_id, cls.pr_number)
+                    _mark_pr_classified(target_id, cls.pr_number)
+                    return f"action:auto_resolved:advisory_clean:pr={cls.pr_number}"
+                except Exception as _ar_exc:
+                    logger.warning(
+                        "auto-resolve: merge failed for %s PR #%s (%s) — falling to brief/gem",
+                        target_id, cls.pr_number, _ar_exc,
+                    )
+                    # fall through to normal brief/gem path
+
     reviewer_verdict_text: str | None = None
     if effective_trigger == "advisory-clean":
         verdict_info = _last_review_verdict(target_id, cls.pr_number)

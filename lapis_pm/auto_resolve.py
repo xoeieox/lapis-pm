@@ -39,8 +39,8 @@ def should_auto_resolve(
     if dial != "conservative":
         return False, f"dial={dial!r}"
 
-    # Clause 2: advisory authority only (hold always escalates)
-    pm_authority = getattr(target, "pm_authority", None) or "advisory"
+    # Clause 2: advisory authority only (hold always escalates; None => fail-safe to gem)
+    pm_authority = getattr(target, "pm_authority", None)
     if pm_authority != "advisory":
         return False, f"pm_authority={pm_authority!r}"
 

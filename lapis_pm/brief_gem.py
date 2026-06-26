@@ -217,6 +217,36 @@ def _fetch_decided_gems() -> list[dict]:
         return []
 
 
+def _call_supersede_endpoint(gem_id: str, reason: str, by: str) -> bool | None:
+    """POST /v0/decision-gems/{gem_id}/supersede.
+
+    Returns True on success, False on 409 (already terminal), None on 404 or any error.
+    Fail-soft: logs warnings on unexpected failures.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("WEAVER_BASE_URL"):
+        return None  # benign no-op under pytest without mock weaver
+
+    try:
+        import httpx
+        base = _weaver_base_url()
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                f"{base}/v0/decision-gems/{gem_id}/supersede",
+                json={"reason": reason, "by": by},
+            )
+            if resp.status_code == 409:
+                return False  # already decided or superseded
+            if resp.status_code == 404:
+                return None  # Leg 1 not yet deployed; swallow
+            resp.raise_for_status()
+            return True
+    except Exception as exc:
+        logger.warning(
+            "brief-gem: supersede call failed for gem %s: %s", gem_id, exc,
+        )
+        return None
+
+
 def _held_path_check_live(target_id: str, pr_number: int, repo: str) -> tuple[bool, str]:
     """Re-fetch live PR diff against LIVE HEAD and check for held paths.
 
@@ -287,11 +317,10 @@ def reconcile_decided_gems() -> list[str]:
 
     actions: list[str] = []
     gems = _fetch_decided_gems()
-    if not gems:
-        return actions
-
     mem = _pm._mem()
-    store = TargetStore()
+
+    if gems:
+        store = TargetStore()
 
     for gem in gems:
         gem_id = gem.get("gem_id", "")
@@ -410,5 +439,53 @@ def reconcile_decided_gems() -> list[str]:
                 "brief-gem: unexpected error processing gem %s: %s", gem_id, exc,
             )
             actions.append(f"brief-gem:error:{gem_id}:{exc}")
+
+    # --- orphan open-gem sweep ---
+    # Supersede open gems whose underlying brief is no longer outstanding.
+    # Silent: no notification, no Desk state. 409 (gem decided on same tick) → leave open;
+    # decided-gem path self-heals on the next tick.
+    map_entries = mem.list_by_prefix("pm/brief-gem/map/", limit=500)
+    for entry in map_entries:
+        key = entry.get("key", "")
+        if not key.startswith("pm/brief-gem/map/"):
+            continue
+        orphan_gem_id = key[len("pm/brief-gem/map/"):]
+        if not orphan_gem_id:
+            continue
+        try:
+            orphan_data = json.loads(entry.get("content", "{}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if orphan_data.get("status") != "open":
+            continue
+        orphan_target_id = orphan_data.get("target_id", "")
+        orphan_brief_cid = orphan_data.get("brief_comment_id", "")
+        if not orphan_target_id or not orphan_brief_cid:
+            continue
+        try:
+            current_brief = _pm.get_outstanding_brief(orphan_target_id)
+            if current_brief == orphan_brief_cid:
+                continue  # brief still outstanding — leave untouched
+            supersede_result = _call_supersede_endpoint(
+                orphan_gem_id,
+                reason="brief resolved via other path (orphan reconcile)",
+                by="lapis-pm:brief-gem-reconciler",
+            )
+            if supersede_result is True:
+                _update_map_status(orphan_gem_id, "superseded",
+                                   annotation="orphan: brief resolved via other path")
+                actions.append(f"brief-gem:orphan-superseded:{orphan_gem_id}")
+            elif supersede_result is False:
+                # 409: gem already decided/superseded by Erah on same tick; leave open
+                logger.debug(
+                    "brief-gem: orphan gem %s already terminal (409), leaving open",
+                    orphan_gem_id,
+                )
+            # None: 404 (Leg 1 not deployed) or network error — swallowed silently
+        except Exception as exc:
+            logger.warning(
+                "brief-gem: unexpected error in orphan sweep for gem %s: %s",
+                orphan_gem_id, exc,
+            )
 
     return actions

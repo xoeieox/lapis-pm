@@ -11,6 +11,7 @@ AC3: cmd_unbind clears the outstanding brief key so get_outstanding_brief return
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -44,7 +45,13 @@ def test_set_brief_outstanding_synth_fail_writes_to_isolated_store(tmp_path):
     # _set_brief_outstanding with fail_n < threshold (starts at 0) takes the
     # write_observation branch (pm_core.py:1431) and writes a pm:synthesis-failed
     # observation to the comment store.
-    pm_core._set_brief_outstanding("my-target", fake_brief)
+    with patch("httpx.Client") as mock_httpx:
+        pm_core._set_brief_outstanding("my-target", fake_brief)
+
+    # No live gem deposited (pytest guard must have no-op'd the deposit).
+    mock_httpx.assert_not_called(), (
+        "httpx.Client was called — deposit_brief_gem reached live weaver under pytest"
+    )
 
     # Prod comment file must be untouched.
     if prod_existed_before:

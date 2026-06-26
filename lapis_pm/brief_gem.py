@@ -33,7 +33,7 @@ from . import brief as _brief
 
 logger = logging.getLogger(__name__)
 
-_BRIX_DEFAULT = "http://203.0.113.10:8403"
+_BRIX_DEFAULT = "http://203.0.113.10:8403"  # prod-only fallback; pytest guard below prevents tests from reaching it
 
 
 def _weaver_base_url() -> str:
@@ -92,6 +92,10 @@ def deposit_brief_gem(
     Fail-soft: weaver unreachable or any error -> logs warning, returns None.
     The brief must already be set outstanding before this is called.
     """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("WEAVER_BASE_URL"):
+        # under pytest with no explicit (mock/test) weaver target → do NOT hit live prod
+        return None   # benign no-op
+
     from . import pm_core as _pm
 
     mem = _pm._mem()
@@ -192,6 +196,10 @@ def _update_map_status(
 
 def _fetch_decided_gems() -> list[dict]:
     """GET /v0/decision-gems?state=decided. Returns empty list on any failure (fail-soft)."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("WEAVER_BASE_URL"):
+        # under pytest with no explicit (mock/test) weaver target → do NOT hit live prod
+        return []   # benign no-op
+
     try:
         import httpx
         base = _weaver_base_url()

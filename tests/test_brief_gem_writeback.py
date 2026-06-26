@@ -32,6 +32,7 @@ Patch targets:
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -150,6 +151,7 @@ class TestBriefRaiseDepositsGem:
             patch("lapis_pm.pm_core._mem", return_value=mock_mem),
             patch("lapis_pm.brief_gem._brief.read_options", return_value=opts),
             patch("httpx.Client", return_value=mock_client),
+            patch.dict(os.environ, {"WEAVER_BASE_URL": "http://mock-weaver:9999"}),
         ):
             gem_id = brief_gem.deposit_brief_gem("my-target", b)
 
@@ -192,6 +194,7 @@ class TestBriefRaiseDepositsGem:
         with (
             patch("lapis_pm.pm_core._mem", return_value=mock_mem),
             patch("httpx.Client") as mock_httpx,
+            patch.dict(os.environ, {"WEAVER_BASE_URL": "http://mock-weaver:9999"}),
         ):
             gem_id = brief_gem.deposit_brief_gem("my-target", b)
 
@@ -213,6 +216,7 @@ class TestBriefRaiseDepositsGem:
             patch("lapis_pm.pm_core._mem", return_value=mock_mem),
             patch("lapis_pm.brief_gem._brief.read_options", return_value=None),
             patch("httpx.Client", return_value=mock_client),
+            patch.dict(os.environ, {"WEAVER_BASE_URL": "http://mock-weaver:9999"}),
         ):
             gem_id = brief_gem.deposit_brief_gem("my-target", b)
 
@@ -800,3 +804,64 @@ class TestWeaverUrlResolution:
         with patch.dict(os.environ, env, clear=True):
             url = brief_gem._weaver_base_url()
         assert "203.0.113.10:8403" in url
+
+
+# ---------------------------------------------------------------------------
+# Test-isolation guard (lapis-pm-brief-gem-test-isolation-v0)
+# ---------------------------------------------------------------------------
+
+class TestPytestGuard:
+    """deposit_brief_gem and _fetch_decided_gems must not reach live weaver under pytest."""
+
+    def test_deposit_brief_gem_noop_under_pytest(self):
+        """With PYTEST_CURRENT_TEST set (always true) and no WEAVER_BASE_URL, deposit is a no-op."""
+        b = _make_brief()
+        env = {k: v for k, v in os.environ.items() if k != "WEAVER_BASE_URL"}
+        env["PYTEST_CURRENT_TEST"] = "test_deposit_brief_gem_noop_under_pytest"
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("httpx.Client") as mock_httpx,
+        ):
+            result = brief_gem.deposit_brief_gem("test-target", b)
+        assert result is None
+        mock_httpx.assert_not_called()
+
+    def test_deposit_brief_gem_runs_when_weaver_base_url_set(self):
+        """With WEAVER_BASE_URL set, deposit bypasses the guard and hits the mock weaver."""
+        b = _make_brief()
+        mock_mem = _make_mock_mem()
+
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"gem_id": "gem-intent-001"}
+        fake_resp.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = fake_resp
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=mock_mem),
+            patch("lapis_pm.brief_gem._brief.read_options", return_value=None),
+            patch("httpx.Client", return_value=mock_client),
+            patch.dict(os.environ, {"WEAVER_BASE_URL": "http://test-weaver:9999"}),
+        ):
+            result = brief_gem.deposit_brief_gem("test-target", b)
+        assert result == "gem-intent-001"
+        mock_client.post.assert_called_once()
+
+    def test_set_brief_outstanding_no_live_deposit(self):
+        """_set_brief_outstanding under pytest deposits no gem to live weaver (original leak)."""
+        from lapis_pm import pm_core
+
+        b = _make_brief(synthesis_failed=False)
+        mock_mem = _make_mock_mem()
+        env = {k: v for k, v in os.environ.items() if k != "WEAVER_BASE_URL"}
+        env["PYTEST_CURRENT_TEST"] = "test_set_brief_outstanding_no_live_deposit"
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=mock_mem),
+            patch.dict(os.environ, env, clear=True),
+            patch("httpx.Client") as mock_httpx,
+        ):
+            pm_core._set_brief_outstanding("my-target", b)
+        mock_httpx.assert_not_called()

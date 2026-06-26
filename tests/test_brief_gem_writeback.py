@@ -865,3 +865,211 @@ class TestPytestGuard:
         ):
             pm_core._set_brief_outstanding("my-target", b)
         mock_httpx.assert_not_called()
+
+    def test_call_supersede_endpoint_noop_under_pytest(self):
+        """_call_supersede_endpoint with no WEAVER_BASE_URL is a no-op under pytest."""
+        env = {k: v for k, v in os.environ.items() if k != "WEAVER_BASE_URL"}
+        env["PYTEST_CURRENT_TEST"] = "test_call_supersede_endpoint_noop_under_pytest"
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("httpx.Client") as mock_httpx,
+        ):
+            result = brief_gem._call_supersede_endpoint("gem-x", "test reason", "test-by")
+        assert result is None
+        mock_httpx.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Orphan open-gem sweep tests
+# ---------------------------------------------------------------------------
+
+def _make_map_entry(gem_id: str, target_id: str, brief_comment_id: str,
+                    status: str = "open") -> dict:
+    content = json.dumps({
+        "target_id": target_id,
+        "brief_comment_id": brief_comment_id,
+        "pr_number": None,
+        "deposited_ts": "2026-06-25T10:00:00+00:00",
+        "actioned_ts": None,
+        "status": status,
+        "annotation": None,
+    })
+    return {"key": f"pm/brief-gem/map/{gem_id}", "content": content}
+
+
+class TestReconcileOrphanSweep:
+    """test_reconcile_supersedes_orphan_open_gem: orphan detection and supersession."""
+
+    def _make_mem_with_entries(self, entries: list[dict]) -> MagicMock:
+        """Mock mem that returns entries from list_by_prefix and supports get/set."""
+        mem = MagicMock()
+        set_calls: list[tuple] = []
+
+        def _get(key: str):
+            for e in entries:
+                if e["key"] == key:
+                    return {"content": e["content"]}
+            return None
+
+        def _list_by_prefix(prefix: str, limit: int = 50):
+            return [e for e in entries if e["key"].startswith(prefix)]
+
+        def _set(key, value, **kwargs):
+            set_calls.append((key, value))
+
+        mem.get.side_effect = _get
+        mem.list_by_prefix.side_effect = _list_by_prefix
+        mem.set.side_effect = _set
+        mem._set_calls = set_calls
+        return mem
+
+    def test_orphan_gem_superseded_when_brief_cleared(self):
+        """Open gem whose brief is no longer outstanding → supersede called, mapping superseded."""
+        entries = [_make_map_entry("gem-orphan", "target-a", "brief-old-cid")]
+        mock_mem = self._make_mem_with_entries(entries)
+
+        supersede_calls: list[tuple] = []
+
+        def _fake_supersede(gem_id, reason, by):
+            supersede_calls.append((gem_id, reason, by))
+            return True
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mock_mem),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint",
+                  side_effect=_fake_supersede),
+        ):
+            actions = brief_gem.reconcile_decided_gems()
+
+        assert len(supersede_calls) == 1
+        assert supersede_calls[0][0] == "gem-orphan"
+        assert any("orphan-superseded" in a for a in actions)
+
+        # Mapping updated to superseded
+        updated = next(
+            (json.loads(v) for k, v in mock_mem._set_calls if "pm/brief-gem/map/" in k),
+            None,
+        )
+        assert updated is not None
+        assert updated["status"] == "superseded"
+        assert "orphan" in (updated.get("annotation") or "").lower()
+
+    def test_gem_with_brief_still_outstanding_untouched(self):
+        """Open gem whose brief is still outstanding is NOT superseded."""
+        entries = [_make_map_entry("gem-live", "target-b", "brief-live-cid")]
+        mock_mem = self._make_mem_with_entries(entries)
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mock_mem),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value="brief-live-cid"),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint") as mock_sup,
+        ):
+            actions = brief_gem.reconcile_decided_gems()
+
+        mock_sup.assert_not_called()
+        assert not any("orphan" in a for a in actions)
+        assert mock_mem._set_calls == []
+
+    def test_changed_brief_triggers_orphan_supersede(self):
+        """Brief replaced by a newer one → old gem is superseded."""
+        entries = [_make_map_entry("gem-stale", "target-c", "brief-old")]
+        mock_mem = self._make_mem_with_entries(entries)
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mock_mem),
+            # A different brief is now outstanding
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value="brief-new"),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint", return_value=True),
+        ):
+            actions = brief_gem.reconcile_decided_gems()
+
+        assert any("orphan-superseded" in a for a in actions)
+
+
+class TestReconcileOrphanIsSilent:
+    """test_reconcile_orphan_is_silent: no Pushover / notify on orphan supersede."""
+
+    def test_no_notification_on_orphan_supersede(self):
+        """Orphan supersede fires no send_notification call (silent auto-clear)."""
+        entries = [_make_map_entry("gem-silent", "target-d", "brief-gone")]
+        mem = MagicMock()
+        mem.list_by_prefix.return_value = entries
+        mem.get.return_value = None
+        mem.set.return_value = None
+
+        notify_calls: list = []
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint", return_value=True),
+            patch("lapis_pm.brief_gem.send_notification",
+                  side_effect=lambda *a, **kw: notify_calls.append(a)),
+        ):
+            brief_gem.reconcile_decided_gems()
+
+        assert notify_calls == []
+
+
+class TestReconcileOrphanIdempotent:
+    """test_reconcile_orphan_idempotent: superseded mapping is not re-processed."""
+
+    def test_superseded_mapping_skipped(self):
+        """A mapping with status='superseded' is not passed to _call_supersede_endpoint."""
+        entries = [_make_map_entry("gem-done", "target-e", "brief-x", status="superseded")]
+        mem = MagicMock()
+        mem.list_by_prefix.return_value = entries
+        mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint") as mock_sup,
+        ):
+            actions = brief_gem.reconcile_decided_gems()
+
+        mock_sup.assert_not_called()
+        assert not any("orphan" in a for a in actions)
+
+    def test_actioned_mapping_skipped(self):
+        """A mapping with status='actioned' is not passed to _call_supersede_endpoint."""
+        entries = [_make_map_entry("gem-done2", "target-f", "brief-y", status="actioned")]
+        mem = MagicMock()
+        mem.list_by_prefix.return_value = entries
+        mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint") as mock_sup,
+        ):
+            actions = brief_gem.reconcile_decided_gems()
+
+        mock_sup.assert_not_called()
+
+    def test_409_leaves_mapping_open(self):
+        """409 from supersede endpoint leaves mapping status=open (decided-gem path heals it)."""
+        entries = [_make_map_entry("gem-conflict", "target-g", "brief-decided")]
+        mem = MagicMock()
+        mem.list_by_prefix.return_value = entries
+        mem.get.return_value = None
+        set_calls: list = []
+        mem.set.side_effect = lambda k, v, **kw: set_calls.append((k, v))
+
+        with (
+            patch("lapis_pm.brief_gem._fetch_decided_gems", return_value=[]),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint", return_value=False),
+        ):
+            actions = brief_gem.reconcile_decided_gems()
+
+        # No map update on 409
+        assert set_calls == []
+        # No orphan-superseded action
+        assert not any("orphan-superseded" in a for a in actions)

@@ -134,6 +134,7 @@ class SpecReviewBrief:
     council_voicing_effective: str = "unknown"  # what actually ran (from run YAML)
     council_voicing_degraded: bool = False  # whether it fell back
     council_voicing_degraded_reason: str = ""  # reason for fallback (gw_not_serving, etc.)
+    council_error_reason: str = ""  # infra failure reason; set ONLY when council leg failed outright or was not run
     facets_operator_requested: str = ""  # what was requested (empty if not degraded)
     facets_operator_effective: str = "unknown"  # what actually ran
     facets_operator_degraded: bool = False  # whether it fell back
@@ -736,6 +737,7 @@ def _build_brief(
     council_confidence = council_raw.get("confidence", "")
     council_positions = council_raw.get("positions", [])
     council_run_id = council_raw.get("run_id", "")
+    council_error_reason = council_raw.get("error_reason", "")
 
     # Extract effective voicing from Council run provenance
     council_voicing_effective = council_raw.get("voicing_effective")
@@ -821,11 +823,44 @@ def _build_brief(
         facets_operator_requested=facets_operator_requested,
         facets_operator_effective=facets_operator_effective,
         facets_operator_degraded=facets_operator_degraded,
+        council_error_reason=council_error_reason,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
         gw_findings_count=gw_findings_count,
         elapsed_gw=elapsed_gw,
         gw_transcript_ref=gw_transcript_ref,
+    )
+
+
+def _council_infra_guidance(reason: str, run_id: str = "") -> str:
+    """Map a council infra failure reason to operator guidance (substring, most-specific first)."""
+    if "heartbeat_stale" in reason or "no_heartbeat_after_startup" in reason:
+        return (
+            "Council worker stalled/died (GW self-contention or a slow voice). "
+            "Re-gate SOLO in a clean window (GW serving big, no concurrent gate), "
+            "or raise COUNCIL_STALL_S for slow nodes. Not a spec objection."
+        )
+    if "gw_not_serving" in reason:
+        return (
+            "GW not serving — gate not run on GW. Wake/serve GW big, then re-gate "
+            "(or pass an explicit sonnet voicing flag). Not a spec objection."
+        )
+    if "ConnectTimeout" in reason or "Council poll error" in reason:
+        return (
+            "Voicing node asleep/unreachable. Wake it (e.g. wake-starhouse) then re-gate. "
+            "Not a spec objection."
+        )
+    if "slot_queued_timeout" in reason or "wake_failed" in reason:
+        return (
+            "GW admission is starving the gate's own concurrent calls. "
+            "Set GW_ADMISSION_MODE off/shadow in conductor.env, then re-gate. "
+            "Not a spec objection."
+        )
+    run_ref = f" `/srv/lapis/council/logs/{run_id}.log`" if run_id else ""
+    return (
+        "Council leg failed for an infra reason. "
+        "Re-gate ONCE in a clean window; if the SAME failure recurs, STOP and inspect"
+        f"{run_ref} before retrying. Not a spec objection."
     )
 
 
@@ -898,6 +933,16 @@ def format_brief(brief: SpecReviewBrief) -> str:
         legs_str = ", ".join(degraded_legs)
         degraded_summary = f"\n⚠️ DEGRADED: 1+ leg fell off GravityWell to paid Claude ({legs_str}).\n"
 
+    # INFRA banner — rendered when council leg failed for a known infra reason
+    infra_banner = ""
+    if brief.council_error_reason:
+        infra_guidance = _council_infra_guidance(brief.council_error_reason, brief.council_run_id)
+        infra_banner = (
+            f"\n## ⚠️ INFRA FAILURE — Not a spec objection\n"
+            f"- **Reason:** `{brief.council_error_reason}`\n"
+            f"- **Action:** {infra_guidance}\n"
+        )
+
     # Plain-English suggested next step — mention reservations for converged-with-reservation
     step_map = {
         "proceed-to-bind": (
@@ -924,6 +969,14 @@ def format_brief(brief: SpecReviewBrief) -> str:
             "After the runner fix lands (`spec-review-output-truncation-runner`), re-run spec-review."
         ),
     }
+    # Override "incomplete" with infra-specific guidance when a council error reason is known
+    if brief.council_error_reason and brief.combined_recommendation == "incomplete":
+        infra_guidance = _council_infra_guidance(brief.council_error_reason, brief.council_run_id)
+        step_map["incomplete"] = (
+            f"**[INFRA — not a spec objection]** Council leg did not complete due to an infra failure.\n\n"
+            f"**Reason:** `{brief.council_error_reason}`\n\n"
+            f"{infra_guidance}"
+        )
     next_step = step_map.get(brief.combined_recommendation, "")
     # Reservation note for converged-with-reservation
     if (
@@ -1058,7 +1111,7 @@ could not extract a JSON verdict from the output. See chain-sibling \
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-{voicing_section}{degraded_summary}{facets_section}{sonnet_section}{gw_section}
+{voicing_section}{degraded_summary}{infra_banner}{facets_section}{sonnet_section}{gw_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -1565,38 +1618,54 @@ def run_spec_review(
                 gw_principal=gw_principal,
             )
 
-            try:
-                async def _deliberate():
-                    init_facets_semaphore(int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2")))
-                    return await run_deliberation(request)
-
-                envelope = asyncio.run(_deliberate())
+            # D1: GW-liveness preflight on the primary Council+Facets legs.
+            # If GW is not serving when council_voicing==gravitywell, skip run_deliberation
+            # entirely — do NOT launch a doomed deliberation that may fall back to paid Sonnet.
+            council_not_run_reason = ""
+            if council_voicing == "gravitywell" and not swarm_serving():
                 print(
-                    f"[spec-review:shared-deliberation-complete] "
-                    f"facets_ok={envelope.facets_ok} council_ok={envelope.council_ok}",
+                    "[spec-review:council-preflight] swarm not serving; skipping run_deliberation",
                     file=sys.stderr,
                 )
-
-                # Extract facets deliberation if successful
-                if envelope.facets_ok and envelope.facets:
-                    facets_deliberation = envelope.facets
-
-                # Extract council run_id for reference
-                council_run_id = envelope.council_run_id
-            except Exception as e:
-                print(
-                    f"[spec-review:shared-deliberation-error] {e}",
-                    file=sys.stderr,
-                )
-                # Degrade gracefully: envelope will be None, council_raw will reflect the error below
-                envelope = None
-            finally:
-                # Clean up grounding temp file if one was created.
+                council_not_run_reason = "gw_not_serving"
                 if _grounding_tmp:
                     try:
                         os.unlink(_grounding_tmp)
                     except OSError:
                         pass
+            else:
+                try:
+                    async def _deliberate():
+                        init_facets_semaphore(int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2")))
+                        return await run_deliberation(request)
+
+                    envelope = asyncio.run(_deliberate())
+                    print(
+                        f"[spec-review:shared-deliberation-complete] "
+                        f"facets_ok={envelope.facets_ok} council_ok={envelope.council_ok}",
+                        file=sys.stderr,
+                    )
+
+                    # Extract facets deliberation if successful
+                    if envelope.facets_ok and envelope.facets:
+                        facets_deliberation = envelope.facets
+
+                    # Extract council run_id for reference
+                    council_run_id = envelope.council_run_id
+                except Exception as e:
+                    print(
+                        f"[spec-review:shared-deliberation-error] {e}",
+                        file=sys.stderr,
+                    )
+                    # Degrade gracefully: envelope will be None, council_raw will reflect the error below
+                    envelope = None
+                finally:
+                    # Clean up grounding temp file if one was created.
+                    if _grounding_tmp:
+                        try:
+                            os.unlink(_grounding_tmp)
+                        except OSError:
+                            pass
 
         # 7. Collect GW Future (with bounded timeout)
         gw_text: str | None = None
@@ -1652,6 +1721,14 @@ def run_spec_review(
                 status = envelope.council_status or "error"
                 if status not in _COUNCIL_TERMINAL:
                     status = "error"
+            # D2: capture the worker's specific failure reason for legibility.
+            # Priority: preflight-skip reason > envelope error string > empty.
+            if council_not_run_reason:
+                _err_reason = council_not_run_reason
+            elif envelope is not None:
+                _err_reason = envelope.errors.get("council", "")
+            else:
+                _err_reason = ""
             council_raw = {
                 "status": status,
                 "landing": "",
@@ -1662,6 +1739,7 @@ def run_spec_review(
                 "voicing_effective": None,
                 "voicing_degraded": False,
                 "voicing_degraded_reason": "",
+                "error_reason": _err_reason,
             }
 
     elapsed = time.time() - start_time

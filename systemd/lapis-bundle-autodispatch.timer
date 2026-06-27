@@ -1,0 +1,16 @@
+[Unit]
+Description=lapis-pm bundle-autodispatch nightly timer — fires at 01:30 LA, after code-reviewer-sweep (00:30 LA)
+
+# Enable with:
+#   sudo cp systemd/lapis-bundle-autodispatch.service /etc/systemd/system/
+#   sudo cp systemd/lapis-bundle-autodispatch.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lapis-bundle-autodispatch.timer
+
+[Timer]
+OnCalendar=*-*-* 01:30:00 America/Los_Angeles
+Persistent=true
+Unit=lapis-bundle-autodispatch.service
+
+[Install]
+WantedBy=timers.target

@@ -15,7 +15,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-INTENT_DIR = Path("/srv/lapis/intent")
+from agents_core.room_paths import room_path, room_str
+
+INTENT_DIR = room_path('intent')
 VOID_RE = re.compile(r"<!--\s*VOID[:\s]", re.IGNORECASE)
 
 # Mem key prefix for the consecutive-void-dispatch counter (calcification monitor).

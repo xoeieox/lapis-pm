@@ -18,6 +18,8 @@ from pathlib import Path
 from statistics import median, quantiles
 from typing import Literal
 
+from agents_core.room_paths import room_path, room_str
+
 try:
     from agents_core.llm import call_claude_cli
 except ImportError:
@@ -26,8 +28,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Filesystem layout
-EVAL_BASE = Path("/srv/lapis/planning/evals")
-FIXTURE_BASE = Path("/srv/lapis/planning/specs")
+EVAL_BASE = room_path('planning.evals')
+FIXTURE_BASE = room_path('planning.specs')
 
 # Timeout: full spec-review workflow per arm
 SPEC_REVIEW_TIMEOUT_S = 1800  # 30 min per arm

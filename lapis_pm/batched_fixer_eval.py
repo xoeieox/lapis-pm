@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional, Any
 
+from agents_core.room_paths import room_path, room_str
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -42,7 +44,7 @@ logger = logging.getLogger(__name__)
 EVAL_BASE = Path("/tmp/batched-fixer-eval")
 CORPUS_DIR = Path(__file__).parent / "fixtures/batched_fixer_corpus"
 RUNS_DIR = EVAL_BASE / "runs"
-REPORTS_DIR = Path("/srv/lapis/planning/evals")
+REPORTS_DIR = room_path('planning.evals')
 
 LAPIS_PM_REPO = Path("/srv/lapis/lapis-pm")
 CONDUCTOR_REPO = Path("/srv/git/conductor-working")

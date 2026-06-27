@@ -38,8 +38,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from agents_core.room_paths import room_path, room_str
+
 PACIFIC = ZoneInfo("America/Los_Angeles")
-BRIEFS_ROOT = Path("/srv/lapis/briefs")
+BRIEFS_ROOT = room_path('briefs')
 
 # Bucket names (canonical — must match state_brief_prompts.BUCKET_ORDER)
 B_BUILT = "Built"
@@ -146,7 +148,7 @@ def _read_buckets(start_ts: datetime) -> dict[str, list[str]]:
 
 def _arc_docs_since(start_ts: datetime) -> list[str]:
     """Return arc doc filenames modified since start_ts. Best-effort."""
-    arc_dir = Path("/srv/lapis/lapis-state")
+    arc_dir = room_path('lapis_state')
     if not arc_dir.exists():
         return []
     results: list[str] = []

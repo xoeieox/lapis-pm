@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from agents_core.room_paths import room_path, room_str
+
 from .compose import compose
 from .decompose import decompose
 from .derive import derive_components
@@ -27,7 +29,7 @@ from .schema import AXES, Component, Gap, Precondition, RoadmapRun
 
 log = logging.getLogger(__name__)
 
-BACKCASTER_RUNS_ROOT = Path("/srv/lapis/backcaster/runs")
+BACKCASTER_RUNS_ROOT = room_path('backcaster.runs')
 
 
 def _check_grounding() -> list[str]:

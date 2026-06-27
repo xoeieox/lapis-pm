@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 import sys
 
+from agents_core.room_paths import room_path
+
 
 def cmd_scout_simulate(args) -> int:
     """Run a scaffold simulation (full matrix or a specific cell)."""
@@ -67,7 +69,7 @@ def cmd_scout_night_run(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     sims_dir_arg: str | None = getattr(args, "sims_dir", None)
-    sims_dir = Path(sims_dir_arg) if sims_dir_arg else Path("/srv/lapis/scout/sims")
+    sims_dir = Path(sims_dir_arg) if sims_dir_arg else room_path('scout.sims')
 
     once: bool = getattr(args, "once", False)
     until_str: str | None = getattr(args, "until", None)
@@ -234,7 +236,7 @@ def cmd_scout_refiner(args) -> int:
     cos_threshold: float = float(getattr(args, "cos_threshold", 0.80))
 
     # Discover active scaffold specs that have trace data
-    sims_dir = Path("/srv/lapis/scout/sims")
+    sims_dir = room_path('scout.sims')
     if spec_filter:
         spec_ids = [spec_filter]
     else:

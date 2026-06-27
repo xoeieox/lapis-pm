@@ -11,10 +11,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from agents_core.room_paths import room_path, room_str
+
 log = logging.getLogger(__name__)
 
-_SPECS_DIR = Path("/srv/lapis/planning/specs")
-_TARGETS_DIR = Path("/srv/lapis/targets")
+_SPECS_DIR = room_path('planning.specs')
+_TARGETS_DIR = room_path('targets')
 
 
 def liveness(ref: str) -> str:

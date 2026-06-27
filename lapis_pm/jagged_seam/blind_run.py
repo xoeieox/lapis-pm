@@ -21,6 +21,8 @@ from typing import Any, Literal
 
 import yaml
 
+from agents_core.room_paths import room_path, room_str
+
 from agents_core.llm import call_operator  # type: ignore[import]
 
 from . import (
@@ -67,8 +69,8 @@ def _check_neutrality(state_doc_path: Path) -> tuple[bool, list[str]]:
 
 
 def run_blind(
-    state_doc: str = "/srv/lapis/jagged-seam/q2-defederation-teeth-state.md",
-    out_dir: str = "/srv/lapis/jagged-seam/runs/",
+    state_doc: str = room_str('jagged_seam', 'q2-defederation-teeth-state.md'),
+    out_dir: str = room_str('jagged_seam', 'runs') + "/",
     *,
     operator_class: str = "gravitywell",
 ) -> dict[str, Any]:

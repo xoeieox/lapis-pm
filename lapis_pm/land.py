@@ -18,13 +18,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agents_core.llm import call_claude_cli
+from agents_core.room_paths import room_path, room_str
 
 logger = logging.getLogger(__name__)
 
 from . import episodic
 
 
-ARC_DOC_DIR = Path("/srv/lapis/lapis-state")
+ARC_DOC_DIR = room_path('lapis_state')
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 ARC_DOC_SYSTEM = """You are the Lapis PM producing an *arc doc* for a work thread that has landed.

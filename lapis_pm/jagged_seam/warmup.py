@@ -21,6 +21,8 @@ from typing import Any
 
 import yaml
 
+from agents_core.room_paths import room_path, room_str
+
 from . import (
     from_backcaster,
     from_prose,
@@ -57,8 +59,8 @@ DRIFT_VECTORS = [
 
 
 def run_warmup(
-    run_dir: str = "/srv/lapis/backcaster/runs/2026-06-08-0351-zephyr-sustainability-goal/",
-    out_dir: str = "/srv/lapis/jagged-seam/runs/",
+    run_dir: str = room_str('backcaster.runs', '2026-06-08-0351-zephyr-sustainability-goal') + "/",
+    out_dir: str = room_str('jagged_seam', 'runs') + "/",
     *,
     operator_class: str = "gravitywell",
 ) -> dict[str, Any]:

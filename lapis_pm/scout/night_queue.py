@@ -28,6 +28,8 @@ from typing import Any
 
 import httpx
 
+from agents_core.room_paths import room_path, room_str
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -397,7 +399,7 @@ class Scheduler:
         self._states = scaffold_states
         self._quarantine = quarantine
         self._rng = random.Random(shuffle_seed if shuffle_seed is not None else int(time.time()))
-        self._traces_root = traces_root or Path("/srv/lapis/scout/traces")
+        self._traces_root = traces_root or room_path('scout.traces')
         self._scaffold_index = 0  # round-robin cursor within current phase
         self._in_relevance_phase = False  # True once all priority states are done
 
@@ -763,7 +765,7 @@ def run_night(
     # Build selection plan (pure; reads traces, calls liveness, writes nothing)
     from .liveness import liveness as _default_liveness
     if traces_root is None:
-        traces_root = Path("/srv/lapis/scout/traces")
+        traces_root = room_path('scout.traces')
     plan = select_worklist(
         scaffolds=scaffolds_loaded,
         selected=selected_entries,

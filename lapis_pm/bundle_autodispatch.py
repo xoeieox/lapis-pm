@@ -409,10 +409,13 @@ def _reconcile_one(
         "[bundle-autodispatch] binding %s → repo=%s authority=advisory", spec_id, repo,
     )
     if not _bind(spec_id, repo, spec_path):
-        logger.error("[bundle-autodispatch] bind failed for %s — deferring; pending marker left for diagnosis", spec_id)
-        # Leave pending marker in place so human can diagnose; do not transition to failed
-        # (bind never ran successfully, so it is not a crash-after-bind).
-        results["deferred"].append({"spec": spec_id, "reason": "bind_failed"})
+        logger.error(
+            "[bundle-autodispatch] !!! %s bind failed — "
+            "renaming .autodispatch-pending → .autodispatch-failed",
+            spec_id,
+        )
+        _pending_marker(spec_path).rename(_failed_marker(spec_path))
+        results["failed"].append({"spec": spec_id, "reason": "bind_failed"})
         return
 
     # Tick (initial fixer dispatch)

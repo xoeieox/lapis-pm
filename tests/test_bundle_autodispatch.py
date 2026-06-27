@@ -660,6 +660,53 @@ class TestTickFailure:
         assert not bad._autodispatch_marker(spec_path).exists()
         assert not bad._pending_marker(spec_path).exists()
 
+    def test_bind_failure_renames_pending_to_failed(self, tmp_path):
+        """On bind failure, .autodispatch-pending is atomically renamed to .autodispatch-failed.
+
+        Regression for Defect B fix: bind failure must not leave .autodispatch-pending in place,
+        which would be misread as a crash by the next run's state-3 crash detection.
+        """
+        spec_path = _write_spec(tmp_path)
+        mock_brief = _make_brief("proceed-to-bind")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=False),
+        ):
+            results = _reconcile(tmp_path)
+
+        assert results["failed"][0]["reason"] == "bind_failed"
+        assert bad._failed_marker(spec_path).exists(), \
+            ".autodispatch-failed must exist after bind failure"
+        assert not bad._pending_marker(spec_path).exists(), \
+            ".autodispatch-pending must be renamed away on bind failure"
+        assert not bad._autodispatch_marker(spec_path).exists()
+
+    def test_bind_failure_pending_left_then_next_run_tombstones(self, tmp_path):
+        """A stale .autodispatch-pending from a bind failure tombstones on the next reconcile run.
+
+        This validates the state-3 crash detection path: if a previous run wrote the pending
+        marker but then crashed before bind completed (leaving pending in place), the next run
+        correctly tombstones it.
+        """
+        spec_path = _write_spec(tmp_path)
+        # Simulate state: target YAML exists, pending marker left by a crashed prior run
+        bad._pending_marker(spec_path).write_text("autodispatch-pending: spec_id=cr-bundle-foo-2026-01-01 ts=2026-01-01T00:00:00\n")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert bad._failed_marker(spec_path).exists(), \
+            "state-3: stale pending must be tombstoned as .autodispatch-failed"
+        assert not bad._pending_marker(spec_path).exists()
+        assert results["failed"][0]["reason"] == "crash_pending_marker"
+
 
 # ---------------------------------------------------------------------------
 # --dry-run: fully side-effect-free for ALL marker states

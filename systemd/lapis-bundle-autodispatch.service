@@ -1,0 +1,18 @@
+[Unit]
+Description=lapis-pm bundle-autodispatch — bind+tick unbound cr-bundle-* specs after nightly debt-bundle sweep
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/data/agents
+ExecStart=/usr/local/bin/lapis-pm bundle-autodispatch
+EnvironmentFile=/data/agents/config/conductor.env
+TimeoutStartSec=7200
+
+# GW-local only. If GW is not serving, each spec is deferred (no paid fallback).
+# A stuck gate cannot zombie the service — _run_gate uses executor.shutdown(wait=False)
+# on timeout, and TimeoutStartSec=7200 provides the outer systemd kill fence.
+
+[Install]
+WantedBy=multi-user.target

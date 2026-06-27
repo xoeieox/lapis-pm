@@ -19,9 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import re
-import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError
 from pathlib import Path
 
@@ -130,31 +128,36 @@ def _run_gate(spec_path: Path, timeout_s: int) -> "SpecReviewBrief | None":
     """
     from lapis_pm.spec_review import run_spec_review
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(
-            run_spec_review,
-            spec_path=spec_path,
-            council_voicing="gravitywell",
-            timeout_s=timeout_s,
-            authority="advisory",
-            dispatch_facets=True,
-            sonnet_reviewer=True,
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        run_spec_review,
+        spec_path=spec_path,
+        council_voicing="gravitywell",
+        timeout_s=timeout_s,
+        authority="advisory",
+        dispatch_facets=True,
+        sonnet_reviewer=False,
+    )
+    grace = 120  # seconds above the inner timeout before we give up
+    try:
+        return future.result(timeout=timeout_s + grace)
+    except _FuturesTimeoutError:
+        logger.warning(
+            "[bundle-autodispatch] gate hard-timeout (%ds) for %s — deferring",
+            timeout_s, spec_path.name,
         )
-        grace = 120  # seconds above the inner timeout before we give up
-        try:
-            return future.result(timeout=timeout_s + grace)
-        except _FuturesTimeoutError:
-            logger.warning(
-                "[bundle-autodispatch] gate hard-timeout (%ds) for %s — deferring",
-                timeout_s, spec_path.name,
-            )
-            return None
-        except Exception as exc:
-            logger.warning(
-                "[bundle-autodispatch] gate error for %s: %s — deferring",
-                spec_path.name, exc,
-            )
-            return None
+        return None
+    except Exception as exc:
+        logger.warning(
+            "[bundle-autodispatch] gate error for %s: %s — deferring",
+            spec_path.name, exc,
+        )
+        return None
+    finally:
+        # Don't block on the thread finishing — let it run to its own internal timeout
+        # in the background. Using the context-manager form would call shutdown(wait=True)
+        # here, defeating the hard-timeout guarantee.
+        executor.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------

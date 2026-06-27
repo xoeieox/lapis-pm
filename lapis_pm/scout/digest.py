@@ -16,13 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agents_core.room_paths import room_path, room_str
 from archetypes_core.provenance import InputRef, UpstreamRef, to_lapis_return
 
 from .scaffold import load_scaffold
 from .schema import BreakModeAggregate, ScoutMapPayload
 
-SCOUT_TRACES_ROOT = Path("/srv/lapis/scout/traces")
-SCOUT_MAPS_ROOT = Path("/srv/lapis/scout/maps")
+SCOUT_TRACES_ROOT = room_path('scout.traces')
+SCOUT_MAPS_ROOT = room_path('scout.maps')
 
 NOVELTY_PARROT_THRESHOLD = 0.30
 
@@ -133,7 +134,7 @@ def digest(
         maps_root = SCOUT_MAPS_ROOT
 
     # Load scaffold to build context token union for novelty filter.
-    scaffold_path = Path("/srv/lapis/scout/sims") / f"{spec_id}.yaml"
+    scaffold_path = room_path('scout.sims', f'{spec_id}.yaml')
     scaffold = load_scaffold(scaffold_path) if scaffold_path.exists() else None
 
     spec_traces_dir = traces_root / spec_id
@@ -162,7 +163,7 @@ def digest(
     # AND upstream_calls (manifest_hash composition pointer).
     input_refs: list[InputRef] = [
         InputRef(
-            ref=f"/srv/lapis/scout/sims/{spec_id}.yaml",
+            ref=room_str('scout.sims', f'{spec_id}.yaml'),
             content_hash=None,
             type="file",
         )

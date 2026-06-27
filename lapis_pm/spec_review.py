@@ -39,17 +39,18 @@ from agents_core.shared_deliberation.orchestrator import (
 )
 from agents_core.shared_deliberation.envelope import DeliberationRequest
 from agents_core.llm import swarm_serving
+from agents_core.room_paths import room_path, room_str
 
 
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
 
-_CLAUDE_QUEUE_COMPLETED = Path("/srv/lapis/claude-queue/completed")
-_CLAUDE_QUEUE_FAILED = Path("/srv/lapis/claude-queue/failed")
-_GPU_QUEUE_COMPLETED = Path("/srv/lapis/gpu-queue/completed")
-_GPU_QUEUE_FAILED = Path("/srv/lapis/gpu-queue/failed")
-_COUNCIL_DIR = Path("/srv/lapis/council")
+_CLAUDE_QUEUE_COMPLETED = room_path('claude_queue.completed')
+_CLAUDE_QUEUE_FAILED = room_path('claude_queue.failed')
+_GPU_QUEUE_COMPLETED = room_path('gpu_queue.completed')
+_GPU_QUEUE_FAILED = room_path('gpu_queue.failed')
+_COUNCIL_DIR = room_path('council')
 # Facets deploy clone path — the same path the post-land pull deploys and the gate injects on PYTHONPATH.
 _FACETS_REPO_PATH = Path(_FACETS_DEPLOY_CLONE)
 
@@ -1605,7 +1606,7 @@ def run_spec_review(
             request = DeliberationRequest(
                 text=spec_text,
                 context={
-                    "spec_path": f"/srv/lapis/planning/specs/{parsed_target_id}.md",
+                    "spec_path": room_str('planning.specs', f'{parsed_target_id}.md'),
                     "target_id": parsed_target_id,
                     "repo": repo,
                     "authority": effective_authority,
@@ -1760,7 +1761,7 @@ def run_spec_review(
             gw_findings_count = 0
 
         # Write transcript JSON to /srv/lapis/spec-review-artifacts/<run_id>/gw-transcript.json
-        artifacts_dir = Path(f"/srv/lapis/spec-review-artifacts/{gw_run_id}")
+        artifacts_dir = room_path('spec_review_artifacts', gw_run_id)
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = artifacts_dir / "gw-transcript.json"
         try:

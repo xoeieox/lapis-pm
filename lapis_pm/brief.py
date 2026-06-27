@@ -42,6 +42,7 @@ from pathlib import Path
 
 from agents_core.llm import call_claude_cli
 from agents_core.notify import send_notification, Priority as NotifyPriority
+from agents_core.room_paths import room_path, room_str
 
 from . import episodic
 
@@ -179,7 +180,7 @@ _CLOSED_FORM_TRIGGERS: dict[str, list[dict]] = {
 }
 
 # Directive consumer path
-_DIRECTIVES_BASE = Path("/srv/lapis/directives/brief-decisions")
+_DIRECTIVES_BASE = room_path('directives.brief_decisions')
 
 
 @dataclass

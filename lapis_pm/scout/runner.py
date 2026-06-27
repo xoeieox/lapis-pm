@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agents_core.room_paths import room_path, room_str
+
 log = logging.getLogger(__name__)
 
 import httpx as _httpx
@@ -32,7 +34,7 @@ from .pseudocode_system import PseudocodeSystemEntity
 from .scaffold import ScoutScaffold, load_scaffold
 from .schema import ScoutTracePayload
 
-SCOUT_TRACES_ROOT = Path("/srv/lapis/scout/traces")
+SCOUT_TRACES_ROOT = room_path('scout.traces')
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +330,7 @@ def run_single(
         )
 
     input_refs = [
-        InputRef(ref=f"/srv/lapis/scout/sims/{scaffold.spec_id}.yaml", content_hash=None, type="file"),
+        InputRef(ref=room_str('scout.sims', f'{scaffold.spec_id}.yaml'), content_hash=None, type="file"),
         InputRef(ref=f"cell:{cell_id}", content_hash=None, type="claim"),
     ]
 

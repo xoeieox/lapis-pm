@@ -39,12 +39,14 @@ from typing import Any
 
 import yaml
 
+from agents_core.room_paths import room_path, room_str
+
 log = logging.getLogger(__name__)
 
-SCOUT_TRACES_ROOT = Path("/srv/lapis/scout/traces")
-SCOUT_MAPS_ROOT = Path("/srv/lapis/scout/maps")
-BACKCASTER_RUNS_ROOT = Path("/srv/lapis/backcaster/runs")
-REFINER_OUTPUT_ROOT = Path("/srv/lapis/scout/refiner")
+SCOUT_TRACES_ROOT = room_path('scout.traces')
+SCOUT_MAPS_ROOT = room_path('scout.maps')
+BACKCASTER_RUNS_ROOT = room_path('backcaster.runs')
+REFINER_OUTPUT_ROOT = room_path('scout.refiner')
 
 # Cosine thresholds reported for calibration
 _COS_THRESHOLDS = (0.70, 0.80, 0.90)

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from agents_core.room_paths import room_path, room_str
+
 log = logging.getLogger(__name__)
 
 # Saturation: one full matrix pass. Tunable in v1; no CLI surface.
@@ -346,7 +348,7 @@ def select_worklist(
 
 def _scaffold_path(scaffold) -> Path:
     """Extract or derive path from scaffold object."""
-    return getattr(scaffold, "_path", Path(f"/srv/lapis/scout/sims/{scaffold.spec_id}.yaml"))
+    return getattr(scaffold, "_path", room_path('scout.sims', f'{scaffold.spec_id}.yaml'))
 
 
 def _ref_age_days(ref: str) -> float | None:

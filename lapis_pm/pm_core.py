@@ -62,6 +62,12 @@ except Exception:
     _ClaudeQueue = None  # type: ignore
 
 from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
+
+try:
+    from agents_core.room_paths import room_path, room_str
+except ImportError as _e:
+    raise RuntimeError("agents_core.room_paths missing — agents-core seam must be deployed first") from _e
+
 from . import episodic, brief, authority, intent_artifact as _intent_artifact
 
 try:
@@ -79,11 +85,11 @@ _repo_unresolved_signalled: set[str] = set()
 
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
-COMPLETED_DIR = Path("/srv/lapis/gpu-queue/completed")
-FAILED_DIR = Path("/srv/lapis/gpu-queue/failed")
-SHAPED_DIR = Path("/srv/lapis/gpu-queue/shaped")  # shaped_runner meta sidecars
-CLAUDE_QUEUE_COMPLETED_DIR = Path("/srv/lapis/claude-queue/completed")
-CLAUDE_QUEUE_FAILED_DIR = Path("/srv/lapis/claude-queue/failed")
+COMPLETED_DIR = room_path('gpu_queue.completed')
+FAILED_DIR = room_path('gpu_queue.failed')
+SHAPED_DIR = room_path('gpu_queue.shaped')  # shaped_runner meta sidecars
+CLAUDE_QUEUE_COMPLETED_DIR = room_path('claude_queue.completed')
+CLAUDE_QUEUE_FAILED_DIR = room_path('claude_queue.failed')
 MAX_DISPATCH_RETRIES = 2
 
 # Agent types that count as "initial fixer" for dispatch guards, lost-fixer
@@ -226,7 +232,7 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # degraded synthesis, not a broken daemon. LOW keeps it attributable.
 _POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener"})
 
-_DEPLOY_LOG = Path("/srv/lapis/lapis-state/lapis-pm-deploy-log.md")
+_DEPLOY_LOG = room_path('lapis_state.deploy_log')
 _DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"
 _DEPLOY_CURRENCY_COOLDOWN_SECS = 3600  # alert at most once per hour
 
@@ -236,8 +242,8 @@ _DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
 # Bounded deferral for in-flight fixers before restarting claude-queue-runner.
 # Tunable without a code change via LAPIS_RESTART_DEFER_MAX_S env var.
 RESTART_DEFER_MAX_S: int = int(os.environ.get("LAPIS_RESTART_DEFER_MAX_S", "1800"))
-_CLAUDE_QUEUE_ACTIVE_DIR = Path("/srv/lapis/claude-queue/active")
-_RESTART_PENDING_DIR = Path("/srv/lapis/lapis-state/restart-pending")
+_CLAUDE_QUEUE_ACTIVE_DIR = room_path('claude_queue.active')
+_RESTART_PENDING_DIR = room_path('lapis_state.restart_pending')
 
 
 def _ensure_head_branch_deleted(repo: str, pr_number: int, *, owner: str | None = None) -> None:
@@ -4290,7 +4296,7 @@ def _act_lost_brief(
     _close_slot_and_deposit(original_rec, target_id)
 
     spec_ref = (episodic.spec(target_id) or "")[:80] or "(spec not found)"
-    spec_path = f"/srv/lapis/planning/specs/{target_id}.md"
+    spec_path = room_str('planning.specs', f'{target_id}.md')
 
     query = (
         f"Two fixer dispatches for {target_id} terminated without opening a PR.\n"
@@ -4317,7 +4323,7 @@ def _act_lost_brief(
 # Brief-decision directive consumer
 # ---------------------------------------------------------------------------
 
-_DIRECTIVES_BASE = Path("/srv/lapis/directives/brief-decisions")
+_DIRECTIVES_BASE = room_path('directives.brief_decisions')
 
 
 def _consume_brief_decisions(target_id: str) -> str | None:

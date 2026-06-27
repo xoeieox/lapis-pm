@@ -29,12 +29,14 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from agents_core.room_paths import room_path, room_str
+
 logger = logging.getLogger(__name__)
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
-TRAJECTORY_ROOT = Path("/srv/lapis/trajectory")
-TARGETS_DIR = Path("/srv/lapis/targets")
-ARC_DOCS_DIR = Path("/srv/lapis/lapis-state")
+TRAJECTORY_ROOT = room_path('trajectory')
+TARGETS_DIR = room_path('targets')
+ARC_DOCS_DIR = room_path('lapis_state')
 QWEN_MODEL = "qwen3.6-35b-a3b"
 
 # ---------------------------------------------------------------------------

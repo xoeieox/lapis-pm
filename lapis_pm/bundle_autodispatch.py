@@ -1,15 +1,30 @@
 """bundle_autodispatch — reconcile unbound cr-bundle-* specs and bind+tick qualifying ones.
 
-Runs nightly after code-reviewer's debt-bundle sweep. Discovers cr-bundle-*.md specs in
-/srv/lapis/planning/specs (excluding superseded/), runs the GW spec-review gate on each unbound
-one, and binds+ticks the ones that pass with advisory authority.
+Runs nightly after code-reviewer's debt-bundle sweep. Discovers
+cr-bundle-<repo>-<YYYY-MM-DD>.md specs in /srv/lapis/planning/specs (excluding superseded/)
+whose frontmatter source contains code-reviewer-debt-bundle-v0, runs the GW spec-review
+gate on each unbound one, and binds+ticks the ones that pass with advisory authority.
 
-Idempotency:
-  - .autodispatch marker (sibling to spec): written only after dispatched:1 is verified.
-  - .autodispatch-failed tombstone: written when bind succeeds but tick does not verify.
-  - Specs with either marker are skipped on re-run.
-  - A spec whose target YAML exists but whose .autodispatch marker is missing is the
-    partial/crashed state → writes .autodispatch-failed for human triage (no double-bind).
+Idempotency / marker states (sibling to spec, same directory — POSIX rename(2) atomic):
+  .autodispatch          - success: dispatched:1 verified in same execution window.
+  .autodispatch-pending  - write-ahead intent: written before bind; transitioned atomically
+                           on resolve (→ .autodispatch) or confirmed crash (→ .autodispatch-failed).
+  .autodispatch-failed   - tombstone: transitioned from .autodispatch-pending only when a
+                           genuine crash is detected (pending present on a later run means
+                           the writer is gone — singleton lock is the primary guarantee).
+
+State machine per spec:
+  .autodispatch present        → SKIP (already completed).
+  .autodispatch-failed present → SKIP (human triage).
+  .autodispatch-pending present → crash mid-flight → rename pending→failed + loud log.
+  target YAML present, no marker → externally/manually bound → SKIP + audit log. NEVER tombstone.
+  no target YAML, no pending    → fresh → gate + bind.
+
+Tombstone invariant: .autodispatch-failed is written ONLY from the presence of an unresolved
+.autodispatch-pending intent — never from the mere absence of a success marker.
+
+Timestamp source of truth: run_ts is injected by the CLI entry point, not generated inside
+this module. This keeps core logic deterministic and avoids clock-skew issues.
 
 GW-serving:
   - swarm_serving() is checked BEFORE calling run_spec_review.
@@ -34,6 +49,13 @@ _MD_REPO_RE = re.compile(
     r"^\*\*Repo:\*\*\s+`([a-z0-9][a-z0-9-]*[a-z0-9])`\s*$",
     re.MULTILINE,
 )
+
+# Debt-bundle filename: cr-bundle-<repo>-<YYYY-MM-DD>.md
+# Excludes: cr-bundle-autodispatch-v0.md, cr-bundle-notadate.md, this fix spec, etc.
+_DEBT_BUNDLE_FILENAME_RE = re.compile(r"^cr-bundle-.+-\d{4}-\d{2}-\d{2}\.md$")
+
+# Source frontmatter must contain code-reviewer-debt-bundle-v0
+_DEBT_BUNDLE_SOURCE_RE = re.compile(r"^source:.*code-reviewer-debt-bundle-v0", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +87,30 @@ def _parse_bundle_frontmatter(spec_path: Path) -> tuple[str, str]:
     return sid_m.group(1), repo_m.group(1)
 
 
+def _has_debt_bundle_source(spec_path: Path) -> bool:
+    """Return True if the spec frontmatter source contains code-reviewer-debt-bundle-v0."""
+    try:
+        head = spec_path.read_text(encoding="utf-8")[:2000]
+    except OSError:
+        return False
+    return bool(_DEBT_BUNDLE_SOURCE_RE.search(head))
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
 
 def _discover_specs(spec_dir: Path) -> list[Path]:
-    """Return sorted cr-bundle-*.md spec paths, excluding superseded/."""
+    """Return sorted debt-bundle spec paths, excluding superseded/ and non-bundle specs.
+
+    A spec qualifies only if BOTH hold:
+    - filename matches cr-bundle-<repo>-<YYYY-MM-DD>.md (ISO-date suffix)
+    - frontmatter source: contains code-reviewer-debt-bundle-v0
+
+    Specs failing either check are silently skipped (debug-log only) — they are not
+    bundles, not errors. This excludes cr-bundle-autodispatch-v0.md and any future
+    non-debt-bundle specs whose names start with cr-bundle-.
+    """
     superseded = spec_dir / "superseded"
     result = []
     for p in sorted(spec_dir.glob("cr-bundle-*.md")):
@@ -81,6 +121,18 @@ def _discover_specs(spec_dir: Path) -> list[Path]:
             continue  # inside superseded/ — skip
         except ValueError:
             pass
+        if not _DEBT_BUNDLE_FILENAME_RE.match(p.name):
+            logger.debug(
+                "[bundle-autodispatch] skipping %s: filename does not match debt-bundle pattern",
+                p.name,
+            )
+            continue
+        if not _has_debt_bundle_source(p):
+            logger.debug(
+                "[bundle-autodispatch] skipping %s: source frontmatter is not code-reviewer-debt-bundle-v0",
+                p.name,
+            )
+            continue
         result.append(p)
     return result
 
@@ -91,6 +143,10 @@ def _discover_specs(spec_dir: Path) -> list[Path]:
 
 def _autodispatch_marker(spec_path: Path) -> Path:
     return Path(str(spec_path) + ".autodispatch")
+
+
+def _pending_marker(spec_path: Path) -> Path:
+    return Path(str(spec_path) + ".autodispatch-pending")
 
 
 def _failed_marker(spec_path: Path) -> Path:
@@ -230,9 +286,18 @@ def _reconcile_one(
     spec_path: Path,
     dry_run: bool,
     gate_timeout_s: int,
+    run_ts: str,
     results: dict,
 ) -> None:
-    """Reconcile one spec file. Mutates results dict in-place."""
+    """Reconcile one spec file. Mutates results dict in-place.
+
+    State machine (checked in order):
+      1. .autodispatch present        → SKIP (completed)
+      2. .autodispatch-failed present → SKIP (human triage)
+      3. .autodispatch-pending present → crash detected → rename pending→failed + loud log
+      4. target YAML present, no marker → externally/manually bound → SKIP + audit log. NEVER tombstone.
+      5. no target YAML, no pending   → fresh → gate + bind
+    """
     # Parse frontmatter
     try:
         spec_id, repo = _parse_bundle_frontmatter(spec_path)
@@ -241,13 +306,13 @@ def _reconcile_one(
         results["skipped"].append({"spec": spec_path.name, "reason": str(exc)})
         return
 
-    # .autodispatch marker → already done
+    # 1. .autodispatch marker → already done
     if _autodispatch_marker(spec_path).exists():
         logger.info("[bundle-autodispatch] %s already has .autodispatch marker — skip", spec_id)
         results["skipped"].append({"spec": spec_id, "reason": "already_dispatched"})
         return
 
-    # .autodispatch-failed tombstone → human triage
+    # 2. .autodispatch-failed tombstone → human triage
     if _failed_marker(spec_path).exists():
         logger.warning(
             "[bundle-autodispatch] %s has .autodispatch-failed tombstone — human triage, skip",
@@ -256,22 +321,32 @@ def _reconcile_one(
         results["skipped"].append({"spec": spec_id, "reason": "failed_tombstone"})
         return
 
-    # Target YAML exists but no .autodispatch marker → partial bind (crash between bind + verify)
-    if _target_yaml_exists(spec_id):
+    # 3. .autodispatch-pending present → writer is gone (singleton lock guarantees this) → crash
+    if _pending_marker(spec_path).exists():
         logger.error(
-            "[bundle-autodispatch] !!! %s: target YAML exists but .autodispatch marker is missing "
-            "— crash after bind detected; writing .autodispatch-failed tombstone for human triage",
+            "[bundle-autodispatch] !!! %s: stale .autodispatch-pending detected — "
+            "prior run crashed between bind and verify; "
+            "%s .autodispatch-failed tombstone for human triage",
             spec_id,
+            "would write" if dry_run else "writing",
         )
         if not dry_run:
-            _failed_marker(spec_path).write_text(
-                "autodispatch: target YAML exists but .autodispatch marker was never written "
-                "(likely crashed between bind and verify)\n",
-                encoding="utf-8",
-            )
-        results["failed"].append({"spec": spec_id, "reason": "partial_bind_no_marker"})
+            _pending_marker(spec_path).rename(_failed_marker(spec_path))
+        results["failed"].append({"spec": spec_id, "reason": "crash_pending_marker"})
         return
 
+    # 4. Target YAML exists, no marker of any kind → externally/manually bound
+    if _target_yaml_exists(spec_id):
+        logger.warning(
+            "[bundle-autodispatch] AUDIT: %s is externally/manually bound "
+            "(target YAML exists, no autodispatch marker) — skipping, not tombstoning. "
+            "This path must be observable to prevent mass-suppression of the crash guard.",
+            spec_id,
+        )
+        results["skipped"].append({"spec": spec_id, "reason": "externally_bound"})
+        return
+
+    # 5. Fresh spec → gate + bind
     logger.info("[bundle-autodispatch] processing %s (repo=%s)", spec_id, repo)
 
     if dry_run:
@@ -320,12 +395,23 @@ def _reconcile_one(
         results["deferred"].append({"spec": spec_id, "reason": f"gate:{rec}"})
         return
 
+    # Write-ahead intent marker before bind (atomic resolve: pending→success or pending→failed)
+    _pending_marker(spec_path).write_text(
+        f"autodispatch-pending: spec_id={spec_id} repo={repo} ts={run_ts}\n",
+        encoding="utf-8",
+    )
+    logger.info(
+        "[bundle-autodispatch] wrote .autodispatch-pending for %s (ts=%s)", spec_id, run_ts,
+    )
+
     # Bind
     logger.info(
         "[bundle-autodispatch] binding %s → repo=%s authority=advisory", spec_id, repo,
     )
     if not _bind(spec_id, repo, spec_path):
-        logger.error("[bundle-autodispatch] bind failed for %s — deferring", spec_id)
+        logger.error("[bundle-autodispatch] bind failed for %s — deferring; pending marker left for diagnosis", spec_id)
+        # Leave pending marker in place so human can diagnose; do not transition to failed
+        # (bind never ran successfully, so it is not a crash-after-bind).
         results["deferred"].append({"spec": spec_id, "reason": "bind_failed"})
         return
 
@@ -333,36 +419,30 @@ def _reconcile_one(
     logger.info("[bundle-autodispatch] firing initial tick for %s", spec_id)
     if not _tick(spec_id, repo):
         logger.error(
-            "[bundle-autodispatch] !!! %s tick failed after bind — writing .autodispatch-failed tombstone",
+            "[bundle-autodispatch] !!! %s tick failed after bind — "
+            "renaming .autodispatch-pending → .autodispatch-failed",
             spec_id,
         )
-        _failed_marker(spec_path).write_text(
-            "autodispatch: bind succeeded but force_dispatch raised\n",
-            encoding="utf-8",
-        )
+        _pending_marker(spec_path).rename(_failed_marker(spec_path))
         results["failed"].append({"spec": spec_id, "reason": "tick_failed"})
         return
 
     # Verify dispatched:1
     if not _verify_dispatched(spec_id):
         logger.error(
-            "[bundle-autodispatch] !!! %s dispatched<1 after tick — writing .autodispatch-failed tombstone",
+            "[bundle-autodispatch] !!! %s dispatched<1 after tick — "
+            "renaming .autodispatch-pending → .autodispatch-failed",
             spec_id,
         )
-        _failed_marker(spec_path).write_text(
-            "autodispatch: bind+tick succeeded but dispatched<1 at verify\n",
-            encoding="utf-8",
-        )
+        _pending_marker(spec_path).rename(_failed_marker(spec_path))
         results["failed"].append({"spec": spec_id, "reason": "dispatch_not_verified"})
         return
 
-    # Success: write .autodispatch marker
-    _autodispatch_marker(spec_path).write_text(
-        f"autodispatched: spec_id={spec_id} repo={repo}\n",
-        encoding="utf-8",
-    )
+    # Success: atomically rename .autodispatch-pending → .autodispatch
+    _pending_marker(spec_path).rename(_autodispatch_marker(spec_path))
     logger.info(
-        "[bundle-autodispatch] successfully bound+ticked+verified %s — .autodispatch marker written",
+        "[bundle-autodispatch] successfully bound+ticked+verified %s — "
+        ".autodispatch-pending renamed to .autodispatch",
         spec_id,
     )
     results["bound"].append({"spec": spec_id, "repo": repo})
@@ -376,8 +456,12 @@ def reconcile(
     spec_dir: Path | None = None,
     dry_run: bool = False,
     gate_timeout_s: int = _DEFAULT_GATE_TIMEOUT_S,
+    run_ts: str = "",
 ) -> dict:
     """Reconcile unbound cr-bundle-* specs.
+
+    run_ts is the caller-supplied ISO timestamp for pending marker provenance.
+    It must be supplied by the CLI entry point, never generated inside this function.
 
     Returns a results dict with keys: bound, deferred, skipped, failed.
     Each value is a list of dicts describing the outcome for each spec.
@@ -389,11 +473,11 @@ def reconcile(
 
     specs = _discover_specs(spec_dir)
     logger.info(
-        "[bundle-autodispatch] discovered %d cr-bundle spec(s) in %s", len(specs), spec_dir,
+        "[bundle-autodispatch] discovered %d cr-bundle debt-bundle spec(s) in %s", len(specs), spec_dir,
     )
 
     for spec_path in specs:
-        _reconcile_one(spec_path, dry_run, gate_timeout_s, results)
+        _reconcile_one(spec_path, dry_run, gate_timeout_s, run_ts, results)
 
     logger.info(
         "[bundle-autodispatch] run complete: bound=%d deferred=%d skipped=%d failed=%d",

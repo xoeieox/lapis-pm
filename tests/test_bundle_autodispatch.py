@@ -1,21 +1,28 @@
 """Tests for lapis_pm.bundle_autodispatch.
 
 Coverage:
-- discovery skips already-bound specs, superseded/, parses frontmatter from YAML+markdown
+- discovery: debt-bundle filename regex + source frontmatter gating
+- discovery skips non-debt-bundle specs (self-collision fix, Defect A)
 - proceed verdict → bind + tick; hold/incomplete → defer (no bind, no marker)
 - GW-unreachable → defer (zero binds, no paid path, no marker)
-- idempotency: .autodispatch marker skips; partial state (YAML exists, no marker) → failed tombstone
-- --dry-run: no binds, no markers written
+- write-ahead pending marker lifecycle (atomic rename, never write-then-delete)
+- crash detection: .autodispatch-pending present on later run → tombstone (Defect B fix)
+- external bind: target YAML + no marker → SKIP + audit log, NEVER tombstone (Defect B regression)
+- --dry-run: no writes/renames of any marker kind; logs "would tombstone" for stale pending
+- atomicity: pending→success and pending→failed are renames, not write+delete
 """
 from __future__ import annotations
 
+import logging
 import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lapis_pm import bundle_autodispatch as bad
+
+_RUN_TS = "2026-06-27T00:00:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +49,30 @@ BUNDLE_SPEC = textwrap.dedent("""\
     **Suggested bind:** `lapis-pm bind cr-bundle-myrepo-2026-06-26 --repo myrepo --authority advisory --create --title "Resolve 3 aged MED debt items in myrepo"`
 """)
 
+# A spec that looks like a bundle filename but has the wrong source frontmatter
+WRONG_SOURCE_SPEC = textwrap.dedent("""\
+    ---
+    spec_id: cr-bundle-foo-2026-06-27
+    status: draft
+    created: 2026-06-27
+    source: some-other-source
+    ---
+
+    **Repo:** `foo`
+""")
+
+# The autodispatch reconciler's own spec (should be excluded by filename - no ISO date)
+AUTODISPATCH_SPEC = textwrap.dedent("""\
+    ---
+    spec_id: cr-bundle-autodispatch-v0
+    status: draft
+    created: 2026-06-27
+    source: some-other-source
+    ---
+
+    **Repo:** `lapis-pm`
+""")
+
 
 def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") -> Path:
     p = tmp_path / name
@@ -50,10 +81,13 @@ def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") ->
 
 
 def _make_brief(recommendation: str = "proceed-to-bind"):
-    """Return a MagicMock SpecReviewBrief with the given recommendation."""
     brief = MagicMock()
     brief.combined_recommendation = recommendation
     return brief
+
+
+def _reconcile(tmp_path, dry_run=False, **kw):
+    return bad.reconcile(spec_dir=tmp_path, dry_run=dry_run, run_ts=_RUN_TS, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -86,32 +120,77 @@ class TestParseBundleFrontmatter:
 
 
 # ---------------------------------------------------------------------------
-# Discovery
+# Discovery — filename regex + source frontmatter gating (Defect A fix)
 # ---------------------------------------------------------------------------
 
 class TestDiscoverSpecs:
-    def test_finds_cr_bundle_files(self, tmp_path):
-        (tmp_path / "cr-bundle-a-2026-06-01.md").write_text("x")
-        (tmp_path / "cr-bundle-b-2026-06-02.md").write_text("x")
-        (tmp_path / "unrelated.md").write_text("x")
+    def test_finds_valid_debt_bundle(self, tmp_path):
+        _write_spec(tmp_path, "cr-bundle-myrepo-2026-06-26.md")
         specs = bad._discover_specs(tmp_path)
-        names = [p.name for p in specs]
-        assert "cr-bundle-a-2026-06-01.md" in names
-        assert "cr-bundle-b-2026-06-02.md" in names
-        assert "unrelated.md" not in names
+        assert len(specs) == 1
+        assert specs[0].name == "cr-bundle-myrepo-2026-06-26.md"
+
+    def test_excludes_no_date_filename(self, tmp_path):
+        """cr-bundle-autodispatch-v0.md has no ISO date suffix — excluded by filename."""
+        p = tmp_path / "cr-bundle-autodispatch-v0.md"
+        p.write_text(AUTODISPATCH_SPEC, encoding="utf-8")
+        specs = bad._discover_specs(tmp_path)
+        assert specs == []
+
+    def test_excludes_notadate_filename(self, tmp_path):
+        """cr-bundle-notadate.md has no ISO date — excluded by filename."""
+        p = tmp_path / "cr-bundle-notadate.md"
+        p.write_text(BUNDLE_SPEC, encoding="utf-8")
+        specs = bad._discover_specs(tmp_path)
+        assert specs == []
+
+    def test_excludes_wrong_source_frontmatter(self, tmp_path):
+        """Correct filename but wrong source → excluded."""
+        p = tmp_path / "cr-bundle-foo-2026-06-27.md"
+        p.write_text(WRONG_SOURCE_SPEC, encoding="utf-8")
+        specs = bad._discover_specs(tmp_path)
+        assert specs == []
+
+    def test_includes_correct_filename_and_source(self, tmp_path):
+        """cr-bundle-foo-2026-06-27.md with debt-bundle source → included."""
+        p = tmp_path / "cr-bundle-foo-2026-06-27.md"
+        p.write_text(BUNDLE_SPEC, encoding="utf-8")
+        specs = bad._discover_specs(tmp_path)
+        assert len(specs) == 1
+        assert specs[0].name == "cr-bundle-foo-2026-06-27.md"
 
     def test_excludes_superseded_subdir(self, tmp_path):
         superseded = tmp_path / "superseded"
         superseded.mkdir()
-        (superseded / "cr-bundle-old-2026-01-01.md").write_text("x")
-        (tmp_path / "cr-bundle-live-2026-06-26.md").write_text("x")
+        (superseded / "cr-bundle-old-2026-01-01.md").write_text(BUNDLE_SPEC)
+        _write_spec(tmp_path, "cr-bundle-live-2026-06-26.md")
         specs = bad._discover_specs(tmp_path)
         names = [p.name for p in specs]
         assert "cr-bundle-live-2026-06-26.md" in names
         assert "cr-bundle-old-2026-01-01.md" not in names
 
+    def test_excludes_non_cr_bundle_files(self, tmp_path):
+        (tmp_path / "unrelated.md").write_text("x")
+        (tmp_path / "cr-other-2026-06-26.md").write_text("x")
+        specs = bad._discover_specs(tmp_path)
+        assert specs == []
+
     def test_empty_dir_returns_empty(self, tmp_path):
         assert bad._discover_specs(tmp_path) == []
+
+    def test_self_exclusion_this_fix_spec(self, tmp_path):
+        """cr-bundle-autodispatch-crashguard-fix-v0.md is excluded by filename (no ISO date)."""
+        p = tmp_path / "cr-bundle-autodispatch-crashguard-fix-v0.md"
+        p.write_text(BUNDLE_SPEC, encoding="utf-8")
+        specs = bad._discover_specs(tmp_path)
+        assert specs == []
+
+    def test_hyphenated_repo_name_included(self, tmp_path):
+        """cr-bundle-my-repo-2026-06-27.md has a hyphenated repo — still matched."""
+        p = tmp_path / "cr-bundle-my-repo-2026-06-27.md"
+        p.write_text(BUNDLE_SPEC, encoding="utf-8")
+        specs = bad._discover_specs(tmp_path)
+        assert len(specs) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +201,10 @@ class TestMarkers:
     def test_autodispatch_marker_path(self, tmp_path):
         p = tmp_path / "cr-bundle-x-2026-06-26.md"
         assert bad._autodispatch_marker(p) == Path(str(p) + ".autodispatch")
+
+    def test_pending_marker_path(self, tmp_path):
+        p = tmp_path / "cr-bundle-x-2026-06-26.md"
+        assert bad._pending_marker(p) == Path(str(p) + ".autodispatch-pending")
 
     def test_failed_marker_path(self, tmp_path):
         p = tmp_path / "cr-bundle-x-2026-06-26.md"
@@ -135,9 +218,7 @@ class TestMarkers:
 class TestProceedToBind:
     def test_proceed_calls_bind_and_tick_once(self, tmp_path):
         spec_path = _write_spec(tmp_path)
-
         mock_brief = _make_brief("proceed-to-bind")
-        mock_dispatch = MagicMock(return_value=[{"status": "pending"}])
 
         with (
             patch.object(bad, "_target_yaml_exists", return_value=False),
@@ -147,7 +228,7 @@ class TestProceedToBind:
             patch.object(bad, "_tick", return_value=True) as mock_tick,
             patch.object(bad, "_verify_dispatched", return_value=True),
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_bind.assert_called_once_with(
             "cr-bundle-myrepo-2026-06-26", "myrepo", spec_path
@@ -156,7 +237,8 @@ class TestProceedToBind:
         assert len(results["bound"]) == 1
         assert results["bound"][0]["spec"] == "cr-bundle-myrepo-2026-06-26"
 
-    def test_proceed_writes_autodispatch_marker(self, tmp_path):
+    def test_proceed_writes_pending_then_renames_to_autodispatch(self, tmp_path):
+        """Pending marker written before bind, then atomically renamed to .autodispatch on success."""
         spec_path = _write_spec(tmp_path)
         mock_brief = _make_brief("proceed-to-bind")
 
@@ -168,10 +250,14 @@ class TestProceedToBind:
             patch.object(bad, "_tick", return_value=True),
             patch.object(bad, "_verify_dispatched", return_value=True),
         ):
-            bad.reconcile(spec_dir=tmp_path)
+            _reconcile(tmp_path)
 
-        marker = bad._autodispatch_marker(spec_path)
-        assert marker.exists(), ".autodispatch marker must be written after verified bind+tick"
+        # .autodispatch-pending must be gone (renamed to .autodispatch)
+        assert not bad._pending_marker(spec_path).exists(), \
+            ".autodispatch-pending must be renamed away on success"
+        # .autodispatch must now exist
+        assert bad._autodispatch_marker(spec_path).exists(), \
+            ".autodispatch must exist after successful bind+tick"
 
     def test_proceed_no_failed_marker_on_success(self, tmp_path):
         spec_path = _write_spec(tmp_path)
@@ -185,9 +271,58 @@ class TestProceedToBind:
             patch.object(bad, "_tick", return_value=True),
             patch.object(bad, "_verify_dispatched", return_value=True),
         ):
-            bad.reconcile(spec_dir=tmp_path)
+            _reconcile(tmp_path)
 
         assert not bad._failed_marker(spec_path).exists()
+
+    def test_pending_written_before_bind(self, tmp_path):
+        """The .autodispatch-pending marker must be written before bind is called."""
+        spec_path = _write_spec(tmp_path)
+        mock_brief = _make_brief("proceed-to-bind")
+        pending_written_before_bind = []
+
+        def check_pending_on_bind(*args, **kwargs):
+            pending_written_before_bind.append(bad._pending_marker(spec_path).exists())
+            return True
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", side_effect=check_pending_on_bind),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            _reconcile(tmp_path)
+
+        assert pending_written_before_bind == [True], \
+            ".autodispatch-pending must exist when bind() is called"
+
+    def test_pending_marker_content_includes_ts(self, tmp_path):
+        """Pending marker must record the injected run_ts."""
+        spec_path = _write_spec(tmp_path)
+        mock_brief = _make_brief("proceed-to-bind")
+        captured = []
+
+        original_write = Path.write_text
+        def capture_write(self, text, *a, **kw):
+            if ".autodispatch-pending" in str(self):
+                captured.append(text)
+            return original_write(self, text, *a, **kw)
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(Path, "write_text", capture_write),
+        ):
+            _reconcile(tmp_path)
+
+        assert any(_RUN_TS in c for c in captured), \
+            "Pending marker must embed the injected run_ts"
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +344,7 @@ class TestHoldDefer:
             patch.object(bad, "_bind", return_value=True) as mock_bind,
             patch.object(bad, "_tick", return_value=True) as mock_tick,
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_bind.assert_not_called()
         mock_tick.assert_not_called()
@@ -230,9 +365,10 @@ class TestHoldDefer:
             patch.object(bad, "_bind", return_value=True),
             patch.object(bad, "_tick", return_value=True),
         ):
-            bad.reconcile(spec_dir=tmp_path)
+            _reconcile(tmp_path)
 
         assert not bad._autodispatch_marker(spec_path).exists()
+        assert not bad._pending_marker(spec_path).exists()
         assert not bad._failed_marker(spec_path).exists()
 
 
@@ -250,7 +386,7 @@ class TestGWUnreachable:
             patch.object(bad, "_run_gate") as mock_gate,
             patch.object(bad, "_bind") as mock_bind,
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_gate.assert_not_called()
         mock_bind.assert_not_called()
@@ -265,9 +401,10 @@ class TestGWUnreachable:
             patch.object(bad, "_gw_serving", return_value=False),
             patch.object(bad, "_run_gate"),
         ):
-            bad.reconcile(spec_dir=tmp_path)
+            _reconcile(tmp_path)
 
         assert not bad._autodispatch_marker(spec_path).exists()
+        assert not bad._pending_marker(spec_path).exists()
         assert not bad._failed_marker(spec_path).exists()
 
     def test_gate_none_return_defers(self, tmp_path):
@@ -280,7 +417,7 @@ class TestGWUnreachable:
             patch.object(bad, "_run_gate", return_value=None),
             patch.object(bad, "_bind") as mock_bind,
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_bind.assert_not_called()
         assert results["deferred"][0]["reason"] == "gate_timeout_or_error"
@@ -300,7 +437,7 @@ class TestIdempotency:
             patch.object(bad, "_run_gate") as mock_gate,
             patch.object(bad, "_bind") as mock_bind,
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_gate.assert_not_called()
         mock_bind.assert_not_called()
@@ -315,39 +452,11 @@ class TestIdempotency:
             patch.object(bad, "_run_gate") as mock_gate,
             patch.object(bad, "_bind") as mock_bind,
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_gate.assert_not_called()
         mock_bind.assert_not_called()
         assert results["skipped"][0]["reason"] == "failed_tombstone"
-
-    def test_partial_state_yaml_exists_no_marker_writes_failed(self, tmp_path):
-        """Target YAML exists but no .autodispatch marker → partial bind → tombstone."""
-        spec_path = _write_spec(tmp_path)
-
-        with (
-            patch.object(bad, "_target_yaml_exists", return_value=True),
-            patch.object(bad, "_bind") as mock_bind,
-        ):
-            results = bad.reconcile(spec_dir=tmp_path)
-
-        mock_bind.assert_not_called()
-        assert results["failed"][0]["reason"] == "partial_bind_no_marker"
-        assert bad._failed_marker(spec_path).exists()
-
-    def test_partial_state_no_double_bind(self, tmp_path):
-        """A spec in partial state must not trigger a bind."""
-        _write_spec(tmp_path)
-
-        with (
-            patch.object(bad, "_target_yaml_exists", return_value=True),
-            patch.object(bad, "_bind") as mock_bind,
-            patch.object(bad, "_tick") as mock_tick,
-        ):
-            bad.reconcile(spec_dir=tmp_path)
-
-        mock_bind.assert_not_called()
-        mock_tick.assert_not_called()
 
     def test_rerun_after_autodispatch_marker_is_noop(self, tmp_path):
         """Second run with existing marker: no gate, no bind, no tick."""
@@ -360,7 +469,7 @@ class TestIdempotency:
             patch.object(bad, "_run_gate") as mock_gate,
             patch.object(bad, "_bind") as mock_bind,
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         mock_gate.assert_not_called()
         mock_bind.assert_not_called()
@@ -368,11 +477,151 @@ class TestIdempotency:
 
 
 # ---------------------------------------------------------------------------
-# Tick failure → .autodispatch-failed tombstone
+# Crash detection: .autodispatch-pending on later run → tombstone (Defect B fix)
+# ---------------------------------------------------------------------------
+
+class TestCrashDetection:
+    def test_stale_pending_tombstones_via_rename(self, tmp_path):
+        """Stale .autodispatch-pending → rename to .autodispatch-failed + loud log."""
+        spec_path = _write_spec(tmp_path)
+        bad._pending_marker(spec_path).write_text("stale pending from crashed run")
+
+        results = _reconcile(tmp_path)
+
+        # pending must be gone
+        assert not bad._pending_marker(spec_path).exists(), \
+            ".autodispatch-pending must be renamed away on crash detection"
+        # failed must exist (renamed from pending)
+        assert bad._failed_marker(spec_path).exists(), \
+            ".autodispatch-failed must be created from pending on crash detection"
+        assert results["failed"][0]["reason"] == "crash_pending_marker"
+
+    def test_stale_pending_tombstone_is_idempotent(self, tmp_path):
+        """After the crash tombstone is written, a second run SKIPs (failed_tombstone)."""
+        spec_path = _write_spec(tmp_path)
+        bad._pending_marker(spec_path).write_text("stale")
+
+        # First run: crash detected, pending → failed
+        r1 = _reconcile(tmp_path)
+        assert r1["failed"][0]["reason"] == "crash_pending_marker"
+        assert bad._failed_marker(spec_path).exists()
+
+        # Second run: failed tombstone → SKIP
+        with patch.object(bad, "_bind") as mock_bind:
+            r2 = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert r2["skipped"][0]["reason"] == "failed_tombstone"
+
+    def test_stale_pending_logs_error(self, tmp_path, caplog):
+        """Stale pending detection must emit an ERROR-level log."""
+        spec_path = _write_spec(tmp_path)
+        bad._pending_marker(spec_path).write_text("stale")
+
+        with caplog.at_level(logging.ERROR, logger="lapis_pm.bundle_autodispatch"):
+            _reconcile(tmp_path)
+
+        assert any("stale .autodispatch-pending" in r.message for r in caplog.records), \
+            "Must emit ERROR-level log on crash detection"
+
+    def test_pending_and_success_never_coexist(self, tmp_path):
+        """After a successful run, both .pending and .success cannot coexist."""
+        spec_path = _write_spec(tmp_path)
+        mock_brief = _make_brief("proceed-to-bind")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            _reconcile(tmp_path)
+
+        pending = bad._pending_marker(spec_path).exists()
+        success = bad._autodispatch_marker(spec_path).exists()
+        assert not pending, ".autodispatch-pending must not exist after success"
+        assert success, ".autodispatch must exist after success"
+        # They never coexist
+        assert not (pending and success)
+
+
+# ---------------------------------------------------------------------------
+# External bind: target YAML + no marker → SKIP, NEVER tombstone (Defect B regression)
+# ---------------------------------------------------------------------------
+
+class TestExternalBindSkip:
+    def test_external_bind_is_skip_not_tombstone(self, tmp_path):
+        """Regression: cr-bundle-conductor-2026-06-23 shape — target YAML + no markers → SKIP.
+
+        This was the false-positive tombstone path in PR #191 (Defect B).
+        The fix: absence of a success marker is NOT evidence of a crash.
+        Only an unresolved .autodispatch-pending is evidence of a crash.
+        """
+        _write_spec(tmp_path, "cr-bundle-conductor-2026-06-23.md")
+
+        with patch.object(bad, "_target_yaml_exists", return_value=True):
+            results = _reconcile(tmp_path)
+
+        assert results["skipped"][0]["reason"] == "externally_bound"
+        assert results["failed"] == [], "Must NEVER tombstone an externally-bound spec"
+
+    def test_external_bind_does_not_write_failed_marker(self, tmp_path):
+        """No .autodispatch-failed marker must be written for externally-bound specs."""
+        spec_path = _write_spec(tmp_path, "cr-bundle-conductor-2026-06-23.md")
+
+        with patch.object(bad, "_target_yaml_exists", return_value=True):
+            _reconcile(tmp_path)
+
+        assert not bad._failed_marker(spec_path).exists()
+
+    def test_external_bind_emits_audit_log(self, tmp_path, caplog):
+        """External bind skip must emit a high-priority (WARNING) audit log line."""
+        _write_spec(tmp_path, "cr-bundle-conductor-2026-06-23.md")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            caplog.at_level(logging.WARNING, logger="lapis_pm.bundle_autodispatch"),
+        ):
+            _reconcile(tmp_path)
+
+        assert any("externally" in r.message.lower() or "manually bound" in r.message.lower()
+                   for r in caplog.records), \
+            "Must emit audit-level log for externally-bound skip"
+
+    def test_external_bind_does_not_call_bind(self, tmp_path):
+        spec_path = _write_spec(tmp_path, "cr-bundle-conductor-2026-06-23.md")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_bind") as mock_bind,
+            patch.object(bad, "_tick") as mock_tick,
+        ):
+            _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        mock_tick.assert_not_called()
+
+    def test_external_bind_also_cr_bundle_autodispatch_v0_shape(self, tmp_path):
+        """cr-bundle-autodispatch-v0.md is excluded by filename before state check."""
+        p = tmp_path / "cr-bundle-autodispatch-v0.md"
+        p.write_text(AUTODISPATCH_SPEC, encoding="utf-8")
+
+        with patch.object(bad, "_target_yaml_exists", return_value=True):
+            results = _reconcile(tmp_path)
+
+        # Excluded by filename — never reaches state-check
+        assert results == {"bound": [], "deferred": [], "skipped": [], "failed": []}
+
+
+# ---------------------------------------------------------------------------
+# Tick failure → rename pending → .autodispatch-failed (atomic)
 # ---------------------------------------------------------------------------
 
 class TestTickFailure:
-    def test_tick_failure_writes_failed_marker(self, tmp_path):
+    def test_tick_failure_renames_pending_to_failed(self, tmp_path):
+        """On tick failure, .autodispatch-pending is atomically renamed to .autodispatch-failed."""
         spec_path = _write_spec(tmp_path)
         mock_brief = _make_brief("proceed-to-bind")
 
@@ -383,13 +632,16 @@ class TestTickFailure:
             patch.object(bad, "_bind", return_value=True),
             patch.object(bad, "_tick", return_value=False),
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         assert results["failed"][0]["reason"] == "tick_failed"
         assert bad._failed_marker(spec_path).exists()
         assert not bad._autodispatch_marker(spec_path).exists()
+        assert not bad._pending_marker(spec_path).exists(), \
+            ".autodispatch-pending must be renamed away on tick failure"
 
-    def test_dispatched_not_verified_writes_failed_marker(self, tmp_path):
+    def test_dispatched_not_verified_renames_pending_to_failed(self, tmp_path):
+        """On dispatched<1 after tick, pending is atomically renamed to failed."""
         spec_path = _write_spec(tmp_path)
         mock_brief = _make_brief("proceed-to-bind")
 
@@ -401,19 +653,20 @@ class TestTickFailure:
             patch.object(bad, "_tick", return_value=True),
             patch.object(bad, "_verify_dispatched", return_value=False),
         ):
-            results = bad.reconcile(spec_dir=tmp_path)
+            results = _reconcile(tmp_path)
 
         assert results["failed"][0]["reason"] == "dispatch_not_verified"
         assert bad._failed_marker(spec_path).exists()
         assert not bad._autodispatch_marker(spec_path).exists()
+        assert not bad._pending_marker(spec_path).exists()
 
 
 # ---------------------------------------------------------------------------
-# --dry-run
+# --dry-run: fully side-effect-free for ALL marker states
 # ---------------------------------------------------------------------------
 
 class TestDryRun:
-    def test_dry_run_no_bind_no_marker(self, tmp_path):
+    def test_dry_run_fresh_spec_no_bind_no_marker(self, tmp_path):
         spec_path = _write_spec(tmp_path)
 
         with (
@@ -422,14 +675,35 @@ class TestDryRun:
             patch.object(bad, "_bind") as mock_bind,
             patch.object(bad, "_tick") as mock_tick,
         ):
-            results = bad.reconcile(spec_dir=tmp_path, dry_run=True)
+            results = _reconcile(tmp_path, dry_run=True)
 
         mock_bind.assert_not_called()
         mock_tick.assert_not_called()
         assert not bad._autodispatch_marker(spec_path).exists()
+        assert not bad._pending_marker(spec_path).exists()
         assert not bad._failed_marker(spec_path).exists()
         # dry-run still counts as "would-bind"
         assert results["bound"][0]["dry_run"] is True
+
+    def test_dry_run_stale_pending_logs_but_no_rename(self, tmp_path, caplog):
+        """Dry-run with stale .autodispatch-pending: logs 'would tombstone', touches nothing."""
+        spec_path = _write_spec(tmp_path)
+        bad._pending_marker(spec_path).write_text("stale from crashed run")
+
+        with caplog.at_level(logging.ERROR, logger="lapis_pm.bundle_autodispatch"):
+            results = _reconcile(tmp_path, dry_run=True)
+
+        # Pending marker must still be there (dry-run never renames)
+        assert bad._pending_marker(spec_path).exists(), \
+            "dry-run must not rename .autodispatch-pending"
+        # Failed marker must NOT appear
+        assert not bad._failed_marker(spec_path).exists(), \
+            "dry-run must not create .autodispatch-failed"
+        # Must log "would tombstone" or equivalent
+        assert any("would" in r.message.lower() for r in caplog.records), \
+            "dry-run must log that it would tombstone"
+        # Result still reported in failed for observability
+        assert results["failed"][0]["reason"] == "crash_pending_marker"
 
     def test_dry_run_gw_not_serving_defers(self, tmp_path):
         _write_spec(tmp_path)
@@ -439,24 +713,56 @@ class TestDryRun:
             patch.object(bad, "_gw_serving", return_value=False),
             patch.object(bad, "_bind") as mock_bind,
         ):
-            results = bad.reconcile(spec_dir=tmp_path, dry_run=True)
+            results = _reconcile(tmp_path, dry_run=True)
 
         mock_bind.assert_not_called()
         assert results["deferred"][0]["reason"] == "gw_not_serving"
 
-    def test_dry_run_partial_state_no_marker_write(self, tmp_path):
-        """In dry-run, partial state is detected but no tombstone is written."""
+    def test_dry_run_external_bind_no_tombstone(self, tmp_path):
+        """Dry-run over externally-bound spec: SKIP, no marker write."""
         spec_path = _write_spec(tmp_path)
 
+        with patch.object(bad, "_target_yaml_exists", return_value=True):
+            results = _reconcile(tmp_path, dry_run=True)
+
+        assert results["skipped"][0]["reason"] == "externally_bound"
+        assert not bad._failed_marker(spec_path).exists()
+        assert not bad._pending_marker(spec_path).exists()
+
+    def test_dry_run_filesystem_identical_over_all_shapes(self, tmp_path):
+        """Dry-run over all marker shapes leaves the filesystem byte-identical."""
+        # Set up one spec in each state
+        fresh_spec = _write_spec(tmp_path, "cr-bundle-fresh-2026-06-27.md")
+
+        done_spec = _write_spec(tmp_path, "cr-bundle-done-2026-06-27.md")
+        bad._autodispatch_marker(done_spec).write_text("done")
+
+        failed_spec = _write_spec(tmp_path, "cr-bundle-failed-2026-06-27.md")
+        bad._failed_marker(failed_spec).write_text("failed tombstone")
+
+        stale_spec = _write_spec(tmp_path, "cr-bundle-stale-2026-06-27.md")
+        bad._pending_marker(stale_spec).write_text("stale pending")
+
+        # Snapshot filesystem state before dry-run
+        def fs_snapshot():
+            return {p.name: p.read_text() for p in tmp_path.iterdir() if p.is_file()}
+
+        before = fs_snapshot()
+
         with (
-            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
             patch.object(bad, "_bind") as mock_bind,
+            patch.object(bad, "_tick") as mock_tick,
         ):
-            results = bad.reconcile(spec_dir=tmp_path, dry_run=True)
+            _reconcile(tmp_path, dry_run=True)
+
+        after = fs_snapshot()
 
         mock_bind.assert_not_called()
-        assert results["failed"][0]["reason"] == "partial_bind_no_marker"
-        assert not bad._failed_marker(spec_path).exists()
+        mock_tick.assert_not_called()
+        assert before == after, \
+            "dry-run must leave the filesystem byte-identical (no writes/renames of any marker)"
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +773,6 @@ class TestCLI:
     def test_bundle_autodispatch_subcommand_registered(self):
         from lapis_pm.cli import build_parser
         p = build_parser()
-        # Should not raise
         args = p.parse_args(["bundle-autodispatch", "--dry-run"])
         assert args.dry_run is True
 
@@ -492,7 +797,6 @@ class TestCLI:
             spec_dir=str(tmp_path),
             gate_timeout=1800,
         )
-        # Empty dir → no failures
         rc = cmd_bundle_autodispatch(args)
         assert rc == 0
 

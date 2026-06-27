@@ -1606,6 +1606,45 @@ def cmd_trajectory_rollup(args) -> int:
     return 2
 
 
+def cmd_bundle_autodispatch(args) -> int:
+    """Handle `lapis-pm bundle-autodispatch [--dry-run] [--spec-dir PATH]`."""
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    from pathlib import Path as _Path
+    from .bundle_autodispatch import reconcile
+
+    spec_dir = _Path(args.spec_dir) if args.spec_dir else None
+    results = reconcile(
+        spec_dir=spec_dir,
+        dry_run=args.dry_run,
+        gate_timeout_s=args.gate_timeout,
+    )
+
+    print(
+        f"bundle-autodispatch: "
+        f"bound={len(results['bound'])} "
+        f"deferred={len(results['deferred'])} "
+        f"skipped={len(results['skipped'])} "
+        f"failed={len(results['failed'])}"
+    )
+    for entry in results["bound"]:
+        prefix = "[dry-run] " if entry.get("dry_run") else ""
+        print(f"  {prefix}BOUND: {entry['spec']} → repo={entry.get('repo', '?')}")
+    for entry in results["deferred"]:
+        print(f"  DEFERRED: {entry['spec']} ({entry.get('reason', '?')})")
+    for entry in results["skipped"]:
+        print(f"  SKIPPED: {entry['spec']} ({entry.get('reason', '?')})")
+    for entry in results["failed"]:
+        print(f"  FAILED: {entry['spec']} ({entry.get('reason', '?')})")
+
+    # Exit 1 if any failed (bound-but-dead state), 0 otherwise
+    return 1 if results["failed"] else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lapis-pm", description="Lapis PM agent CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2231,6 +2270,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print eligible targets and their current dispatch record size without writing.",
     )
     cmp.set_defaults(func=cmd_compact)
+
+    # ------------------------------------------------------------------
+    # bundle-autodispatch — reconcile unbound cr-bundle-* specs
+    # ------------------------------------------------------------------
+    bad = sub.add_parser(
+        "bundle-autodispatch",
+        help=(
+            "Reconcile unbound cr-bundle-* specs: run the GW spec-review gate and "
+            "bind+tick qualifying ones with advisory authority."
+        ),
+    )
+    bad.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        dest="dry_run",
+        help="Print what would be bound without binding or writing markers.",
+    )
+    bad.add_argument(
+        "--spec-dir",
+        default=None,
+        dest="spec_dir",
+        metavar="PATH",
+        help="Spec directory to scan (default: /srv/lapis/planning/specs).",
+    )
+    bad.add_argument(
+        "--gate-timeout",
+        default=1800,
+        type=int,
+        dest="gate_timeout",
+        metavar="SECONDS",
+        help="Hard timeout for the spec-review gate in seconds (default: 1800).",
+    )
+    bad.set_defaults(func=cmd_bundle_autodispatch)
 
     return p
 

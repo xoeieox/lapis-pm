@@ -1609,6 +1609,7 @@ def cmd_trajectory_rollup(args) -> int:
 def cmd_bundle_autodispatch(args) -> int:
     """Handle `lapis-pm bundle-autodispatch [--dry-run] [--spec-dir PATH]`."""
     import logging as _logging
+    from datetime import datetime, timezone
     _logging.basicConfig(
         level=_logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1617,11 +1618,15 @@ def cmd_bundle_autodispatch(args) -> int:
     from pathlib import Path as _Path
     from .bundle_autodispatch import reconcile
 
+    # Timestamp injected here at the CLI edge — never generated inside the pure reconcile logic.
+    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     spec_dir = _Path(args.spec_dir) if args.spec_dir else None
     results = reconcile(
         spec_dir=spec_dir,
         dry_run=args.dry_run,
         gate_timeout_s=args.gate_timeout,
+        run_ts=run_ts,
     )
 
     print(

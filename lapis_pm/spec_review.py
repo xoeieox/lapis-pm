@@ -1398,6 +1398,7 @@ def run_spec_review(
         facets_deliberation: dict | None = None
         envelope = None
         council_run_id: str | None = None
+        council_not_run_reason = ""
 
         if dispatch_facets and effective_authority in {"advisory", "hold"}:
             # Set the council timeout from the caller's timeout_s
@@ -1621,7 +1622,6 @@ def run_spec_review(
             # D1: GW-liveness preflight on the primary Council+Facets legs.
             # If GW is not serving when council_voicing==gravitywell, skip run_deliberation
             # entirely — do NOT launch a doomed deliberation that may fall back to paid Sonnet.
-            council_not_run_reason = ""
             if council_voicing == "gravitywell" and not swarm_serving():
                 print(
                     "[spec-review:council-preflight] swarm not serving; skipping run_deliberation",

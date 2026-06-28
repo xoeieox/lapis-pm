@@ -59,6 +59,18 @@ def call_model_sync(
             timeout=timeout,
             on_wake_fail=_GRAVITYWELL_WAKE_FAIL,
         )
+    elif model == "quest":
+        if call_operator is None:
+            log.warning("call_model_sync: call_operator unavailable; returning None")
+            return None
+        return call_operator(
+            "quest",
+            prompt=prompt,
+            system=system,
+            json_mode=json_mode,
+            timeout=timeout,
+            on_wake_fail="skip",
+        )
     elif model == "qwen":
         if call_operator is None:
             log.warning("call_model_sync: call_operator unavailable; returning None")

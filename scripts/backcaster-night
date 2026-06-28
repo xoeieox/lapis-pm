@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Backcaster night wrapper — iterate all /srv/lapis/planning/backcaster-goals/*.md
+# with --model ${BACKCASTER_MODEL:-haiku} (default: haiku), hard-cap per-goal,
+# stop if past stop-hour to clear GPU
+# before council-sweep at 04:30 PT.
+#
+# Staged here for lapis-scheduler-v0; once that lands the per-goal scheduling
+# moves into the registry and this wrapper becomes obsolete.
+#
+# DELTA (backcaster-quest-leg-v0): after each successful run, invokes
+# `lapis-pm backcaster-quest --all-unsourced <run_id>` (local-only, zero-paid)
+# within the remaining wall-clock budget.
+# Keep: BACKCASTER_MODEL override + wake hook (live-drift hazard — deploy +delta only).
+set -uo pipefail
+
+GOALS_DIR="${BACKCASTER_GOALS_DIR:-/srv/lapis/planning/backcaster-goals}"
+PER_GOAL_TIMEOUT="${BACKCASTER_PER_GOAL_TIMEOUT:-1500}"  # 25 min
+PER_QUEST_TIMEOUT="${BACKCASTER_QUEST_TIMEOUT:-600}"      # 10 min per quest run
+STOP_HOUR="${BACKCASTER_STOP_HOUR:-4}"                    # vacate GPU by 04:00 PT
+
+log() { printf '%s backcaster-night: %s\n' "$(date -Iseconds)" "$*"; }
+
+if [[ ! -d "$GOALS_DIR" ]]; then
+    log "goals dir missing: $GOALS_DIR"
+    exit 1
+fi
+
+shopt -s nullglob
+goals=("$GOALS_DIR"/*.md)
+if [[ ${#goals[@]} -eq 0 ]]; then
+    log "no goal files in $GOALS_DIR"
+    exit 0
+fi
+
+log "starting batch over ${#goals[@]} goal(s); per-goal cap ${PER_GOAL_TIMEOUT}s; stop after ${STOP_HOUR}:00 PT"
+
+rc=0
+for goal in "${goals[@]}"; do
+    hour_pt=$(TZ=America/Los_Angeles date +%-H)
+    if (( hour_pt >= STOP_HOUR )); then
+        log "stop-hour reached (${STOP_HOUR}:00 PT); skipping remaining goals"
+        break
+    fi
+    name=$(basename "$goal" .md)
+    log "→ $name"
+
+    # Capture output to extract run_dir for the quest leg
+    bc_out=$(mktemp)
+    if timeout "$PER_GOAL_TIMEOUT" /usr/local/bin/lapis-pm backcaster "$goal" \
+            --model "${BACKCASTER_MODEL:-haiku}" 2>&1 | tee "$bc_out"; then
+        log "✓ $name"
+
+        # Extract run_id from output: "  run_dir: /srv/lapis/backcaster/runs/<run_id>"
+        run_dir_line=$(grep -m1 'run_dir:' "$bc_out" || true)
+        run_id=$(echo "$run_dir_line" | sed 's|.*runs/||; s|[[:space:]].*||' | tr -d '[:space:]')
+        rm -f "$bc_out"
+
+        if [[ -n "$run_id" ]]; then
+            hour_pt=$(TZ=America/Los_Angeles date +%-H)
+            if (( hour_pt >= STOP_HOUR )); then
+                log "stop-hour reached before quest leg for $name; skipping"
+            else
+                log "→ quest leg for $name ($run_id)"
+                if timeout "$PER_QUEST_TIMEOUT" /usr/local/bin/lapis-pm backcaster-quest \
+                        "$run_id" --all-unsourced; then
+                    log "✓ quest leg $name"
+                else
+                    qec=$?
+                    log "✗ quest leg $name (exit $qec; non-fatal)"
+                    # Quest leg failures are non-fatal for the night batch
+                fi
+            fi
+        else
+            log "could not parse run_id from backcaster output for $name; skipping quest leg"
+        fi
+    else
+        ec=$?
+        rm -f "$bc_out"
+        log "✗ $name (exit $ec)"
+        rc=1
+    fi
+done
+
+log "batch done (rc=$rc)"
+exit $rc

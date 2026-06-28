@@ -45,7 +45,7 @@ FINANCIAL_SUBTYPES = ("extractive", "distributive", "neutral")
 # simpler — backcaster uses {type, ref} dicts per spec)
 # ---------------------------------------------------------------------------
 
-CitationType = Literal["corpus", "mem", "scenario"]
+CitationType = Literal["corpus", "mem", "scenario", "web"]
 
 
 class BackcasterCitation(BaseModel):

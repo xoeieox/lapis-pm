@@ -40,7 +40,7 @@ from agents_core.targets import TargetStore
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
-from .backcaster.cli import cmd_backcaster
+from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .scout.cli import cmd_scout
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
@@ -2227,6 +2227,48 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bc.set_defaults(func=cmd_backcaster)
+
+    # ------------------------------------------------------------------
+    # backcaster-quest — post-hoc web sourcing for unsourced gaps
+    # Sibling subcommand (not nested under backcaster) to avoid positional
+    # goal_file collision.
+    # ------------------------------------------------------------------
+    bq = sub.add_parser(
+        "backcaster-quest",
+        help=(
+            "Source unsourced gaps in a completed Backcaster run via Dowser "
+            "(web read+critique, leg-driven GW flips)."
+        ),
+    )
+    bq.add_argument(
+        "run_id",
+        metavar="RUN_ID",
+        help="Run directory name under /srv/lapis/backcaster/runs/ (e.g. 2026-06-28-2004-zephyr-...).",
+    )
+    bq.add_argument(
+        "--gap",
+        action="append",
+        default=None,
+        metavar="PRECONDITION_ID",
+        help="Target a specific gap by precondition ID (repeatable). Mutually exclusive with --all-unsourced.",
+    )
+    bq.add_argument(
+        "--all-unsourced",
+        dest="all_unsourced",
+        action="store_true",
+        default=False,
+        help="Target all unsourced gaps in the run.",
+    )
+    bq.add_argument(
+        "--escalate",
+        action="store_true",
+        default=False,
+        help=(
+            "Use read_operator=sonnet (paid) instead of quest (local-only). "
+            "No swarm flip. Morning human-targeted re-dispatch path only."
+        ),
+    )
+    bq.set_defaults(func=cmd_backcaster_quest)
 
     # ------------------------------------------------------------------
     # decisions-export — export recent mem entries as a markdown artifact

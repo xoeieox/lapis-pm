@@ -232,16 +232,7 @@ def test_quest_source_run_pass_writes_back(tmp_path):
     run_dir, run_id = _make_run_dir(tmp_path, gaps)
     dowser = _stub_dowser()
 
-    with patch("lapis_pm.backcaster.quest_leg.Path") as mock_path_cls:
-        # Make Path(room_path(...)) / run_id point to our tmp run_dir
-        mock_path_cls.side_effect = lambda *a, **kw: (
-            tmp_path if (len(a) == 1 and str(a[0]) == str(tmp_path)) else Path(*a, **kw)
-        )
-        # Patch room_path to return tmp_path
-        with patch("lapis_pm.backcaster.quest_leg.Path") as _:
-            pass
-
-    # Simpler: patch the room_path import inside quest_leg
+    # Patch the room_path import inside quest_leg
     with patch("agents_core.room_paths.room_path", return_value=str(tmp_path)):
         with patch("lapis_pm.backcaster.quest_leg._rederive_gap") as mock_rederive:
             summary = quest_source_run(

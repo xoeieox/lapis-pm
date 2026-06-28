@@ -251,6 +251,7 @@ def _phase_swarm_read(
         return result.get("drafts", []), False
     except Exception as exc:
         log.warning("[quest_leg] read_batch failed: %s", exc)
+        flip_fn("big")
         return None, False
 
 
@@ -509,9 +510,12 @@ def quest_source_run(
             good_cits = [c for c in raw_cits if _audit_citation(c)]
 
             if not good_cits:
+                # Transient marker: all citations failed provenance audit, but Dowser
+                # may return different (non-denylist) URLs on a future run — do NOT
+                # use insufficient-sources (known-hopeless) here.
                 _write_sidecar(run_dir, pid, {
                     "quest_attempted": today,
-                    "verdict": "insufficient-sources",
+                    "verdict": "provenance-audit-no-survivors",
                     "note": "pass verdict but no citations survived provenance audit",
                     "search_strings": prov.get("search_strings", []),
                     "hits_count": prov.get("hits_count", 0),
@@ -553,13 +557,14 @@ def quest_source_run(
                         f"Prior critic reason: {verdict_item.get('diagnosis', '')}"
                     ),
                 }
+                prior_web = sum(1 for c in gap.citations if c.type == "web")
                 counter_sourced = _try_counter_query(
                     gap, pid, run_dir, today, counter_req,
                     read_operator, critic_operator, _dowser, is_local,
                     _flip_fn, _gate_fn, prov,
                 )
                 if counter_sourced:
-                    citations_added += sum(1 for c in gap.citations if c.type == "web")
+                    citations_added += sum(1 for c in gap.citations if c.type == "web") - prior_web
                     gaps_sourced += 1
                 else:
                     gaps_honest_null += 1

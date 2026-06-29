@@ -371,271 +371,304 @@ def quest_source_run(
     is_local = model_policy == "local-only"
 
     # -----------------------------------------------------------------------
-    # Build Dowser requests (positionally aligned to target_gaps)
+    # Any-exit flip guard (criterion 6c): SIGTERM handler + try/finally ensure
+    # GW is never stranded on swarm on any exit path (normal, exception, SIGTERM).
     # -----------------------------------------------------------------------
-    pid_order: list[str] = []  # index -> pid; matches request/draft/verdict order
-    clean_requests: list[dict] = []
+    import signal as _sig
+    _prev_sigterm = _sig.getsignal(_sig.SIGTERM)
 
-    for gap in target_gaps:
-        pid = gap.precondition_id
-        intent = precondition_statements.get(pid) or gap.what_missing[:400]
-        context = (
-            f"what_exists: {gap.what_exists}\n"
-            f"what_missing: {gap.what_missing}\n"
-            f"what_miswired: {gap.what_miswired}"
-        )
-        sub_intents = [
-            f"What exists: {gap.what_exists[:200]}",
-            f"What is missing: {gap.what_missing[:200]}",
-            f"What is miswired: {gap.what_miswired[:200]}",
-        ]
-        clean_requests.append({"intent": intent, "context": context, "sub_intents": sub_intents})
-        pid_order.append(pid)
-
-    # -----------------------------------------------------------------------
-    # Phase 1: Read batch
-    # -----------------------------------------------------------------------
-    today = datetime.now(timezone.utc).date().isoformat()
-    read_drafts: list[dict] | None = None
-    read_timed_out = False
+    def _sigterm_handler(signum, frame):
+        raise SystemExit(128 + signum)
 
     if is_local:
-        read_drafts, read_timed_out = _phase_swarm_read(
-            clean_requests, read_operator, _dowser, _flip_fn, _gate_fn
-        )
-    else:
         try:
-            result = _dowser.read_batch(clean_requests, read_operator=read_operator)
-            read_drafts = result.get("drafts", [])
-        except Exception as exc:
-            log.warning("[quest_leg] read_batch (escalation) failed: %s", exc)
+            _sig.signal(_sig.SIGTERM, _sigterm_handler)
+        except (OSError, ValueError):
+            pass  # not in main thread; cannot install signal handler
 
-    if not read_drafts:
-        verdict = "infra-unavailable"
-        note = "read phase timed out" if read_timed_out else "read phase failed"
+    try:
+        # -----------------------------------------------------------------------
+        # Build Dowser requests (positionally aligned to target_gaps)
+        # -----------------------------------------------------------------------
+        pid_order: list[str] = []  # index -> pid; matches request/draft/verdict order
+        clean_requests: list[dict] = []
+
         for gap in target_gaps:
-            _write_sidecar(run_dir, gap.precondition_id, {
-                "quest_attempted": today, "verdict": verdict, "note": note,
-            })
-        # Fail toward big
+            pid = gap.precondition_id
+            intent = precondition_statements.get(pid) or gap.what_missing[:400]
+            context = (
+                f"what_exists: {gap.what_exists}\n"
+                f"what_missing: {gap.what_missing}\n"
+                f"what_miswired: {gap.what_miswired}"
+            )
+            sub_intents = [
+                f"What exists: {gap.what_exists[:200]}",
+                f"What is missing: {gap.what_missing[:200]}",
+                f"What is miswired: {gap.what_miswired[:200]}",
+            ]
+            clean_requests.append({"intent": intent, "context": context, "sub_intents": sub_intents})
+            pid_order.append(pid)
+
+        # -----------------------------------------------------------------------
+        # Phase 1: Read batch
+        # -----------------------------------------------------------------------
+        today = datetime.now(timezone.utc).date().isoformat()
+        read_drafts: list[dict] | None = None
+        read_timed_out = False
+
+        if is_local:
+            read_drafts, read_timed_out = _phase_swarm_read(
+                clean_requests, read_operator, _dowser, _flip_fn, _gate_fn
+            )
+        else:
+            try:
+                result = _dowser.read_batch(clean_requests, read_operator=read_operator)
+                read_drafts = result.get("drafts", [])
+            except Exception as exc:
+                log.warning("[quest_leg] read_batch (escalation) failed: %s", exc)
+
+        if not read_drafts:
+            verdict = "infra-unavailable"
+            note = "read phase timed out" if read_timed_out else "read phase failed"
+            for gap in target_gaps:
+                _write_sidecar(run_dir, gap.precondition_id, {
+                    "quest_attempted": today, "verdict": verdict, "note": note,
+                })
+            # Fail toward big
+            if is_local:
+                _flip_fn("big")
+            return _empty_summary(caution_before, len(target_gaps), note)
+
+        # -----------------------------------------------------------------------
+        # Phase 2: Critique batch
+        # -----------------------------------------------------------------------
+        critique_verdicts: list[dict] | None = None
+        critique_timed_out = False
+
+        critique_verdicts, critique_timed_out = _phase_big_critique(
+            read_drafts, critic_operator, _dowser, _flip_fn, _gate_fn, is_local
+        )
+
+        # -----------------------------------------------------------------------
+        # Phase 3: One retry for subpar verdicts (diagnosis-driven)
+        # -----------------------------------------------------------------------
+        retries_used = 0
+        if critique_verdicts:
+            subpar_idx = [
+                i for i, v in enumerate(critique_verdicts)
+                if v.get("status") != "pass"
+            ]
+            if subpar_idx:
+                retry_reqs = []
+                for i in subpar_idx:
+                    diagnosis = critique_verdicts[i].get("diagnosis", "") or "subpar"
+                    retry_reqs.append({
+                        **clean_requests[i],
+                        "prior_diagnosis": diagnosis,
+                    })
+
+                retry_drafts: list[dict] | None = None
+                if is_local:
+                    retry_drafts, _ = _phase_swarm_read(
+                        retry_reqs, read_operator, _dowser, _flip_fn, _gate_fn
+                    )
+                else:
+                    try:
+                        r = _dowser.read_batch(retry_reqs, read_operator=read_operator)
+                        retry_drafts = r.get("drafts", [])
+                    except Exception as exc:
+                        log.warning("[quest_leg] retry read_batch failed: %s", exc)
+
+                if retry_drafts:
+                    retries_used = 1
+                    retry_verdicts, _ = _phase_big_critique(
+                        retry_drafts, critic_operator, _dowser, _flip_fn, _gate_fn, is_local
+                    )
+                    if retry_verdicts:
+                        for j, i in enumerate(subpar_idx):
+                            if j < len(retry_verdicts) and retry_verdicts[j].get("status") == "pass":
+                                critique_verdicts[i] = retry_verdicts[j]
+                                if j < len(retry_drafts):
+                                    read_drafts[i] = retry_drafts[j]
+
+        # Mid-loop backstop: leave GW on big before write-back loop (which may
+        # re-flip to swarm via counter-queries for no-credible-sources gaps).
         if is_local:
             _flip_fn("big")
-        return _empty_summary(caution_before, len(target_gaps), note)
 
-    # -----------------------------------------------------------------------
-    # Phase 2: Critique batch
-    # -----------------------------------------------------------------------
-    critique_verdicts: list[dict] | None = None
-    critique_timed_out = False
+        # -----------------------------------------------------------------------
+        # Phase 4: Write-back per gap
+        # -----------------------------------------------------------------------
+        pid_to_gap = {g.precondition_id: g for g in target_gaps}
+        gaps_sourced = 0
+        gaps_honest_null = 0
+        citations_added = 0
 
-    critique_verdicts, critique_timed_out = _phase_big_critique(
-        read_drafts, critic_operator, _dowser, _flip_fn, _gate_fn, is_local
-    )
+        for i, pid in enumerate(pid_order):
+            gap = pid_to_gap[pid]
+            draft = read_drafts[i] if i < len(read_drafts) else {}
+            verdict_item = (critique_verdicts or [])[i] if critique_verdicts and i < len(critique_verdicts) else {}
 
-    # -----------------------------------------------------------------------
-    # Phase 3: One retry for subpar verdicts (diagnosis-driven)
-    # -----------------------------------------------------------------------
-    retries_used = 0
-    if critique_verdicts:
-        subpar_idx = [
-            i for i, v in enumerate(critique_verdicts)
-            if v.get("status") != "pass"
-        ]
-        if subpar_idx:
-            retry_reqs = []
-            for i in subpar_idx:
-                diagnosis = critique_verdicts[i].get("diagnosis", "") or "subpar"
-                retry_reqs.append({
-                    **clean_requests[i],
-                    "prior_diagnosis": diagnosis,
-                })
-
-            retry_drafts: list[dict] | None = None
-            if is_local:
-                retry_drafts, _ = _phase_swarm_read(
-                    retry_reqs, read_operator, _dowser, _flip_fn, _gate_fn
-                )
-            else:
-                try:
-                    r = _dowser.read_batch(retry_reqs, read_operator=read_operator)
-                    retry_drafts = r.get("drafts", [])
-                except Exception as exc:
-                    log.warning("[quest_leg] retry read_batch failed: %s", exc)
-
-            if retry_drafts:
-                retries_used = 1
-                retry_verdicts, _ = _phase_big_critique(
-                    retry_drafts, critic_operator, _dowser, _flip_fn, _gate_fn, is_local
-                )
-                if retry_verdicts:
-                    for j, i in enumerate(subpar_idx):
-                        if j < len(retry_verdicts) and retry_verdicts[j].get("status") == "pass":
-                            critique_verdicts[i] = retry_verdicts[j]
-                            if j < len(retry_drafts):
-                                read_drafts[i] = retry_drafts[j]
-
-    # Invariant: leave GW on big (interactive default)
-    if is_local:
-        _flip_fn("big")
-
-    # -----------------------------------------------------------------------
-    # Phase 4: Write-back per gap
-    # -----------------------------------------------------------------------
-    pid_to_gap = {g.precondition_id: g for g in target_gaps}
-    gaps_sourced = 0
-    gaps_honest_null = 0
-    citations_added = 0
-
-    for i, pid in enumerate(pid_order):
-        gap = pid_to_gap[pid]
-        draft = read_drafts[i] if i < len(read_drafts) else {}
-        verdict_item = (critique_verdicts or [])[i] if critique_verdicts and i < len(critique_verdicts) else {}
-
-        if critique_timed_out or not critique_verdicts:
-            _write_sidecar(run_dir, pid, {
-                "quest_attempted": today,
-                "verdict": "infra-unavailable",
-                "note": "critique phase timed out" if critique_timed_out else "critique phase failed",
-            })
-            gaps_honest_null += 1
-            continue
-
-        status = verdict_item.get("status", "subpar")
-        outcome = draft.get("outcome", "no-credible-sources")
-        prov = draft.get("provenance", {})
-
-        if status == "pass":
-            # Provenance audit first
-            raw_cits = draft.get("citations", [])
-            good_cits = [c for c in raw_cits if _audit_citation(c)]
-
-            if not good_cits:
-                # Transient marker: all citations failed provenance audit, but Dowser
-                # may return different (non-denylist) URLs on a future run — do NOT
-                # use insufficient-sources (known-hopeless) here.
+            if critique_timed_out or not critique_verdicts:
                 _write_sidecar(run_dir, pid, {
                     "quest_attempted": today,
-                    "verdict": "provenance-audit-no-survivors",
-                    "note": "pass verdict but no citations survived provenance audit",
-                    "search_strings": prov.get("search_strings", []),
-                    "hits_count": prov.get("hits_count", 0),
+                    "verdict": "infra-unavailable",
+                    "note": "critique phase timed out" if critique_timed_out else "critique phase failed",
                 })
                 gaps_honest_null += 1
                 continue
 
-            # Attach citations FIRST, then clear unsourced (validator order)
-            for c in good_cits:
-                gap.citations.append(BackcasterCitation(type="web", ref=c["url"]))
-                citations_added += 1
-            gap.unsourced = False
+            status = verdict_item.get("status", "subpar")
+            outcome = draft.get("outcome", "no-credible-sources")
+            prov = draft.get("provenance", {})
 
-            _write_sidecar(run_dir, pid, {
-                "quest_attempted": today,
-                "verdict": "sourced",
-                "findings": draft.get("findings", ""),
-                "citations": good_cits,
-                "provenance": prov,
-                "critic_verdict": verdict_item.get("verdict", {}),
-            })
+            if status == "pass":
+                # Provenance audit first
+                raw_cits = draft.get("citations", [])
+                good_cits = [c for c in raw_cits if _audit_citation(c)]
 
-            try:
-                _rederive_gap(gap, run_dir)
-            except Exception as exc:
-                log.warning("[quest_leg] re-derive failed for %s: %s", pid, exc)
-
-            gaps_sourced += 1
-
-        else:
-            # Honest-null, routed by Dowser's typed outcome
-            if outcome == "no-credible-sources":
-                # Adversarial counter-query: treat null as hypothesis to disprove
-                counter_req = {
-                    **clean_requests[i],
-                    "prior_diagnosis": (
-                        "Previous pass found no credible sources. "
-                        "Reframe with an opposing angle or alternate vocabulary. "
-                        f"Prior critic reason: {verdict_item.get('diagnosis', '')}"
-                    ),
-                }
-                prior_web = sum(1 for c in gap.citations if c.type == "web")
-                counter_sourced = _try_counter_query(
-                    gap, pid, run_dir, today, counter_req,
-                    read_operator, critic_operator, _dowser, is_local,
-                    _flip_fn, _gate_fn, prov,
-                )
-                if counter_sourced:
-                    citations_added += sum(1 for c in gap.citations if c.type == "web") - prior_web
-                    gaps_sourced += 1
-                else:
+                if not good_cits:
+                    # Transient marker: all citations failed provenance audit, but Dowser
+                    # may return different (non-denylist) URLs on a future run — do NOT
+                    # use insufficient-sources (known-hopeless) here.
+                    _write_sidecar(run_dir, pid, {
+                        "quest_attempted": today,
+                        "verdict": "provenance-audit-no-survivors",
+                        "note": "pass verdict but no citations survived provenance audit",
+                        "search_strings": prov.get("search_strings", []),
+                        "hits_count": prov.get("hits_count", 0),
+                    })
                     gaps_honest_null += 1
+                    continue
 
-            elif outcome == "high-friction":
+                # Attach citations FIRST, then clear unsourced (validator order)
+                for c in good_cits:
+                    gap.citations.append(BackcasterCitation(type="web", ref=c["url"]))
+                    citations_added += 1
+                gap.unsourced = False
+
                 _write_sidecar(run_dir, pid, {
                     "quest_attempted": today,
-                    "verdict": "high-friction-retry-candidate",
-                    "search_strings": prov.get("search_strings", []),
-                    "hits_count": prov.get("hits_count", 0),
-                    "critic_reason": verdict_item.get("diagnosis", ""),
-                    "friction_ratio": prov.get("friction_ratio", 0.0),
+                    "verdict": "sourced",
+                    "findings": draft.get("findings", ""),
+                    "citations": good_cits,
+                    "provenance": prov,
+                    "critic_verdict": verdict_item.get("verdict", {}),
                 })
-                gaps_honest_null += 1
+
+                try:
+                    _rederive_gap(gap, run_dir)
+                except Exception as exc:
+                    log.warning("[quest_leg] re-derive failed for %s: %s", pid, exc)
+
+                gaps_sourced += 1
 
             else:
-                # infra-unavailable or unknown transient
-                _write_sidecar(run_dir, pid, {
-                    "quest_attempted": today,
-                    "verdict": "infra-unavailable",
-                    "note": f"outcome={outcome}; transient",
-                })
-                gaps_honest_null += 1
+                # Honest-null, routed by Dowser's typed outcome
+                if outcome == "no-credible-sources":
+                    # Adversarial counter-query: treat null as hypothesis to disprove
+                    counter_req = {
+                        **clean_requests[i],
+                        "prior_diagnosis": (
+                            "Previous pass found no credible sources. "
+                            "Reframe with an opposing angle or alternate vocabulary. "
+                            f"Prior critic reason: {verdict_item.get('diagnosis', '')}"
+                        ),
+                    }
+                    prior_web = sum(1 for c in gap.citations if c.type == "web")
+                    counter_sourced = _try_counter_query(
+                        gap, pid, run_dir, today, counter_req,
+                        read_operator, critic_operator, _dowser, is_local,
+                        _flip_fn, _gate_fn, prov,
+                    )
+                    if counter_sourced:
+                        citations_added += sum(1 for c in gap.citations if c.type == "web") - prior_web
+                        gaps_sourced += 1
+                    else:
+                        gaps_honest_null += 1
 
-    # -----------------------------------------------------------------------
-    # Phase 5: Recompute caution + write back
-    # -----------------------------------------------------------------------
-    updated_map = {g.precondition_id: g for g in target_gaps}
-    final_gaps = [updated_map.get(g.precondition_id, g) for g in all_gaps]
-    caution_after = compute_epistemic_caution(final_gaps)
-    _write_gaps(run_dir, final_gaps)
-    run_data["epistemic_caution"] = caution_after
-    _write_run(run_dir, run_data)
+                elif outcome == "high-friction":
+                    _write_sidecar(run_dir, pid, {
+                        "quest_attempted": today,
+                        "verdict": "high-friction-retry-candidate",
+                        "search_strings": prov.get("search_strings", []),
+                        "hits_count": prov.get("hits_count", 0),
+                        "critic_reason": verdict_item.get("diagnosis", ""),
+                        "friction_ratio": prov.get("friction_ratio", 0.0),
+                    })
+                    gaps_honest_null += 1
 
-    # -----------------------------------------------------------------------
-    # Build summary
-    # -----------------------------------------------------------------------
-    null_outcomes: dict[str, int] = {
-        "insufficient-sources": 0,
-        "high-friction": 0,
-        "infra-unavailable": 0,
-    }
-    escalate_candidates: list[str] = []
-    for gap in target_gaps:
-        sidecar = _load_sidecar(run_dir, gap.precondition_id) or {}
-        v = sidecar.get("verdict", "")
-        if v == "insufficient-sources":
-            null_outcomes["insufficient-sources"] += 1
-        elif v == "high-friction-retry-candidate":
-            null_outcomes["high-friction"] += 1
-            escalate_candidates.append(gap.precondition_id)
-        elif v == "infra-unavailable":
-            null_outcomes["infra-unavailable"] += 1
+                else:
+                    # infra-unavailable or unknown transient
+                    _write_sidecar(run_dir, pid, {
+                        "quest_attempted": today,
+                        "verdict": "infra-unavailable",
+                        "note": f"outcome={outcome}; transient",
+                    })
+                    gaps_honest_null += 1
 
-    summary: dict[str, Any] = {
-        "gaps_targeted": len(target_gaps),
-        "gaps_sourced": gaps_sourced,
-        "gaps_honest_null": gaps_honest_null,
-        "citations_added": citations_added,
-        "caution_before": caution_before,
-        "caution_after": caution_after,
-        "retries_used": retries_used,
-        "null_outcomes": null_outcomes,
-    }
-    if escalate_candidates:
-        summary["escalate_candidates"] = escalate_candidates
-        summary["escalate_note"] = (
-            f"Gap(s) {escalate_candidates} found high-friction: insufficient credible "
-            "web evidence under the local-only operator. Worth a morning `--escalate` pass."
-        )
-    return summary
+        # Final backstop: ensure GW on big after write-back loop.
+        # Counter-queries inside the loop can flip to swarm; a flip POST returning
+        # non-200 must not leave GW stranded. The try/finally catches exception
+        # + SIGTERM, but this explicit call closes the mid-loop POST-failure edge.
+        if is_local:
+            _flip_fn("big")
+
+        # -----------------------------------------------------------------------
+        # Phase 5: Recompute caution + write back
+        # -----------------------------------------------------------------------
+        updated_map = {g.precondition_id: g for g in target_gaps}
+        final_gaps = [updated_map.get(g.precondition_id, g) for g in all_gaps]
+        caution_after = compute_epistemic_caution(final_gaps)
+        _write_gaps(run_dir, final_gaps)
+        run_data["epistemic_caution"] = caution_after
+        _write_run(run_dir, run_data)
+
+        # -----------------------------------------------------------------------
+        # Build summary
+        # -----------------------------------------------------------------------
+        null_outcomes: dict[str, int] = {
+            "insufficient-sources": 0,
+            "high-friction": 0,
+            "infra-unavailable": 0,
+        }
+        escalate_candidates: list[str] = []
+        for gap in target_gaps:
+            sidecar = _load_sidecar(run_dir, gap.precondition_id) or {}
+            v = sidecar.get("verdict", "")
+            if v == "insufficient-sources":
+                null_outcomes["insufficient-sources"] += 1
+            elif v == "high-friction-retry-candidate":
+                null_outcomes["high-friction"] += 1
+                escalate_candidates.append(gap.precondition_id)
+            elif v == "infra-unavailable":
+                null_outcomes["infra-unavailable"] += 1
+
+        summary: dict[str, Any] = {
+            "gaps_targeted": len(target_gaps),
+            "gaps_sourced": gaps_sourced,
+            "gaps_honest_null": gaps_honest_null,
+            "citations_added": citations_added,
+            "caution_before": caution_before,
+            "caution_after": caution_after,
+            "retries_used": retries_used,
+            "null_outcomes": null_outcomes,
+        }
+        if escalate_candidates:
+            summary["escalate_candidates"] = escalate_candidates
+            summary["escalate_note"] = (
+                f"Gap(s) {escalate_candidates} found high-friction: insufficient credible "
+                "web evidence under the local-only operator. Worth a morning `--escalate` pass."
+            )
+        return summary
+
+    finally:
+        if is_local:
+            _flip_fn("big")  # best-effort; idempotent; covers exception + SIGTERM exit paths
+        try:
+            _sig.signal(_sig.SIGTERM, _prev_sigterm)
+        except (OSError, ValueError):
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -720,6 +720,149 @@ def test_flip_serve_timeout_aborts_read_phase(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# AC6c: Any-exit flip guard — SIGTERM and exception paths
+# ---------------------------------------------------------------------------
+
+def test_sigterm_mid_swarm_flips_to_big(tmp_path):
+    """AC6c(i): SIGTERM raised mid-swarm-phase still results in flip('big') as final flip call."""
+    import signal
+
+    gaps = [{
+        "precondition_id": "gap-sigterm",
+        "what_exists": "x", "what_missing": "y", "what_miswired": "z",
+        "citations": [], "unsourced": True,
+    }]
+    run_dir, run_id = _make_run_dir(tmp_path, gaps)
+
+    flip_calls: list[str] = []
+
+    def _mock_flip(mode: str) -> bool:
+        flip_calls.append(mode)
+        return True
+
+    def _sigterm_read_batch(requests_list, read_operator="quest", budget=None):
+        # After flip-to-swarm, send SIGTERM to ourselves to simulate night-wrapper kill.
+        # The handler installed by quest_source_run should raise SystemExit,
+        # which unwinds through the try/finally and calls flip("big").
+        import os
+        os.kill(os.getpid(), signal.SIGTERM)
+        # Should not reach here
+        return {"drafts": []}
+
+    dowser = MagicMock()
+    dowser.read_batch = MagicMock(side_effect=_sigterm_read_batch)
+    dowser.critique_batch = MagicMock(return_value={"verdicts": []})
+
+    with patch("agents_core.room_paths.room_path", return_value=str(tmp_path)):
+        try:
+            quest_source_run(
+                run_id, all_unsourced=True, escalate=False,
+                _dowser=dowser, _flip_fn=_mock_flip, _gate_fn=_always_serving,
+            )
+        except SystemExit:
+            pass  # expected: SIGTERM -> SystemExit
+
+    # GW must end on big regardless of SIGTERM
+    assert flip_calls, "flip must have been called at least once"
+    assert flip_calls[-1] == "big", f"final flip must be 'big', got {flip_calls[-1]}"
+    assert "swarm" in flip_calls, "swarm flip must have occurred"
+
+
+def test_exception_mid_swarm_flips_to_big(tmp_path):
+    """AC6c(i): unhandled exception mid-flip-lifecycle triggers finally block and flips to big.
+
+    _phase_swarm_read catches read_batch exceptions internally, so we use a gate function
+    that raises AFTER the swarm flip — this propagates uncaught out of _phase_swarm_read
+    and up through quest_source_run's try/finally, which must call flip('big').
+    """
+    gaps = [{
+        "precondition_id": "gap-exc",
+        "what_exists": "x", "what_missing": "y", "what_miswired": "z",
+        "citations": [], "unsourced": True,
+    }]
+    run_dir, run_id = _make_run_dir(tmp_path, gaps)
+
+    flip_calls: list[str] = []
+
+    def _mock_flip(mode: str) -> bool:
+        flip_calls.append(mode)
+        return True
+
+    def _gate_raises_after_swarm(timeout_s: int = 240) -> bool:
+        # Raise after the swarm flip to simulate an unexpected gate crash.
+        # _phase_swarm_read doesn't catch gate exceptions, so this propagates
+        # to quest_source_run's outer try/finally.
+        if "swarm" in flip_calls:
+            raise RuntimeError("unexpected gate crash mid-flip-lifecycle")
+        return True
+
+    dowser = _stub_dowser()
+
+    with patch("agents_core.room_paths.room_path", return_value=str(tmp_path)):
+        with pytest.raises(RuntimeError, match="unexpected gate crash"):
+            quest_source_run(
+                run_id, all_unsourced=True, escalate=False,
+                _dowser=dowser, _flip_fn=_mock_flip, _gate_fn=_gate_raises_after_swarm,
+            )
+
+    # finally block must have called flip("big")
+    assert flip_calls, "flip must have been called at least once"
+    assert flip_calls[-1] == "big", f"final flip must be 'big', got {flip_calls[-1]}"
+    assert "swarm" in flip_calls
+
+
+def test_counter_query_failed_big_flip_still_ends_on_big(tmp_path):
+    """AC6c(ii): counter-query whose big-flip POST returns non-200 still ends with GW on big.
+
+    Simulates: read-swarm succeeds, critique-big flip POST fails (returns False),
+    but the final backstop after the write-back loop + the finally block still call flip('big').
+    """
+    gaps = [{
+        "precondition_id": "gap-cq-fail",
+        "what_exists": "x", "what_missing": "y", "what_miswired": "z",
+        "citations": [], "unsourced": True,
+    }]
+    run_dir, run_id = _make_run_dir(tmp_path, gaps)
+
+    flip_calls: list[str] = []
+    flip_call_count = {"big": 0}
+
+    def _mock_flip(mode: str) -> bool:
+        flip_calls.append(mode)
+        if mode == "big":
+            flip_call_count["big"] += 1
+            # First big-flip (inside _phase_big_critique for counter-query) returns False
+            # to simulate a non-200 POST response.
+            if flip_call_count["big"] == 1:
+                return False
+        return True
+
+    # Stub: main read returns no-credible-sources to trigger counter-query path.
+    # Counter-query also returns no-credible-sources so we reach the write_known_hopeless path.
+    dowser = _stub_dowser(
+        read_outcome="no-credible-sources",
+        read_citations=[],
+        critique_status="subpar",
+        critique_diagnosis="no sources",
+    )
+
+    with patch("agents_core.room_paths.room_path", return_value=str(tmp_path)):
+        summary = quest_source_run(
+            run_id, all_unsourced=True, escalate=False,
+            _dowser=dowser, _flip_fn=_mock_flip, _gate_fn=_always_serving,
+        )
+
+    # Run must complete cleanly
+    assert summary["gaps_sourced"] == 0  # no-credible-sources, honest-null
+
+    # GW must end on big despite the failed big-flip POST inside the counter-query
+    assert flip_calls, "flip must have been called"
+    assert flip_calls[-1] == "big", f"final flip must be 'big', got {flip_calls[-1]}"
+    # Total big flips must be >= 2: the failed first + the backstop/finally call(s)
+    assert flip_call_count["big"] >= 2, "must have retried flip-to-big via backstop"
+
+
+# ---------------------------------------------------------------------------
 # AC8: Full end-to-end with stubbed Dowser (all_unsourced, round-trip)
 # ---------------------------------------------------------------------------
 

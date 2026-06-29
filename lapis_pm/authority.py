@@ -184,10 +184,12 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
 
 
 def classify(repo: str, pr_number: int, spec_summary: str,
-             pm_authority: str = "advisory") -> PRClassification:
+             pm_authority: str = "advisory",
+             verification: str = "pm-live-test") -> PRClassification:
     """Classify a PR based on static checks.
 
-    For auto-merge targets: also runs inline Sonnet screen (unchanged behavior).
+    For auto-merge targets: also runs inline Sonnet screen. If verification is not
+    'machine', the auto path downgrades to advisory (raises a brief) rather than merging.
     For advisory/hold targets: static checks only; Opus reviewer is dispatched
     by pm_core's review-gate loop (not here).
     """
@@ -224,8 +226,26 @@ def classify(repo: str, pr_number: int, spec_summary: str,
             diff=diff_text,
         )
 
-    # --- Auto-merge path: inline Sonnet screen (unchanged behavior) ---
+    # --- Auto-merge path: inline Sonnet screen ---
     if pm_authority == "auto":
+        # Gate: verification must be 'machine'. Not machine-verified => downgrade to advisory.
+        if verification != "machine":
+            return PRClassification(
+                verdict="advisory",
+                screen_verdict="unknown",
+                static_outcome=StaticOutcome.static_pass,
+                reasons=[
+                    f"auto-tier downgraded: verification={verification!r} (needs PM touch)"
+                ],
+                issues=[],
+                pr_number=pr_number,
+                repo=repo,
+                title=pr.get("title", ""),
+                html_url=pr.get("html_url", ""),
+                changed_paths=paths,
+                diff_loc=loc,
+                diff=diff_text,
+            )
         screen_result = screen(repo, pr_number, spec_summary, diff_text)
         sv = screen_result.get("verdict", "needs-human")
         reasons: list[str] = []

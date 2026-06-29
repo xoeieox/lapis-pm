@@ -39,6 +39,7 @@ from agents_core.targets import TargetStore
 
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod
+from .spec_review import _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .scout.cli import cmd_scout
@@ -285,6 +286,13 @@ def cmd_bind(args) -> int:
         target.data["adopted_head_branch"] = _adopted_head_branch
 
     target.bind_pm(repo=args.repo, authority=args.authority)
+
+    # Resolve pm_verification: --verification flag overrides spec field; absent => pm-live-test
+    _spec_verif = _parse_spec_verification_text(spec_body)
+    _verif_flag = getattr(args, "verification", None)
+    effective_verification = _verif_flag if _verif_flag is not None else _spec_verif
+    target.data["pm_verification"] = effective_verification
+
     target.save()
 
     episodic.write_spec(args.target_id, spec_body)
@@ -298,7 +306,8 @@ def cmd_bind(args) -> int:
         )
     except Exception as _e:
         print(f"[router-portfolio:emit-failed] kickoff: {_e}", file=sys.stderr)
-    print(f"Bound {args.target_id} → repo={args.repo}, authority={args.authority}")
+    print(f"Bound {args.target_id} → repo={args.repo}, authority={args.authority}, "
+          f"verification={effective_verification}")
     if _adopted_pr_number is not None:
         print(f"Adopted PR #{_adopted_pr_number} on branch {_adopted_head_branch!r}")
     print(f"Spec: {len(spec_body)} chars")
@@ -707,6 +716,7 @@ def _print_target_status(t, explain: bool = False):
     print(f"  pm_bound:      {t.pm_bound}")
     print(f"  pm_repo:       {t.pm_repo}")
     print(f"  pm_authority:  {t.pm_authority}")
+    print(f"  pm_verification: {t.data.get('pm_verification', 'pm-live-test (default)')}")
     print(f"  paused:        {t.paused}"
           + (f" (reason: {t.paused_reason})" if t.paused and t.paused_reason else ""))
     cursor = pm_core.get_cursor(t.id)
@@ -758,6 +768,7 @@ def _target_to_json_dict(t) -> dict:
         "title": t.title,
         "pm_repo": t.pm_repo,
         "pm_authority": t.pm_authority,
+        "pm_verification": t.data.get("pm_verification", "pm-live-test"),
         "paused": t.paused,
         "cursor": pm_core.get_cursor(t.id),
         "dispatched_total": len(dispatched),
@@ -1661,6 +1672,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--repo", default=None, help="Forgejo repo name (required for single-target)")
     b.add_argument("--authority", default=None, choices=["advisory", "auto", "hold"],
                    help="Authority level (default: advisory; hold = fresh-reviewer + 4-cycle budget)")
+    b.add_argument("--verification", default=None, choices=["machine", "pm-live-test"],
+                   help="Verification mode override (default: parsed from spec, else pm-live-test). "
+                        "'machine' = auto-merge eligible; 'pm-live-test' = always routes to PM.")
     b.add_argument("--legs-from", dest="legs_from", default=None, metavar="PATH",
                    help="Path to chain legs YAML; switches to chain-mode (mutex with --repo)")
     b.add_argument("--no-auto-fire", dest="no_auto_fire", action="store_true",

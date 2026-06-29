@@ -242,6 +242,42 @@ def _parse_spec_authority(spec_path: Path) -> str:
     return m.group(1)
 
 
+_VERIFICATION_RE = re.compile(
+    r"^\*\*Verification:\*\*\s+(\S+)",
+    re.MULTILINE,
+)
+_VERIFICATION_MACHINE_ALIASES = frozenset({"machine"})
+
+
+def _parse_spec_verification_text(text: str) -> str:
+    """Extract Verification from spec text (first 50 lines).
+
+    Returns 'machine' or 'pm-live-test'. Absent or unrecognized => 'pm-live-test' (fail-safe).
+    Accepts aliases: live-test, human => pm-live-test.
+    """
+    first_50 = "\n".join(text.splitlines()[:50])
+    m = _VERIFICATION_RE.search(first_50)
+    if not m:
+        return "pm-live-test"
+    val = m.group(1).lower().rstrip(".,;:!)")
+    if val in _VERIFICATION_MACHINE_ALIASES:
+        return "machine"
+    return "pm-live-test"
+
+
+def _parse_spec_verification(spec_path: Path) -> str:
+    """Extract Verification from spec file (first 50 lines).
+
+    Sibling to _parse_spec_authority. Returns 'machine' or 'pm-live-test'.
+    Absent/unrecognized/unreadable => 'pm-live-test' (fail-safe, never hard-errors).
+    """
+    try:
+        text = spec_path.read_text(encoding="utf-8")
+    except OSError:
+        return "pm-live-test"
+    return _parse_spec_verification_text(text)
+
+
 def _synth_target_id(parsed_target_id: str) -> str:
     """Generate a synthetic target_id for queue tracking. Never written to TargetStore."""
     return f"spec-review-{parsed_target_id}-{int(time.time())}-{uuid.uuid4().hex[:6]}"

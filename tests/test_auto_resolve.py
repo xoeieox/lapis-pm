@@ -53,11 +53,13 @@ def _make_target(
     target_id: str = "my-target",
     pm_authority: str = "advisory",
     pm_repo: str = "lapis-pm",
+    pm_verification: str = "machine",
 ) -> MagicMock:
     t = MagicMock()
     t.id = target_id
     t.pm_authority = pm_authority
     t.pm_repo = pm_repo
+    t.data = {"pm_verification": pm_verification}
     return t
 
 

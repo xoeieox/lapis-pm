@@ -157,7 +157,7 @@ class TestAuthorityClassify:
             patch("lapis_pm.authority.get_pr_diff", return_value=diff),
             patch("lapis_pm.authority.screen", return_value=screen_result) as mock_screen,
         ):
-            cls = authority.classify("myrepo", 1, "spec", pm_authority="auto")
+            cls = authority.classify("myrepo", 1, "spec", pm_authority="auto", verification="machine")
         mock_screen.assert_called_once()
         assert cls.screen_verdict == "clean"
         assert cls.verdict == "auto"

@@ -2691,9 +2691,11 @@ class Decision:
     payload: dict
 
 
-def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str) -> Decision:
+def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
+                   verification: str = "pm-live-test") -> Decision:
     spec_summary = episodic.spec_summary(target_id)
-    cls = authority.classify(repo, pr["number"], spec_summary, pm_authority=pm_authority)
+    cls = authority.classify(repo, pr["number"], spec_summary, pm_authority=pm_authority,
+                             verification=verification)
     payload = {"classification": cls, "pr": pr}
 
     # Static hold: held paths always surface immediately (no reviewer needed)
@@ -3092,6 +3094,12 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             _should, _merge_opt = _ar.should_auto_resolve(
                 cls, _ar_target, _ar_target.pm_repo or "",
             )
+            if not _should and _merge_opt and "needs-pm-touch" in _merge_opt:
+                episodic.write_observation(
+                    target_id,
+                    f"auto-resolve skipped: {_merge_opt} — routing to PM brief",
+                    extra_tags=["pm:auto-resolve-skipped:verification", f"pm:pr={cls.pr_number}"],
+                )
             if _should:
                 try:
                     brief._act_merge_pr(target_id, cls.pr_number)
@@ -4633,6 +4641,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # 4. Decide (priority order, single action)
     decision_str = "noop:no_change"
     pm_authority = target.pm_authority
+    pm_verification = target.data.get("pm_verification", "pm-live-test")
 
     # 4.0 Brief-decision directive consumer — highest-priority decide branch.
     # If a directive file exists for this target, apply it and skip the rest.
@@ -4706,7 +4715,7 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                                 _eval_gate_handled = True
 
             if not _eval_gate_handled:
-                decision = _decide_for_pr(target_id, repo, pr, pm_authority)
+                decision = _decide_for_pr(target_id, repo, pr, pm_authority, pm_verification)
                 if decision.kind == "merge":
                     decision_str = _act_merge(target_id, decision.payload)
                 elif decision.kind == "hold_brief":

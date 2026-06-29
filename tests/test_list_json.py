@@ -29,6 +29,7 @@ SCHEMA_KEYS = {
     "title",
     "pm_repo",
     "pm_authority",
+    "pm_verification",
     "paused",
     "cursor",
     "dispatched_total",

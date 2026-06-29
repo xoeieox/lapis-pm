@@ -30,7 +30,7 @@ def should_auto_resolve(
     target,  # agents_core.targets.Target
     repo: str,
 ) -> tuple[bool, str | None]:
-    """Conservative auto-resolve predicate — all five clauses must hold.
+    """Conservative auto-resolve predicate — all six clauses must hold.
 
     Returns (True, merge_option_id) or (False, reason).
     """
@@ -66,7 +66,15 @@ def should_auto_resolve(
         return False, "advisory-clean template has no merge_pr option"
     merge_option_id: str = merge_opt["id"]
 
+    # Clause 6: verification must be 'machine' — target's acceptance must be
+    # fully establishable by the automated pipeline. Absent field => 'pm-live-test'
+    # (fail-safe: unmarked targets stop auto-resolving).
+    pm_verification = getattr(target, "data", {}).get("pm_verification", "pm-live-test")
+    if pm_verification != "machine":
+        return False, f"verification={pm_verification!r}:needs-pm-touch"
+
     # Clause 5: live held-path check via the same gate brief_gem uses (fail-closed)
+    # Placed last because it requires a network call; short-circuit above avoids it.
     blocked, reason = brief_gem._held_path_check_live(target.id, cls.pr_number, repo)
     if blocked:
         return False, f"held_path blocked: {reason}"

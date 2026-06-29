@@ -247,7 +247,6 @@ _VERIFICATION_RE = re.compile(
     re.MULTILINE,
 )
 _VERIFICATION_MACHINE_ALIASES = frozenset({"machine"})
-_VERIFICATION_HUMAN_ALIASES = frozenset({"pm-live-test", "live-test", "human"})
 
 
 def _parse_spec_verification_text(text: str) -> str:

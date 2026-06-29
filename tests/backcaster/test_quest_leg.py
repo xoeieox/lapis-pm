@@ -432,6 +432,12 @@ def test_provenance_audit_drops_junk_domain(tmp_path):
     assert g["unsourced"] is True
     assert summary["citations_added"] == 0
 
+    # Sidecar must record provenance-audit-no-survivors verdict
+    sidecar_path = run_dir / "quest" / "gap-junk.yaml"
+    assert sidecar_path.exists(), "sidecar not written for provenance-audit-no-survivors"
+    sidecar = yaml.safe_load(sidecar_path.read_text())
+    assert sidecar["verdict"] == "provenance-audit-no-survivors"
+
 
 def test_provenance_audit_passes_credible_domain(tmp_path):
     """AC3b: credible-domain citation passes audit; unsourced flips to False."""

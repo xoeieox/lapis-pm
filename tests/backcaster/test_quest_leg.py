@@ -898,3 +898,47 @@ def test_end_to_end_all_unsourced(tmp_path):
     # run.yaml updated
     run_data = yaml.safe_load((run_dir / "run.yaml").read_text())
     assert run_data["epistemic_caution"] == "low"
+
+
+# ---------------------------------------------------------------------------
+# _gate_doorman_serving() unit tests (AC1 + AC2 of serving-gate fix)
+# ---------------------------------------------------------------------------
+
+def test_gate_doorman_deferred_mode_returns_true():
+    """AC1: serving=False, serving_mode=deferred → gate passes immediately."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "nodes": {"gravitywell": {"serving": False, "serving_mode": "deferred"}}
+    }
+    with patch("httpx.get", return_value=mock_resp):
+        assert _gate_doorman_serving(timeout_s=10) is True
+
+
+def test_gate_doorman_serving_true_returns_true():
+    """AC1: serving=True → gate passes immediately (baseline still works)."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "nodes": {"gravitywell": {"serving": True}}
+    }
+    with patch("httpx.get", return_value=mock_resp):
+        assert _gate_doorman_serving(timeout_s=10) is True
+
+
+def test_gate_doorman_offline_times_out():
+    """AC2: GW offline (all polls raise) → gate swallows errors and returns False."""
+    # Control time so the loop runs once, errors are swallowed, then exits.
+    times = [0.0, 0.0, 999.0]  # [deadline-set, loop-enter, loop-exit/sleep-arg]
+    call_n = {"n": 0}
+
+    def _mono():
+        v = times[min(call_n["n"], len(times) - 1)]
+        call_n["n"] += 1
+        return v
+
+    with patch("time.monotonic", side_effect=_mono):
+        with patch("time.sleep"):
+            with patch("httpx.get", side_effect=OSError("connection refused")):
+                result = _gate_doorman_serving(timeout_s=1)
+    assert result is False

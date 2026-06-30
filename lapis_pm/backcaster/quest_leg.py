@@ -98,7 +98,7 @@ def _gate_doorman_serving(timeout_s: int = FLIP_SERVE_TIMEOUT) -> bool:
             resp = _httpx.get(f"{DOORMAN_URL}/status", timeout=5)
             if resp.status_code == 200:
                 gw = resp.json().get("nodes", {}).get("gravitywell", {})
-                if gw.get("serving"):
+                if gw.get("serving") or gw.get("serving_mode") == "deferred":
                     return True
         except Exception as exc:
             log.debug("[quest_leg] doorman poll error: %s", exc)

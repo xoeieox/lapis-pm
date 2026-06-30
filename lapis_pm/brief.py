@@ -224,6 +224,7 @@ def synthesize(
     notify: NotifyPriority | None = NotifyPriority.NORMAL,
     options_extra_tags: list[str] | None = None,
     reviewer_verdict_text: str | None = None,
+    functional_critic_text: str | None = None,
 ) -> Brief:
     """Produce a brief, write it as a comment, optionally push to Pushover.
 
@@ -232,6 +233,8 @@ def synthesize(
     pr_number: PR number for merge_pr action in closed-form briefs
     notify: NotifyPriority.X → write comment AND call send_notification at that priority.
             None → write pm:brief comment but skip send_notification; Brief.pushed=False.
+    functional_critic_text: when set, appended to the brief body verbatim under a
+            "## Functional Critic" section after LLM synthesis (AC8 hook point).
 
     When trigger is a closed-form trigger, also writes a sibling pm:brief-options
     comment so that claude-view can render resolution buttons.  The brief markdown
@@ -291,6 +294,9 @@ def synthesize(
             f"{episodes_block}\n"
             "## Decision needed\nReview thread directly.\n"
         )
+
+    if functional_critic_text:
+        body = body + f"\n\n## Functional Critic\n\n{functional_critic_text}\n"
 
     body = body + _brief_version_line()
 

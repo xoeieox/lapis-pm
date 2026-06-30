@@ -1517,6 +1517,70 @@ def cmd_facets_gw_eval(args) -> int:
         return 1
 
 
+def cmd_functional_critic(args) -> int:
+    """Handle `lapis-pm functional-critic` subcommand (DoD integration smoke).
+
+    Usage: python3 -m lapis_pm.cli functional-critic <repo> <pr_number> <spec_path>
+
+    Checks out PR head, runs pytest, calls GW-122B for AC coverage assessment,
+    and prints the verdict JSON to stdout.
+    """
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    from . import functional_critic as fc
+
+    repo = args.repo
+    pr_number = args.pr_number
+    spec_path = args.spec_path
+
+    # Load spec text
+    try:
+        spec_text = open(spec_path).read()
+    except OSError as exc:
+        print(f"ERROR: cannot read spec file {spec_path}: {exc}", file=sys.stderr)
+        return 1
+
+    # Fetch head SHA from Forgejo
+    try:
+        from agents_core.forgejo import get_open_prs as _get_open_prs
+        repo_name = repo.split("/")[-1]
+        open_prs = _get_open_prs(repo_name) or []
+        pr = next((p for p in open_prs if p.get("number") == pr_number), None)
+        if pr is None:
+            print(f"ERROR: PR #{pr_number} not found in open PRs for {repo_name}", file=sys.stderr)
+            return 1
+        head_sha = (pr.get("head") or {}).get("sha", "")
+        if not head_sha:
+            print(f"ERROR: no head SHA for PR #{pr_number}", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"ERROR: cannot fetch PR info: {exc}", file=sys.stderr)
+        return 1
+
+    run_id = f"cli-fc-{repo_name}-pr{pr_number}"
+    print(f"Running functional critic: repo={repo_name} pr={pr_number} sha={head_sha[:8]} run_id={run_id}", file=sys.stderr)
+
+    verdict = fc.run_functional_critic(
+        target_id=f"cli-{repo_name}",
+        pr_number=pr_number,
+        head_sha=head_sha,
+        repo=repo_name,
+        spec_text=spec_text,
+        run_id=run_id,
+    )
+
+    print(json.dumps(verdict, ensure_ascii=False, indent=2))
+
+    if verdict.get("overall") == "pass":
+        return 0
+    elif verdict.get("overall") == "unverifiable":
+        return 2
+    else:
+        return 1
+
+
 def cmd_batched_fixer_eval(args) -> int:
     """Handle `lapis-pm batched-fixer-eval` subcommand."""
     import logging
@@ -2120,6 +2184,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit verdict as JSON (in addition to markdown report).",
     )
     fge.set_defaults(func=cmd_facets_gw_eval)
+
+    # ------------------------------------------------------------------
+    # functional-critic — AC-anchored oracle verification (functional-critic-v0)
+    # ------------------------------------------------------------------
+    fc_p = sub.add_parser(
+        "functional-critic",
+        help=(
+            "Run the functional critic against an open PR. "
+            "Checks out PR head, runs pytest, calls GW-122B for AC coverage, "
+            "prints verdict JSON to stdout."
+        ),
+    )
+    fc_p.add_argument("repo", help="Repository name (e.g. 'lapis-pm').")
+    fc_p.add_argument("pr_number", type=int, help="PR number to evaluate.")
+    fc_p.add_argument("spec_path", help="Path to the spec markdown file.")
+    fc_p.set_defaults(func=cmd_functional_critic)
 
     # ------------------------------------------------------------------
     # batched-fixer-eval — patch-quality eval harness (H5/U4)

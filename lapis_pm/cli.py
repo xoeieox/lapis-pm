@@ -43,6 +43,11 @@ from .spec_review import _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .scout.cli import cmd_scout
+from .prior_art_scout.cli import (
+    cmd_prior_art_scout_run,
+    cmd_prior_art_scout_status,
+    cmd_prior_art_scout_reset_hopeless,
+)
 
 # Four-stage PM lifecycle template used for all lapis-pm-monitored targets.
 PM_LIFECYCLE_STAGES = [
@@ -2410,6 +2415,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     st.add_argument("message", help="Steer message text.")
     st.set_defaults(func=cmd_steer)
+
+    # ------------------------------------------------------------------
+    # prior-art-scout — nightly lineage sweep for prior art via Dowser
+    # ------------------------------------------------------------------
+    pas = sub.add_parser(
+        "prior-art-scout",
+        help="Prior-Art Scout: find prior art for committed roadmap items via Dowser.",
+    )
+    pas_sub = pas.add_subparsers(dest="prior_art_scout_sub", required=True)
+
+    pas_run = pas_sub.add_parser("run", help="Execute a scout run.")
+    pas_run.add_argument(
+        "--escalate",
+        action="store_true",
+        default=False,
+        help=(
+            "Use read_operator=sonnet (paid, morning targeted path). "
+            "No swarm flip. Only for named-item re-runs at Erah's request."
+        ),
+    )
+    pas_run.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Select items and write cursor but skip all LLM calls.",
+    )
+    pas_run.add_argument(
+        "--wall-budget",
+        dest="wall_budget",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap total items processed this run (smoke/testing).",
+    )
+    pas_run.set_defaults(func=cmd_prior_art_scout_run)
+
+    pas_status = pas_sub.add_parser("status", help="Print last run summary from run.yaml.")
+    pas_status.set_defaults(func=cmd_prior_art_scout_status)
+
+    pas_rh = pas_sub.add_parser(
+        "reset-hopeless",
+        help="Clear the known-hopeless sidecar for a given item key.",
+    )
+    pas_rh.add_argument(
+        "key",
+        metavar="KEY",
+        help="Roadmap item key (e.g. architecture/prior-art-scout-v0).",
+    )
+    pas_rh.set_defaults(func=cmd_prior_art_scout_reset_hopeless)
 
     return p
 

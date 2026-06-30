@@ -15,6 +15,8 @@ class ScoutItem(BaseModel):
     citations: list[dict] = Field(default_factory=list)
     outcome: str = ""  # sources-found | no-credible-sources | high-friction | infra-unavailable
     lean: str = ""     # adopt-pattern | adopt-tool | not-relevant | pending
+    seed_type: str = "committed"  # "committed" | "collision"
+    collision_hash: str = ""      # non-empty when seed_type == "collision"
 
 
 class ScoutRun(BaseModel):
@@ -29,3 +31,6 @@ class ScoutRun(BaseModel):
     model_policy: str
     saturated_namespaces: list[str] = Field(default_factory=list)
     wall_budget_applied: int | None = None
+    collision_targeted: int = 0
+    collision_sourced: int = 0
+    collision_honest_null: int = 0

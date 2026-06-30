@@ -25,7 +25,8 @@ from typing import Any
 
 import yaml
 
-from .query_gen import item_to_request
+from .collision_seed import load_collision_seeds
+from .query_gen import collision_to_request, item_to_request
 from .schema import ScoutItem, ScoutRun
 from .sidecar import is_known_hopeless, load_sidecar, write_sidecar
 
@@ -43,6 +44,9 @@ FLIP_SERVE_TIMEOUT = int(os.environ.get("FLIP_SERVE_TIMEOUT", "240"))
 _CURSOR_PATH = Path("/srv/lapis/prior-art-scout/cursor.json")
 _PRIORITY2_BATCH_SIZE = 30
 _SNAPSHOT_CAP = 500
+
+COLLIDER_ROOT = Path(os.environ.get("COLLIDER_ROOT", "/srv/lapis/collider"))
+COLLISION_BATCH_SIZE = int(os.environ.get("COLLISION_BATCH_SIZE", "5"))
 
 _CREDIBILITY_FLOOR = 0.3
 _DENYLIST_SUBSTRINGS = [
@@ -252,6 +256,66 @@ _STUB_CANNED_CITATIONS = [
         "credibility": 0.8,
     }
 ]
+
+
+_STUB_COLLISION_SEEDS: list[dict] = [
+    {
+        "hash": "stubhash001",
+        "idea": "Distributed narrative consensus via gossip-propagated story state",
+        "verdict": "challenges",
+        "value_score": 0.72,
+        "atom_titles": ["consensus", "narrative"],
+        "run_id": "stub-run-001",
+    },
+    {
+        "hash": "stubhash002",
+        "idea": "Archetypal-weight diffing as a change-detection primitive for story continuity",
+        "verdict": "novel-seed",
+        "value_score": 0.68,
+        "atom_titles": ["archetypal", "diffing"],
+        "run_id": "stub-run-001",
+    },
+]
+
+_STUB_COLLISION_FINDINGS = (
+    "No directly matching prior work found in academic or open-source literature "
+    "as of this stub run."
+)
+
+
+def _stub_collision_run(
+    seeds: list[dict],
+    today: str,
+) -> tuple[list[ScoutItem], int, int]:
+    """Return stub collision ScoutItems with canned sourced output."""
+    items: list[ScoutItem] = []
+    sourced = 0
+    honest_null = 0
+    for seed in seeds:
+        col_hash = seed["hash"]
+        key = "collision/" + col_hash
+        write_sidecar(key, {
+            "scout_attempted": today,
+            "verdict": "sourced",
+            "findings": _STUB_COLLISION_FINDINGS,
+            "citations": _STUB_CANNED_CITATIONS,
+            "lean": "not-relevant",
+        })
+        si = ScoutItem(
+            key=key,
+            namespace="collision",
+            summary=seed["idea"][:200],
+            status="exploratory",
+            findings=_STUB_COLLISION_FINDINGS,
+            citations=_STUB_CANNED_CITATIONS,
+            outcome="sources-found",
+            lean="not-relevant",
+            seed_type="collision",
+            collision_hash=col_hash,
+        )
+        items.append(si)
+        sourced += 1
+    return items, sourced, honest_null
 
 
 def _stub_run(
@@ -485,6 +549,13 @@ def scout_run(
         all_selected = all_selected[:wall_budget]
         log.info("[prior_art_scout] wall_budget=%d applied; trimmed to %d items", wall_budget, len(all_selected))
 
+    # P3: collision cap - committed items are P1+P2 and get priority
+    if wall_budget is not None:
+        remaining = max(0, wall_budget - len(all_selected))
+        collision_cap = min(COLLISION_BATCH_SIZE, remaining)
+    else:
+        collision_cap = COLLISION_BATCH_SIZE
+
     # Derive cursor and batch string from actual p2 keys that landed in the trimmed selection.
     # If wall_budget exhausted p1 slots and left no room for p2, cursor must not advance.
     p2_keys_set = {item["key"] for item in p2_items}
@@ -525,10 +596,18 @@ def scout_run(
             model_policy=model_policy,
             saturated_namespaces=saturated_namespaces,
             wall_budget_applied=wall_budget,
+            collision_targeted=collision_cap,
         )
+
+    # Load collision seeds after dry-run short-circuit (dry-run skips all LLM calls)
+    if is_stub:
+        collision_seeds = _STUB_COLLISION_SEEDS[:collision_cap]
+    else:
+        collision_seeds = load_collision_seeds(COLLIDER_ROOT, collision_cap)
 
     if is_stub:
         stub_items, sourced_count, honest_null_count = _stub_run(all_selected, is_local, today)
+        col_stub_items, col_sourced, col_hn = _stub_collision_run(collision_seeds, today)
         _save_cursor(new_cursor)
         caution = _compute_caution(sourced_count, honest_null_count, len(all_selected))
         run = ScoutRun(
@@ -543,11 +622,14 @@ def scout_run(
             model_policy=model_policy,
             saturated_namespaces=saturated_namespaces,
             wall_budget_applied=wall_budget,
+            collision_targeted=len(collision_seeds),
+            collision_sourced=col_sourced,
+            collision_honest_null=col_hn,
         )
-        _write_brief_and_yaml(stub_items, run, today)
+        _write_brief_and_yaml(stub_items + col_stub_items, run, today)
         return run
 
-    if not all_selected:
+    if not all_selected and not collision_seeds:
         _save_cursor(new_cursor)
         return ScoutRun(
             run_date=today,
@@ -560,10 +642,11 @@ def scout_run(
             caution="low",
             model_policy=model_policy,
             saturated_namespaces=saturated_namespaces,
+            collision_targeted=0,
         )
 
     # -----------------------------------------------------------------------
-    # 4. Build Dowser requests
+    # 4. Build Dowser requests (committed P1+P2, then collision P3)
     # -----------------------------------------------------------------------
     key_order: list[str] = []
     clean_requests: list[dict] = []
@@ -572,6 +655,20 @@ def scout_run(
         key_order.append(item["key"])
 
     item_by_key = {item["key"]: item for item in all_selected}
+
+    # Fold collision seeds into the same batch
+    collision_key_info: dict[str, dict] = {}
+    for seed in collision_seeds:
+        ckey = "collision/" + seed["hash"]
+        collision_key_info[ckey] = seed
+        key_order.append(ckey)
+        clean_requests.append(collision_to_request(seed))
+        item_by_key[ckey] = {
+            "key": ckey,
+            "namespace": "collision",
+            "summary": seed["idea"][:200],
+            "status": "exploratory",
+        }
 
     # -----------------------------------------------------------------------
     # Any-exit big-flip guard (mirrors quest_leg)
@@ -614,19 +711,23 @@ def scout_run(
             if is_local:
                 _flip_fn("big")
             _save_cursor(new_cursor)
-            n = len(key_order)
+            committed_n = len(all_selected)
+            col_n = len(collision_seeds)
             run = ScoutRun(
                 run_date=today,
                 priority1_count=len(p1_items),
                 priority2_batch=p2_batch_str,
                 skipped_hopeless=skipped_hopeless,
-                items_targeted=n,
+                items_targeted=committed_n,
                 items_sourced=0,
-                items_honest_null=n,
+                items_honest_null=committed_n,
                 caution="high",
                 model_policy=model_policy,
                 saturated_namespaces=saturated_namespaces,
                 wall_budget_applied=wall_budget,
+                collision_targeted=col_n,
+                collision_sourced=0,
+                collision_honest_null=col_n,
             )
             _write_brief_and_yaml([], run, today)
             return run
@@ -686,8 +787,11 @@ def scout_run(
         # Phase 4: Write-back per item
         # -------------------------------------------------------------------
         scout_items: list[ScoutItem] = []
+        collision_items: list[ScoutItem] = []
         items_sourced = 0
         items_honest_null = 0
+        collision_sourced_count = 0
+        collision_honest_null_count = 0
 
         for i, key in enumerate(key_order):
             snap_item = item_by_key[key]
@@ -697,12 +801,16 @@ def scout_run(
                 if critique_verdicts and i < len(critique_verdicts)
                 else {}
             )
+            is_collision = key in collision_key_info
+            col_hash = collision_key_info[key]["hash"] if is_collision else ""
 
             si = ScoutItem(
                 key=key,
                 namespace=snap_item["namespace"],
                 summary=snap_item["summary"],
                 status=snap_item["status"],
+                seed_type="collision" if is_collision else "committed",
+                collision_hash=col_hash,
             )
 
             if critique_timed_out or not critique_verdicts:
@@ -712,8 +820,11 @@ def scout_run(
                     "note": "critique timed out" if critique_timed_out else "critique failed",
                 })
                 si.outcome = "infra-unavailable"
-                items_honest_null += 1
-                scout_items.append(si)
+                if is_collision:
+                    collision_honest_null_count += 1
+                else:
+                    items_honest_null += 1
+                (collision_items if is_collision else scout_items).append(si)
                 continue
 
             status = verdict_item.get("status", "subpar")
@@ -731,8 +842,11 @@ def scout_run(
                         "note": "pass verdict but no citations survived provenance audit",
                     })
                     si.outcome = "no-credible-sources"
-                    items_honest_null += 1
-                    scout_items.append(si)
+                    if is_collision:
+                        collision_honest_null_count += 1
+                    else:
+                        items_honest_null += 1
+                    (collision_items if is_collision else scout_items).append(si)
                     continue
 
                 lean = _classify_lean(verdict_item)
@@ -750,7 +864,10 @@ def scout_run(
                 si.findings = findings
                 si.citations = good_cits
                 si.lean = lean
-                items_sourced += 1
+                if is_collision:
+                    collision_sourced_count += 1
+                else:
+                    items_sourced += 1
 
             else:
                 if outcome == "no-credible-sources":
@@ -773,10 +890,16 @@ def scout_run(
                         si.findings = sidecar.get("findings", "")
                         si.citations = good_cits
                         si.lean = lean
-                        items_sourced += 1
+                        if is_collision:
+                            collision_sourced_count += 1
+                        else:
+                            items_sourced += 1
                     else:
                         si.outcome = "no-credible-sources"
-                        items_honest_null += 1
+                        if is_collision:
+                            collision_honest_null_count += 1
+                        else:
+                            items_honest_null += 1
 
                 elif outcome == "high-friction":
                     write_sidecar(key, {
@@ -787,7 +910,10 @@ def scout_run(
                         "critic_reason": verdict_item.get("diagnosis", ""),
                     })
                     si.outcome = "high-friction"
-                    items_honest_null += 1
+                    if is_collision:
+                        collision_honest_null_count += 1
+                    else:
+                        items_honest_null += 1
 
                 else:
                     write_sidecar(key, {
@@ -796,9 +922,12 @@ def scout_run(
                         "note": f"outcome={outcome}; transient",
                     })
                     si.outcome = "infra-unavailable"
-                    items_honest_null += 1
+                    if is_collision:
+                        collision_honest_null_count += 1
+                    else:
+                        items_honest_null += 1
 
-            scout_items.append(si)
+            (collision_items if is_collision else scout_items).append(si)
 
         # Final big-flip backstop
         if is_local:
@@ -821,8 +950,11 @@ def scout_run(
             model_policy=model_policy,
             saturated_namespaces=saturated_namespaces,
             wall_budget_applied=wall_budget,
+            collision_targeted=len(collision_seeds),
+            collision_sourced=collision_sourced_count,
+            collision_honest_null=collision_honest_null_count,
         )
-        _write_brief_and_yaml(scout_items, run, today)
+        _write_brief_and_yaml(scout_items + collision_items, run, today)
         return run
 
     finally:

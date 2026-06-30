@@ -64,6 +64,11 @@ def _render_brief(items: list[ScoutItem], run: ScoutRun) -> str:
     if run.wall_budget_applied is not None:
         lines.append(f"NOTE: --wall-budget {run.wall_budget_applied} applied; run is capped.")
 
+    lines.append(
+        f"Collision seeds: {run.collision_targeted} targeted"
+        f" (COLLISION_BATCH_SIZE cap=5)."
+    )
+
     if run.model_policy == "allow-escalation":
         policy_detail = "(sonnet deep-read + 122B critic)"
     else:
@@ -73,9 +78,15 @@ def _render_brief(items: list[ScoutItem], run: ScoutRun) -> str:
     lines.append("---")
     lines.append("")
 
-    # Sourced findings
-    sourced = [i for i in items if i.outcome == "sources-found"]
-    for si in sourced:
+    # Split by seed_type
+    committed = [i for i in items if i.seed_type != "collision"]
+    collision = [i for i in items if i.seed_type == "collision"]
+
+    # --- Committed Prior Art ---
+    lines.append("## Committed Prior Art")
+    lines.append("")
+    committed_sourced = [i for i in committed if i.outcome == "sources-found"]
+    for si in committed_sourced:
         lines.append(f"## [{si.key}] - {si.lean}")
         lines.append(f"**Summary:** {si.summary}")
         if si.findings:
@@ -90,21 +101,71 @@ def _render_brief(items: list[ScoutItem], run: ScoutRun) -> str:
             lines.append(f"  Source: {url} {cred_label}".rstrip())
         lines.append("")
 
-    # Honest-null log
-    null_items = [i for i in items if i.outcome != "sources-found"]
-    if null_items:
-        lines.append(f"---")
+    # --- Committed Honest-Null Log ---
+    committed_null = [i for i in committed if i.outcome != "sources-found"]
+    if committed_null:
+        lines.append("---")
         lines.append("")
-        lines.append(f"## honest-null log ({len(null_items)} items)")
-        for si in null_items:
+        lines.append(f"## Committed Honest-Null Log ({len(committed_null)} items)")
+        for si in committed_null:
             lines.append(f"- {si.key}: {si.outcome or 'unknown'}")
         lines.append("")
+
+    # --- Exploratory section ---
+    lines.append("---")
+    lines.append("")
+    lines.append("## Exploratory - Kami Collision Seeds [EXPLORATORY]")
+    lines.append("")
+    lines.append(
+        "> These findings ground *speculative directions* not yet committed to the roadmap."
+    )
+    lines.append(
+        "> Honest-null means no detectable prior threads were found - no further interpretation."
+    )
+    lines.append("")
+
+    if run.collision_targeted == 0:
+        if run.wall_budget_applied is not None and run.wall_budget_applied <= len(committed):
+            lines.append(
+                "No collision seeds targeted this run (budget exhausted by committed items)."
+            )
+        else:
+            lines.append("No collision seeds targeted this run (no unseen survivors).")
+        lines.append("")
+    else:
+        collision_sourced = [i for i in collision if i.outcome == "sources-found"]
+        for si in collision_sourced:
+            lines.append(f"## [EXPLORATORY] [{si.key}] - {si.lean}")
+            lines.append(f"**Summary:** {si.summary}")
+            if si.findings:
+                lines.append(f"**Findings:** {si.findings}")
+            for cit in si.citations:
+                url = cit.get("url", "")
+                excerpt = cit.get("excerpt", "")
+                credibility = cit.get("credibility", "")
+                cred_label = f"[credibility: {credibility}]" if credibility else ""
+                if excerpt:
+                    lines.append(f'  > "{excerpt}"')
+                lines.append(f"  Source: {url} {cred_label}".rstrip())
+            lines.append("")
+
+        collision_null = [i for i in collision if i.outcome != "sources-found"]
+        if collision_null:
+            lines.append(f"### Exploratory Honest-Null Log ({len(collision_null)} items)")
+            lines.append("")
+            lines.append(
+                "No detectable prior threads found for the following speculative directions."
+            )
+            for si in collision_null:
+                lines.append(f"- {si.key}: {si.outcome or 'unknown'}")
+            lines.append("")
 
     return "\n".join(lines)
 
 
 def _append_vault_digest(items: list[ScoutItem], run: ScoutRun) -> None:
-    sourced = [i for i in items if i.outcome == "sources-found"]
+    committed = [i for i in items if i.seed_type != "collision"]
+    sourced = [i for i in committed if i.outcome == "sources-found"]
     actionable = [i for i in sourced if i.lean in ("adopt-pattern", "adopt-tool")]
     if not actionable:
         return

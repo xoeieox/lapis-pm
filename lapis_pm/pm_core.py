@@ -3085,15 +3085,17 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         else:
             effective_trigger = "advisory-clean"
 
+    # Single TargetStore read shared by the auto-resolve and FC hook blocks below.
+    _target = TargetStore().get(target_id)
+
     # Conservative auto-resolve: merge unambiguous advisory-clean PRs without a gem.
     # Predicate is deterministic (no LLM). On any merge failure, falls through to
     # the normal brief/gem path — never swallows a brief.
     if not hold and effective_trigger == "advisory-clean":
         from . import auto_resolve as _ar
-        _ar_target = TargetStore().get(target_id)
-        if _ar_target is not None:
+        if _target is not None:
             _should, _merge_opt = _ar.should_auto_resolve(
-                cls, _ar_target, _ar_target.pm_repo or "",
+                cls, _target, _target.pm_repo or "",
             )
             if not _should and _merge_opt and "needs-pm-touch" in _merge_opt:
                 episodic.write_observation(
@@ -3130,9 +3132,8 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
 
     # AC8: functional critic hook — fires when pm_verification == "agent-functional"
     functional_critic_text: str | None = None
-    _fc_target = TargetStore().get(target_id)
-    _pm_verification = (_fc_target.data.get("pm_verification", "pm-live-test")
-                        if _fc_target else "pm-live-test")
+    _pm_verification = (_target.data.get("pm_verification", "pm-live-test")
+                        if _target else "pm-live-test")
     if _pm_verification == "agent-functional":
         try:
             from . import functional_critic as _fc
@@ -3156,7 +3157,14 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
                 # AC9: notify on partial or unverifiable
                 _overall = _verdict.get("overall")
                 if _overall in ("partial", "unverifiable"):
-                    _nx_count = _fc.unexercised_ac_count(_verdict)
+                    _ac_verdicts = _verdict.get("ac_verdicts") or []
+                    if _ac_verdicts:
+                        _nx_count = _fc.unexercised_ac_count(_verdict)
+                        _nx_str = f"{_nx_count} unexercised AC(s)"
+                    else:
+                        # ac_verdicts is empty when GW was unavailable or worktree
+                        # failed — every AC is unverifiable, not just 0
+                        _nx_str = "all ACs unverifiable"
                     _brief_link = (cls.html_url or
                                    f"PR #{cls.pr_number} in {cls.repo}")
                     try:
@@ -3164,7 +3172,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
                         send_notification(
                             message=(
                                 f"Functional critic: overall={_overall} "
-                                f"({_nx_count} unexercised AC(s)). "
+                                f"({_nx_str}). "
                                 f"Spec: {target_id}. {_brief_link}"
                             ),
                             title=f"lapis-pm: functional critic {_overall}: {target_id}",

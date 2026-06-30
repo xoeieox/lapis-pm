@@ -140,14 +140,24 @@ def _remove_worktree(repo_path: str, worktree_dir: str) -> None:
 # Test runner (direct subprocess, not via GW agent)
 # ---------------------------------------------------------------------------
 
-def _run_pytest(worktree_dir: str, timeout_s: int = PYTEST_TIMEOUT_S) -> dict:
-    """Run pytest -v in worktree. Returns result dict with stdout/returncode."""
+def _run_pytest(
+    worktree_dir: str,
+    timeout_s: int = PYTEST_TIMEOUT_S,
+    *,
+    env: dict | None = None,
+) -> dict:
+    """Run pytest -v in worktree. Returns result dict with stdout/returncode.
+
+    Pass env with .critic-bin/ prepended to PATH so sandbox shims intercept
+    pip/curl/wget/nc invocations during test execution.
+    """
     start = time.monotonic()
     try:
         r = subprocess.run(
             ["python3", "-m", "pytest", "-v", "--tb=short", "--no-header", "-q"],
             capture_output=True, text=True,
             cwd=worktree_dir, timeout=timeout_s,
+            env=env,
         )
         return {
             "returncode": r.returncode,
@@ -444,11 +454,15 @@ def run_functional_critic(
         if not worktree_created:
             return _unverifiable(f"worktree creation failed for sha={head_sha[:12]}")
 
-        # AC1 + Fold 1: sandbox shims in worktree
+        # AC1 + Fold 1: sandbox shims in worktree; prepend .critic-bin/ to PATH
+        # so pip/curl/wget/nc interceptors fire during pytest execution
         _plant_sandbox_shims(worktree_dir)
+        _shim_dir = str(Path(worktree_dir) / ".critic-bin")
+        _critic_env = os.environ.copy()
+        _critic_env["PATH"] = _shim_dir + os.pathsep + _critic_env.get("PATH", "")
 
         # Run pytest directly (execution layer, separate from GW analysis)
-        pytest_result = _run_pytest(worktree_dir)
+        pytest_result = _run_pytest(worktree_dir, env=_critic_env)
 
         # AC7: if GW unavailable, return unverifiable (no paid fallback)
         verdict = _call_gw_critic(acs, diff_summary, pytest_result, worktree_dir, run_id)

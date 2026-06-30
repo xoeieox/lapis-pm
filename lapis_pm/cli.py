@@ -38,7 +38,7 @@ except ImportError:
 from agents_core.targets import TargetStore
 
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
-from . import episodic, brief, pm_core, land, chain as chain_mod
+from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer_mod
 from .spec_review import _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
@@ -1661,6 +1661,35 @@ def cmd_bundle_autodispatch(args) -> int:
     return 1 if results["failed"] else 0
 
 
+def cmd_steer(args) -> int:
+    """File a typed steer message for mid-run PM course-correction."""
+    type_ = args.type
+    if type_ not in steer_mod.VALID_TYPES:
+        print(
+            f"ERROR: invalid steer type {type_!r}; must be one of {steer_mod.VALID_TYPES}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        path = steer_mod.file_steer(
+            target_id=args.target_id,
+            type_=type_,
+            message=args.message,
+            filed_by="pm",
+        )
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    # Read back to confirm write
+    import json as _json
+    payload = _json.loads(path.read_text())
+    print(f"Steer filed: {path}")
+    print(f"  type:    {payload['type']}")
+    print(f"  target:  {payload['target_id']}")
+    print(f"  message: {payload['message']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lapis-pm", description="Lapis PM agent CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2365,6 +2394,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard timeout for the spec-review gate in seconds (default: 1800).",
     )
     bad.set_defaults(func=cmd_bundle_autodispatch)
+
+    # ------------------------------------------------------------------
+    # steer — file a typed mid-run steer message
+    # ------------------------------------------------------------------
+    st = sub.add_parser(
+        "steer",
+        help="File a typed steer message for mid-run PM course-correction.",
+    )
+    st.add_argument("target_id", help="Target ID to steer.")
+    st.add_argument(
+        "type",
+        choices=list(steer_mod.VALID_TYPES),
+        help="Steer type: context (informational), directive (reprioritize/constrain), emergency (halt).",
+    )
+    st.add_argument("message", help="Steer message text.")
+    st.set_defaults(func=cmd_steer)
 
     return p
 

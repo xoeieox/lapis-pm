@@ -239,6 +239,8 @@ agents:
 
       {intent_block}
 
+      {steer_directive_block}
+
       ## Mem check first (before editing code)
 
       Load relevant context from mem:
@@ -343,6 +345,8 @@ agents:
       {spec_summary}
 
       {intent_block}
+
+      {steer_directive_block}
 
       ## Role invariant
 

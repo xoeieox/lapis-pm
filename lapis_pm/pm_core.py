@@ -68,7 +68,7 @@ try:
 except ImportError as _e:
     raise RuntimeError("agents_core.room_paths missing — agents-core seam must be deployed first") from _e
 
-from . import episodic, brief, authority, intent_artifact as _intent_artifact
+from . import episodic, brief, authority, intent_artifact as _intent_artifact, steer
 
 try:
     from . import eval_gate as _eval_gate
@@ -1300,6 +1300,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "base_branch": base_branch,
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
+    steer.inject_overlay(target_id, vars_, agent_type)
     res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
     append_dispatched(target_id, {
         "gpu_id": res.task_id,
@@ -3165,6 +3166,7 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
         "slug": dispatch_record.get("slug", "retry"),
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
+    steer.inject_overlay(target_id, vars_, agent_type)
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
     new_record = {
         "gpu_id": res.task_id,
@@ -3286,6 +3288,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     # Increment kill-switch counter before dispatch
     _increment_review_gate_counter()
 
+    steer.inject_overlay(target_id, vars_, agent_type)
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
 
     record = {
@@ -3353,6 +3356,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
         f"Push to the existing branch — do NOT create a new branch or new PR."
     )
 
+    steer.inject_overlay(target_id, vars_, "fixer_retry")
     res = _SHAPER.dispatch("fixer_retry", target_id, user_prompt, vars_=vars_)
     _check_calcification(target_id)
 
@@ -4205,6 +4209,7 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
         "existing_branch": f"lapis/{target_id}/forced",
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
+    steer.inject_overlay(target_id, vars_, agent_type)
     res = _SHAPER.dispatch(agent_type, target_id, dispatch_intent, vars_=vars_)
     _check_calcification(target_id)
 
@@ -4608,6 +4613,28 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     directives = _encode_user_comments(target_id, new_comments)
     encoded += len(directives)  # user-authored already in JSONL; count them
 
+    # 3.x Steer channel — context and directive are non-actions; consume them here
+    # so they are registered before any decide-phase early-return can skip them.
+    # Emergency is NOT consumed here; its file stays pending until the decide-phase
+    # pause commits (durability — see step 4.0a below).
+    for s in steer.consume_pending_steers(target_id, types=("context", "directive")):
+        stype = s.get("type")
+        if stype == "context":
+            episodic.write_observation(
+                target_id,
+                f"[steer:context] {s['message']}",
+                extra_tags=["pm:steer:context", f"pm:steer:ts={s['ts']}"],
+            )
+            encoded += 1
+        elif stype == "directive":
+            steer.set_directive_overlay(target_id, s["message"])
+            episodic.write_observation(
+                target_id,
+                f"[steer:directive] Registered overlay for next fixer dispatch: {s['message']}",
+                extra_tags=["pm:steer:directive", f"pm:steer:ts={s['ts']}"],
+            )
+            encoded += 1
+
     seen_pr_ids = _seen_pr_ids(target_id)
     new_prs = _encode_new_prs(target_id, repo, open_prs, seen_pr_ids)
     encoded += len(new_prs)
@@ -4642,6 +4669,27 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     decision_str = "noop:no_change"
     pm_authority = target.pm_authority
     pm_verification = target.data.get("pm_verification", "pm-live-test")
+
+    # 4.0a Emergency steer — halt the run (highest-priority decide branch).
+    # File is read non-destructively; pause is committed and saved FIRST;
+    # only then is the file moved to applied/ so no crash window loses the halt.
+    _emergencies = steer.peek_emergencies(target_id)
+    if _emergencies:
+        _emergency = _emergencies[0]
+        episodic.write_observation(
+            target_id,
+            f"[steer:emergency] {_emergency['message']}",
+            extra_tags=["pm:steer:emergency", f"pm:steer:ts={_emergency['ts']}"],
+        )
+        set_pause_state(target_id, "paused")
+        target.set_paused(True, reason=f"steer:emergency: {_emergency['message'][:100]}")
+        target.save()
+        steer.mark_applied(_emergency["_path"], disposition="emergency_paused")
+        _ts = _emergency["ts"]
+        set_cursor(target_id, _now_iso())
+        return TickResult(target_id, False, "ok", encoded,
+                          f"action:steer_emergency_applied:{_ts}",
+                          reconciled=reconciled)
 
     # 4.0 Brief-decision directive consumer — highest-priority decide branch.
     # If a directive file exists for this target, apply it and skip the rest.

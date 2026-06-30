@@ -465,7 +465,7 @@ def scout_run(
     decision_in_flight_keys = [i["key"] for i in decision_items]
 
     cursor = _load_cursor()
-    p2_batch_keys, new_cursor = _select_priority2_batch(
+    p2_batch_keys, _tentative_cursor = _select_priority2_batch(
         decision_in_flight_keys, cursor, _PRIORITY2_BATCH_SIZE
     )
 
@@ -485,8 +485,14 @@ def scout_run(
         all_selected = all_selected[:wall_budget]
         log.info("[prior_art_scout] wall_budget=%d applied; trimmed to %d items", wall_budget, len(all_selected))
 
+    # Derive cursor and batch string from actual p2 keys that landed in the trimmed selection.
+    # If wall_budget exhausted p1 slots and left no room for p2, cursor must not advance.
+    p2_keys_set = {item["key"] for item in p2_items}
+    actual_p2_keys = [item["key"] for item in all_selected if item["key"] in p2_keys_set]
+    new_cursor = actual_p2_keys[-1] if actual_p2_keys else cursor
+
     p2_batch_str = (
-        f"{len(p2_items)}/{len(decision_in_flight_keys)}"
+        f"{len(actual_p2_keys)}/{len(decision_in_flight_keys)}"
         f" (cursor @{new_cursor or 'start'})"
     )
 
@@ -638,7 +644,6 @@ def scout_run(
         # -------------------------------------------------------------------
         # Phase 3: Retry for subpar (diagnosis-driven)
         # -------------------------------------------------------------------
-        retries_used = 0
         if critique_verdicts:
             subpar_idx = [
                 i for i, v in enumerate(critique_verdicts)
@@ -663,7 +668,6 @@ def scout_run(
                         log.warning("[prior_art_scout] retry read_batch failed: %s", exc)
 
                 if retry_drafts:
-                    retries_used = 1
                     retry_verdicts, _ = _phase_big_critique(
                         retry_drafts, critic_operator, _dowser, _flip_fn, _gate_fn, is_local
                     )

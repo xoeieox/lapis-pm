@@ -64,7 +64,11 @@ def _render_brief(items: list[ScoutItem], run: ScoutRun) -> str:
     if run.wall_budget_applied is not None:
         lines.append(f"NOTE: --wall-budget {run.wall_budget_applied} applied; run is capped.")
 
-    lines.append(f"Model policy: {run.model_policy} (QUEST read + 122B critic).")
+    if run.model_policy == "allow-escalation":
+        policy_detail = "(sonnet deep-read + 122B critic)"
+    else:
+        policy_detail = "(QUEST read + 122B critic)"
+    lines.append(f"Model policy: {run.model_policy} {policy_detail}.")
     lines.append("")
     lines.append("---")
     lines.append("")

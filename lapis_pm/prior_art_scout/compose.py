@@ -5,6 +5,7 @@ Appends top findings to the inertia-vault digest.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -64,9 +65,10 @@ def _render_brief(items: list[ScoutItem], run: ScoutRun) -> str:
     if run.wall_budget_applied is not None:
         lines.append(f"NOTE: --wall-budget {run.wall_budget_applied} applied; run is capped.")
 
+    _collision_batch_cap = int(os.environ.get("COLLISION_BATCH_SIZE", "5"))
     lines.append(
         f"Collision seeds: {run.collision_targeted} targeted"
-        f" (COLLISION_BATCH_SIZE cap=5)."
+        f" (COLLISION_BATCH_SIZE cap={_collision_batch_cap})."
     )
 
     if run.model_policy == "allow-escalation":

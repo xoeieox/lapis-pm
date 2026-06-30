@@ -25,6 +25,8 @@ from typing import Any
 
 import yaml
 
+from agents_core.room_paths import room_str as _room_str
+
 from .collision_seed import load_collision_seeds
 from .query_gen import collision_to_request, item_to_request
 from .schema import ScoutItem, ScoutRun
@@ -45,7 +47,7 @@ _CURSOR_PATH = Path("/srv/lapis/prior-art-scout/cursor.json")
 _PRIORITY2_BATCH_SIZE = 30
 _SNAPSHOT_CAP = 500
 
-COLLIDER_ROOT = Path(os.environ.get("COLLIDER_ROOT", "/srv/lapis/collider"))
+COLLIDER_ROOT = Path(os.environ.get("COLLIDER_ROOT", _room_str("collider")))
 COLLISION_BATCH_SIZE = int(os.environ.get("COLLISION_BATCH_SIZE", "5"))
 
 _CREDIBILITY_FLOOR = 0.3
@@ -287,34 +289,67 @@ def _stub_collision_run(
     seeds: list[dict],
     today: str,
 ) -> tuple[list[ScoutItem], int, int]:
-    """Return stub collision ScoutItems with canned sourced output."""
+    """Return stub collision ScoutItems, exercising sourced, honest-null, and dedup paths.
+
+    Dedup (test cases 3 + 5): skips any hash whose sidecar already exists, mirroring
+    the load_collision_seeds dedup check so cross-night dedup is exercised in stub mode.
+
+    Honest-null (test case 4): every second seed (odd index) gets insufficient-sources
+    to exercise the honest-null sidecar write-back path.
+    """
     items: list[ScoutItem] = []
     sourced = 0
     honest_null = 0
-    for seed in seeds:
+    for idx, seed in enumerate(seeds):
         col_hash = seed["hash"]
         key = "collision/" + col_hash
-        write_sidecar(key, {
-            "scout_attempted": today,
-            "verdict": "sourced",
-            "findings": _STUB_COLLISION_FINDINGS,
-            "citations": _STUB_CANNED_CITATIONS,
-            "lean": "not-relevant",
-        })
-        si = ScoutItem(
-            key=key,
-            namespace="collision",
-            summary=seed["idea"][:200],
-            status="exploratory",
-            findings=_STUB_COLLISION_FINDINGS,
-            citations=_STUB_CANNED_CITATIONS,
-            outcome="sources-found",
-            lean="not-relevant",
-            seed_type="collision",
-            collision_hash=col_hash,
-        )
-        items.append(si)
-        sourced += 1
+        # Dedup: skip if already sidecarred (mirrors load_collision_seeds; exercises cases 3+5)
+        if load_sidecar(key) is not None:
+            continue
+        if idx % 2 == 1:
+            # Honest-null path (exercises case 4)
+            write_sidecar(key, {
+                "scout_attempted": today,
+                "verdict": "insufficient-sources",
+                "findings": "",
+                "citations": [],
+            })
+            si = ScoutItem(
+                key=key,
+                namespace="collision",
+                summary=seed["idea"][:200],
+                status="exploratory",
+                findings="",
+                citations=[],
+                outcome="insufficient-sources",
+                lean="",
+                seed_type="collision",
+                collision_hash=col_hash,
+            )
+            items.append(si)
+            honest_null += 1
+        else:
+            write_sidecar(key, {
+                "scout_attempted": today,
+                "verdict": "sourced",
+                "findings": _STUB_COLLISION_FINDINGS,
+                "citations": _STUB_CANNED_CITATIONS,
+                "lean": "not-relevant",
+            })
+            si = ScoutItem(
+                key=key,
+                namespace="collision",
+                summary=seed["idea"][:200],
+                status="exploratory",
+                findings=_STUB_COLLISION_FINDINGS,
+                citations=_STUB_CANNED_CITATIONS,
+                outcome="sources-found",
+                lean="not-relevant",
+                seed_type="collision",
+                collision_hash=col_hash,
+            )
+            items.append(si)
+            sourced += 1
     return items, sourced, honest_null
 
 

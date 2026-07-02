@@ -1,0 +1,12 @@
+[Unit]
+Description=Research-quest nightly producer at 02:30 America/Los_Angeles
+
+[Timer]
+# The vacated backcaster-night/night-coordinator slot — well clear of
+# podcast-ingest-night's 21:30 start + up to 4.5h TTL (ends ~02:00), so the
+# two nightly GPU jobs never contend for GW's serving mode.
+OnCalendar=*-*-* 02:30:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target

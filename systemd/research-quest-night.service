@@ -1,0 +1,23 @@
+[Unit]
+Description=Research-quest nightly producer — sources the standing Dowser backlog into /srv/lapis/research/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStartPre=/usr/local/bin/wake-gravitywell
+ExecStart=/usr/bin/python3 -m lapis_pm.cli research-quest --limit 5
+EnvironmentFile=-/data/agents/config/conductor.env
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# 5 entries worst-case: per-entry swarm-gate (<=240s) + read (<=300s) +
+# big-gate (<=240s) + critique, well under 2h even with every entry hitting
+# the retry-cap-then-permanent-null path.
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target

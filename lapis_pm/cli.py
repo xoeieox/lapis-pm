@@ -42,6 +42,7 @@ from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer
 from .spec_review import _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
+from .research_quest import cmd_research_quest
 from .scout.cli import cmd_scout
 from .prior_art_scout.cli import (
     cmd_prior_art_scout_run,
@@ -2397,6 +2398,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bq.set_defaults(func=cmd_backcaster_quest)
+
+    # ------------------------------------------------------------------
+    # research-quest — nightly producer sourcing the standing Dowser backlog
+    # ------------------------------------------------------------------
+    rq = sub.add_parser(
+        "research-quest",
+        help=(
+            "Source pending entries in the Dowser research backlog "
+            "(/srv/lapis/research/queue/dowser-backlog.yaml) into /srv/lapis/research/."
+        ),
+    )
+    rq.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Max backlog entries to process this run (default: 5).",
+    )
+    rq.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Select and log pending entries without touching GW/Dowser or the backlog.",
+    )
+    rq.set_defaults(func=cmd_research_quest)
 
     # ------------------------------------------------------------------
     # decisions-export — export recent mem entries as a markdown artifact

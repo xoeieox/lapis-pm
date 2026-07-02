@@ -17,30 +17,28 @@ fail toward big (never strand GW mid-flip in swarm).
 """
 from __future__ import annotations
 
+import functools
 import logging
-import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .. import gw_flip_gate
 from .compose import compute_epistemic_caution
 from .schema import BackcasterCitation, Gap
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (re-exported from the shared module for any existing external readers)
 # ---------------------------------------------------------------------------
 
-FLIP_CONTROLLER_URL = os.environ.get(
-    "FLIP_CONTROLLER_URL", "http://203.0.113.10:8408"
-)
-FLIP_CONTROLLER_TOKEN = os.environ.get("FLIP_CONTROLLER_TOKEN", "")
-DOORMAN_URL = os.environ.get("DOORMAN_URL", "http://127.0.0.1:8407")
-FLIP_SERVE_TIMEOUT = int(os.environ.get("FLIP_SERVE_TIMEOUT", "240"))
+FLIP_CONTROLLER_URL = gw_flip_gate.FLIP_CONTROLLER_URL
+FLIP_CONTROLLER_TOKEN = gw_flip_gate.FLIP_CONTROLLER_TOKEN
+DOORMAN_URL = gw_flip_gate.DOORMAN_URL
+FLIP_SERVE_TIMEOUT = gw_flip_gate.FLIP_SERVE_TIMEOUT
 
 # Credibility floor for provenance audit (mirrors Dowser's threshold)
 _CREDIBILITY_FLOOR = 0.3
@@ -55,56 +53,12 @@ _DENYLIST_SUBSTRINGS = [
 
 
 # ---------------------------------------------------------------------------
-# GW flip + doorman serving-gate
+# GW flip + doorman serving-gate — thin wrappers over the shared module
+# (AC1, research-quest-nightly-producer-v0: extraction only, no behavior change).
 # ---------------------------------------------------------------------------
 
-def _flip_gw(mode: str) -> bool:
-    """POST to flip-controller; return True on success."""
-    try:
-        import httpx
-        url = f"{FLIP_CONTROLLER_URL}/v0/nodes/gravitywell/flip"
-        headers: dict[str, str] = {}
-        if FLIP_CONTROLLER_TOKEN:
-            headers["Authorization"] = f"Bearer {FLIP_CONTROLLER_TOKEN}"
-        resp = httpx.post(
-            url,
-            json={"mode": mode, "source": "backcaster-quest-leg"},
-            headers=headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        log.info("[quest_leg] GW flip -> %s OK", mode)
-        return True
-    except Exception as exc:
-        log.warning("[quest_leg] GW flip -> %s failed: %s", mode, exc)
-        return False
-
-
-def _gate_doorman_serving(timeout_s: int = FLIP_SERVE_TIMEOUT) -> bool:
-    """Poll doorman /status until nodes.gravitywell.serving == True.
-
-    Returns False only on hard timeout (never raises).
-    """
-    try:
-        import httpx as _httpx
-    except ImportError:
-        log.warning("[quest_leg] httpx not available; cannot gate on doorman")
-        return False
-
-    deadline = time.monotonic() + timeout_s
-    poll_interval = 5
-    while time.monotonic() < deadline:
-        try:
-            resp = _httpx.get(f"{DOORMAN_URL}/status", timeout=5)
-            if resp.status_code == 200:
-                gw = resp.json().get("nodes", {}).get("gravitywell", {})
-                if gw.get("serving") or gw.get("serving_mode") == "deferred":
-                    return True
-        except Exception as exc:
-            log.debug("[quest_leg] doorman poll error: %s", exc)
-        time.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
-    log.warning("[quest_leg] doorman serving-gate timed out after %ds", timeout_s)
-    return False
+_flip_gw = functools.partial(gw_flip_gate.flip_gw, source="backcaster-quest-leg")
+_gate_doorman_serving = gw_flip_gate.gate_doorman_serving
 
 
 # ---------------------------------------------------------------------------
@@ -225,58 +179,12 @@ def _rederive_gap(gap: Gap, run_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Core flip+gate phase helpers (return False on timeout/error)
+# Core flip+gate phase helpers — thin wrappers over the shared module
+# (AC1, research-quest-nightly-producer-v0: extraction only, no behavior change).
 # ---------------------------------------------------------------------------
 
-def _phase_swarm_read(
-    clean_requests: list[dict],
-    read_operator: str,
-    dowser: Any,
-    flip_fn: Any,
-    gate_fn: Any,
-) -> tuple[list[dict] | None, bool]:
-    """Flip to swarm, gate, read. Returns (drafts, timed_out).
-
-    On timeout: flips back to big before returning.
-    """
-    if not flip_fn("swarm"):
-        log.warning("[quest_leg] swarm flip failed")
-        return None, False
-    if not gate_fn(FLIP_SERVE_TIMEOUT):
-        log.warning("[quest_leg] serving-gate timed out after swarm flip; failing toward big")
-        flip_fn("big")
-        return None, True
-    try:
-        result = dowser.read_batch(clean_requests, read_operator=read_operator)
-        return result.get("drafts", []), False
-    except Exception as exc:
-        log.warning("[quest_leg] read_batch failed: %s", exc)
-        flip_fn("big")
-        return None, False
-
-
-def _phase_big_critique(
-    drafts: list[dict],
-    critic_operator: str,
-    dowser: Any,
-    flip_fn: Any,
-    gate_fn: Any,
-    is_local: bool,
-) -> tuple[list[dict] | None, bool]:
-    """Flip to big (if local path), gate, critique. Returns (verdicts, timed_out)."""
-    if is_local:
-        if not flip_fn("big"):
-            log.warning("[quest_leg] big flip failed before critique")
-            return None, False
-        if not gate_fn(FLIP_SERVE_TIMEOUT):
-            log.warning("[quest_leg] serving-gate timed out after big flip")
-            return None, True
-    try:
-        result = dowser.critique_batch(drafts, critic_operator=critic_operator)
-        return result.get("verdicts", []), False
-    except Exception as exc:
-        log.warning("[quest_leg] critique_batch failed: %s", exc)
-        return None, False
+_phase_swarm_read = gw_flip_gate.phase_swarm_read
+_phase_big_critique = gw_flip_gate.phase_big_critique
 
 
 # ---------------------------------------------------------------------------
@@ -373,20 +281,9 @@ def quest_source_run(
     # -----------------------------------------------------------------------
     # Any-exit flip guard (criterion 6c): SIGTERM handler + try/finally ensure
     # GW is never stranded on swarm on any exit path (normal, exception, SIGTERM).
+    # Shared with research-quest-nightly-producer-v0 via gw_flip_gate (AC1).
     # -----------------------------------------------------------------------
-    import signal as _sig
-    _prev_sigterm = _sig.getsignal(_sig.SIGTERM)
-
-    def _sigterm_handler(signum, frame):
-        raise SystemExit(128 + signum)
-
-    if is_local:
-        try:
-            _sig.signal(_sig.SIGTERM, _sigterm_handler)
-        except (OSError, ValueError):
-            pass  # not in main thread; cannot install signal handler
-
-    try:
+    with gw_flip_gate.any_exit_flip_guard(_flip_fn, active=is_local):
         # -----------------------------------------------------------------------
         # Build Dowser requests (positionally aligned to target_gaps)
         # -----------------------------------------------------------------------
@@ -661,14 +558,6 @@ def quest_source_run(
                 "web evidence under the local-only operator. Worth a morning `--escalate` pass."
             )
         return summary
-
-    finally:
-        if is_local:
-            _flip_fn("big")  # best-effort; idempotent; covers exception + SIGTERM exit paths
-        try:
-            _sig.signal(_sig.SIGTERM, _prev_sigterm)
-        except (OSError, ValueError):
-            pass
 
 
 # ---------------------------------------------------------------------------

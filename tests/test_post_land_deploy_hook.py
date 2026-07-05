@@ -1,6 +1,8 @@
 """Unit tests for _post_land_deploy_hook in pm_core."""
 
+import importlib.util
 import json
+import re
 import subprocess
 import sys
 from io import StringIO
@@ -8,8 +10,54 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 import pytest
+import yaml
 
 from lapis_pm import pm_core, spec_review
+
+# R4 (night-plan-conductor-deploy-sync-v0): committed fixture reproducing conductor's
+# real scripts/-local import edges (verified against origin/main = bede656 this
+# cycle) — see tests/fixtures/conductor-night-closure/ for provenance notes per file.
+_CLOSURE_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "conductor-night-closure"
+
+# Matches both `from X import ...` and `import X` at any indent (module-level or
+# deferred inside a function) — deliberately indent-agnostic since the whole point
+# of R4 is to catch deferred (function-local) sibling imports, not just top-level ones.
+_IMPORT_RE = re.compile(
+    r'^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\b|import\s+([A-Za-z_][A-Za-z0-9_]*)\b)',
+    re.MULTILINE,
+)
+
+
+def _local_import_targets(source: str) -> set:
+    """Every bare module name referenced by an import statement in `source`."""
+    targets = set()
+    for m in _IMPORT_RE.finditer(source):
+        name = m.group(1) or m.group(2)
+        if name:
+            targets.add(name)
+    return targets
+
+
+def _compute_import_closure(seed_modules, source_for) -> set:
+    """Fixpoint transitive closure over `seed_modules` (R4 spec algorithm).
+
+    `source_for(mod)` returns mod's source text, or None if `mod` is not a
+    scripts/-local sibling (stdlib/agents_core/pip packages are not edges).
+    """
+    closure = set()
+    frontier = set(seed_modules)
+    while frontier:
+        mod = frontier.pop()
+        if mod in closure:
+            continue
+        src = source_for(mod)
+        if src is None:
+            continue
+        closure.add(mod)
+        for candidate in _local_import_targets(src):
+            if candidate not in closure:
+                frontier.add(candidate)
+    return closure
 
 
 def _make_completed_process(returncode=0, stderr="", stdout=""):
@@ -1548,3 +1596,618 @@ class TestHeadAdvanceGate:
 
         assert len(sudo_calls) == 0, "No restart while pending marker is live and queue busy"
         assert len(write_calls) == 0, "No new marker written while live marker exists"
+
+
+def _conductor_git_fake_run(
+    *, pull_rc=0, fetch_rc=0, fetch_stderr="", head_sha="cafe1111",
+    main_sha="cafe1111", status_stdout="", branch="main",
+):
+    """Fake subprocess.run dispatcher for the conductor pull + R7 freshness-gate calls.
+
+    Handles: `git pull --ff-only`, `git fetch origin main`, `git rev-parse HEAD`,
+    `git rev-parse origin/main`, `git rev-parse --abbrev-ref HEAD`, `git status --porcelain`.
+    """
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            sub = cmd[3] if len(cmd) > 3 else ""
+            if sub == "pull":
+                return _make_completed_process(
+                    returncode=pull_rc, stderr="pull failed" if pull_rc else ""
+                )
+            if sub == "fetch":
+                return _make_completed_process(returncode=fetch_rc, stderr=fetch_stderr)
+            if sub == "rev-parse":
+                if "--abbrev-ref" in cmd:
+                    return _make_completed_process(returncode=0, stdout=branch)
+                if cmd[-1] == "origin/main":
+                    return _make_completed_process(returncode=0, stdout=main_sha)
+                return _make_completed_process(returncode=0, stdout=head_sha)
+            if sub == "status":
+                return _make_completed_process(returncode=0, stdout=status_stdout)
+        return _make_completed_process(returncode=0)
+    return fake_run
+
+
+class TestConductorNightPlanDeploy:
+    """Tests for night-plan-conductor-deploy-sync-v0.
+
+    Adds conductor to the post-land deploy machinery: (R1) a deploy-clone pull, (R2/R9)
+    an atomic, per-file-isolated copy of the night-plan script closure into
+    /data/agents/scripts, gated on (R3/R7) a self-fetching source-freshness check, with
+    (R10) single-alert ownership so a dirty/stale source pages exactly once.
+    """
+
+    # --- R1: classification ---
+
+    def test_conductor_pull_path(self):
+        assert pm_core._POST_LAND_PULL["conductor"] == ["/srv/git/conductor"]
+
+    def test_conductor_in_post_land_pull_low_signal(self):
+        assert "conductor" in pm_core._POST_LAND_PULL_LOW_SIGNAL
+
+    def test_conductor_not_in_post_land_pull_critical(self):
+        assert "conductor" not in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_conductor_not_in_post_land_restart(self):
+        """R5: night scripts are timer-oneshot — no restart map entry."""
+        assert "conductor" not in pm_core._POST_LAND_RESTART
+
+    def test_conductor_not_in_post_land_restart_user(self):
+        assert "conductor" not in pm_core._POST_LAND_RESTART_USER
+
+    # --- R4: closure-correctness anchor ---
+
+    def test_manifest_includes_night_plan_and_deep_deps(self):
+        """The deep deps a naive depth-2 read misses (gpu_lane/rsi_ingest/podcast_engine)
+        must be present, not just the top-level entrypoint + yaml modules."""
+        for fname in (
+            "night_plan.py", "night_coordinator.py", "gpu_lane.py",
+            "rsi_ingest.py", "podcast_engine.py", "night_producers.yaml",
+        ):
+            assert fname in pm_core._CONDUCTOR_NIGHT_SCRIPTS
+
+    def test_fixture_closure_matches_manifest(self):
+        """Always-on drift guard: recompute the transitive scripts/-local import
+        closure from the committed fixture (seed = {night_plan, night_coordinator,
+        every yaml `module:`}; edge = any `from X`/`import X` where X.py exists;
+        fixpoint) and assert it EQUALS _CONDUCTOR_NIGHT_SCRIPTS exactly. A manifest
+        missing a deep dep (the round-1 hole: gpu_lane/rsi_ingest/podcast_engine)
+        fails this test, not a night run. Runs with no dependency on the live
+        conductor path — the fixture is the primary always-on vehicle."""
+        producers = yaml.safe_load(
+            (_CLOSURE_FIXTURE_DIR / "night_producers.yaml").read_text()
+        )
+        seed = {"night_plan", "night_coordinator"} | {
+            p["module"] for p in producers["producers"]
+        }
+
+        def source_for(mod):
+            f = _CLOSURE_FIXTURE_DIR / f"{mod}.py"
+            return f.read_text() if f.is_file() else None
+
+        closure = _compute_import_closure(seed, source_for)
+        expected_files = {f"{mod}.py" for mod in closure} | {"night_producers.yaml"}
+        assert set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) == expected_files
+
+    def test_load_test_gpu_lane_registers_and_deferred_siblings_import(self):
+        """Load-test exercising DEFERRED imports (the ones a bare top-level module
+        import does not touch): night_plan + night_coordinator import, the "gpu" lane
+        actually REGISTERS (gpu_lane's import is try/except-guarded — a bare `import
+        night_coordinator` passes even when gpu_lane.py is absent, so asserting the
+        module imports is not sufficient), and each active producer's deferred
+        siblings import (arxiv_watch -> rsi_ingest, idea_collider -> podcast_engine)."""
+        fixture_modules = [
+            "night_plan", "night_coordinator", "gpu_lane", "scout_producer",
+            "arxiv_producer", "arxiv_watch", "rsi_ingest",
+            "idea_collider_night_batch_producer", "idea_collider",
+            "idea_collider_night_batch", "podcast_engine", "kami_producer",
+            "kami_batch", "kami_selector", "kami_sweep", "kami_adjudicator",
+            "kami_small", "enlightenment_producer", "enlightenment_reader",
+            "research_headings",
+        ]
+        for mod in fixture_modules:
+            sys.modules.pop(mod, None)
+        fixture_dir = str(_CLOSURE_FIXTURE_DIR)
+        sys.path.insert(0, fixture_dir)
+        try:
+            import night_plan  # noqa: F401
+            import night_coordinator
+
+            assert "gpu" in night_coordinator._LANE_HANDLERS, (
+                "gpu_lane's guarded import must actually register the 'gpu' lane "
+                "for all three gpu-lane producers — a bare `import night_coordinator` "
+                "succeeding is not sufficient (guarded-import trap)"
+            )
+
+            import arxiv_watch  # noqa: F401
+            assert "rsi_ingest" in sys.modules
+
+            import idea_collider  # noqa: F401
+            assert "podcast_engine" in sys.modules
+        finally:
+            sys.path.remove(fixture_dir)
+            for mod in fixture_modules:
+                sys.modules.pop(mod, None)
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("lapis_engine") is None,
+        reason="lapis_engine not importable in this environment — the scout "
+        "cross-package precondition is a documented go-live requirement, not "
+        "something the closure copy delivers, so it cannot be checked here",
+    )
+    def test_scout_cross_package_precondition_importable(self):
+        """Honest limit: scout_producer's cross-package deps (lapis_pm.scout.*,
+        lapis_engine.adapters) are function-deferred, so a bare `import
+        scout_producer` does not exercise them, and the closure copy does not (and
+        must not claim to) deliver them — they are installed packages, not
+        scripts/-local siblings. This only asserts the /data/agents runtime
+        precondition that go-live step 3 confirms."""
+        import lapis_pm.scout.selection  # noqa: F401
+        import lapis_engine.adapters  # noqa: F401
+
+    @pytest.mark.skipif(
+        not (Path("/srv/git/conductor") / ".git").is_dir(),
+        reason="live conductor deploy clone not present in this environment",
+    )
+    def test_live_conductor_closure_matches_fixture(self):
+        """Skipif live-drift test: recomputes the closure from conductor's
+        CANONICAL origin/main (not the local checkout, which may be on a stale
+        feature branch — see R3/R7) and asserts it matches _CONDUCTOR_NIGHT_SCRIPTS,
+        so fixture staleness vs the real conductor repo is caught wherever this can
+        run (BRIX). Soft-skips (not fails) on network/fetch trouble — it verifies
+        fixture freshness, it does not gate the deploy."""
+        clone = "/srv/git/conductor"
+        try:
+            fetch = subprocess.run(
+                ["git", "-C", clone, "fetch", "origin", "main"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            pytest.skip(f"could not fetch origin/main from live conductor clone: {exc}")
+        if fetch.returncode != 0:
+            pytest.skip(f"git fetch origin main failed: {fetch.stderr!r}")
+
+        def source_for(mod):
+            r = subprocess.run(
+                ["git", "-C", clone, "show", f"origin/main:scripts/{mod}.py"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return r.stdout if r.returncode == 0 else None
+
+        yaml_result = subprocess.run(
+            ["git", "-C", clone, "show", "origin/main:scripts/night_producers.yaml"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if yaml_result.returncode != 0:
+            pytest.skip("could not read origin/main:scripts/night_producers.yaml")
+
+        producers = yaml.safe_load(yaml_result.stdout)
+        seed = {"night_plan", "night_coordinator"} | {
+            p["module"] for p in producers["producers"]
+        }
+        closure = _compute_import_closure(seed, source_for)
+        expected_files = {f"{mod}.py" for mod in closure} | {"night_producers.yaml"}
+        assert set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) == expected_files
+
+    # --- R7: source-freshness gate ---
+
+    def test_fetch_fail_with_pending_change_emits_normal_and_skips_copy(self, tmp_path):
+        """A fetch failure with a real delivery blocked (dest missing a file the
+        source has) must SKIP the copy entirely and alert NORMAL, not copy stale."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "priority": priority})
+            return True
+
+        fake_run = _conductor_git_fake_run(fetch_rc=1, fetch_stderr="could not resolve host")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert list(dest_dir.iterdir()) == [], "fetch-fail must copy zero files, not stale content"
+        assert len(notify_calls) == 1
+        assert notify_calls[0]["priority"] == Priority.NORMAL
+
+    def test_fetch_fail_with_no_pending_change_emits_low(self, tmp_path):
+        """A fetch failure when the runtime already matches the local source is a LOW
+        signal (nothing lost, just couldn't re-verify) — not NORMAL."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        content = "print('same')"
+        (src_dir / "night_plan.py").write_text(content)
+        (dest_dir / "night_plan.py").write_text(content)
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        fake_run = _conductor_git_fake_run(fetch_rc=1, fetch_stderr="network unreachable")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert (dest_dir / "night_plan.py").read_text() == content
+        assert len(notify_calls) == 1
+        assert notify_calls[0] == Priority.LOW
+
+    def test_dirty_source_skips_copy_emits_normal(self, tmp_path):
+        """A dirty source (uncommitted changes) must SKIP the copy, not deliver
+        partially-modified content, and alert NORMAL naming remediation."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "priority": priority})
+            return True
+
+        fake_run = _conductor_git_fake_run(
+            fetch_rc=0, head_sha="aaa", main_sha="aaa",
+            status_stdout="M scripts/night_plan.py\n", branch="main",
+        )
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert list(dest_dir.iterdir()) == [], "dirty source must not deliver any file"
+        assert len(notify_calls) == 1
+        assert notify_calls[0]["priority"] == Priority.NORMAL
+        assert "clean-on-main" in notify_calls[0]["message"]
+
+    def test_off_main_source_skips_copy_emits_normal(self, tmp_path):
+        """A source checked out on a feature branch (today's live state) must SKIP
+        the copy even if clean, else the runtime can regress to a stale manifest."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "priority": priority})
+            return True
+
+        fake_run = _conductor_git_fake_run(
+            fetch_rc=0, head_sha="aaa", main_sha="bbb", status_stdout="",
+            branch="lapis/chub-register-cockpit-8408",
+        )
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert list(dest_dir.iterdir()) == []
+        assert len(notify_calls) == 1
+        assert notify_calls[0]["priority"] == Priority.NORMAL
+
+    # --- R2/R3/R9: copy mechanics (fresh source) ---
+
+    def test_fresh_source_creates_missing_file(self, tmp_path):
+        """The exact go-live case: night_plan.py absent at dest, source verified fresh."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test-trigger")
+
+        assert (dest_dir / "night_plan.py").read_text() == "print('v1')"
+        log_text = log_file.read_text()
+        assert "night_plan.py" in log_text
+        assert "created" in log_text
+        assert "test-trigger" in log_text
+
+    def test_fresh_source_updates_changed_file(self, tmp_path):
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v2')")
+        (dest_dir / "night_plan.py").write_text("print('v1')")
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert (dest_dir / "night_plan.py").read_text() == "print('v2')"
+        log_text = log_file.read_text()
+        assert ".." in log_text, "changed-file log line must show old8..new8, not 'created'"
+        assert "created" not in log_text
+
+    def test_fresh_source_noop_when_current(self, tmp_path):
+        """Idempotent no-op: identical content at dest → no log write, no mutation."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        content = "print('same')"
+        (src_dir / "night_plan.py").write_text(content)
+        (dest_dir / "night_plan.py").write_text(content)
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert (dest_dir / "night_plan.py").read_text() == content
+        assert not log_file.exists(), "no-op copy must not write a provenance line"
+
+    def test_source_file_absent_is_skipped_not_raised(self, tmp_path):
+        """A manifest entry naming a file conductor doesn't have must not raise —
+        it's a manifest bug caught by the drift guard, not a deploy-time failure."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        # src_dir intentionally left without any of the manifested files.
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")  # must not raise
+
+        assert list(dest_dir.iterdir()) == []
+
+    def test_per_file_isolation_oserror_continues_to_next_file(self, tmp_path):
+        """An OSError copying file N must not abort the closure — file N+1 still copies."""
+        import shutil as _shutil
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('plan')")
+        (src_dir / "night_coordinator.py").write_text("print('coordinator')")
+
+        real_copyfileobj = _shutil.copyfileobj
+
+        def flaky_copyfileobj(fsrc, fdst, *args, **kwargs):
+            if getattr(fsrc, "name", "").endswith("night_plan.py"):
+                raise OSError("simulated disk-full")
+            return real_copyfileobj(fsrc, fdst, *args, **kwargs)
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("shutil.copyfileobj", side_effect=flaky_copyfileobj),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")  # must not raise
+
+        assert not (dest_dir / "night_plan.py").exists(), "the failing file must not land"
+        assert (dest_dir / "night_coordinator.py").read_text() == "print('coordinator')", (
+            "the file after the failing one must still be copied"
+        )
+        assert list(dest_dir.glob(".*.tmp")) == [], "no stray temp file after the failure"
+
+    def test_atomic_replace_failure_leaves_dest_whole_and_cleans_temp(self, tmp_path):
+        """A failure between temp-write and os.replace must leave the pre-existing
+        dest file intact (never partial) and must not leave a stray .tmp file."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('new')")
+        (dest_dir / "night_plan.py").write_text("print('old')")
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        def failing_replace(src, dst):
+            raise OSError("simulated failure during replace")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("os.replace", side_effect=failing_replace),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")  # must not raise
+
+        assert (dest_dir / "night_plan.py").read_text() == "print('old')", (
+            "dest must remain whole (old content) after a failed replace"
+        )
+        assert list(dest_dir.glob(".*.tmp")) == [], "temp file must be cleaned up on failure"
+
+    # --- R10: single-alert ownership ---
+
+    def test_dirty_source_via_full_hook_emits_exactly_one_alert(self, tmp_path):
+        """A generic conductor pull failure PLUS a dirty/off-main freshness-gate source
+        is one root cause — the hook must emit exactly one Pushover, not two."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        # The generic `_post_land_git_pull` pull attempt fails (would normally emit a
+        # LOW alert for a low-signal repo); the freshness gate's OWN fetch succeeds but
+        # finds the source off-main — it, not the generic pull-fail path, must own the
+        # single alert emitted here.
+        fake_run = _conductor_git_fake_run(
+            pull_rc=1, fetch_rc=0, head_sha="aaa", main_sha="bbb",
+            branch="lapis/some-feature-branch",
+        )
+
+        with (
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_deploy_hook("conductor")
+
+        assert len(notify_calls) == 1, f"expected exactly one alert, got {notify_calls}"
+        assert notify_calls[0] == Priority.NORMAL
+        assert list(dest_dir.iterdir()) == []
+
+    def test_transient_fetch_fail_via_full_hook_emits_exactly_one_alert(self, tmp_path):
+        """The round-4 HIGH: local refs equal+clean but the R7 fetch itself fails must
+        still emit exactly ONE alert (not zero) and must not copy stale content."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+        # dest missing night_plan.py — a real delivery would be blocked by the skip.
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        # generic pull succeeds trivially (no-op, local refs already equal — pre==post);
+        # the freshness gate's OWN fetch fails.
+        fake_run = _conductor_git_fake_run(
+            pull_rc=0, fetch_rc=1, fetch_stderr="could not resolve host",
+            head_sha="aaa", main_sha="aaa",
+        )
+
+        with (
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_deploy_hook("conductor")
+
+        assert len(notify_calls) == 1, f"expected exactly one alert, got {notify_calls}"
+        assert notify_calls[0] == Priority.NORMAL
+        assert list(dest_dir.iterdir()) == [], "a failed fetch must never copy stale content"
+
+    # --- R8: no-producer-drop (copy preserves whatever the canonical source has) ---
+
+    def test_night_producers_yaml_copy_preserves_full_producer_set(self, tmp_path):
+        """Copying night_producers.yaml from a verified-fresh source must deliver its
+        full byte-for-byte content — no filtering/dropping of any producer entry."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        yaml_content = (
+            "producers:\n"
+            "  - module: scout_producer\n    active: true\n"
+            "  - module: arxiv_producer\n    active: true\n"
+            "  - module: idea_collider_night_batch_producer\n    active: true\n"
+        )
+        (src_dir / "night_producers.yaml").write_text(yaml_content)
+        # runtime previously had a stale/partial yaml — the copy must overwrite it
+        # with the full canonical content, not merge or filter.
+        (dest_dir / "night_producers.yaml").write_text("producers:\n  - module: scout_producer\n")
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        result_yaml = (dest_dir / "night_producers.yaml").read_text()
+        assert "idea_collider_night_batch_producer" in result_yaml
+        assert result_yaml == yaml_content

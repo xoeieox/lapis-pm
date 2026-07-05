@@ -1,0 +1,29 @@
+# Night producers manifest — which producers are active tonight.
+# This is the "which minds run" surface. Remove or set active: false to stop a producer.
+# The pre-night approval gate (future leg) reads + filters this manifest.
+
+producers:
+  - name: enlightenment
+    module: enlightenment_producer
+    class: EnlightenmentProducer
+    active: false  # corpus exhausted — infra/enlightenment-corpus-interior-castle-complete
+
+  - name: scout
+    module: scout_producer
+    class: ScoutProducer
+    active: true
+
+  - name: arxiv-watch
+    module: arxiv_producer
+    class: ArxivWatchProducer
+    active: true
+
+  - name: kami
+    module: kami_producer
+    class: KamiProducer
+    active: false  # held pending vault-rag threshold bug
+
+  - name: idea-collider-night-batch
+    module: idea_collider_night_batch_producer
+    class: IdeaColliderNightBatchProducer
+    active: true

@@ -29,14 +29,17 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
 
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import importlib
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -213,6 +216,20 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # dirty/detached state, makes the ff-only pull fail (LOW alert) until the tree is restored to main.
     # The durable decouple to a dedicated deploy clone is a deferred follow-on (see §4), NOT this unit.
     "gardener":       ["/srv/git/gardener-working"],
+    # conductor: NOT a code-only pull like the entries above. /srv/git/conductor is
+    # conductor's DEPLOY CLONE (cf. lapis-pm's own /srv/git/lapis-pm vs -working split,
+    # :174-179) — this pull keeps that reference tree current so _deploy_conductor_night_scripts
+    # (see night-plan-conductor-deploy-sync-v0) has a fresh source to copy FROM. It does NOT
+    # by itself deploy anything: the night timers execute from /data/agents/scripts
+    # (agents-core), an unrelated tree this pull never touches — see the copy step below.
+    # LIABILITY (inherited, not solved, by this unit — mirrors the gardener double-duty-tree
+    # note above): if /srv/git/conductor is left checked out on a feature branch or dirty
+    # (e.g. by a /pm-pr-review or worker checkout against this path instead of a scratch
+    # clone), the ff-only pull fails (LOW alert, attributable) until restored to main. The
+    # source-freshness gate in _deploy_conductor_night_scripts additionally refuses to copy
+    # from a non-main/dirty source, so this liability cannot corrupt the runtime — it only
+    # blocks delivery until remediated. See spec §Go-live step 1.
+    "conductor":      ["/srv/git/conductor"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -230,7 +247,65 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # code → degraded next spec-review fire. LOW keeps it attributable.
 # gardener: timer-oneshot service (07:00 LA nightly synthesis) — stale code is a
 # degraded synthesis, not a broken daemon. LOW keeps it attributable.
-_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener"})
+# conductor: night scripts are timer-oneshot (re-import on each fire); a stale/failed
+# pull-then-copy is a degraded night, attributable via the U2a gate + success-predicates,
+# not a broken daemon. NOTE (R10): conductor's actual alerting is owned by the
+# source-freshness gate in _deploy_conductor_night_scripts, which alerts on every
+# failure mode (transient fetch-fail, dirty, off-main) — the generic LOW pull-fail
+# Pushover below is suppressed specifically for conductor to avoid a double-alert for
+# one root cause. conductor stays in this set for classification purposes only.
+_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener", "conductor"})
+
+# ---------------------------------------------------------------------------
+# conductor night-plan script closure (night-plan-conductor-deploy-sync-v0)
+# ---------------------------------------------------------------------------
+# Deploy clone conductor pulls into (see _POST_LAND_PULL["conductor"] above) and the
+# root the R7 source-freshness gate fetches/rev-parses against. Module-level constant
+# (not inlined) so tests can patch it to a temp git repo — see _CONDUCTOR_SCRIPTS_SRC.
+_CONDUCTOR_DEPLOY_CLONE = "/srv/git/conductor"
+
+# Copy source/dest. Module-level constants (not inlined literals) so the real-filesystem
+# DoD tests can patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", <tmp_path>) exactly as the
+# existing suite patches _DEPLOY_LOG (:235) — a fixer must never inline the production path
+# in the helper body, or the tests would have to write to the live runtime to exercise it.
+_CONDUCTOR_SCRIPTS_SRC = "/srv/git/conductor/scripts"
+_CONDUCTOR_SCRIPTS_DEST = "/data/agents/scripts"
+
+# The transitive scripts/-local import closure reachable from night_plan.py + every
+# producer declared in night_producers.yaml (seed = {night_plan, night_coordinator, all
+# yaml `module:` values}; edge = any `from X`/`import X` where scripts/X.py exists;
+# fixpoint). Computed 2026-07-04 against conductor origin/main = bede656 — see spec
+# night-plan-conductor-deploy-sync-v0 §"night_plan.py's runtime closure" for the full
+# derivation and the deeper deps (gpu_lane, rsi_ingest, podcast_engine) a naive depth-2
+# read misses.
+#
+# GROWTH OBLIGATION (mirrors the _POST_LAND_RESTART §2.3 note at :156-164): when a
+# producer is added to (or a new scripts/-local import added by) conductor's
+# night_producers.yaml, its module + every new sibling dep MUST be added here. An
+# unmanifested file is a silent runtime gap the next conductor merge will not fill.
+_CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = (
+    "night_plan.py",
+    "night_coordinator.py",
+    "gpu_lane.py",
+    "scout_producer.py",
+    "arxiv_producer.py",
+    "arxiv_watch.py",
+    "rsi_ingest.py",
+    "idea_collider_night_batch_producer.py",
+    "idea_collider.py",
+    "idea_collider_night_batch.py",
+    "podcast_engine.py",
+    "kami_producer.py",
+    "kami_batch.py",
+    "kami_selector.py",
+    "kami_sweep.py",
+    "kami_adjudicator.py",
+    "kami_small.py",
+    "enlightenment_producer.py",
+    "enlightenment_reader.py",
+    "research_headings.py",
+    "night_producers.yaml",
+)
 
 _DEPLOY_LOG = room_path('lapis_state.deploy_log')
 _DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"
@@ -388,7 +463,12 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                         )
                     except Exception:
                         pass
-                elif is_low_signal_repo:
+                # R10 (night-plan-conductor-deploy-sync-v0): conductor's alerting is
+                # owned by the source-freshness gate in _deploy_conductor_night_scripts,
+                # which fires on every conductor failure mode (transient, dirty,
+                # off-main). Suppressing the generic LOW here avoids a double-alert
+                # for one root cause — the stderr log above is retained either way.
+                elif is_low_signal_repo and repo != "conductor":
                     try:
                         from agents_core.notify import send_notification, Priority as _P
                         send_notification(
@@ -425,7 +505,7 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                     )
                 except Exception:
                     pass
-            elif is_low_signal_repo:
+            elif is_low_signal_repo and repo != "conductor":  # R10 — see note above
                 try:
                     from agents_core.notify import send_notification, Priority as _P
                     send_notification(
@@ -439,6 +519,211 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                 except Exception:
                     pass
     return any_advanced
+
+
+def _file_short_hash(path: Path) -> str:
+    """8-char sha256 prefix of a file's contents, for copy-provenance logging."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:8]
+    except OSError:
+        return "unknown"
+
+
+def _write_conductor_copy_log(fname: str, old_repr: str, new_sha: str, trigger: str) -> None:
+    """Append one provenance line for a conductor night-plan script copy. Best-effort."""
+    ts = _now_iso()
+    change = "created" if old_repr == "absent" else f"{old_repr}..{new_sha}"
+    line = f"- `{ts}` | conductor:scripts/{fname} | {change} | {trigger}\n"
+    try:
+        with open(_DEPLOY_LOG, "a") as f:
+            f.write(line)
+    except OSError as e:
+        print(f"[post-land-deploy:conductor] deploy log write failed: {e}", file=sys.stderr)
+
+
+def _conductor_copy_would_change(src_dir: Path, dest_dir: Path) -> bool:
+    """True if at least one manifested file's copy would create-or-update dest.
+
+    Used only to pick alert priority when the R7 fetch itself fails (NORMAL if real
+    delivery was blocked, LOW if the runtime already matches the local source).
+    """
+    for fname in _CONDUCTOR_NIGHT_SCRIPTS:
+        src = src_dir / fname
+        dst = dest_dir / fname
+        if not src.exists():
+            continue
+        if not dst.exists() or not filecmp.cmp(str(src), str(dst), shallow=False):
+            return True
+    return False
+
+
+def _copy_one_conductor_script(fname: str, src_dir: Path, dest_dir: Path, trigger: str) -> None:
+    """Create-or-update one manifested file atomically. Idempotent no-op if unchanged.
+
+    R9: written via temp-in-dest-dir + os.replace so a concurrent night-timer read never
+    observes a half-written file. The temp is unlinked if the write/replace fails, so a
+    repeated failure does not accumulate stray .tmp files in the runtime directory.
+    """
+    src = src_dir / fname
+    dst = dest_dir / fname
+    if not src.exists():
+        # A manifest entry naming a file not present in conductor is a manifest bug
+        # (caught by the closure drift test), not a deploy-time failure.
+        print(f"[post-land-deploy:conductor] manifest source missing: {src}", file=sys.stderr)
+        return
+    if dst.exists() and filecmp.cmp(str(src), str(dst), shallow=False):
+        return  # idempotent no-op — no log, no restart
+
+    old_repr = _file_short_hash(dst) if dst.exists() else "absent"
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=str(dest_dir), prefix=f".{fname}.", suffix=".tmp")
+        with os.fdopen(fd, "wb") as tmp_f, open(src, "rb") as src_f:
+            shutil.copyfileobj(src_f, tmp_f)
+        shutil.copystat(str(src), tmp_path)
+        os.replace(tmp_path, str(dst))
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    new_sha = _file_short_hash(dst)
+    _write_conductor_copy_log(fname, old_repr, new_sha, trigger)
+
+
+def _deploy_conductor_night_scripts(trigger: str = "post-land-hook") -> None:
+    """Copy the night-plan script closure into the /data/agents/scripts runtime.
+
+    R3/R7 — source-freshness gate: this function does its OWN `git fetch origin main`
+    against the conductor deploy clone before copying anything. A fetch failure means
+    freshness is unverifiable (transient/network/auth) — copying local refs in that
+    state risks silently delivering stale content (the round-4 HIGH this gate closes),
+    so the copy is skipped entirely and an alert fires. Only when the fetch succeeds
+    AND post-fetch HEAD == origin/main AND the tree is clean does the copy proceed —
+    otherwise the last-known-good runtime is preserved (skip-not-corrupt).
+
+    R2/R9 — the copy itself is per-file isolated (one bad file must not skip the rest
+    of the closure) and atomic (temp-in-dest-dir + os.replace).
+
+    Never raises: an unexpected error anywhere in this function (including the git
+    subprocess calls) is caught, logged, and alerted at LOW priority — a copy failure
+    must never fail the merge that triggered it.
+    """
+    try:
+        _deploy_conductor_night_scripts_impl(trigger)
+    except Exception as e:
+        print(
+            f"[post-land-deploy:conductor] unexpected error (non-fatal): {e}",
+            file=sys.stderr,
+        )
+        try:
+            from agents_core.notify import send_notification, Priority as _P
+            send_notification(
+                message=f"conductor night-plan script deploy hit an unexpected error: {e}",
+                title="conductor: night-plan deploy error",
+                priority=_P.LOW,
+            )
+        except Exception:
+            pass
+
+
+def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
+    clone = _CONDUCTOR_DEPLOY_CLONE
+    src_dir = Path(_CONDUCTOR_SCRIPTS_SRC)
+    dest_dir = Path(_CONDUCTOR_SCRIPTS_DEST)
+
+    # --- R7: own fetch, not derived from _post_land_git_pull's return bool (which
+    # cannot distinguish "already-current" from "pull-failed"). ---
+    try:
+        fetch_result = subprocess.run(
+            ["git", "-C", clone, "fetch", "origin", "main"],
+            capture_output=True, text=True, timeout=30,
+        )
+        fetch_ok = fetch_result.returncode == 0
+        fetch_err = fetch_result.stderr.strip()[:300] if not fetch_ok else ""
+    except (subprocess.TimeoutExpired, OSError) as e:
+        fetch_ok = False
+        fetch_err = str(e)
+
+    if not fetch_ok:
+        would_change = _conductor_copy_would_change(src_dir, dest_dir)
+        print(
+            f"[post-land-deploy:conductor] source fetch failed ({fetch_err}); "
+            f"night-plan copy SKIPPED, runtime preserved",
+            file=sys.stderr,
+        )
+        try:
+            from agents_core.notify import send_notification, Priority as _P
+            send_notification(
+                message=(
+                    f"conductor source fetch failed ({fetch_err}); night-plan copy "
+                    f"SKIPPED, runtime preserved"
+                ),
+                title="conductor: night-plan deploy skipped",
+                priority=_P.NORMAL if would_change else _P.LOW,
+            )
+        except Exception:
+            pass
+        return
+
+    head_proc = subprocess.run(
+        ["git", "-C", clone, "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+    main_proc = subprocess.run(
+        ["git", "-C", clone, "rev-parse", "origin/main"],
+        capture_output=True, text=True, timeout=5,
+    )
+    status_proc = subprocess.run(
+        ["git", "-C", clone, "status", "--porcelain"],
+        capture_output=True, text=True, timeout=15,
+    )
+    branch_proc = subprocess.run(
+        ["git", "-C", clone, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+
+    head_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+    main_sha = main_proc.stdout.strip() if main_proc.returncode == 0 else ""
+    dirty = bool(status_proc.stdout.strip()) if status_proc.returncode == 0 else True
+    branch_name = branch_proc.stdout.strip() if branch_proc.returncode == 0 else "unknown"
+
+    is_fresh = bool(head_sha) and head_sha == main_sha and not dirty
+
+    if not is_fresh:
+        head8 = head_sha[:8] if head_sha else "unknown"
+        print(
+            f"[post-land-deploy:conductor] source not clean-on-main ({branch_name}@{head8}); "
+            f"night-plan copy SKIPPED, runtime preserved",
+            file=sys.stderr,
+        )
+        try:
+            from agents_core.notify import send_notification, Priority as _P
+            send_notification(
+                message=(
+                    f"conductor deploy clone not clean-on-main ({branch_name}@{head8}); "
+                    f"night-plan script copy SKIPPED, runtime preserved; restore "
+                    f"/srv/git/conductor to main — see spec §Go-live "
+                    f"(night-plan-conductor-deploy-sync-v0)"
+                ),
+                title="conductor: night-plan deploy skipped",
+                priority=_P.NORMAL,
+            )
+        except Exception:
+            pass
+        return
+
+    # --- R2/R9: source verified fresh — copy the closure, per-file isolated. ---
+    for fname in _CONDUCTOR_NIGHT_SCRIPTS:
+        try:
+            _copy_one_conductor_script(fname, src_dir, dest_dir, trigger)
+        except OSError as e:
+            print(f"[post-land-deploy:conductor] copy failed for {fname}: {e}", file=sys.stderr)
+            continue
 
 
 def _count_inflight_fixers() -> int:
@@ -606,6 +891,13 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
     head_advanced = _post_land_git_pull(repo, trigger=trigger)
     if not repo:
         return
+
+    # night-plan-conductor-deploy-sync-v0 (R2/R3): copy the night-plan script closure
+    # into the /data/agents/scripts runtime. conductor is absent from both restart maps
+    # below (R5 — night scripts are timer-oneshot, no restart needed), so this branch
+    # does not interfere with the restart logic that follows.
+    if repo == "conductor":
+        _deploy_conductor_night_scripts(trigger=trigger)
 
     units = _POST_LAND_RESTART.get(repo)
     if units:

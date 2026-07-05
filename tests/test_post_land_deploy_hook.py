@@ -1,6 +1,8 @@
 """Unit tests for _post_land_deploy_hook in pm_core."""
 
+import importlib.util
 import json
+import re
 import subprocess
 import sys
 from io import StringIO
@@ -8,8 +10,54 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 import pytest
+import yaml
 
 from lapis_pm import pm_core, spec_review
+
+# R4 (night-plan-conductor-deploy-sync-v0): committed fixture reproducing conductor's
+# real scripts/-local import edges (verified against origin/main = bede656 this
+# cycle) — see tests/fixtures/conductor-night-closure/ for provenance notes per file.
+_CLOSURE_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "conductor-night-closure"
+
+# Matches both `from X import ...` and `import X` at any indent (module-level or
+# deferred inside a function) — deliberately indent-agnostic since the whole point
+# of R4 is to catch deferred (function-local) sibling imports, not just top-level ones.
+_IMPORT_RE = re.compile(
+    r'^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\b|import\s+([A-Za-z_][A-Za-z0-9_]*)\b)',
+    re.MULTILINE,
+)
+
+
+def _local_import_targets(source: str) -> set:
+    """Every bare module name referenced by an import statement in `source`."""
+    targets = set()
+    for m in _IMPORT_RE.finditer(source):
+        name = m.group(1) or m.group(2)
+        if name:
+            targets.add(name)
+    return targets
+
+
+def _compute_import_closure(seed_modules, source_for) -> set:
+    """Fixpoint transitive closure over `seed_modules` (R4 spec algorithm).
+
+    `source_for(mod)` returns mod's source text, or None if `mod` is not a
+    scripts/-local sibling (stdlib/agents_core/pip packages are not edges).
+    """
+    closure = set()
+    frontier = set(seed_modules)
+    while frontier:
+        mod = frontier.pop()
+        if mod in closure:
+            continue
+        src = source_for(mod)
+        if src is None:
+            continue
+        closure.add(mod)
+        for candidate in _local_import_targets(src):
+            if candidate not in closure:
+                frontier.add(candidate)
+    return closure
 
 
 def _make_completed_process(returncode=0, stderr="", stdout=""):
@@ -1607,7 +1655,7 @@ class TestConductorNightPlanDeploy:
     def test_conductor_not_in_post_land_restart_user(self):
         assert "conductor" not in pm_core._POST_LAND_RESTART_USER
 
-    # --- manifest sanity (partial R4 — see spec for the full fixture-based drift guard) ---
+    # --- R4: closure-correctness anchor ---
 
     def test_manifest_includes_night_plan_and_deep_deps(self):
         """The deep deps a naive depth-2 read misses (gpu_lane/rsi_ingest/podcast_engine)
@@ -1617,6 +1665,129 @@ class TestConductorNightPlanDeploy:
             "rsi_ingest.py", "podcast_engine.py", "night_producers.yaml",
         ):
             assert fname in pm_core._CONDUCTOR_NIGHT_SCRIPTS
+
+    def test_fixture_closure_matches_manifest(self):
+        """Always-on drift guard: recompute the transitive scripts/-local import
+        closure from the committed fixture (seed = {night_plan, night_coordinator,
+        every yaml `module:`}; edge = any `from X`/`import X` where X.py exists;
+        fixpoint) and assert it EQUALS _CONDUCTOR_NIGHT_SCRIPTS exactly. A manifest
+        missing a deep dep (the round-1 hole: gpu_lane/rsi_ingest/podcast_engine)
+        fails this test, not a night run. Runs with no dependency on the live
+        conductor path — the fixture is the primary always-on vehicle."""
+        producers = yaml.safe_load(
+            (_CLOSURE_FIXTURE_DIR / "night_producers.yaml").read_text()
+        )
+        seed = {"night_plan", "night_coordinator"} | {
+            p["module"] for p in producers["producers"]
+        }
+
+        def source_for(mod):
+            f = _CLOSURE_FIXTURE_DIR / f"{mod}.py"
+            return f.read_text() if f.is_file() else None
+
+        closure = _compute_import_closure(seed, source_for)
+        expected_files = {f"{mod}.py" for mod in closure} | {"night_producers.yaml"}
+        assert set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) == expected_files
+
+    def test_load_test_gpu_lane_registers_and_deferred_siblings_import(self):
+        """Load-test exercising DEFERRED imports (the ones a bare top-level module
+        import does not touch): night_plan + night_coordinator import, the "gpu" lane
+        actually REGISTERS (gpu_lane's import is try/except-guarded — a bare `import
+        night_coordinator` passes even when gpu_lane.py is absent, so asserting the
+        module imports is not sufficient), and each active producer's deferred
+        siblings import (arxiv_watch -> rsi_ingest, idea_collider -> podcast_engine)."""
+        fixture_modules = [
+            "night_plan", "night_coordinator", "gpu_lane", "scout_producer",
+            "arxiv_producer", "arxiv_watch", "rsi_ingest",
+            "idea_collider_night_batch_producer", "idea_collider",
+            "idea_collider_night_batch", "podcast_engine", "kami_producer",
+            "kami_batch", "kami_selector", "kami_sweep", "kami_adjudicator",
+            "kami_small", "enlightenment_producer", "enlightenment_reader",
+            "research_headings",
+        ]
+        for mod in fixture_modules:
+            sys.modules.pop(mod, None)
+        fixture_dir = str(_CLOSURE_FIXTURE_DIR)
+        sys.path.insert(0, fixture_dir)
+        try:
+            import night_plan  # noqa: F401
+            import night_coordinator
+
+            assert "gpu" in night_coordinator._LANE_HANDLERS, (
+                "gpu_lane's guarded import must actually register the 'gpu' lane "
+                "for all three gpu-lane producers — a bare `import night_coordinator` "
+                "succeeding is not sufficient (guarded-import trap)"
+            )
+
+            import arxiv_watch  # noqa: F401
+            assert "rsi_ingest" in sys.modules
+
+            import idea_collider  # noqa: F401
+            assert "podcast_engine" in sys.modules
+        finally:
+            sys.path.remove(fixture_dir)
+            for mod in fixture_modules:
+                sys.modules.pop(mod, None)
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("lapis_engine") is None,
+        reason="lapis_engine not importable in this environment — the scout "
+        "cross-package precondition is a documented go-live requirement, not "
+        "something the closure copy delivers, so it cannot be checked here",
+    )
+    def test_scout_cross_package_precondition_importable(self):
+        """Honest limit: scout_producer's cross-package deps (lapis_pm.scout.*,
+        lapis_engine.adapters) are function-deferred, so a bare `import
+        scout_producer` does not exercise them, and the closure copy does not (and
+        must not claim to) deliver them — they are installed packages, not
+        scripts/-local siblings. This only asserts the /data/agents runtime
+        precondition that go-live step 3 confirms."""
+        import lapis_pm.scout.selection  # noqa: F401
+        import lapis_engine.adapters  # noqa: F401
+
+    @pytest.mark.skipif(
+        not (Path("/srv/git/conductor") / ".git").is_dir(),
+        reason="live conductor deploy clone not present in this environment",
+    )
+    def test_live_conductor_closure_matches_fixture(self):
+        """Skipif live-drift test: recomputes the closure from conductor's
+        CANONICAL origin/main (not the local checkout, which may be on a stale
+        feature branch — see R3/R7) and asserts it matches _CONDUCTOR_NIGHT_SCRIPTS,
+        so fixture staleness vs the real conductor repo is caught wherever this can
+        run (BRIX). Soft-skips (not fails) on network/fetch trouble — it verifies
+        fixture freshness, it does not gate the deploy."""
+        clone = "/srv/git/conductor"
+        try:
+            fetch = subprocess.run(
+                ["git", "-C", clone, "fetch", "origin", "main"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            pytest.skip(f"could not fetch origin/main from live conductor clone: {exc}")
+        if fetch.returncode != 0:
+            pytest.skip(f"git fetch origin main failed: {fetch.stderr!r}")
+
+        def source_for(mod):
+            r = subprocess.run(
+                ["git", "-C", clone, "show", f"origin/main:scripts/{mod}.py"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return r.stdout if r.returncode == 0 else None
+
+        yaml_result = subprocess.run(
+            ["git", "-C", clone, "show", "origin/main:scripts/night_producers.yaml"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if yaml_result.returncode != 0:
+            pytest.skip("could not read origin/main:scripts/night_producers.yaml")
+
+        producers = yaml.safe_load(yaml_result.stdout)
+        seed = {"night_plan", "night_coordinator"} | {
+            p["module"] for p in producers["producers"]
+        }
+        closure = _compute_import_closure(seed, source_for)
+        expected_files = {f"{mod}.py" for mod in closure} | {"night_producers.yaml"}
+        assert set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) == expected_files
 
     # --- R7: source-freshness gate ---
 

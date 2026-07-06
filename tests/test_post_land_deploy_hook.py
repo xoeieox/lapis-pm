@@ -1134,6 +1134,168 @@ class TestGardenerDeploy:
         )
 
 
+class TestCockpitDeploy:
+    """Tests for cockpit entry in _POST_LAND_PULL / _POST_LAND_RESTART_USER
+    (lapis-pm-deploy-pull-restart-cockpit-v0)."""
+
+    def test_cockpit_pull_path(self):
+        """cockpit pulls the single-tree PYTHONPATH-import serving clone."""
+        assert "cockpit" in pm_core._POST_LAND_PULL
+        assert pm_core._POST_LAND_PULL["cockpit"] == ["/srv/git/cockpit-working"]
+
+    def test_cockpit_restart_user_unit(self):
+        """cockpit.service is restarted via the --user (no-sudo) path."""
+        assert pm_core._POST_LAND_RESTART_USER["cockpit"] == ("cockpit.service",)
+
+    def test_cockpit_not_in_post_land_restart(self):
+        """cockpit is a --user unit, never the sudo/system path."""
+        assert "cockpit" not in pm_core._POST_LAND_RESTART
+
+    def test_cockpit_not_in_post_land_pull_critical(self):
+        """cockpit pull failure is LOW signal, not critical — must not be in CRITICAL set."""
+        assert "cockpit" not in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_cockpit_in_post_land_pull_low_signal(self):
+        """cockpit pull failure emits LOW-priority notification (advisory, self-announcing)."""
+        assert "cockpit" in pm_core._POST_LAND_PULL_LOW_SIGNAL
+
+    def test_cockpit_pull_and_restart_dispatch(self, capsys):
+        """Landing a cockpit PR with HEAD advancing issues exactly one git pull and
+        one `systemctl --user restart cockpit.service` call — no sudo call anywhere."""
+        pull_calls = []
+        sudo_calls = []
+        user_restart_calls = []
+        revparse_count = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "sudo":
+                sudo_calls.append(cmd)
+            elif cmd[0] == "systemctl" and "--user" in cmd and "restart" in cmd:
+                user_restart_calls.append(cmd)
+            return _make_completed_process(returncode=0, stdout="active")
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                    pm_core._post_land_deploy_hook("cockpit")
+
+        assert len(pull_calls) == 1
+        assert pull_calls[0] == [
+            "git", "-C", "/srv/git/cockpit-working", "pull", "--ff-only", "origin", "main"
+        ]
+        assert len(user_restart_calls) == 1
+        assert user_restart_calls[0] == ["systemctl", "--user", "restart", "cockpit.service"]
+        assert len(sudo_calls) == 0, "cockpit must never be restarted via sudo"
+
+    def test_cockpit_noop_on_unchanged_head(self, capsys):
+        """No-op pull (HEAD unchanged) must not issue a cockpit.service restart."""
+        user_restart_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="sameshasha")
+            if cmd[0] == "systemctl" and "--user" in cmd and "restart" in cmd:
+                user_restart_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                    pm_core._post_land_deploy_hook("cockpit")
+
+        assert len(user_restart_calls) == 0, "No restart when HEAD unchanged"
+
+    def test_cockpit_pull_failure_sends_low_priority_notify(self):
+        """A failed cockpit pull emits exactly one LOW-priority notification."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not fast-forward")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("cockpit")
+
+        assert len(notify_calls) == 1, "Expected exactly one notification on cockpit pull failure"
+        assert notify_calls[0]["priority"] == Priority.LOW, (
+            f"Expected Priority.LOW, got {notify_calls[0]['priority']}"
+        )
+        assert "cockpit" in notify_calls[0]["message"]
+        assert "/srv/git/cockpit-working" in notify_calls[0]["message"]
+
+    def test_cockpit_pull_failure_not_critical_channel(self):
+        """cockpit pull failure must NOT emit NORMAL or HIGH priority — LOW only."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            return _make_completed_process(returncode=1, stderr="not ff")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("cockpit")
+
+        assert all(p == Priority.LOW for p in notify_calls), (
+            "cockpit pull failure must only emit LOW priority — never NORMAL or HIGH"
+        )
+
+    def test_cockpit_pull_failure_does_not_raise(self):
+        """A failed cockpit pull must not raise — landing must still complete."""
+        def fake_run(cmd, **kwargs):
+            return _make_completed_process(returncode=1, stderr="diverged")
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+            pm_core._post_land_git_pull("cockpit")  # must not raise
+
+    def test_cockpit_restart_failure_does_not_raise(self, capsys):
+        """Non-zero rc from cockpit.service restart is logged to stderr, does not raise."""
+        revparse_count = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "systemctl" and "--user" in cmd and "restart" in cmd:
+                return _make_completed_process(returncode=1, stderr="unit failed")
+            return _make_completed_process(returncode=0, stdout="active")
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                    pm_core._post_land_deploy_hook("cockpit")  # must not raise
+
+        captured = capsys.readouterr()
+        assert "rc=1" in captured.err or "failed" in captured.err
+
+
 class TestMergeAndDeploy:
     """Tests for merge_and_deploy choicepoint."""
 

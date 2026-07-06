@@ -167,6 +167,13 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
 #    any is absent from this map). See spec §5 tripwire.
 _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
     "agents-core": ("doorman-server.service", "slot-server.service"),
+    # cockpit.service: Type=simple long-running uvicorn (PM/Ops console + vitals rail),
+    # binds 203.0.113.10:8409. Restart=on-failure is crash-only; it does not fire on a
+    # clean stop, which is the gap this closes (2026-07-05 outage: service inactive ~3h
+    # with fully current code underneath it). Restarts through the existing generic
+    # immediate-restart path (not the claude-queue-runner in-flight-deferral path —
+    # cockpit is not deferred).
+    "cockpit": ("cockpit.service",),
 }
 
 # Canonical deploy clone path for facets. Not pip-installed; the spec-review gate
@@ -230,6 +237,12 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # from a non-main/dirty source, so this liability cannot corrupt the runtime — it only
     # blocks delivery until remediated. See spec §Go-live step 1.
     "conductor":      ["/srv/git/conductor"],
+    # cockpit is a single-tree PYTHONPATH-import service (like synapse), not a split
+    # dev/deploy pair. cockpit.service is Type=simple, long-running --user unit; a pull
+    # alone leaves it serving stale code until restarted (see _POST_LAND_RESTART_USER).
+    # Pull failure -> LOW signal (advisory live console, not a silent load-bearing
+    # substrate like synapse/agents-core) — see _POST_LAND_PULL_LOW_SIGNAL below.
+    "cockpit":        ["/srv/git/cockpit-working"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -254,7 +267,11 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # failure mode (transient fetch-fail, dirty, off-main) — the generic LOW pull-fail
 # Pushover below is suppressed specifically for conductor to avoid a double-alert for
 # one root cause. conductor stays in this set for classification purposes only.
-_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener", "conductor"})
+# cockpit: advisory live/action console for Erah, not a silent substrate every session
+# depends on (contrast synapse/agents-core, which are CRITICAL). A stale or dead
+# cockpit is visible the moment Erah opens the UI — LOW keeps a pull failure
+# attributable without polluting the critical Pushover channel.
+_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener", "conductor", "cockpit"})
 
 # ---------------------------------------------------------------------------
 # conductor night-plan script closure (night-plan-conductor-deploy-sync-v0)

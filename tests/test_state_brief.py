@@ -17,7 +17,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 import pytest
 
-from lapis_pm import state_brief, brief
+from lapis_pm import state_brief, state_brief_prompts, brief
 
 
 class TestDegradedBriefTimeout:
@@ -134,6 +134,7 @@ class TestGenerateBriefWallClockBudget:
             patch("lapis_pm.state_brief._mem") as mock_mem,
         ):
             mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.return_value = []
 
             start = time.time()
             try:
@@ -159,6 +160,7 @@ class TestGenerateBriefWallClockBudget:
             patch("lapis_pm.state_brief._mem") as mock_mem,
         ):
             mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.return_value = []
 
             start = time.time()
             try:
@@ -184,6 +186,7 @@ class TestGenerateBriefWallClockBudget:
             patch("lapis_pm.state_brief._mem") as mock_mem,
         ):
             mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.return_value = []
 
             start = time.time()
             try:
@@ -197,3 +200,200 @@ class TestGenerateBriefWallClockBudget:
             elapsed = time.time() - start
 
         assert elapsed < 32, f"Live brief took {elapsed:.1f}s (budget: 30s + overhead)"
+
+
+class TestReadGardenerObservations:
+    """Tests for _read_gardener_observations()."""
+
+    def test_parses_critical_and_warning_bullets(self):
+        """Critical/Warning bullets are parsed with urgency label preserved."""
+        entry = {
+            "key": "gardener/derived/2026-07-05-0800",
+            "value": (
+                "# Gardener derived context — 2026-07-05T08:00:00Z\n\n"
+                "- [Critical] A systemic deadlock is confirmed.  (evidence: mem:foo, mem:bar)\n"
+                "- [Warning] Stale cursors detected.  (evidence: mem:baz)\n"
+            ),
+        }
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [
+                {"key": entry["key"]}
+            ]
+            mock_mem.return_value.get.return_value = entry
+
+            result = state_brief._read_gardener_observations()
+
+        assert result == [
+            "[Critical] A systemic deadlock is confirmed.",
+            "[Warning] Stale cursors detected.",
+        ]
+
+    def test_filters_narration_keys(self):
+        """narration-* keys are excluded from consideration, even if newer."""
+        narration_entry = {
+            "key": "gardener/derived/narration-2026-07-06-0900",
+            "value": "- [Critical] Should not appear.  (evidence: mem:x)",
+        }
+        real_entry = {
+            "key": "gardener/derived/2026-07-05-0800",
+            "value": "- [Warning] Should appear.  (evidence: mem:y)",
+        }
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [
+                {"key": narration_entry["key"]},
+                {"key": real_entry["key"]},
+            ]
+            mock_mem.return_value.get.return_value = real_entry
+
+            result = state_brief._read_gardener_observations()
+
+        assert result == ["[Warning] Should appear."]
+
+    def test_no_entries_returns_empty_list(self):
+        """No gardener/derived entries at all → []."""
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = []
+
+            result = state_brief._read_gardener_observations()
+
+        assert result == []
+
+    def test_only_narration_entries_returns_empty_list(self):
+        """If every entry is narration-*, result is []."""
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [
+                {"key": "gardener/derived/narration-2026-07-06-0900"}
+            ]
+
+            result = state_brief._read_gardener_observations()
+
+        assert result == []
+
+    def test_info_and_unclassified_are_skipped(self):
+        """Only Critical/Warning bullets are captured; other lines are ignored."""
+        entry = {
+            "key": "gardener/derived/2026-07-05-0800",
+            "value": (
+                "# Gardener derived context — 2026-07-05T08:00:00Z\n\n"
+                "- No Critical/Warning cross-cutting observations this pass.\n"
+                "- [Critical] Real one.  (evidence: mem:z)\n"
+            ),
+        }
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [{"key": entry["key"]}]
+            mock_mem.return_value.get.return_value = entry
+
+            result = state_brief._read_gardener_observations()
+
+        assert result == ["[Critical] Real one."]
+
+    def test_descending_key_sort_picks_latest(self):
+        """Multiple entries → the lexicographically-latest key is used."""
+        older = {"key": "gardener/derived/2026-07-01-0800"}
+        newer = {"key": "gardener/derived/2026-07-05-0800"}
+        newer_full = {**newer, "value": "- [Warning] Newest.  (evidence: mem:w)"}
+
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [older, newer]
+            mock_mem.return_value.get.return_value = newer_full
+
+            result = state_brief._read_gardener_observations()
+
+        mock_mem.return_value.get.assert_called_once_with(newer["key"])
+        assert result == ["[Warning] Newest."]
+
+    def test_read_buckets_degrades_on_mem_failure(self):
+        """_read_buckets() swallows exceptions from the gardener read and shows []."""
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = OSError("mem unreachable")
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        assert buckets[state_brief.B_GARDENER] == []
+
+
+class TestFormatBucketSectionsPeriod:
+    """Tests for period-conditional Gardener bucket exclusion."""
+
+    def _buckets(self):
+        return {
+            "Built": [],
+            "Notable ratifications": [],
+            "In flight": [],
+            "Captured — not yet built": [],
+            "Awaiting your call": [],
+            "Gardener Cross-Cutting Observations": ["[Critical] test observation"],
+        }
+
+    def test_daily_includes_gardener_section(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets(), "2026-07-06 08:00 PT", period="daily",
+        )
+        assert "Gardener Cross-Cutting Observations" in sections
+        assert "[Critical] test observation" in sections
+
+    def test_weekly_omits_gardener_section(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets(), "2026-06-29 08:00 PT", period="weekly",
+        )
+        assert "Gardener Cross-Cutting Observations" not in sections
+
+    def test_default_period_is_daily(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets(), "2026-07-06 08:00 PT",
+        )
+        assert "Gardener Cross-Cutting Observations" in sections
+
+    def test_build_daily_prompt_includes_gardener(self):
+        prompt = state_brief_prompts.build_daily_prompt(self._buckets(), "2026-07-06 08:00 PT")
+        assert "Gardener Cross-Cutting Observations" in prompt
+
+    def test_build_weekly_prompt_omits_gardener(self):
+        prompt = state_brief_prompts.build_weekly_prompt(self._buckets(), "2026-06-29 08:00 PT")
+        assert "Gardener Cross-Cutting Observations" not in prompt
+
+
+class TestWeeklyDryRunAndDegraded:
+    """Tests for weekly-period dry-run and degraded-fallback paths."""
+
+    def test_weekly_dry_run_omits_gardener_bucket(self):
+        """Weekly dry-run placeholder omits the Gardener section."""
+        buckets = {
+            "Built": [],
+            "Notable ratifications": [],
+            "In flight": [],
+            "Captured — not yet built": [],
+            "Awaiting your call": [],
+            "Gardener Cross-Cutting Observations": ["[Critical] should not appear"],
+        }
+        with patch.dict("os.environ", {"LAPIS_BRIEF_DRY_RUN": "1"}):
+            result = state_brief._generate_prose(
+                period="weekly",
+                buckets=buckets,
+                start_label="2026-06-29 08:00 PT",
+            )
+
+        assert "Gardener Cross-Cutting Observations" not in result
+        assert "should not appear" not in result
+
+    def test_weekly_degraded_fallback_omits_gardener_bucket(self):
+        """Weekly call_claude_cli failure degrades to a placeholder without Gardener."""
+        buckets = {
+            "Built": [],
+            "Notable ratifications": [],
+            "In flight": [],
+            "Captured — not yet built": [],
+            "Awaiting your call": [],
+            "Gardener Cross-Cutting Observations": ["[Warning] should not appear"],
+        }
+        with patch("agents_core.llm.call_claude_cli", return_value=None):
+            result = state_brief._generate_prose(
+                period="weekly",
+                buckets=buckets,
+                start_label="2026-06-29 08:00 PT",
+            )
+
+        assert "*(DEGRADED — StarHouse unreachable)*" in result
+        assert "Gardener Cross-Cutting Observations" not in result
+        assert "should not appear" not in result

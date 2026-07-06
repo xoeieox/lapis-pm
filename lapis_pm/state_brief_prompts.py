@@ -4,12 +4,15 @@ One template per cadence. The data-read layer formats bucket data into labelled
 sections before the LLM call; the template instructs the model to write prose
 under those headers exactly as given.
 
-Bucket ordering (load-bearing — all cadences):
+Bucket ordering (load-bearing — daily cadences: morning/afternoon/live):
   Built (since <start>)
   Notable ratifications (since <start>)
   In flight
   Captured — not yet built
   Awaiting your call
+  Gardener Cross-Cutting Observations
+
+Weekly briefs omit the Gardener bucket (see format_bucket_sections `period` arg).
 """
 
 from __future__ import annotations
@@ -20,13 +23,20 @@ BUCKET_ORDER = [
     "In flight",
     "Captured — not yet built",
     "Awaiting your call",
+    "Gardener Cross-Cutting Observations",
 ]
+
+_GARDENER_BUCKET = "Gardener Cross-Cutting Observations"
 
 DAILY_SYSTEM = """You are the Lapis PM state-brief narrator. Your job is to write
 clear, terse prose for Erah — the principal engineer — summarising the current
 state of in-flight Lapis work. You receive structured data already sorted into
 named buckets. Write prose under each bucket header as given. Do not add headers
-of your own and do not move items between headers."""
+of your own and do not move items between headers.
+
+For the Gardener Cross-Cutting Observations bucket, preserve the urgency labels
+([Critical], [Warning]) and evidence links exactly as given. These are systemic
+insights from Gardener's overnight synthesis — treat them as high-priority."""
 
 DAILY_TEMPLATE = """\
 Write a short prose paragraph under each header exactly as given below.
@@ -42,7 +52,9 @@ a weekly synthesis for Erah — the principal engineer — covering the trailing
 of Lapis work. You receive structured data already sorted into named buckets.
 Write prose under each bucket header as given. Do not add headers of your own and
 do not move items between headers. After the five buckets, write a "Weekly arc"
-section as instructed."""
+section as instructed.
+
+NOTE: Omit the Gardener Cross-Cutting Observations bucket entirely for weekly briefs."""
 
 WEEKLY_TEMPLATE = """\
 Write a short prose paragraph under each header exactly as given below.
@@ -60,8 +72,8 @@ and should be labelled "speculative" in your output).
 """
 
 
-def format_bucket_sections(buckets: dict[str, list[str]], start_label: str) -> str:
-    """Render the five standard buckets into labelled markdown sections.
+def format_bucket_sections(buckets: dict[str, list[str]], start_label: str, *, period: str = "daily") -> str:
+    """Render the standard buckets into labelled markdown sections.
 
     Args:
         buckets: mapping of bucket name → list of item strings.
@@ -69,9 +81,12 @@ def format_bucket_sections(buckets: dict[str, list[str]], start_label: str) -> s
             "(since <start>)" suffix — this function adds that suffix).
         start_label: human-readable time label, e.g. "2026-05-01 08:00 PT" or
             "2026-04-24 (7 days ago)".
+        period: "daily" or "weekly" — the Gardener bucket is omitted for weekly.
     """
     sections: list[str] = []
     for name in BUCKET_ORDER:
+        if name == _GARDENER_BUCKET and period == "weekly":
+            continue
         if name in ("Built", "Notable ratifications"):
             header = f"## {name} (since {start_label})"
         else:
@@ -88,12 +103,12 @@ def format_bucket_sections(buckets: dict[str, list[str]], start_label: str) -> s
 def build_daily_prompt(buckets: dict[str, list[str]], start_label: str) -> str:
     """Return the user-turn prompt for morning/afternoon/live briefs."""
     return DAILY_TEMPLATE.format(
-        bucket_sections=format_bucket_sections(buckets, start_label),
+        bucket_sections=format_bucket_sections(buckets, start_label, period="daily"),
     )
 
 
 def build_weekly_prompt(buckets: dict[str, list[str]], start_label: str) -> str:
     """Return the user-turn prompt for weekly briefs."""
     return WEEKLY_TEMPLATE.format(
-        bucket_sections=format_bucket_sections(buckets, start_label),
+        bucket_sections=format_bucket_sections(buckets, start_label, period="weekly"),
     )

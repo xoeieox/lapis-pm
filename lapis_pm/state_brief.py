@@ -7,12 +7,15 @@ latest-<period>.md symlinks.
 IMPORTANT: Do NOT import from lapis_pm.brief — that module is a different
 abstraction (PM authority-gate brief synthesiser) and must not be modified.
 
-Bucket ordering (all cadences):
+Bucket ordering (daily cadences — morning/afternoon/live):
   Built (since <start>)
   Notable ratifications (since <start>)
   In flight
   Captured — not yet built
   Awaiting your call
+  Gardener Cross-Cutting Observations
+
+Weekly briefs omit the Gardener bucket (see state_brief_prompts.py).
 
 Models:
   morning / afternoon / live → call_llm (qwen3.6-35b-a3b, local GPU)
@@ -49,6 +52,13 @@ B_RATIFICATIONS = "Notable ratifications"
 B_IN_FLIGHT = "In flight"
 B_CAPTURED = "Captured — not yet built"
 B_AWAITING = "Awaiting your call"
+B_GARDENER = "Gardener Cross-Cutting Observations"
+
+# Parses flat markdown bullets from gardener/writeback.py:derive_context output, e.g.
+# "- [Critical] <text>  (evidence: ...)". Info/Unclassified are filtered out upstream
+# and never appear in these mem entries.
+_GARDENER_BULLET_RE = re.compile(r'^- \[(Critical|Warning)\]\s+(.+?)(?:\s+\(evidence:.*\))?$')
+_GARDENER_DERIVED_PREFIX = "gardener/derived/"
 
 
 # ---------------------------------------------------------------------------
@@ -137,13 +147,63 @@ def _read_buckets(start_ts: datetime) -> dict[str, list[str]]:
             val = rec.get("value", "") if rec else ""
             awaiting_items.append(f"{brief_id}: {val[:120]}" if val else brief_id)
 
+    # --- Gardener cross-cutting observations: most recent gardener/derived entry ---
+    # Not time-windowed (unlike Built/Ratifications) — always shows the latest pass.
+    # Degrades to [] on any mem query failure so a Gardener outage never blocks the brief.
+    try:
+        gardener_items = _read_gardener_observations()
+    except Exception:
+        gardener_items = []
+
     return {
         B_BUILT: built_items,
         B_RATIFICATIONS: ratification_items,
         B_IN_FLIGHT: in_flight_items,
         B_CAPTURED: captured_items,
         B_AWAITING: awaiting_items,
+        B_GARDENER: gardener_items,
     }
+
+
+def _read_gardener_observations() -> list[str]:
+    """Read Critical and Warning observations from the most recent gardener/derived entry.
+
+    Reads gardener/derived/* mem entries (the structured digest gardener.writeback
+    produces), not the on-disk synthesis artifacts. Narration entries
+    (gardener/derived/narration-*) are excluded — see gardener/server.py:_is_narration_key —
+    since they hold prose, not the flat bullet digest this parses.
+
+    Returns [] if no gardener entries exist, all are narration, or parsing fails.
+    """
+    mem = _mem()
+    entries = mem.list_by_prefix(_GARDENER_DERIVED_PREFIX, limit=500)
+    entries = [
+        e for e in entries
+        if not e.get("key", "").removeprefix(_GARDENER_DERIVED_PREFIX).startswith("narration-")
+    ]
+    if not entries:
+        return []
+
+    # Keys are ISO-ish timestamp slugs; descending sort gets the newest entry.
+    latest = sorted(entries, key=lambda e: e.get("key", ""), reverse=True)[0]
+    rec = mem.get(latest["key"])
+    if not rec:
+        return []
+
+    content = rec.get("value") or rec.get("content") or ""
+    if not content:
+        return []
+
+    observations: list[str] = []
+    for line in content.split("\n"):
+        match = _GARDENER_BULLET_RE.match(line.strip())
+        if not match:
+            continue
+        urgency, text = match.group(1), match.group(2).strip()
+        if text:
+            observations.append(f"[{urgency}] {text[:200]}")
+
+    return observations[:10]
 
 
 def _arc_docs_since(start_ts: datetime) -> list[str]:
@@ -182,7 +242,7 @@ def _generate_prose(period: str, buckets: dict[str, list[str]], start_label: str
     )
 
     if os.environ.get("LAPIS_BRIEF_DRY_RUN") == "1":
-        return _dry_run_placeholder(buckets, start_label)
+        return _dry_run_placeholder(buckets, start_label, period=period)
 
     if period == "weekly":
         prompt = build_weekly_prompt(buckets, start_label)
@@ -200,7 +260,10 @@ def _generate_prose(period: str, buckets: dict[str, list[str]], start_label: str
 
     if not result:
         # Fallback: placeholder so the file is always structurally valid
-        return _dry_run_placeholder(buckets, start_label, tag="*(DEGRADED — StarHouse unreachable)*")
+        return _dry_run_placeholder(
+            buckets, start_label, period=period,
+            tag="*(DEGRADED — StarHouse unreachable)*",
+        )
 
     return result
 
@@ -242,11 +305,12 @@ def _call_llm_with_timeout(prompt: str, system: str, timeout_sec: int = 30) -> s
 def _dry_run_placeholder(
     buckets: dict[str, list[str]],
     start_label: str,
+    period: str = "daily",
     tag: str = "(dry run — bucket headings included)",
 ) -> str:
-    """Generate a structurally complete placeholder with all five bucket headings."""
+    """Generate a structurally complete placeholder with all bucket headings for `period`."""
     from .state_brief_prompts import format_bucket_sections
-    sections = format_bucket_sections(buckets, start_label)
+    sections = format_bucket_sections(buckets, start_label, period=period)
     return f"{tag}\n\n{sections}\n"
 
 

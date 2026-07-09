@@ -77,7 +77,7 @@ def _canned_agent(final_diff, last_test_outcome=None):
     """Build a call_gw_agent stub that returns a canned (fixer_result, transcript)
     without any network call. Signature matches code_oracle_run's kwarg-only call."""
 
-    def _stub(*, prompt, system, cwd, writeable, backend_url, timeout, max_steps, work_id, on_wake_fail):
+    def _stub(*, prompt, system, cwd, writeable, backend_url, acquire_lease, timeout, max_steps, work_id, on_wake_fail):
         fixer_result = {
             "final_diff": final_diff,
             "last_test_outcome": last_test_outcome,

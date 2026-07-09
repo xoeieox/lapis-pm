@@ -87,6 +87,7 @@ def run_code_oracle_experiment(
                 cwd=str(agent_wt),
                 writeable=True,
                 backend_url=agent_backend_url,
+                acquire_lease=False,
                 timeout=timeout_s,
                 max_steps=max_steps,
                 work_id=run_id,

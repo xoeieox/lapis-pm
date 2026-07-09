@@ -1062,11 +1062,21 @@ def classify_checker_class_cocommitted(
     return "BLIND"
 
 
+# Reproduce pointer: code-appended (never LLM-generated) so it is deterministic in
+# mock mode and leak-proof in real mode. {test_files} is the scoped test file PATHS
+# space-joined - never node IDs or golden_test_ids.
+REPRODUCE_POINTER_TMPL = (
+    "To observe the failure, run: pytest {test_files}. "
+    "Investigate the cause, fix it, and confirm the tests pass."
+)
+
+
 def launder_intent(
     task_intent_raw: str,
     mock_mode: bool = False,
+    scoped_test_files: Optional[list[str]] = None,
 ) -> tuple[str, Literal["gw", "fallback", "mock"]]:
-    """Rewrite task intent as a from-symptom description with solution-naming stripped.
+    """Rewrite task intent as a from-symptom, investigate-diagnose-fix-verify description.
 
     Real mode: calls call_operator('gravitywell', ...) — zero paid, local 122B.
     Mock mode (AC2 testing / CI): returns a stub paraphrase without calling GW.
@@ -1076,13 +1086,23 @@ def launder_intent(
 
     The harness ALWAYS feeds task_intent_paraphrased (never raw commit body) to the
     fixer model. This code-path must exist even when the call is mocked (AC2).
+
+    When scoped_test_files is provided, a reproduce pointer naming the test FILE(s)
+    (never node IDs or the golden diff) is code-appended in every mode - it is never
+    produced by the LLM, so it stays deterministic and leak-proof.
     """
+    reproduce_pointer = ""
+    if scoped_test_files:
+        reproduce_pointer = "\n\n" + REPRODUCE_POINTER_TMPL.format(
+            test_files=" ".join(scoped_test_files)
+        )
+
     if mock_mode:
         # MOCK: strip Co-Authored-By trailers and obvious solution-naming; never return raw verbatim
         cleaned = re.sub(r"\nCo-Authored-By:.*", "", task_intent_raw, flags=re.DOTALL).strip()
         cleaned = re.sub(r"PR #\d+", "", cleaned).strip()
         paraphrased = f"[Symptom] {cleaned[:200]}" if cleaned else "[Symptom: unspecified]"
-        return paraphrased, "mock"
+        return paraphrased + reproduce_pointer, "mock"
 
     try:
         from agents_core.llm import call_operator
@@ -1091,18 +1111,20 @@ def launder_intent(
             "Rewrite the following task description as a from-symptom specification.\n"
             "Remove ALL solution-naming (e.g. 'change X to Y', 'add import Z', 'set path to ...', "
             "'fix the function').\n"
-            "Describe only the observable symptom or failing behavior in 1-2 sentences.\n\n"
+            "Describe only the observable symptom or failing behavior in 1-2 sentences, framed "
+            "as something to investigate and diagnose and fix and verify - never a directive "
+            "naming the solution.\n\n"
             f"Original:\n{task_intent_raw}\n\n"
             "Rewritten symptom description (no solution-naming):"
         )
         result = call_operator("gravitywell", prompt)
         paraphrased = result.strip() if result else task_intent_raw
-        return paraphrased, "gw"
+        return paraphrased + reproduce_pointer, "gw"
     except Exception as exc:
         logger.warning("Intent laundering failed: %s; using cleaned raw", exc)
         cleaned = re.sub(r"\nCo-Authored-By:.*", "", task_intent_raw, flags=re.DOTALL).strip()
         paraphrased = cleaned[:500] if cleaned else task_intent_raw
-        return paraphrased, "fallback"
+        return paraphrased + reproduce_pointer, "fallback"
 
 
 def check_laundering_quality(
@@ -1498,6 +1520,267 @@ def build_corpus(
     )
 
     return corpus, metadata
+
+
+# ---------------------------------------------------------------------------
+# Single-commit harvest (symptom-first-v0) - CORE, reuses build_corpus's helpers
+# ---------------------------------------------------------------------------
+
+
+class TargetShaNotResolvedError(RuntimeError):
+    """--target-sha could not be resolved via `git rev-parse '<sha>^'` (invalid/nonexistent sha)."""
+
+    def __init__(self, sha: str, repo_label: str):
+        self.sha = sha
+        self.repo_label = repo_label
+        super().__init__(
+            f"--target-sha '{sha}' could not be resolved in repo '{repo_label}' "
+            f"(git rev-parse '{sha}^' failed); pass a full commit SHA that exists "
+            f"on the current branch"
+        )
+
+
+class NonDiscriminatesHarvestError(RuntimeError):
+    """A real (non-mock) --target-sha harvest produced a non-DISCRIMINATES fixture."""
+
+    def __init__(self, sha: str, checker_class: str):
+        self.sha = sha
+        self.checker_class = checker_class
+        super().__init__(
+            f"harvested fixture for {sha} is {checker_class}, not DISCRIMINATES; a single "
+            f"targeted harvest must be a usable A/B discriminator - refusing to save. Pick a "
+            f"commit with a co-committed test that fails at the parent and passes at the fix."
+        )
+
+
+def _assert_no_intent_leak(
+    paraphrased: str,
+    golden_test_ids: list[str],
+    golden_test_diff: str,
+    golden_source_diff: str,
+    sha: str,
+) -> None:
+    """Leak guard on the harvested task_intent_paraphrased (mirrors generate_candidates'
+    leak guard at :1548-1561). Raises loudly rather than emitting a contaminated fixture."""
+    if golden_test_diff and golden_test_diff.strip() and golden_test_diff.strip() in paraphrased:
+        raise RuntimeError(
+            f"Leak guard violated: golden_test_diff content found in task_intent_paraphrased "
+            f"for {sha[:8]}. The harvested task must never reveal the oracle's test."
+        )
+    if golden_source_diff and golden_source_diff.strip() and golden_source_diff.strip() in paraphrased:
+        raise RuntimeError(
+            f"Leak guard violated: golden_source_diff content found in task_intent_paraphrased "
+            f"for {sha[:8]}. The harvested task must never reveal the fix."
+        )
+    for tid in golden_test_ids:
+        if tid and tid in paraphrased:
+            raise RuntimeError(
+                f"Leak guard violated: golden_test_id {tid!r} found in task_intent_paraphrased "
+                f"for {sha[:8]}. Oracle test node IDs must never be shown to the agent."
+            )
+
+
+def harvest_one(
+    sha: str,
+    repo_path: Path,
+    repo_label: str,
+    *,
+    skip_base_runs: bool = False,
+    mock_launder: bool = False,
+) -> Optional[FixtureRecord]:
+    """Harvest exactly one commit into a FixtureRecord.
+
+    Reuses build_corpus's per-commit derivation sub-functions and applies the same
+    structural filters (inline, byte-identical constants - not a shared helper) for
+    this single sha, chosen explicitly rather than discovered by the '^fix' subject
+    scan. Return semantics mirror build_corpus exactly: DISCRIMINATES, BLIND, and
+    UNTESTED are all valid non-None returns; None is returned ONLY on a structural
+    filter exclusion or a fail-first flakiness exclusion - never on checker_class alone.
+
+    Does NOT do build_corpus's batch-only post-processing (cross-commit dedup,
+    per-tier blind_holdout assignment) - those are meaningless for a single fixture.
+
+    Raises TargetShaNotResolvedError if `git rev-parse '{sha}^'` fails (invalid sha).
+    """
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-harvest")
+
+    # Read-only metadata lookup - identical to build_corpus's parent-sha resolution
+    # (:1311-1313). No git worktree add / checkout / index write; never mutates repo_path.
+    parent_result = subprocess.run(
+        ["git", "rev-parse", f"{sha}^"],
+        cwd=repo_path, capture_output=True, text=True, timeout=5,
+    )
+    parent_sha = parent_result.stdout.strip()
+    if parent_result.returncode != 0 or not parent_sha:
+        raise TargetShaNotResolvedError(sha, repo_label)
+
+    cb_result = subprocess.run(
+        ["git", "show", "--format=%B", "--no-patch", sha],
+        cwd=repo_path, capture_output=True, text=True, timeout=10,
+    )
+    commit_body = cb_result.stdout.strip()
+
+    ns_result = subprocess.run(
+        ["git", "show", "--numstat", "--format=", sha],
+        cwd=repo_path, capture_output=True, text=True, timeout=10,
+    )
+    changed_files: list[tuple[str, int]] = []
+    total_changed = 0
+    for fline in ns_result.stdout.strip().split("\n"):
+        if not fline.strip():
+            continue
+        fp = fline.split()
+        if len(fp) >= 3:
+            try:
+                chg = int(fp[0]) + int(fp[1])
+                changed_files.append((fp[2], chg))
+                total_changed += chg
+            except ValueError:
+                pass
+
+    # Structural filters - byte-identical to build_corpus's inline checks (:1272-1289).
+    if not changed_files:
+        return None
+    if len(changed_files) > 2:
+        return None
+    if len(changed_files) == 2 and not any("test" in f[0] for f in changed_files):
+        return None
+    if total_changed > 80:
+        return None
+
+    is_test_only = all(
+        "test" in f[0] or f[0].endswith("_test.py")
+        for f in changed_files
+    )
+    if is_test_only:
+        return None
+
+    if total_changed <= 2:
+        return None
+
+    pr_number: Optional[int] = None
+    pr_match = re.search(r"(?:PR #|pull/|#)(\d+)", commit_body)
+    if pr_match:
+        pr_number = int(pr_match.group(1))
+
+    source_files = [f for f in changed_files if "test" not in f[0]]
+    if not source_files:
+        return None
+    path = source_files[0][0]
+
+    pre_result = subprocess.run(
+        ["git", "show", f"{parent_sha}:{path}"],
+        cwd=repo_path, capture_output=True, text=True, timeout=10,
+    )
+    pre_state = pre_result.stdout if pre_result.returncode == 0 else ""
+
+    fd_result = subprocess.run(
+        ["git", "show", "--format=", sha],
+        cwd=repo_path, capture_output=True, text=True, timeout=10,
+    )
+    full_diff = fd_result.stdout
+    golden_source_diff, golden_test_diff = split_diff_by_type(full_diff)
+    golden_diff = full_diff
+    golden_test_ids = extract_test_ids_from_diff(golden_test_diff)
+
+    pre_state_slice = slice_pre_state_from_diff(pre_state, golden_source_diff or golden_diff)
+
+    if len(changed_files) == 2 or total_changed > 30:
+        tier: Literal["T1", "T2", "T3"] = "T2"
+    else:
+        tier = "T1"
+    non_test_files = [f for f in changed_files if "test" not in f[0]]
+    if len(non_test_files) > 1:
+        tier = "T3"
+
+    signals = _compute_difficulty_signals(golden_source_diff or golden_diff, pre_state)
+
+    task_intent_raw = commit_body
+    intent_source: Literal["commit-body", "reviewer-comment"] = "commit-body"
+    is_reviewer_cycle = False
+
+    scoped_test_files = find_scoped_test_files(repo_path, path)
+
+    base_stable_fail_set: list[str] = []
+    base_flaky_set: list[str] = []
+    target_test_files: list[str] = []
+    flaky_excluded = 0
+    fail_first_confirmed = False
+    ff_is_flaky = False
+
+    if not skip_base_runs:
+        # dedicated_clone guarantees the shared working tree (repo_path) is never
+        # mutated by the git-worktree-add calls inside run_base_tests_n_times /
+        # verify_fail_first - both are always pointed at clone_path, never repo_path.
+        with dedicated_clone(repo_path, run_id) as clone_path:
+            if scoped_test_files:
+                try:
+                    (
+                        base_stable_fail_set,
+                        base_flaky_set,
+                        target_test_files,
+                    ) = run_base_tests_n_times(
+                        clone_path, parent_sha, sha, scoped_test_files, n=FLAKE_RUN_COUNT,
+                    )
+                    flaky_excluded = len(base_flaky_set)
+                except Exception as exc:
+                    logger.warning("Base runs failed for %s: %s", sha[:8], exc)
+
+            if golden_test_diff and golden_test_ids:
+                try:
+                    ff_confirmed, ff_sanity, ff_is_flaky = verify_fail_first(
+                        clone_path, parent_sha, golden_test_diff, golden_source_diff,
+                        golden_test_ids, n=FLAKE_RUN_COUNT,
+                    )
+                    fail_first_confirmed = ff_confirmed and ff_sanity
+                except Exception as exc:
+                    logger.warning("Fail-first verification failed for %s: %s", sha[:8], exc)
+
+    if ff_is_flaky:
+        logger.warning("Fixture %s has flaky golden tests - quarantining (AC-O2)", sha[:8])
+        return None
+
+    checker_class = classify_checker_class_cocommitted(golden_test_diff, fail_first_confirmed)
+
+    task_intent_paraphrased, _launder_status = launder_intent(
+        task_intent_raw, mock_mode=mock_launder, scoped_test_files=scoped_test_files,
+    )
+
+    _assert_no_intent_leak(
+        task_intent_paraphrased, golden_test_ids, golden_test_diff, golden_source_diff, sha,
+    )
+
+    return FixtureRecord(
+        repo=repo_label,
+        sha=sha,
+        parent_sha=parent_sha,
+        pr_number=pr_number,
+        path=path,
+        file_loc=f"line 1-{len(pre_state.splitlines())}",
+        changed_lines=total_changed,
+        tier=tier,
+        golden_diff_cyclomatic_delta=signals["golden_diff_cyclomatic_delta"],
+        distinct_symbols_touched=signals["distinct_symbols_touched"],
+        is_concurrency_code=signals["is_concurrency_code"],
+        task_intent_raw=task_intent_raw,
+        task_intent_paraphrased=task_intent_paraphrased,
+        intent_source=intent_source,
+        pre_state_slice=pre_state_slice,
+        golden_diff=golden_diff,
+        golden_source_diff=golden_source_diff,
+        golden_test_diff=golden_test_diff,
+        golden_test_ids=golden_test_ids,
+        fail_first_confirmed=fail_first_confirmed,
+        scoped_test_files=scoped_test_files,
+        base_stable_fail_set=base_stable_fail_set,
+        base_flaky_set=base_flaky_set,
+        target_test_files=target_test_files,
+        checker_class=checker_class,
+        is_reviewer_cycle=is_reviewer_cycle,
+        is_test_only=False,
+        blind_holdout=False,
+        flaky_excluded_count=flaky_excluded,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1925,11 +2208,17 @@ def run_eval(
     phase: Literal["build-corpus", "run", "report"] = "run",
     run_id: Optional[str] = None,
     mock_mode: bool = False,
+    target_sha: Optional[str] = None,
+    repo_only: Optional[str] = None,
 ) -> Optional[EvalResult]:
     """Main harness entry point.
 
     CORE phases (this bind): build-corpus.
     DEFERRED phases (follow-on leg): run, report.
+
+    target_sha (build-corpus only): harvest exactly this one commit via harvest_one
+    instead of the full build_corpus sweep, and save_corpus just that one fixture.
+    repo_only selects which repo to harvest it from (default "lapis-pm").
     """
     if run_id is None:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -1950,6 +2239,36 @@ def run_eval(
                         "raw-body (contaminated) intent. Wake GW and run `gw-serve big`, confirm "
                         "doorman /status serving:true, then re-run build-corpus."
                     )
+
+            if target_sha is not None:
+                repo_label = repo_only or "lapis-pm"
+                if repo_label == "lapis-pm":
+                    repo_path = LAPIS_PM_REPO
+                elif repo_label == "conductor":
+                    repo_path = CONDUCTOR_REPO
+                else:
+                    raise ValueError(
+                        f"--repo-only {repo_label!r} is not recognized; expected 'lapis-pm' or 'conductor'"
+                    )
+
+                fixture = harvest_one(
+                    target_sha, repo_path, repo_label,
+                    skip_base_runs=mock_mode, mock_launder=mock_mode,
+                )
+                if fixture is None:
+                    raise RuntimeError(
+                        f"harvest_one excluded {target_sha} in {repo_label}: structural filter "
+                        f"or fail-first flakiness quarantine (see logs above)"
+                    )
+                if not mock_mode and fixture.checker_class != "DISCRIMINATES":
+                    raise NonDiscriminatesHarvestError(target_sha, fixture.checker_class)
+
+                save_corpus([fixture])
+                logger.info(
+                    "Harvested single fixture: %s-%s (%s)",
+                    fixture.repo, fixture.sha[:8], fixture.checker_class,
+                )
+                return None
 
             corpus, metadata = build_corpus(launder_mock_mode=mock_mode)
 

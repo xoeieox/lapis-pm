@@ -38,7 +38,7 @@ from agents_core.shared_deliberation.orchestrator import (
     init_facets_semaphore,
 )
 from agents_core.shared_deliberation.envelope import DeliberationRequest
-from agents_core.llm import swarm_serving
+from agents_core.llm import swarm_model, swarm_serving
 from agents_core.room_paths import room_path, room_str
 
 
@@ -482,21 +482,29 @@ def _dispatch_spec_reviewer(
     )
 
 
-def _check_doorman_heartbeat(doorman_host: str = "127.0.0.1", doorman_port: int = 8407) -> bool:
-    """Check if doorman is reachable via a fast liveness probe.
+def _gw_slot2_url() -> str | None:
+    """Resolve Slot-2's base URL: GW_SLOT2_URL env if set, else GW_URL's host with
+    the port swapped to GW_SLOT2_PORT (default 8082). Mirrors the derivation
+    pattern in agents_core.doorman_server._NodeState._slot2_url() — that's an
+    instance method and can't be imported directly, so the ~4-line pattern is
+    replicated here rather than hardcoding a second Tailscale IP.
 
-    Returns True if doorman responds; False if unreachable or timeout.
-    Uses a 2-second timeout for the probe.
+    Returns None when GW_URL has no parseable hostname — callers must treat
+    that as "Slot-2 unresolved" and skip gracefully rather than build a
+    malformed URL.
     """
-    try:
-        import requests as _requests
-        response = _requests.get(
-            f"http://{doorman_host}:{doorman_port}/healthz",
-            timeout=2.0,
-        )
-        return response.status_code == 200
-    except Exception:
-        return False
+    override = os.environ.get("GW_SLOT2_URL")
+    if override:
+        return override
+
+    gw_url = os.environ.get("GW_URL", "http://203.0.113.11:8081")
+    slot2_port = os.environ.get("GW_SLOT2_PORT", "8082")
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(gw_url)
+    if not parts.hostname:
+        return None
+    netloc = f"{parts.hostname}:{slot2_port}"
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
 def _dispatch_gw_reviewer(
@@ -507,7 +515,10 @@ def _dispatch_gw_reviewer(
     run_id: str,
     gw_principal: str | None = None,
 ) -> tuple[str | None, list[dict], float]:
-    """Dispatch and run the GW reference reviewer synchronously.
+    """Dispatch and run the GW reference reviewer synchronously against Slot-2
+    Devstral (:8082), lease-free — a distinct-model second opinion that runs
+    concurrently with the 27B Facets/Council voicing on :8081 at zero lease
+    contention.
 
     Returns (text, transcript, elapsed_s) where text is the verdict string (or None
     if GW did not run), transcript is the list of tool calls, and elapsed_s is the
@@ -523,14 +534,37 @@ def _dispatch_gw_reviewer(
         elapsed = time.time() - start_time
         return verdict, [], elapsed
 
-    # Doorman pre-flight heartbeat
-    if not _check_doorman_heartbeat():
+    gw_slot2_url = _gw_slot2_url()
+    if gw_slot2_url is None:
         elapsed = time.time() - start_time
         print(
-            f"[spec-review:gw-reviewer] doorman unreachable — skipping GW leg",
+            f"[spec-review:gw-reviewer] GW_URL has no parseable hostname — "
+            f"Slot-2 unresolved, skipping GW leg",
             file=sys.stderr,
         )
         return None, [], elapsed
+
+    # Single bounded (4s) probe: doubles as the readiness gate AND the
+    # provenance source (the served model), replacing the doorman-heartbeat
+    # pre-check (irrelevant to a lease-free Slot-2 consumer). None -> not
+    # serving -> skip; a model string -> up -> run, and that string IS the
+    # provenance. Logged, not hard-matched (Slot-2 may advertise either
+    # gravitywell-devstral or the gravitywell-slot2 alias).
+    served_model = swarm_model(gw_slot2_url)
+    if served_model is None:
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] GW reviewer did not run: Slot-2 not serving "
+            f"(url={gw_slot2_url})",
+            file=sys.stderr,
+        )
+        return None, [], elapsed
+
+    print(
+        f"[spec-review:gw-reviewer-provenance] endpoint={gw_slot2_url} "
+        f"served_model={served_model}",
+        file=sys.stderr,
+    )
 
     try:
         from agents_core.gw_agent import call_gw_agent, DEFAULT_READONLY_TOOLS
@@ -564,6 +598,8 @@ def _dispatch_gw_reviewer(
             work_id=run_id,
             timeout=300,
             principal=gw_principal,
+            backend_url=gw_slot2_url,
+            acquire_lease=False,
         )
         elapsed = time.time() - start_time
         if text is not None:

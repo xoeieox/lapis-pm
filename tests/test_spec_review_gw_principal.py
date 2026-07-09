@@ -156,7 +156,7 @@ def test_dispatch_gw_reviewer_passes_principal_to_call_gw_agent():
     mock_gw_module.call_gw_agent = mock_call_gw
     mock_gw_module.DEFAULT_READONLY_TOOLS = []
 
-    with patch("lapis_pm.spec_review._check_doorman_heartbeat", return_value=True):
+    with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
         with patch.dict(sys.modules, {
             "agents_core.gw_agent": mock_gw_module,
         }):
@@ -183,7 +183,7 @@ def test_dispatch_gw_reviewer_none_principal_is_forwarded():
     mock_gw_module.call_gw_agent = mock_call_gw
     mock_gw_module.DEFAULT_READONLY_TOOLS = []
 
-    with patch("lapis_pm.spec_review._check_doorman_heartbeat", return_value=True):
+    with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
         with patch.dict(sys.modules, {"agents_core.gw_agent": mock_gw_module}):
             _dispatch_gw_reviewer(
                 spec_text="spec",

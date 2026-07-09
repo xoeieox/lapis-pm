@@ -4,7 +4,7 @@ Tests the additive, non-steering GW reference leg alongside Sonnet:
 - Stub mechanism (GW_REVIEW_STUB env var)
 - Non-steering property (recommendation identical with/without GW leg)
 - Divergence record shape (agree, gw_ran, gw_transcript_ref)
-- gw_ran=False path (doorman unreachable, timeout)
+- gw_ran=False path (Slot-2 not serving, unparseable GW_URL)
 - Return shape regression (text is not None check)
 """
 from __future__ import annotations
@@ -19,58 +19,111 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lapis_pm.spec_review import (
-    _check_doorman_heartbeat,
     _combined_recommendation,
     _dispatch_gw_reviewer,
+    _gw_slot2_url,
     SpecReviewBrief,
 )
 
 
 # ---------------------------------------------------------------------------
-# Doorman heartbeat
+# Slot-2 URL derivation
 # ---------------------------------------------------------------------------
 
-def test_doorman_heartbeat_reachable():
-    """_check_doorman_heartbeat returns True when doorman responds 200."""
-    mock_response = MagicMock()
-    mock_response.status_code = 200
+def test_gw_slot2_url_default_derived_from_default_gw_url():
+    """With no env overrides, GW_SLOT2_URL derives to the default GW_URL host on :8082."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        os.environ.pop("GW_URL", None)
+        os.environ.pop("GW_SLOT2_PORT", None)
+        result = _gw_slot2_url()
 
-    with patch("requests.get", return_value=mock_response):
-        result = _check_doorman_heartbeat()
-        assert result is True
-
-
-def test_doorman_heartbeat_unreachable():
-    """_check_doorman_heartbeat returns False on network error."""
-    with patch("requests.get", side_effect=Exception("connection refused")):
-        result = _check_doorman_heartbeat()
-        assert result is False
+    assert result == "http://203.0.113.11:8082"
 
 
-def test_doorman_heartbeat_non_200():
-    """_check_doorman_heartbeat returns False on non-200 status."""
-    mock_response = MagicMock()
-    mock_response.status_code = 503
+def test_gw_slot2_url_derived_from_non_default_gw_url():
+    """GW_SLOT2_URL derives from a non-default GW_URL — same host, port swapped to 8082."""
+    with patch.dict(os.environ, {"GW_URL": "http://10.0.0.5:9090"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        os.environ.pop("GW_SLOT2_PORT", None)
+        result = _gw_slot2_url()
 
-    with patch("requests.get", return_value=mock_response):
-        result = _check_doorman_heartbeat()
-        assert result is False
+    assert result == "http://10.0.0.5:8082"
 
 
-def test_doorman_probe_target_regression():
-    """_check_doorman_heartbeat probes http://127.0.0.1:8407/healthz (not 203.0.113.10 or /health)."""
-    mock_response = MagicMock()
-    mock_response.status_code = 200
+def test_gw_slot2_url_explicit_env_override():
+    """An explicit GW_SLOT2_URL env var is used verbatim, no derivation."""
+    with patch.dict(os.environ, {"GW_SLOT2_URL": "http://elsewhere:9999"}, clear=False):
+        result = _gw_slot2_url()
 
-    with patch("requests.get", return_value=mock_response) as mock_get:
-        result = _check_doorman_heartbeat()
+    assert result == "http://elsewhere:9999"
 
-    # Verify the correct URL was called
-    mock_get.assert_called_once_with(
-        "http://127.0.0.1:8407/healthz",
-        timeout=2.0,
-    )
-    assert result is True
+
+def test_gw_slot2_url_unparseable_gw_url_returns_none():
+    """An unparseable GW_URL (no hostname) resolves Slot-2 as None, not a malformed URL."""
+    with patch.dict(os.environ, {"GW_URL": "not-a-url"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        result = _gw_slot2_url()
+
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Lease-free Slot-2 dispatch + provenance
+# ---------------------------------------------------------------------------
+
+def test_gw_slot2_serving_runs_lease_free_against_slot2():
+    """swarm_model(GW_SLOT2_URL) returning a Devstral id -> reviewer runs;
+    call_gw_agent is called with backend_url=GW_SLOT2_URL and acquire_lease=False."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_URL": "http://10.0.0.5:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral") as mock_sm:
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    mock_sm.assert_called_once_with("http://10.0.0.5:8082")
+    mock_call_gw.assert_called_once()
+    kwargs = mock_call_gw.call_args.kwargs
+    assert kwargs.get("backend_url") == "http://10.0.0.5:8082"
+    assert kwargs.get("acquire_lease") is False
+    assert text == "clean"
+
+
+def test_gw_slot2_provenance_logged_on_successful_run(capsys):
+    """A provenance log line naming :8082 and the served model is emitted on a
+    successful run, sourced from the same swarm_model call (no extra network call)."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    captured = capsys.readouterr()
+    assert "gw-reviewer-provenance" in captured.err
+    assert "203.0.113.11:8082" in captured.err
+    assert "gravitywell-devstral" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -305,26 +358,34 @@ def test_gw_ran_false_transcript_ref_empty():
 # gw_ran=False paths
 # ---------------------------------------------------------------------------
 
-def test_gw_doorman_unreachable_returns_none():
-    """When doorman is unreachable, _dispatch_gw_reviewer returns (None, [], elapsed)."""
-    with patch("lapis_pm.spec_review._check_doorman_heartbeat", return_value=False):
-        text, transcript, elapsed = _dispatch_gw_reviewer(
-            spec_text="spec",
-            synth_target_id="tid",
-            parsed_target_id="id",
-            repo="repo",
-            run_id="run",
-        )
+def test_gw_slot2_not_serving_returns_none():
+    """When swarm_model(GW_SLOT2_URL) returns None (Slot-2 not serving), _dispatch_gw_reviewer
+    returns (None, [], elapsed) and never calls call_gw_agent."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch("lapis_pm.spec_review.swarm_model", return_value=None):
+        with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+            text, transcript, elapsed = _dispatch_gw_reviewer(
+                spec_text="spec",
+                synth_target_id="tid",
+                parsed_target_id="id",
+                repo="repo",
+                run_id="run",
+            )
 
     assert text is None
     assert transcript == []
     assert elapsed >= 0
+    mock_call_gw.assert_not_called()
 
 
 def test_gw_agents_core_import_failure_returns_none():
     """When agents_core import fails, _dispatch_gw_reviewer returns (None, [], elapsed)."""
     # Patch at the import site inside _dispatch_gw_reviewer
-    with patch("lapis_pm.spec_review._check_doorman_heartbeat", return_value=True):
+    with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
         with patch.dict("sys.modules", {"agents_core": None, "agents_core.gw_agent": None}):
             text, transcript, elapsed = _dispatch_gw_reviewer(
                 spec_text="spec",
@@ -383,9 +444,9 @@ def test_tuple_none_first_element_is_truthy():
     assert text is None  # CORRECT check
 
 
-def test_doorman_unreachable_returns_none_not_empty_tuple():
-    """When doorman is unreachable, gw_text is None, not an empty tuple."""
-    with patch("lapis_pm.spec_review._check_doorman_heartbeat", return_value=False):
+def test_slot2_not_serving_returns_none_not_empty_tuple():
+    """When Slot-2 is not serving, gw_text is None, not an empty tuple."""
+    with patch("lapis_pm.spec_review.swarm_model", return_value=None):
         gw_text, gw_transcript, gw_elapsed = _dispatch_gw_reviewer(
             spec_text="spec",
             synth_target_id="tid",

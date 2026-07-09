@@ -1596,9 +1596,27 @@ def cmd_batched_fixer_eval(args) -> int:
     phase = args.phase
     run_id = args.run_id
     mock_mode = args.mock
+    target_sha = getattr(args, "target_sha", None)
+    repo_only = getattr(args, "repo_only", None)
 
     try:
-        result = bfe.run_eval(phase=phase, run_id=run_id, mock_mode=mock_mode)
+        result = bfe.run_eval(
+            phase=phase, run_id=run_id, mock_mode=mock_mode,
+            target_sha=target_sha, repo_only=repo_only,
+        )
+    except bfe.TargetShaNotResolvedError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except bfe.NonDiscriminatesHarvestError as e:
+        print(f"warning: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    try:
         if result is None:
             if phase == "build-corpus":
                 print("Corpus built and frozen. PM must ratify before run phase.", file=sys.stderr)
@@ -2230,6 +2248,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Emit result as JSON (in addition to markdown report).",
+    )
+    bfe.add_argument(
+        "--target-sha",
+        default=None,
+        help="build-corpus only: harvest exactly this one commit (via harvest_one) instead of "
+             "the full corpus sweep; bypasses the '^fix' subject filter (structural filters "
+             "still apply).",
+    )
+    bfe.add_argument(
+        "--repo-only",
+        choices=["lapis-pm", "conductor"],
+        default="lapis-pm",
+        help="Repo to harvest --target-sha from (default: lapis-pm).",
     )
     bfe.set_defaults(func=cmd_batched_fixer_eval)
 

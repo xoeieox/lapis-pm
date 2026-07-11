@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -429,3 +430,203 @@ class TestRealConductorClosure:
                 f"This was the bug on 2026-06-09. "
                 f"Closure: {closure}"
             )
+
+
+class TestCopyModeRestartOnChange:
+    """Coverage for copy-mode restart-on-change: RSYNC_CHANGES>0 + smoke-ok
+    gate, restart hysteresis, and the --user-scope env prerequisite
+    skip-and-flag path (AC2, AC3, AC5, AC6). Uses MANIFEST env override plus
+    mocked git/systemctl so the whole daemon-sync.sh flow runs isolated from
+    real host paths and real systemd units.
+    """
+
+    MARKER = Path("/tmp/daemon-sync-restart-flip-controller.service")
+
+    @pytest.fixture(autouse=True)
+    def _clean_markers(self):
+        for p in Path("/tmp").glob("daemon-sync-restart-*"):
+            p.unlink(missing_ok=True)
+        yield
+        for p in Path("/tmp").glob("daemon-sync-restart-*"):
+            p.unlink(missing_ok=True)
+
+    def _setup_fixture(self, tmp_path, hysteresis_sec=None, dbus_env=True, include_weaver=False):
+        deploy_source = tmp_path / "conductor-working"
+        scripts_dir = deploy_source / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "night_coordinator.py").write_text("# entry\n")
+
+        copy_to = tmp_path / "runtime_scripts"
+
+        repos_yaml = textwrap.dedent(f"""\
+            repos:
+              conductor:
+                deploy_mode: copy
+                deploy_source: {deploy_source}
+                copy_from: scripts
+                copy_to: {copy_to}
+                entry_points:
+                  - night_coordinator.py
+                services:
+                  - unit: flip-controller.service
+                    scope: user
+        """)
+        if include_weaver:
+            repos_yaml += (
+                f"  weaver:\n"
+                f"    deploy_source: {tmp_path / 'weaver-working'}\n"
+                f"    services:\n"
+                f"      - unit: weaver-server.service\n"
+                f"        scope: user\n"
+            )
+
+        manifest = tmp_path / "daemon-manifest.yaml"
+        manifest.write_text(repos_yaml)
+
+        mock_git = tmp_path / "git"
+        mock_git.write_text(textwrap.dedent("""\
+            #!/bin/bash
+            for arg in "$@"; do
+                case "$arg" in
+                    rev-parse) echo "abc1234def5678"; exit 0 ;;
+                    diff)      exit 0 ;;
+                    merge)     exit 0 ;;
+                    fetch)     exit 0 ;;
+                esac
+            done
+            exit 0
+        """))
+        mock_git.chmod(0o755)
+
+        restart_log = tmp_path / "restart.log"
+        pid_counter = tmp_path / "pid_counter"
+        mock_systemctl = tmp_path / "systemctl"
+        mock_systemctl.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            for arg in "$@"; do
+                case "$arg" in
+                    restart) echo "restart:$*" >> "{restart_log}"; exit 0 ;;
+                    --property=LoadState) echo "LoadState=loaded"; exit 0 ;;
+                    --property=ActiveState) echo "ActiveState=active"; exit 0 ;;
+                    --property=MainPID)
+                        n=0
+                        [[ -f "{pid_counter}" ]] && n=$(cat "{pid_counter}")
+                        n=$((n+1))
+                        echo "$n" > "{pid_counter}"
+                        echo "MainPID=$((1000+n))"
+                        exit 0
+                        ;;
+                esac
+            done
+            exit 0
+        """))
+        mock_systemctl.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + ":" + env["PATH"]
+        env["MANIFEST"] = str(manifest)
+        if hysteresis_sec is not None:
+            env["DAEMON_SYNC_RESTART_HYSTERESIS_SEC"] = str(hysteresis_sec)
+        if dbus_env:
+            xdg_dir = tmp_path / "xdgrun"
+            xdg_dir.mkdir(exist_ok=True)
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/tmp/fake-bus"
+            env["XDG_RUNTIME_DIR"] = str(xdg_dir)
+        else:
+            env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+            env.pop("XDG_RUNTIME_DIR", None)
+
+        return {
+            "deploy_source": deploy_source,
+            "scripts_dir": scripts_dir,
+            "copy_to": copy_to,
+            "manifest": manifest,
+            "restart_log": restart_log,
+            "env": env,
+        }
+
+    def _run(self, fixture, extra_env=None):
+        env = dict(fixture["env"])
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["bash", str(DAEMON_SYNC)],
+            capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
+        )
+
+    def _restart_count(self, fixture):
+        if not fixture["restart_log"].exists():
+            return 0
+        return fixture["restart_log"].read_text().count("restart:")
+
+    def test_restart_fires_when_changes_and_smoke_pass(self, tmp_path):
+        """AC2: RSYNC_CHANGES>0 + smoke-ok -> restart fires, marker written."""
+        fx = self._setup_fixture(tmp_path)
+        result = self._run(fx)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert self._restart_count(fx) == 1
+        assert "flip-controller.service" in fx["restart_log"].read_text()
+        assert self.MARKER.exists()
+
+    def test_no_restart_when_zero_changes(self, tmp_path):
+        """AC2: a second run with no source changes -> rsync reports 0 changes -> no restart."""
+        fx = self._setup_fixture(tmp_path, hysteresis_sec=0)
+        self._run(fx)
+        assert self._restart_count(fx) == 1
+
+        result = self._run(fx)
+        assert result.returncode == 0
+        assert self._restart_count(fx) == 1, "no new restart expected when rsync changes == 0"
+        assert "Rsync changed 0 files" in result.stdout
+
+    def test_no_restart_when_smoke_check_fails(self, tmp_path):
+        """AC3: import smoke-check failure blocks the restart and surfaces the anomaly."""
+        fx = self._setup_fixture(tmp_path)
+        (fx["scripts_dir"] / "night_coordinator.py").write_text("import this_module_does_not_exist\n")
+        result = self._run(fx)
+        assert result.returncode == 0
+        assert self._restart_count(fx) == 0, "must not restart when smoke-check fails"
+        assert "ANOMALOUS" in result.stderr
+        assert "smoke-check failed" in result.stderr
+
+    def test_hysteresis_blocks_second_restart_within_window(self, tmp_path):
+        """AC5: two qualifying restarts within the hysteresis window -> exactly one restart;
+        after the window elapses, a restart fires again."""
+        # A 3s (not 1s) window avoids flaking on the marker's epoch-second
+        # granularity: two runs a few ms apart could otherwise straddle a
+        # second boundary and see elapsed=1 even though real time was <0.1s.
+        fx = self._setup_fixture(tmp_path, hysteresis_sec=3)
+        self._run(fx)
+        assert self._restart_count(fx) == 1
+
+        (fx["scripts_dir"] / "night_coordinator.py").write_text("# entry v2\n")
+        result = self._run(fx)
+        assert result.returncode == 0
+        assert self._restart_count(fx) == 1, "second restart within the hysteresis window must be skipped"
+        assert "hysteresis" in (result.stdout + result.stderr).lower()
+
+        time.sleep(3.5)
+        (fx["scripts_dir"] / "night_coordinator.py").write_text("# entry v3\n")
+        result = self._run(fx)
+        assert result.returncode == 0
+        assert self._restart_count(fx) == 2, "restart should fire again once the hysteresis window elapses"
+
+    def test_missing_marker_does_not_block_restart(self, tmp_path):
+        """AC5: a missing/unreadable marker does not block the restart (assume-safe-and-proceed)."""
+        fx = self._setup_fixture(tmp_path, hysteresis_sec=60)
+        assert not self.MARKER.exists()
+        result = self._run(fx)
+        assert result.returncode == 0
+        assert self._restart_count(fx) == 1
+
+    def test_env_prereq_missing_skips_restart_and_marks_incomplete(self, tmp_path):
+        """AC6: missing DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR -> restart skipped,
+        deploy result reported INCOMPLETE (not success), anomaly surfaced, run proceeds."""
+        fx = self._setup_fixture(tmp_path, dbus_env=False, include_weaver=True)
+        result = self._run(fx)
+        assert result.returncode == 0, "run must not halt even though the restart is skipped"
+        assert self._restart_count(fx) == 0, "no systemctl --user restart call should be made"
+        assert "INCOMPLETE" in result.stdout
+        assert "ANOMALOUS" in result.stderr
+        assert "DBUS_SESSION_BUS_ADDRESS" in result.stderr
+        assert "── Repo: weaver" in result.stdout, "run must proceed to other repos, not halt"

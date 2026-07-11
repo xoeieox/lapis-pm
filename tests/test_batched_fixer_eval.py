@@ -847,8 +847,8 @@ def test_ac13_mock_generate_candidates():
     )
     candidates = generate_candidates(f, n=3, mock_mode=True)
     assert len(candidates) == 3
-    assert all(c is not None for c in candidates)
-    assert all("<<<<<<< SEARCH" in c for c in candidates)
+    assert all(c is not None for c, _ in candidates)
+    assert all("<<<<<<< SEARCH" in c for c, _ in candidates)
 
 
 def test_ac13_compute_flakiness_fingerprint_three_runs():

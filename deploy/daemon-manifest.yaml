@@ -30,5 +30,10 @@ repos:
     copy_to: /data/agents/scripts
     entry_points:
       - night_coordinator.py
+      - flip_controller.py
+      - gw_actuator.py
     seed_manifests:
       - night_producers.yaml
+    services:
+      - unit: flip-controller.service
+        scope: user

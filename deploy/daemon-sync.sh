@@ -11,12 +11,15 @@ set -euo pipefail
 CLEANUP_FILES=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANIFEST="$SCRIPT_DIR/daemon-manifest.yaml"
+MANIFEST="${MANIFEST:-$SCRIPT_DIR/daemon-manifest.yaml}"
 DEPLOY_LOG="/srv/lapis/lapis-state/lapis-pm-deploy-log.md"
 ACTIVE_WORK="/srv/git/inertia-vault-working/Active Work.md"
 FORGEJO_BASE="http://203.0.113.10:3000"
 FORGEJO_TIMEOUT=10
 FORGEJO_LAST_OK_FILE="/tmp/daemon-sync-forgejo-last-ok"
+# Minimum interval between consecutive restarts of a given unit (fixed, not
+# adaptive — Erah-decided 2026-07-11). Override in tests to avoid real sleeps.
+DAEMON_SYNC_RESTART_HYSTERESIS_SEC="${DAEMON_SYNC_RESTART_HYSTERESIS_SEC:-60}"
 DRY_RUN=0
 
 cleanup() {
@@ -228,6 +231,115 @@ surface_anomaly() {
     append_anomaly_to_active_work "$entry"
 }
 
+# ── Restart mechanics (single source of truth; service-mode and copy-mode both
+#    call restart_service_unit — the actual systemctl + liveness + anomaly code
+#    lives here exactly once) ────────────────────────────────────────────────
+
+restart_service_unit() {
+    # restart_service_unit <repo> <unit> <scope> <reason>
+    # Restart one unit, compare pre/post PID for liveness, surface anomalies.
+    local repo="$1" unit="$2" scope="$3" reason="$4"
+
+    local PRE_PID=""
+    if [[ "$scope" == "system" ]]; then
+        PRE_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+    else
+        PRE_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+    fi
+
+    log "Restarting $unit (scope=$scope, reason=$reason, pre-restart PID=${PRE_PID:-unknown})"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        [[ "$scope" == "system" ]] \
+            && echo "[dry-run] sudo -n systemctl restart $unit" \
+            || echo "[dry-run] systemctl --user restart $unit"
+        return 0
+    fi
+
+    local RESTART_OK=1
+    if [[ "$scope" == "system" ]]; then
+        sudo_or_warn systemctl restart "$unit" || RESTART_OK=0
+    else
+        if ! systemctl --user restart "$unit" 2>/dev/null; then
+            warn "systemctl --user restart $unit failed — run manually: systemctl --user restart $unit"
+            RESTART_OK=0
+        fi
+    fi
+
+    if [[ "$RESTART_OK" -eq 0 ]]; then
+        surface_anomaly "$repo — $unit restart command failed (scope=$scope). Service may still be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
+        return 1
+    fi
+
+    log "Liveness check for $unit"
+    sleep 3
+
+    local POST_STATE="unknown" POST_PID=""
+    if [[ "$scope" == "system" ]]; then
+        POST_STATE=$(systemctl show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
+        POST_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+    else
+        POST_STATE=$(systemctl --user show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
+        POST_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
+    fi
+
+    if [[ "$POST_STATE" != "active" ]]; then
+        surface_anomaly "$repo — $unit is not active after restart (state=$POST_STATE). Restart did not take. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit && systemctl status $unit" || echo "systemctl --user restart $unit && systemctl --user status $unit")"
+        return 1
+    elif [[ -n "$PRE_PID" && "$PRE_PID" != "0" && "$POST_PID" == "$PRE_PID" ]]; then
+        surface_anomaly "$repo — $unit PID unchanged after restart (PID=$POST_PID). Service may be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
+        return 1
+    else
+        log "Liveness OK: $unit active (state=$POST_STATE, PID ${PRE_PID:-?}→${POST_PID:-?})"
+        return 0
+    fi
+}
+
+restart_services() {
+    # restart_services <repo> <reason> — restart every unit listed in the
+    # manifest for <repo>, unconditionally (no hysteresis/env gating — that's
+    # copy-mode-only and is checked explicitly at its call site, not here).
+    local repo="$1" reason="$2"
+    while IFS=$'\t' read -r unit scope; do
+        [[ -z "$unit" ]] && continue
+        restart_service_unit "$repo" "$unit" "$scope" "$reason"
+    done < <(get_services "$repo")
+}
+
+restart_marker_path() {
+    echo "/tmp/daemon-sync-restart-$1"
+}
+
+restart_hysteresis_ok() {
+    # Returns 0 (ok to restart) unless a restart of $1 was recorded within
+    # DAEMON_SYNC_RESTART_HYSTERESIS_SEC. Missing/unreadable/corrupt marker
+    # => assume-safe-and-proceed (worst case is one extra restart).
+    local unit="$1"
+    local marker
+    marker=$(restart_marker_path "$unit")
+    local last_restart
+    last_restart=$(cat "$marker" 2>/dev/null) || return 0
+    [[ "$last_restart" =~ ^[0-9]+$ ]] || return 0
+    local now elapsed
+    now=$(date +%s)
+    elapsed=$(( now - last_restart ))
+    [[ "$elapsed" -ge "$DAEMON_SYNC_RESTART_HYSTERESIS_SEC" ]]
+}
+
+record_restart_marker() {
+    # Atomic write (temp + mv). Best-effort: a write failure is not critical
+    # (loses hysteresis history, never blocks a restart).
+    local unit="$1"
+    local marker
+    marker=$(restart_marker_path "$unit")
+    local tmp
+    tmp=$(mktemp "${marker}.XXXXXX" 2>/dev/null) || return 0
+    if date +%s > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$marker" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+
 # ── Step 1: Manifest drift check ──────────────────────────────────────────────
 log "Step 1: manifest drift check"
 while IFS=$'\t' read -r unit scope; do
@@ -248,6 +360,7 @@ done < <(get_repos | while read -r r; do get_services "$r"; done)
 while read -r repo; do
     deploy_source=$(get_deploy_source "$repo")
     log "── Repo: $repo (source: $deploy_source) ──"
+    REPO_DEPLOY_INCOMPLETE=0
 
     # ── Step 2: Dirty guard with provenance ───────────────────────────────────
     log "Step 2: dirty guard"
@@ -413,7 +526,8 @@ except Exception as e:
         else
             mkdir -p "$COPY_TO"
             if rsync -a --no-relative --exclude='__pycache__' --itemize-changes --files-from="$CLOSURE_FILE" "$COPY_FROM/" "$COPY_TO/" 2>&1 | tee "$RSYNC_OUTPUT"; then
-                RSYNC_CHANGES=$(grep -c '>' "$RSYNC_OUTPUT" || echo 0)
+                RSYNC_CHANGES=$(grep -c '>' "$RSYNC_OUTPUT" || true)
+                RSYNC_CHANGES="${RSYNC_CHANGES:-0}"
                 log "Rsync complete: $RSYNC_CHANGES file(s) changed/added"
             else
                 surface_anomaly "$repo — rsync failed for $COPY_FROM to $COPY_TO. Check filesystem permissions and disk space."
@@ -436,7 +550,7 @@ except Exception as e:
         if [[ "$DRY_RUN" -eq 0 ]]; then
             SMOKE_ERR_FILE=$(mktemp)
             CLEANUP_FILES+=("$SMOKE_ERR_FILE")
-            PYTHONPATH="$COPY_TO:${PYTHONPATH:-}" python3 - "$COPY_TO" "${SEEDS[@]}" 2>"$SMOKE_ERR_FILE" <<'SMOKE_CHECK'
+            if PYTHONPATH="$COPY_TO:${PYTHONPATH:-}" python3 - "$COPY_TO" "${SEEDS[@]}" 2>"$SMOKE_ERR_FILE" <<'SMOKE_CHECK'
 import sys, importlib
 copy_to = sys.argv[1]
 seeds = sys.argv[2:]
@@ -454,7 +568,11 @@ if failed:
         print(msg, file=sys.stderr)
     sys.exit(1)
 SMOKE_CHECK
-            SMOKE_EXIT=$?
+            then
+                SMOKE_EXIT=0
+            else
+                SMOKE_EXIT=1
+            fi
             if [[ $SMOKE_EXIT -ne 0 ]]; then
                 SMOKE_ERR=$(cat "$SMOKE_ERR_FILE" 2>/dev/null | tr '\n' ' ' || echo "unknown error")
                 surface_anomaly "$repo — import smoke-check failed. Deployed scripts cannot import dependencies: $SMOKE_ERR"
@@ -462,6 +580,42 @@ SMOKE_CHECK
             else
                 log "Smoke-check OK: all entry points and seed modules importable"
             fi
+        fi
+
+        # ── Step 6: copy-mode restart-on-change ───────────────────────────────
+        # Gates are explicit here (not hidden in restart_service_unit/restart_services):
+        # RSYNC_CHANGES>0, smoke-check passed (a failed smoke-check already `continue`d
+        # out of this repo above, so reaching here means it passed), per-unit restart
+        # hysteresis, and the --user-scope env prerequisite (skip-and-flag, never halt
+        # the run).
+        log "Step 6: copy-mode restart-on-change"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            while IFS=$'\t' read -r unit scope; do
+                [[ -z "$unit" ]] && continue
+                [[ "$scope" == "system" ]] \
+                    && echo "[dry-run] sudo -n systemctl restart $unit" \
+                    || echo "[dry-run] systemctl --user restart $unit"
+            done < <(get_services "$repo")
+        elif [[ "${RSYNC_CHANGES:-0}" -eq 0 ]]; then
+            log "Rsync changed 0 files — restart skipped"
+        else
+            while IFS=$'\t' read -r unit scope; do
+                [[ -z "$unit" ]] && continue
+
+                if [[ "$scope" == "user" ]] && { [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || [[ -z "${XDG_RUNTIME_DIR:-}" ]]; }; then
+                    surface_anomaly "$repo — $unit restart SKIPPED: DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR not set for a --user scope restart. Files landed in $COPY_TO but the running service is knowingly still on old code (deploy result INCOMPLETE). Self-corrects on the next run once the env is present."
+                    REPO_DEPLOY_INCOMPLETE=1
+                    continue
+                fi
+
+                if ! restart_hysteresis_ok "$unit"; then
+                    log "Restart hysteresis: $unit was restarted within the last ${DAEMON_SYNC_RESTART_HYSTERESIS_SEC}s — skipping"
+                    continue
+                fi
+
+                restart_service_unit "$repo" "$unit" "$scope" "copy-mode restart-on-change ($RSYNC_CHANGES file(s) changed, smoke-check OK)"
+                record_restart_marker "$unit"
+            done < <(get_services "$repo")
         fi
 
     else
@@ -487,61 +641,7 @@ SMOKE_CHECK
             log "Step 5: no new commits — restarts skipped"
         else
             log "Step 5: restarting services for $repo (HEAD advanced $PRE_REV..$POST_REV)"
-            while IFS=$'\t' read -r unit scope; do
-                [[ -z "$unit" ]] && continue
-                # Capture pre-restart PID for liveness comparison
-                PRE_PID=""
-                if [[ "$scope" == "system" ]]; then
-                    PRE_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-                else
-                    PRE_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-                fi
-
-                log "Restarting $unit (scope=$scope, pre-restart PID=${PRE_PID:-unknown})"
-                if [[ "$DRY_RUN" -eq 1 ]]; then
-                    [[ "$scope" == "system" ]] \
-                        && echo "[dry-run] sudo -n systemctl restart $unit" \
-                        || echo "[dry-run] systemctl --user restart $unit"
-                    continue
-                fi
-
-                RESTART_OK=1
-                if [[ "$scope" == "system" ]]; then
-                    sudo_or_warn systemctl restart "$unit" || RESTART_OK=0
-                else
-                    if ! systemctl --user restart "$unit" 2>/dev/null; then
-                        warn "systemctl --user restart $unit failed — run manually: systemctl --user restart $unit"
-                        RESTART_OK=0
-                    fi
-                fi
-
-                if [[ "$RESTART_OK" -eq 0 ]]; then
-                    surface_anomaly "$repo — $unit restart command failed (scope=$scope). Service may still be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
-                    continue
-                fi
-
-                # Step 6: liveness check — verify active + fresh PID
-                log "Step 6: liveness check for $unit"
-                sleep 3
-
-                POST_STATE="unknown"
-                POST_PID=""
-                if [[ "$scope" == "system" ]]; then
-                    POST_STATE=$(systemctl show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
-                    POST_PID=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-                else
-                    POST_STATE=$(systemctl --user show "$unit" --property=ActiveState 2>/dev/null | cut -d= -f2 || echo "unknown")
-                    POST_PID=$(systemctl --user show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2 || echo "")
-                fi
-
-                if [[ "$POST_STATE" != "active" ]]; then
-                    surface_anomaly "$repo — $unit is not active after restart (state=$POST_STATE). Restart did not take. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit && systemctl status $unit" || echo "systemctl --user restart $unit && systemctl --user status $unit")"
-                elif [[ -n "$PRE_PID" && "$PRE_PID" != "0" && "$POST_PID" == "$PRE_PID" ]]; then
-                    surface_anomaly "$repo — $unit PID unchanged after restart (PID=$POST_PID). Service may be running old code. Manual: $([ "$scope" = "system" ] && echo "sudo systemctl restart $unit" || echo "systemctl --user restart $unit")"
-                else
-                    log "Liveness OK: $unit active (state=$POST_STATE, PID ${PRE_PID:-?}→${POST_PID:-?})"
-                fi
-            done < <(get_services "$repo")
+            restart_services "$repo" "code sync $PRE_REV..$POST_REV"
         fi
     fi
 
@@ -552,7 +652,11 @@ SMOKE_CHECK
         log "Deploy log updated"
     fi
 
-    log "Summary ($repo): code=$([ "$CODE_CHANGED" -eq 1 ] && echo "synced $PRE_REV..$POST_REV" || echo unchanged)"
+    DEPLOY_RESULT=$([ "$CODE_CHANGED" -eq 1 ] && echo "synced $PRE_REV..$POST_REV" || echo unchanged)
+    if [[ "${REPO_DEPLOY_INCOMPLETE:-0}" -eq 1 ]]; then
+        DEPLOY_RESULT="INCOMPLETE ($DEPLOY_RESULT; restart skipped — see anomaly)"
+    fi
+    log "Summary ($repo): code=$DEPLOY_RESULT"
 
 done < <(get_repos)
 

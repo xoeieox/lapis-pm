@@ -1794,6 +1794,113 @@ def grounding_hook(fixture: FixtureRecord) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Search/replace apply helper (candidate-apply-robustness-v0) - pure, no I/O
+# ---------------------------------------------------------------------------
+
+_SR_SEARCH_MARKER = "<<<<<<< SEARCH"
+_SR_DIVIDER_MARKER = "======="
+_SR_REPLACE_MARKER = ">>>>>>> REPLACE"
+
+
+def _parse_search_replace_blocks(
+    candidate_text: str,
+) -> tuple[Optional[list[tuple[str, str]]], str]:
+    """Line-based parser for one or more SEARCH/REPLACE blocks.
+
+    Each of the three marker lines must appear as its own full line (exact
+    literal, no leading/trailing characters). Walks a state machine expecting
+    marker -> SEARCH-body -> '=======' -> REPLACE-body -> marker, in order.
+    Any structural violation (missing closing marker, out-of-order markers, an
+    orphan '=======' or '>>>>>>> REPLACE' outside a block) returns
+    (None, "malformed-block") rather than skipping the offending block.
+
+    Returns (blocks, "") on success, where blocks is a list of
+    (search_text, replace_text) tuples; (None, reason) otherwise, reason is
+    "no-blocks-parsed" or "malformed-block".
+    """
+    lines = candidate_text.splitlines()
+    blocks: list[tuple[str, str]] = []
+    n = len(lines)
+    i = 0
+    found_any_marker = False
+
+    while i < n:
+        line = lines[i]
+        if line == _SR_SEARCH_MARKER:
+            found_any_marker = True
+            i += 1
+            search_lines: list[str] = []
+            while i < n and lines[i] != _SR_DIVIDER_MARKER:
+                if lines[i] in (_SR_SEARCH_MARKER, _SR_REPLACE_MARKER):
+                    return None, "malformed-block"
+                search_lines.append(lines[i])
+                i += 1
+            if i >= n:
+                return None, "malformed-block"
+            i += 1  # skip divider
+
+            replace_lines: list[str] = []
+            while i < n and lines[i] != _SR_REPLACE_MARKER:
+                if lines[i] in (_SR_SEARCH_MARKER, _SR_DIVIDER_MARKER):
+                    return None, "malformed-block"
+                replace_lines.append(lines[i])
+                i += 1
+            if i >= n:
+                return None, "malformed-block"
+            i += 1  # skip replace marker
+
+            blocks.append(("\n".join(search_lines), "\n".join(replace_lines)))
+        elif line in (_SR_DIVIDER_MARKER, _SR_REPLACE_MARKER):
+            # Orphan divider/replace marker with no preceding SEARCH marker.
+            return None, "malformed-block"
+        else:
+            i += 1
+
+    if not found_any_marker:
+        return None, "no-blocks-parsed"
+    if not blocks:
+        return None, "malformed-block"
+    return blocks, ""
+
+
+def apply_search_replace(
+    original_text: str, candidate_text: str
+) -> tuple[Optional[str], str]:
+    """Apply one or more SEARCH/REPLACE blocks against original_text.
+
+    Parses candidate_text for fenced SEARCH/REPLACE blocks (fence-agnostic -
+    any surrounding markdown fence, or none, is tolerated; only the marker
+    lines matter). Blocks apply SEQUENTIALLY against the progressively-updated
+    text: block N's SEARCH is matched (exact + unique) against the text as
+    modified by blocks 1..N-1 of this same candidate, in the order the blocks
+    appear. If any block fails, the whole candidate fails - no partial
+    application is returned.
+
+    Strict verbatim exact-match only (no whitespace normalization, no fuzzy
+    matching). Never raises on malformed model output.
+
+    Returns (new_text, "applied") when ALL blocks matched uniquely.
+    Returns (None, reason) otherwise, where reason is one of:
+      "no-blocks-parsed", "malformed-block", "search-not-found",
+      "search-ambiguous".
+    """
+    blocks, parse_reason = _parse_search_replace_blocks(candidate_text)
+    if blocks is None:
+        return None, parse_reason
+
+    text = original_text
+    for search_text, replace_text in blocks:
+        count = text.count(search_text)
+        if count == 0:
+            return None, "search-not-found"
+        if count > 1:
+            return None, "search-ambiguous"
+        text = text.replace(search_text, replace_text, 1)
+
+    return text, "applied"
+
+
+# ---------------------------------------------------------------------------
 # Candidate generation (DEFERRED run phase — swarm mocked in CI)
 # ---------------------------------------------------------------------------
 
@@ -1804,17 +1911,19 @@ def generate_candidates(
     temperature: float = 0.7,
     mock_mode: bool = True,
 ) -> list[Optional[str]]:
-    """Generate N candidate diffs via call_swarm (mocked in CI).
+    """Generate N candidate SEARCH/REPLACE blocks via call_swarm (mocked in CI).
 
-    In mock_mode, returns deterministic canned diffs.
+    In mock_mode, returns deterministic canned SEARCH/REPLACE candidates anchored
+    on a line of fixture.pre_state_slice.
     None entries = swarm health signals (not failed patches) — recorded separately.
     """
     if mock_mode:
+        slice_lines = fixture.pre_state_slice.splitlines() if fixture.pre_state_slice else []
+        anchor_line = slice_lines[0] if slice_lines else f"# {fixture.path}"
         return [
-            f"--- a/{fixture.path}\n+++ b/{fixture.path}\n"
-            f"@@ -1,3 +1,3 @@\n"
-            f" # Mock candidate {i + 1} for {fixture.sha[:8]}\n"
-            f"-old line\n+new line\n unchanged\n"
+            f"{_SR_SEARCH_MARKER}\n{anchor_line}\n{_SR_DIVIDER_MARKER}\n"
+            f"{anchor_line}  # mock candidate {i + 1} for {fixture.sha[:8]}\n"
+            f"{_SR_REPLACE_MARKER}\n"
             for i in range(n)
         ]
 
@@ -1822,11 +1931,21 @@ def generate_candidates(
 
     grounding = grounding_hook(fixture)
     prompt = (
-        f"Fix the following issue in {fixture.path}:\n\n"
+        f"Locate the exact lines to change to fix the following issue in {fixture.path}:\n\n"
         f"Task: {fixture.task_intent_paraphrased}\n\n"
         f"{('Context:\n' + grounding + chr(10) + chr(10)) if grounding else ''}"
         f"Current code:\n```\n{fixture.pre_state_slice}\n```\n\n"
-        "Emit a unified diff in a ```diff ... ``` fence. Minimal changes only."
+        "Copy the exact lines to change VERBATIM from the code above (including exact "
+        "indentation and trailing whitespace) into a SEARCH block, with enough surrounding "
+        "unchanged lines that the SEARCH block occurs exactly ONCE in the code above, then "
+        "give the replacement. Emit ONLY one or more blocks in this exact format:\n"
+        "<<<<<<< SEARCH\n"
+        "<verbatim lines from the code above>\n"
+        "=======\n"
+        "<replacement lines>\n"
+        ">>>>>>> REPLACE\n"
+        "A SEARCH block that matches zero or multiple places in the code above will be "
+        "rejected, so widen the SEARCH context until it is unique. Minimal changes only."
     )
     # Leak guard (AC-O4, spec §1.4): golden test diff AND node IDs must never appear
     # in the candidate prompt. Checking both prevents a future regression that injects
@@ -1843,8 +1962,8 @@ def generate_candidates(
                 f"for {fixture.sha[:8]}. Oracle test node IDs must never be shown to the candidate."
             )
     system = (
-        "You are a code fixer. Emit only a unified diff in a ```diff``` fenced block. "
-        "No explanations."
+        "You are a code fixer. Emit only one or more SEARCH/REPLACE blocks in the exact "
+        "format described. No explanations."
     )
 
     try:
@@ -1855,17 +1974,28 @@ def generate_candidates(
             timeout=60,
             max_concurrent=min(4, n),
         )
-        extracted = []
-        for c in raw:
-            if c is None:
-                extracted.append(None)
-            else:
-                m = re.search(r"```diff\n(.*?)\n```", c, re.DOTALL)
-                extracted.append(m.group(1) if m else c)
-        return extracted
     except Exception as exc:
         logger.error("call_swarm failed: %s", exc)
         return [None] * n
+
+    # Output-level leak guard (belt-and-suspenders): the prompt-level guard above is
+    # the primary defense (the model never sees the golden test); this drops any
+    # candidate that verbatim-copies a golden_test_id anyway, recorded as a none/
+    # swarm-health signal rather than surfaced as an applied candidate.
+    extracted: list[Optional[str]] = []
+    for c in raw:
+        if c is None:
+            extracted.append(None)
+            continue
+        if any(tid and tid in c for tid in fixture.golden_test_ids):
+            logger.warning(
+                "Output-level leak guard: golden_test_id found in candidate for %s; dropping",
+                fixture.sha[:8],
+            )
+            extracted.append(None)
+            continue
+        extracted.append(c)
+    return extracted
 
 
 # ---------------------------------------------------------------------------
@@ -1904,22 +2034,23 @@ def oracle_evaluate_candidate(
             if r_test.returncode != 0:
                 return "apply_error", [], "unverified"
 
-            # Step 2: apply-check candidate source diff
-            check = subprocess.run(
-                ["git", "apply", "--check"],
-                input=candidate_text,
-                cwd=wt_path, capture_output=True, text=True, timeout=10,
-            )
-            if check.returncode != 0:
+            # Step 2-3: search/replace apply against the real worktree file, post
+            # golden-test-diff (candidate-apply-robustness-v0). A non-matching or
+            # malformed candidate is a recorded "failed", not a crash; a read/write
+            # error on the target file is infra-level "apply_error".
+            target_file = wt_path / fixture.path
+            try:
+                current_text = target_file.read_text()
+            except Exception:
+                return "apply_error", [], "unverified"
+
+            new_text, sr_reason = apply_search_replace(current_text, candidate_text)
+            if new_text is None:
                 return "failed", [], "unverified"
 
-            # Step 3: apply candidate source diff
-            apply = subprocess.run(
-                ["git", "apply"],
-                input=candidate_text,
-                cwd=wt_path, capture_output=True, text=True, timeout=10,
-            )
-            if apply.returncode != 0:
+            try:
+                target_file.write_text(new_text)
+            except Exception:
                 return "apply_error", [], "unverified"
 
             # Step 4: run golden test IDs
@@ -1949,21 +2080,20 @@ def oracle_evaluate_candidate(
 
             return "success", golden_failures, "pass"
 
-        # Legacy / BLIND / UNTESTED path (AC4)
-        check = subprocess.run(
-            ["git", "apply", "--check"],
-            input=candidate_text,
-            cwd=wt_path, capture_output=True, text=True, timeout=10,
-        )
-        if check.returncode != 0:
+        # Legacy / BLIND / UNTESTED path (AC4) - search/replace apply (candidate-apply-robustness-v0)
+        target_file = wt_path / fixture.path
+        try:
+            current_text = target_file.read_text()
+        except Exception:
+            return "apply_error", [], "unverified"
+
+        new_text, sr_reason = apply_search_replace(current_text, candidate_text)
+        if new_text is None:
             return "failed", [], "unverified"
 
-        apply = subprocess.run(
-            ["git", "apply"],
-            input=candidate_text,
-            cwd=wt_path, capture_output=True, text=True, timeout=10,
-        )
-        if apply.returncode != 0:
+        try:
+            target_file.write_text(new_text)
+        except Exception:
             return "apply_error", [], "unverified"
 
         if not fixture.scoped_test_files:

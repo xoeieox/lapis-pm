@@ -848,7 +848,7 @@ def test_ac13_mock_generate_candidates():
     candidates = generate_candidates(f, n=3, mock_mode=True)
     assert len(candidates) == 3
     assert all(c is not None for c in candidates)
-    assert all("--- a/" in c for c in candidates)
+    assert all("<<<<<<< SEARCH" in c for c in candidates)
 
 
 def test_ac13_compute_flakiness_fingerprint_three_runs():
@@ -1628,9 +1628,11 @@ def test_aco3_oracle_pass_when_golden_test_passes(tmp_path, discriminates_fixtur
 
     # Candidate that correctly fixes foo() → 'new'
     good_candidate = (
-        "diff --git a/lapis_pm/module.py b/lapis_pm/module.py\n"
-        "--- a/lapis_pm/module.py\n+++ b/lapis_pm/module.py\n"
-        "@@ -1,2 +1,2 @@\n def foo():\n-    return 'old'\n+    return 'new'\n"
+        "<<<<<<< SEARCH\n"
+        "def foo():\n    return 'old'\n"
+        "=======\n"
+        "def foo():\n    return 'new'\n"
+        ">>>>>>> REPLACE\n"
     )
 
     with dedicated_clone(repo, "test-aco3-pass") as clone_path:
@@ -1667,9 +1669,11 @@ def test_aco3_oracle_regressed_when_golden_fails(tmp_path, discriminates_fixture
 
     # Candidate that returns wrong value — golden test still fails
     bad_candidate = (
-        "diff --git a/lapis_pm/module.py b/lapis_pm/module.py\n"
-        "--- a/lapis_pm/module.py\n+++ b/lapis_pm/module.py\n"
-        "@@ -1,2 +1,2 @@\n def foo():\n-    return 'old'\n+    return 'wrong'\n"
+        "<<<<<<< SEARCH\n"
+        "def foo():\n    return 'old'\n"
+        "=======\n"
+        "def foo():\n    return 'wrong'\n"
+        ">>>>>>> REPLACE\n"
     )
 
     with dedicated_clone(repo, "test-aco3-regressed") as clone_path:
@@ -1728,9 +1732,9 @@ def test_aco4_prompt_does_not_reference_golden_test():
     assert "pre_state_slice" in source
     # The prompt f-string expression block is between 'prompt = (' and the leak guard.
     # The leak guard checks for the field AFTER prompt is built — exclude it.
-    # Find the raw prompt string: from 'prompt = (' up to the first 'Emit a unified diff' line.
-    if "Emit a unified diff" in source:
-        prompt_template = source.split("prompt =")[1].split("Emit a unified diff")[0]
+    # Find the raw prompt string: from 'prompt = (' up to the first 'Copy the exact lines' line.
+    if "Copy the exact lines" in source:
+        prompt_template = source.split("prompt =")[1].split("Copy the exact lines")[0]
         assert "golden_test_diff" not in prompt_template, \
             "golden_test_diff must not be fed into the prompt f-string"
         assert "golden_test_ids" not in prompt_template, \

@@ -86,7 +86,7 @@ def _advancing_fake_run(extra=None):
 class TestPostLandDeployHook:
     """Tests for _post_land_deploy_hook."""
 
-    def test_mapped_repo_fires_restart_per_unit(self, capsys):
+    def test_mapped_repo_fires_restart_per_unit(self, capsys, tmp_path):
         """Mapped repo causes git pull (both paths) then system + user restarts when HEAD advances."""
         pull_calls = []
         sudo_restart_calls = []
@@ -108,11 +108,12 @@ class TestPostLandDeployHook:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                            pm_core._post_land_deploy_hook("agents-core")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                pm_core._post_land_deploy_hook("agents-core")
 
         assert len(pull_calls) == 2
         pull_paths = [c[2] for c in pull_calls]
@@ -140,7 +141,7 @@ class TestPostLandDeployHook:
                 pm_core._post_land_deploy_hook(None)
         mock_run.assert_not_called()
 
-    def test_restart_failure_does_not_raise(self, capsys):
+    def test_restart_failure_does_not_raise(self, capsys, tmp_path):
         """Non-zero returncode from restart is logged to stderr but does not raise."""
         revparse_count = {}
 
@@ -155,10 +156,11 @@ class TestPostLandDeployHook:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                        pm_core._post_land_deploy_hook("agents-core")  # must not raise
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
         assert "rc=1" in captured.err
@@ -175,7 +177,7 @@ class TestPostLandDeployHook:
         captured = capsys.readouterr()
         assert "errored" in captured.err
 
-    def test_user_unit_restart_uses_no_sudo(self, capsys):
+    def test_user_unit_restart_uses_no_sudo(self, capsys, tmp_path):
         """User-unit restarts must use `systemctl --user restart`, never sudo."""
         sudo_calls = []
         user_calls = []
@@ -194,11 +196,12 @@ class TestPostLandDeployHook:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                            pm_core._post_land_deploy_hook("agents-core")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                pm_core._post_land_deploy_hook("agents-core")
 
         restart_user = [c for c in user_calls if "restart" in c]
         assert len(restart_user) == 2
@@ -211,7 +214,7 @@ class TestPostLandDeployHook:
         for c in sudo_restart:
             assert "--user" not in c
 
-    def test_user_unit_restart_failure_logged_does_not_raise(self, capsys):
+    def test_user_unit_restart_failure_logged_does_not_raise(self, capsys, tmp_path):
         """Non-zero rc from a user-unit restart is logged to stderr and does not raise."""
         revparse_count = {}
 
@@ -228,11 +231,12 @@ class TestPostLandDeployHook:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                            pm_core._post_land_deploy_hook("agents-core")  # must not raise
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
         assert "rc=1" in captured.err or "failed" in captured.err
@@ -263,7 +267,7 @@ class TestPostLandDeployHook:
         captured = capsys.readouterr()
         assert "disabled" in captured.err
 
-    def test_xdg_runtime_dir_unset_skips_user_restarts_logs_error(self, capsys):
+    def test_xdg_runtime_dir_unset_skips_user_restarts_logs_error(self, capsys, tmp_path):
         """XDG_RUNTIME_DIR unset → no systemctl --user calls issued, loud error logged."""
         user_calls = []
         sudo_calls = []
@@ -283,18 +287,19 @@ class TestPostLandDeployHook:
 
         env_without_xdg = {k: v for k, v in __import__("os").environ.items() if k != "XDG_RUNTIME_DIR"}
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", env_without_xdg, clear=True):
-                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                            pm_core._post_land_deploy_hook("agents-core")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", env_without_xdg, clear=True):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                pm_core._post_land_deploy_hook("agents-core")
 
         assert len(user_calls) == 0, "No systemctl --user calls when XDG_RUNTIME_DIR unset"
         assert len(sudo_calls) == 2, "System-unit restarts still fire"
         captured = capsys.readouterr()
         assert "XDG_RUNTIME_DIR" in captured.err
 
-    def test_user_unit_not_active_after_restart_logs_loudly(self, capsys):
+    def test_user_unit_not_active_after_restart_logs_loudly(self, capsys, tmp_path):
         """If is-active returns non-active after restart, loud stderr log, no raise."""
         revparse_count = {}
 
@@ -309,11 +314,12 @@ class TestPostLandDeployHook:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                            pm_core._post_land_deploy_hook("agents-core")  # must not raise
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
         assert "not active after restart" in captured.err
@@ -864,7 +870,7 @@ class TestSynapseDeploy:
         """synapse.service is a system unit, not a --user unit — must not be in _RESTART_USER."""
         assert "synapse" not in pm_core._POST_LAND_RESTART_USER
 
-    def test_synapse_pull_triggers_git_pull_and_system_restart(self):
+    def test_synapse_pull_triggers_git_pull_and_system_restart(self, tmp_path):
         """Landing a synapse PR fires exactly one git pull and one sudo systemctl restart."""
         pull_calls = []
         restart_calls = []
@@ -886,9 +892,10 @@ class TestSynapseDeploy:
             return _make_completed_process(returncode=0)
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("synapse")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        pm_core._post_land_deploy_hook("synapse")
 
         assert len(pull_calls) == 1
         assert pull_calls[0] == [
@@ -947,7 +954,7 @@ class TestSynapseDeploy:
             "synapse pull failure title must contain 'synapse' (parameterized per repo)"
         )
 
-    def test_synapse_restart_failure_does_not_raise(self, capsys):
+    def test_synapse_restart_failure_does_not_raise(self, capsys, tmp_path):
         """Non-zero returncode from synapse.service restart is logged to stderr, does not raise."""
         revparse_count = {}
 
@@ -964,8 +971,9 @@ class TestSynapseDeploy:
             return _make_completed_process(returncode=0)
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                pm_core._post_land_deploy_hook("synapse")  # must not raise
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    pm_core._post_land_deploy_hook("synapse")  # must not raise
 
         captured = capsys.readouterr()
         assert "rc=1" in captured.err or "failed" in captured.err
@@ -1159,7 +1167,7 @@ class TestCockpitDeploy:
         """cockpit pull failure emits LOW-priority notification (advisory, self-announcing)."""
         assert "cockpit" in pm_core._POST_LAND_PULL_LOW_SIGNAL
 
-    def test_cockpit_pull_and_restart_dispatch(self, capsys):
+    def test_cockpit_pull_and_restart_dispatch(self, capsys, tmp_path):
         """Landing a cockpit PR with HEAD advancing issues exactly one git pull and
         one `systemctl --user restart cockpit.service` call — no sudo call anywhere."""
         pull_calls = []
@@ -1182,9 +1190,10 @@ class TestCockpitDeploy:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("cockpit")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        pm_core._post_land_deploy_hook("cockpit")
 
         assert len(pull_calls) == 1
         assert pull_calls[0] == [
@@ -1273,7 +1282,7 @@ class TestCockpitDeploy:
         with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
             pm_core._post_land_git_pull("cockpit")  # must not raise
 
-    def test_cockpit_restart_failure_does_not_raise(self, capsys):
+    def test_cockpit_restart_failure_does_not_raise(self, capsys, tmp_path):
         """Non-zero rc from cockpit.service restart is logged to stderr, does not raise."""
         revparse_count = {}
 
@@ -1288,9 +1297,10 @@ class TestCockpitDeploy:
             return _make_completed_process(returncode=0, stdout="active")
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                    pm_core._post_land_deploy_hook("cockpit")  # must not raise
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        pm_core._post_land_deploy_hook("cockpit")  # must not raise
 
         captured = capsys.readouterr()
         assert "rc=1" in captured.err or "failed" in captured.err
@@ -1597,17 +1607,18 @@ class TestHeadAdvanceGate:
         assert "noop" in captured.err
         assert "HEAD unchanged" in captured.err
 
-    def test_head_advance_idle_queue_restarts_now(self, capsys):
+    def test_head_advance_idle_queue_restarts_now(self, capsys, tmp_path):
         """HEAD advance + idle queue → both units restart immediately."""
         sudo_calls = []
         fake_run = self._make_advancing_run(sudo_calls=sudo_calls)
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                        with patch.object(pm_core, "_write_restart_pending") as mock_write:
-                            pm_core._post_land_deploy_hook("agents-core")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            with patch.object(pm_core, "_write_restart_pending") as mock_write:
+                                pm_core._post_land_deploy_hook("agents-core")
 
         restart_units = [c[4] for c in sudo_calls if "restart" in c]
         assert "claude-queue-runner.service" in restart_units
@@ -1625,12 +1636,13 @@ class TestHeadAdvanceGate:
             written["units"] = units
 
         with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.object(pm_core, "_count_inflight_fixers", return_value=3):
-                    with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                        with patch.object(pm_core, "_write_restart_pending", side_effect=fake_write):
-                            with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                                pm_core._post_land_deploy_hook("agents-core")
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.object(pm_core, "_count_inflight_fixers", return_value=3):
+                        with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                            with patch.object(pm_core, "_write_restart_pending", side_effect=fake_write):
+                                with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                                    pm_core._post_land_deploy_hook("agents-core")
 
         # gpu-queue-runner should restart immediately; claude-queue-runner is deferred
         restart_units = [c[4] for c in sudo_calls if "restart" in c]
@@ -2213,6 +2225,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("shutil.copyfileobj", side_effect=flaky_copyfileobj),
         ):

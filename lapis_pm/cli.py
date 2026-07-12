@@ -1658,6 +1658,91 @@ def cmd_batched_fixer_eval(args) -> int:
         return 1
 
 
+def cmd_code_oracle_run(args) -> int:
+    """Handle `lapis-pm code-oracle-run` subcommand.
+
+    Thin wiring: loads one fixture from the corpus by id and delegates to
+    the existing `run_code_oracle_experiment` (real writeable agent iterates
+    against a failing test in an isolated throwaway clone, judged by the
+    independent oracle). This command performs no filesystem writes of its
+    own - isolation is entirely `run_code_oracle_experiment`'s existing
+    dedicated_clone/detached_worktree responsibility.
+    """
+    import subprocess
+
+    from . import batched_fixer_eval as bfe
+    from .code_oracle_run import run_code_oracle_experiment
+
+    corpus = bfe.load_corpus()
+    available_ids = [f"{f.repo}-{f.sha[:8]}" for f in corpus]
+    fixture = next(
+        (f for f, fid in zip(corpus, available_ids) if fid == args.fixture_id), None
+    )
+    if fixture is None:
+        print(
+            f"ERROR: unknown --fixture-id {args.fixture_id!r}. "
+            f"Available ids: {available_ids}",
+            file=sys.stderr,
+        )
+        return 1
+
+    repo_path = Path(args.repo_path)
+    if not (repo_path / ".git").exists():
+        print(
+            f"ERROR: --repo-path {repo_path} is not a valid git repo (no .git found).",
+            file=sys.stderr,
+        )
+        return 1
+
+    verify = subprocess.run(
+        ["git", "cat-file", "-e", fixture.parent_sha],
+        cwd=repo_path, capture_output=True,
+    )
+    if verify.returncode != 0:
+        print(
+            f"ERROR: fixture parent_sha {fixture.parent_sha} not found in "
+            f"{repo_path} history.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        "code-oracle-run: this command performs no writes under "
+        f"{repo_path}; isolation is delegated entirely to "
+        "run_code_oracle_experiment's dedicated_clone/detached_worktree.",
+        file=sys.stderr,
+    )
+
+    try:
+        result = run_code_oracle_experiment(
+            fixture=fixture,
+            agent_backend_url=args.agent_backend_url,
+            repo_path=repo_path,
+            out_dir=Path(args.out_dir),
+            run_id=args.run_id,
+            max_steps=args.max_steps,
+            timeout_s=args.timeout,
+        )
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    result_path = Path(args.out_dir) / f"{result['run_id']}.json"
+    print("\n" + "=" * 70)
+    print("Code-Oracle Run - Summary")
+    print("=" * 70)
+    print(f"Run ID: {result['run_id']}")
+    print(f"Fixture ID: {result['fixture_id']}")
+    print(f"Agent backend URL: {result['agent_backend_url']}")
+    print(f"Oracle outcome: {result['oracle_outcome']}")
+    print(f"Apply status: {result['apply_status']}")
+    print(f"Agent self-report: {result['agent_self_report']}")
+    print(f"Result file: {result_path}")
+    print("=" * 70)
+
+    return 0
+
+
 def cmd_trajectory_rollup(args) -> int:
     """Handle `lapis-pm trajectory-rollup` subcommand."""
     import logging
@@ -2263,6 +2348,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repo to harvest --target-sha from (default: lapis-pm).",
     )
     bfe.set_defaults(func=cmd_batched_fixer_eval)
+
+    from .batched_fixer_eval import LAPIS_PM_REPO as _LAPIS_PM_REPO
+
+    cor = sub.add_parser(
+        "code-oracle-run",
+        help="Run one self-correction agent against one corpus fixture, judged by the "
+             "independent oracle (thin wiring to run_code_oracle_experiment).",
+    )
+    cor.add_argument(
+        "--fixture-id", required=True,
+        help="Corpus fixture id, e.g. lapis-pm-66a7d2ea.",
+    )
+    cor.add_argument(
+        "--agent-backend-url", required=True,
+        help="Endpoint the writeable agent is served from (model selection is by endpoint).",
+    )
+    cor.add_argument(
+        "--repo-path", default=_LAPIS_PM_REPO, type=Path,
+        help="Git repo the fixture's clone/worktree is created from (default: "
+             f"{_LAPIS_PM_REPO}).",
+    )
+    cor.add_argument(
+        "--out-dir", default="/tmp/code-oracle-run", type=Path,
+        help="Directory the structured result + transcript are written to.",
+    )
+    cor.add_argument(
+        "--run-id", default=None,
+        help="Run id (default: derived by the harness from the fixture identity).",
+    )
+    cor.add_argument(
+        "--max-steps", default=60, type=int,
+        help="Max agent tool-call steps before giving up (default: 60).",
+    )
+    cor.add_argument(
+        "--timeout", default=1800, type=int,
+        help="Agent wall-clock timeout in seconds; maps to timeout_s (default: 1800).",
+    )
+    cor.set_defaults(func=cmd_code_oracle_run)
 
     sr = sub.add_parser(
         "spec-review",

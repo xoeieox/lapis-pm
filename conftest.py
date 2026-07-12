@@ -125,3 +125,28 @@ def _isolate_comment_store(monkeypatch, tmp_path):
         return
     monkeypatch.setattr(episodic, "_store", lambda: CommentStore(root=tmp_path))
     yield
+
+
+@_pytest.fixture(autouse=True)
+def _block_real_pushover(monkeypatch):
+    """Safety net: no test in this suite may perform a real Pushover send.
+
+    agents_core.notify.send_notification has THREE independently-bound call sites in
+    this codebase, not one: lapis_pm/pm_core.py resolves it via a deferred
+    `from agents_core.notify import send_notification` *inside* each function body
+    (so patching the agents_core.notify module attribute is sufficient there), but
+    lapis_pm/brief.py and lapis_pm/brief_gem.py both do a *module-level* import,
+    binding their own independent name at import time — patching the source module
+    attribute does NOT affect those already-bound references. All three must be
+    patched or a test exercising brief.py/brief_gem.py that forgets an explicit
+    patch will still fire a real Pushover send. Individual tests may still assert
+    on notify behavior by patching any of these three references themselves — that
+    inner patch wins for the duration of its own `with`/monkeypatch scope.
+    """
+    import agents_core.notify as _notify_mod
+    from lapis_pm import brief as _brief_mod
+    from lapis_pm import brief_gem as _brief_gem_mod
+
+    monkeypatch.setattr(_notify_mod, "send_notification", lambda *a, **kw: False)
+    monkeypatch.setattr(_brief_mod, "send_notification", lambda *a, **kw: False)
+    monkeypatch.setattr(_brief_gem_mod, "send_notification", lambda *a, **kw: False)

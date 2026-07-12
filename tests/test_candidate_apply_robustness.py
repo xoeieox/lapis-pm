@@ -197,8 +197,9 @@ def test_mock_generate_candidates_are_search_replace_and_apply():
     )
     candidates = generate_candidates(fixture, n=2, mock_mode=True)
     assert len(candidates) == 2
-    for c in candidates:
+    for c, retries in candidates:
         assert c is not None
+        assert retries == 0
         assert "<<<<<<< SEARCH" in c
         new_text, status = apply_search_replace(fixture.pre_state_slice, c)
         assert status == "applied", f"mock candidate rejected: {status}"
@@ -356,4 +357,4 @@ def test_leak_guard_output_side_drops_candidate(monkeypatch):
 
     candidates = generate_candidates(fixture, n=2, mock_mode=False)
     assert len(candidates) == 2
-    assert all(c is None for c in candidates)
+    assert all(c is None for c, _ in candidates)

@@ -133,6 +133,7 @@ class CandidateResult:
     test_failures: list[str] = field(default_factory=list)
     test_errors: list[str] = field(default_factory=list)
     latency_s: float = 0.0
+    format_retries: int = 0
 
 
 @dataclass
@@ -1905,25 +1906,70 @@ def apply_search_replace(
 # ---------------------------------------------------------------------------
 
 
+_FORMAT_RETRY_SUFFIX = (
+    "\n\nYour previous output was NOT in the required format. JSON or any other "
+    "structure will be REJECTED. Only the exact SEARCH/REPLACE marker blocks are "
+    "accepted:\n"
+    "<<<<<<< SEARCH\n"
+    "<verbatim lines>\n"
+    "=======\n"
+    "<replacement lines>\n"
+    ">>>>>>> REPLACE\n"
+    "No explanations, no JSON, no other schema - ONLY one or more blocks in this "
+    "exact marker format."
+)
+
+
+def _check_leak_guard(fixture: FixtureRecord, prompt: str) -> None:
+    """Leak guard (AC-O4, spec §1.4): golden test diff AND node IDs must never appear
+    in the candidate prompt. Checking both prevents a future regression that injects
+    node IDs without the full diff text."""
+    if fixture.golden_test_diff and fixture.golden_test_diff.strip() in prompt:
+        raise RuntimeError(
+            f"Leak guard violated: golden_test_diff content in candidate prompt "
+            f"for {fixture.sha[:8]}. The oracle's test must never be shown to the candidate."
+        )
+    for tid in fixture.golden_test_ids:
+        if tid and tid in prompt:
+            raise RuntimeError(
+                f"Leak guard violated: golden_test_id {tid!r} found in candidate prompt "
+                f"for {fixture.sha[:8]}. Oracle test node IDs must never be shown to the candidate."
+            )
+
+
 def generate_candidates(
     fixture: FixtureRecord,
     n: int = 1,
     temperature: float = 0.7,
     mock_mode: bool = True,
-) -> list[Optional[str]]:
+    max_format_retries: int = 2,
+) -> list[tuple[Optional[str], int]]:
     """Generate N candidate SEARCH/REPLACE blocks via call_swarm (mocked in CI).
 
     In mock_mode, returns deterministic canned SEARCH/REPLACE candidates anchored
     on a line of fixture.pre_state_slice.
     None entries = swarm health signals (not failed patches) — recorded separately.
+
+    Any slot whose completion fails to PARSE as SEARCH/REPLACE blocks (a coder model
+    ignoring the format in favor of e.g. a JSON diff schema) is re-prompted with a
+    corrective directive up to max_format_retries times, stopping the instant it
+    parses. A slot that parses but fails to APPLY (search-not-found / search-ambiguous)
+    is never retried — that is diagnosis signal, not format noise.
+
+    Returns a list of (candidate_text, retries_used) tuples, order-preserved, one per
+    slot. retries_used is the count of corrective retries that slot consumed (0 =
+    first-shot compliant).
     """
     if mock_mode:
         slice_lines = fixture.pre_state_slice.splitlines() if fixture.pre_state_slice else []
         anchor_line = slice_lines[0] if slice_lines else f"# {fixture.path}"
         return [
-            f"{_SR_SEARCH_MARKER}\n{anchor_line}\n{_SR_DIVIDER_MARKER}\n"
-            f"{anchor_line}  # mock candidate {i + 1} for {fixture.sha[:8]}\n"
-            f"{_SR_REPLACE_MARKER}\n"
+            (
+                f"{_SR_SEARCH_MARKER}\n{anchor_line}\n{_SR_DIVIDER_MARKER}\n"
+                f"{anchor_line}  # mock candidate {i + 1} for {fixture.sha[:8]}\n"
+                f"{_SR_REPLACE_MARKER}\n",
+                0,
+            )
             for i in range(n)
         ]
 
@@ -1947,20 +1993,7 @@ def generate_candidates(
         "A SEARCH block that matches zero or multiple places in the code above will be "
         "rejected, so widen the SEARCH context until it is unique. Minimal changes only."
     )
-    # Leak guard (AC-O4, spec §1.4): golden test diff AND node IDs must never appear
-    # in the candidate prompt. Checking both prevents a future regression that injects
-    # node IDs without the full diff text.
-    if fixture.golden_test_diff and fixture.golden_test_diff.strip() in prompt:
-        raise RuntimeError(
-            f"Leak guard violated: golden_test_diff content in candidate prompt "
-            f"for {fixture.sha[:8]}. The oracle's test must never be shown to the candidate."
-        )
-    for tid in fixture.golden_test_ids:
-        if tid and tid in prompt:
-            raise RuntimeError(
-                f"Leak guard violated: golden_test_id {tid!r} found in candidate prompt "
-                f"for {fixture.sha[:8]}. Oracle test node IDs must never be shown to the candidate."
-            )
+    _check_leak_guard(fixture, prompt)
     system = (
         "You are a code fixer. Emit only one or more SEARCH/REPLACE blocks in the exact "
         "format described. No explanations."
@@ -1976,25 +2009,57 @@ def generate_candidates(
         )
     except Exception as exc:
         logger.error("call_swarm failed: %s", exc)
-        return [None] * n
+        return [(None, 0)] * n
+
+    def is_parse_failure(text: Optional[str]) -> bool:
+        if text is None:
+            return False
+        blocks, _reason = _parse_search_replace_blocks(text)
+        return blocks is None
+
+    texts: list[Optional[str]] = list(raw)
+    retries_used = [0] * n
+    pending = [i for i in range(n) if is_parse_failure(texts[i])]
+
+    round_num = 0
+    while pending and round_num < max_format_retries:
+        round_num += 1
+        corrective_prompt = prompt + _FORMAT_RETRY_SUFFIX
+        _check_leak_guard(fixture, corrective_prompt)
+        try:
+            retry_raw = call_swarm(
+                [corrective_prompt] * len(pending),
+                system=system,
+                temperature=temperature,
+                timeout=60,
+                max_concurrent=min(4, len(pending)),
+            )
+        except Exception as exc:
+            logger.error("call_swarm format-retry round %d failed: %s", round_num, exc)
+            break
+
+        still_pending = []
+        for idx, new_text in zip(pending, retry_raw):
+            retries_used[idx] += 1
+            if new_text is not None:
+                texts[idx] = new_text
+            if is_parse_failure(texts[idx]):
+                still_pending.append(idx)
+        pending = still_pending
 
     # Output-level leak guard (belt-and-suspenders): the prompt-level guard above is
     # the primary defense (the model never sees the golden test); this drops any
     # candidate that verbatim-copies a golden_test_id anyway, recorded as a none/
     # swarm-health signal rather than surfaced as an applied candidate.
-    extracted: list[Optional[str]] = []
-    for c in raw:
-        if c is None:
-            extracted.append(None)
-            continue
-        if any(tid and tid in c for tid in fixture.golden_test_ids):
+    extracted: list[tuple[Optional[str], int]] = []
+    for i, text in enumerate(texts):
+        if text is not None and any(tid and tid in text for tid in fixture.golden_test_ids):
             logger.warning(
                 "Output-level leak guard: golden_test_id found in candidate for %s; dropping",
                 fixture.sha[:8],
             )
-            extracted.append(None)
-            continue
-        extracted.append(c)
+            text = None
+        extracted.append((text, retries_used[i]))
     return extracted
 
 
@@ -2151,20 +2216,21 @@ def run_fixture(
         tier=fixture.tier,
         repo=fixture.repo,
         n_candidates_generated=max_n,
-        none_count=sum(1 for c in candidates_raw if c is None),
+        none_count=sum(1 for c, _ in candidates_raw if c is None),
     )
 
     if mock_mode:
         # DEFERRED SCAFFOLD: mock mode for testing deferred AC5/AC6 surfaces.
         # The oracle is NOT invoked here — mock mode tests swarm generation plumbing only.
         # AC4 oracle tests use classify_candidate_outcome directly (see test_batched_fixer_eval.py).
-        for i, candidate_text in enumerate(candidates_raw):
+        for i, (candidate_text, format_retries) in enumerate(candidates_raw):
             candidate = CandidateResult(
                 fixture_id=fixture_id,
                 candidate_seed=i,
                 candidate_text=candidate_text,
                 apply_status="success" if candidate_text else "apply_error",
                 scoped_test_outcome="pass" if i == 0 else "unverified",  # SCAFFOLD
+                format_retries=format_retries,
             )
             result.candidates.append(candidate)
         # DEFERRED: execute-select (AC6)
@@ -2179,7 +2245,7 @@ def run_fixture(
 
     try:
         with dedicated_clone(repo_path, run_id) as clone_path:
-            for i, candidate_text in enumerate(candidates_raw):
+            for i, (candidate_text, format_retries) in enumerate(candidates_raw):
                 if candidate_text is None:
                     result.candidates.append(
                         CandidateResult(
@@ -2188,6 +2254,7 @@ def run_fixture(
                             candidate_text=None,
                             apply_status="apply_error",
                             scoped_test_outcome="unverified",
+                            format_retries=format_retries,
                         )
                     )
                     continue
@@ -2204,6 +2271,7 @@ def run_fixture(
                             apply_status=apply_status,
                             scoped_test_outcome=test_outcome,
                             test_failures=post_failures,
+                            format_retries=format_retries,
                         )
                     )
                 except Exception as exc:
@@ -2216,6 +2284,7 @@ def run_fixture(
                             apply_status="apply_error",
                             apply_error=str(exc),
                             scoped_test_outcome="unverified",
+                            format_retries=format_retries,
                         )
                     )
 

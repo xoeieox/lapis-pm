@@ -99,6 +99,8 @@ class TestPostLandDeployHook:
                 revparse_count[path] = revparse_count.get(path, 0) + 1
                 sha = "presha111" if revparse_count[path] == 1 else "postsha222"
                 return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             if cmd[0] == "git" and "pull" in cmd:
                 pull_calls.append(cmd)
             elif cmd[0] == "sudo":
@@ -189,6 +191,8 @@ class TestPostLandDeployHook:
                 revparse_count[path] = revparse_count.get(path, 0) + 1
                 sha = "presha111" if revparse_count[path] == 1 else "postsha222"
                 return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             if cmd[0] == "sudo":
                 sudo_calls.append(cmd)
             elif cmd[0] == "systemctl" and "--user" in cmd:
@@ -279,6 +283,8 @@ class TestPostLandDeployHook:
                 revparse_count[path] = revparse_count.get(path, 0) + 1
                 sha = "presha111" if revparse_count[path] == 1 else "postsha222"
                 return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             if cmd[0] == "systemctl" and "--user" in cmd:
                 user_calls.append(cmd)
             elif cmd[0] == "sudo":
@@ -309,6 +315,8 @@ class TestPostLandDeployHook:
                 revparse_count[path] = revparse_count.get(path, 0) + 1
                 sha = "presha111" if revparse_count[path] == 1 else "postsha222"
                 return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             if cmd[0] == "systemctl" and "--user" in cmd and "is-active" in cmd:
                 return _make_completed_process(returncode=3, stdout="failed\n")
             return _make_completed_process(returncode=0, stdout="active")
@@ -339,6 +347,8 @@ class TestPostLandGitPull:
         def fake_run(cmd, **kwargs):
             if "rev-parse" in cmd:
                 return _make_completed_process(returncode=0, stdout="abc12345")
+            if "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             pull_calls.append(cmd)
             return _make_completed_process(returncode=0, stdout="")
 
@@ -433,6 +443,8 @@ class TestPostLandGitPull:
         def fake_run(cmd, **kwargs):
             if "rev-parse" in cmd:
                 return _make_completed_process(returncode=0, stdout="abc12345")
+            if "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             pull_calls.append(cmd)
             return _make_completed_process(returncode=0, stdout="")
 
@@ -1181,6 +1193,8 @@ class TestCockpitDeploy:
                 revparse_count[path] = revparse_count.get(path, 0) + 1
                 sha = "presha111" if revparse_count[path] == 1 else "postsha222"
                 return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             if cmd[0] == "git" and "pull" in cmd:
                 pull_calls.append(cmd)
             elif cmd[0] == "sudo":
@@ -1304,6 +1318,215 @@ class TestCockpitDeploy:
 
         captured = capsys.readouterr()
         assert "rc=1" in captured.err or "failed" in captured.err
+
+
+class TestRagOpsDeploy:
+    """Tests for rag-ops entry in _POST_LAND_PULL (lapis-pm-deploy-pull-rag-ops-v0).
+
+    rag-ops is pure `docker compose` config + a bash script — no daemon imports it,
+    so this mirrors TestGardenerDeploy's shape exactly: LOW signal, pull only, no
+    restart. See pm_core.py's _POST_LAND_PULL["rag-ops"] comment for why a pull
+    alone does not make docker re-read the compose file (out of scope here, §0/§2
+    of the spec).
+    """
+
+    def test_rag_ops_not_in_post_land_restart(self):
+        """rag-ops must not be in _POST_LAND_RESTART: no daemon to restart."""
+        assert "rag-ops" not in pm_core._POST_LAND_RESTART
+
+    def test_rag_ops_not_in_post_land_restart_user(self):
+        """rag-ops must not be in _POST_LAND_RESTART_USER: no long-running user service."""
+        assert "rag-ops" not in pm_core._POST_LAND_RESTART_USER
+
+    def test_rag_ops_not_in_post_land_pull_critical(self):
+        """rag-ops pull failure is LOW signal, not critical — must not be in CRITICAL set."""
+        assert "rag-ops" not in pm_core._POST_LAND_PULL_CRITICAL
+
+    def test_rag_ops_in_post_land_pull_low_signal(self):
+        """rag-ops pull failure emits LOW-priority notification (attributable, never paging)."""
+        assert "rag-ops" in pm_core._POST_LAND_PULL_LOW_SIGNAL
+
+    def test_rag_ops_pull_triggers_git_pull_no_restart(self):
+        """Landing a rag-ops PR fires exactly one git pull and zero systemctl/docker calls."""
+        pull_calls = []
+        restart_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
+            if cmd[0] == "git" and "pull" in cmd:
+                pull_calls.append(cmd)
+            elif cmd[0] == "sudo":
+                restart_calls.append(cmd)
+            elif cmd[0] == "systemctl":
+                restart_calls.append(cmd)
+            elif cmd[0] == "docker":
+                restart_calls.append(cmd)
+            return _make_completed_process(returncode=0)
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                pm_core._post_land_deploy_hook("rag-ops")
+
+        assert len(pull_calls) == 1
+        assert pull_calls[0] == [
+            "git", "-C", "/data/rag", "pull", "--ff-only", "origin", "main"
+        ]
+        assert len(restart_calls) == 0, (
+            "rag-ops is pure docker compose config — no systemctl/docker invocation "
+            "of any kind, per spec §1/§2"
+        )
+
+    def test_rag_ops_pull_failure_sends_low_priority_notify(self):
+        """A failed rag-ops pull emits exactly one LOW-priority notification."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            if "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
+            return _make_completed_process(returncode=1, stderr="not fast-forward")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("rag-ops")
+
+        assert len(notify_calls) == 1, "Expected exactly one notification on rag-ops pull failure"
+        assert notify_calls[0]["priority"] == Priority.LOW, (
+            f"Expected Priority.LOW, got {notify_calls[0]['priority']}"
+        )
+        assert "rag-ops" in notify_calls[0]["message"]
+        assert "/data/rag" in notify_calls[0]["message"]
+
+    def test_rag_ops_pull_failure_does_not_raise(self):
+        """A failed rag-ops pull must not raise — landing must still complete."""
+        def fake_run(cmd, **kwargs):
+            if "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
+            return _make_completed_process(returncode=1, stderr="diverged")
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+            pm_core._post_land_git_pull("rag-ops")  # must not raise
+
+    def test_rag_ops_pull_failure_not_critical_channel(self):
+        """rag-ops pull failure must NOT emit NORMAL or HIGH priority — low signal only."""
+        from agents_core.notify import Priority
+
+        notify_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "rev-parse" in cmd:
+                return _make_completed_process(returncode=0, stdout="abc12345")
+            if "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
+            return _make_completed_process(returncode=1, stderr="not ff")
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        with (
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._post_land_git_pull("rag-ops")
+
+        assert all(p == Priority.LOW for p in notify_calls), (
+            "rag-ops pull failure must only emit LOW priority — never NORMAL or HIGH"
+        )
+
+
+class TestPostLandGitPullDirtyTreeAndDivergence:
+    """Poison-pill hardening for the shared _post_land_git_pull (Facets + Council
+    spec-review, lapis-pm-deploy-pull-rag-ops-v0 §1.3). Both tests exercise the
+    real git binary against a throwaway repo pair — not mocked subprocess — since
+    the load-bearing behavior here is git's own actual dirty/divergence detection.
+    """
+
+    @staticmethod
+    def _make_origin_and_clone(tmp_path):
+        """A tiny origin repo (branch `main`, one commit) and a working clone of it."""
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(origin)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=origin, check=True, capture_output=True)
+        (origin / "f.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=origin, check=True, capture_output=True)
+
+        clone = tmp_path / "clone"
+        subprocess.run(
+            ["git", "clone", str(origin), str(clone)], check=True, capture_output=True
+        )
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=clone, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=clone, check=True, capture_output=True)
+        return origin, clone
+
+    def test_post_land_git_pull_dirty_tree_logs_specific_warning(self, tmp_path, capsys):
+        """A dirty mapped clone (uncommitted local modification) must log the distinct
+        dirty-tree message and must NOT attempt the `git pull` subprocess at all."""
+        _origin, clone = self._make_origin_and_clone(tmp_path)
+        (clone / "f.txt").write_text("locally modified, uncommitted\n")
+
+        calls = []
+        real_run = subprocess.run
+
+        def spy_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"gardener": [str(clone)]}),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=spy_run),
+        ):
+            advanced = pm_core._post_land_git_pull("gardener")
+
+        assert advanced is False
+        captured = capsys.readouterr()
+        assert "dirty working tree" in captured.err
+        assert not any(
+            cmd[:2] == ["git", "-C"] and "pull" in cmd for cmd in calls
+        ), "a dirty tree must skip the git pull subprocess entirely"
+
+    def test_post_land_git_pull_non_fastforward_fails_clean(self, tmp_path, capsys):
+        """A mapped clone whose local main has diverged from origin/main (non-fast-forward,
+        distinct from the dirty-uncommitted-changes case above) must fail the pull cleanly:
+        return False, not raise, and leave no merge-in-progress state behind."""
+        origin, clone = self._make_origin_and_clone(tmp_path)
+
+        # Advance origin/main independently...
+        (origin / "f.txt").write_text("v2-on-origin\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "origin-advances"], cwd=origin, check=True, capture_output=True)
+
+        # ...while the clone's local main also gains a commit origin never saw.
+        (clone / "g.txt").write_text("local-only commit\n")
+        subprocess.run(["git", "add", "."], cwd=clone, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "clone-diverges"], cwd=clone, check=True, capture_output=True)
+
+        with patch.object(pm_core, "_POST_LAND_PULL", {"gardener": [str(clone)]}):
+            advanced = pm_core._post_land_git_pull("gardener")  # must not raise
+
+        assert advanced is False
+        status = subprocess.run(
+            ["git", "-C", str(clone), "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+        assert status.returncode == 0
+        # No merge-in-progress markers left behind by the failed --ff-only attempt.
+        assert not (clone / ".git" / "MERGE_HEAD").exists()
+        assert "both modified" not in status.stdout
+        assert "Unmerged paths" not in status.stdout
 
 
 class TestMergeAndDeploy:
@@ -1574,6 +1797,8 @@ class TestHeadAdvanceGate:
                 revparse_count[path] = revparse_count.get(path, 0) + 1
                 sha = "pre111sha" if revparse_count[path] == 1 else "post222sha"
                 return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
             if cmd[0] == "git" and "pull" in cmd:
                 if pull_calls is not None:
                     pull_calls.append(cmd)

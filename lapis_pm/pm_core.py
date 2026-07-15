@@ -243,6 +243,17 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # Pull failure -> LOW signal (advisory live console, not a silent load-bearing
     # substrate like synapse/agents-core) — see _POST_LAND_PULL_LOW_SIGNAL below.
     "cockpit":        ["/srv/git/cockpit-working"],
+    # rag-ops's live deploy clone is /data/rag, a SEPARATE checkout from the PM working tree
+    # /srv/git/rag-ops-working (see rag-ops-vault-rag-drift-reconcile-v0's Substrate for why these
+    # two trees diverge). This pull keeps /data/rag's git ref current with origin/main so a future
+    # /pm-pr-review's close-out doesn't have to hand-reconcile it (as happened for PR #5 and #6,
+    # 2026-07-14) — it does NOT make docker re-read the pulled docker-compose.yml. docker compose
+    # only applies compose-file changes at container create/recreate time (`docker compose up -d
+    # [--force-recreate]`), never on a bare git pull against a running container. Actually deploying
+    # a future rag-ops config change to the live services remains a manual post-merge step (matching
+    # every rag-ops PR's own existing "Deploy note" convention) — this hook only prevents the git
+    # tree itself from silently drifting behind what's merged. Spec: lapis-pm-deploy-pull-rag-ops-v0.
+    "rag-ops":        ["/data/rag"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -271,7 +282,13 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # depends on (contrast synapse/agents-core, which are CRITICAL). A stale or dead
 # cockpit is visible the moment Erah opens the UI — LOW keeps a pull failure
 # attributable without polluting the critical Pushover channel.
-_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset({"code-reviewer", "facets", "gardener", "conductor", "cockpit"})
+# rag-ops: pure docker compose config + a bash script, no daemon imports it. A stale
+# /data/rag git ref is attributable drift (§0 of lapis-pm-deploy-pull-rag-ops-v0), not a
+# broken runtime — docker compose doesn't even re-read the pulled files until a manual
+# recreate, so LOW keeps this failure attributable without polluting the critical channel.
+_POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset(
+    {"code-reviewer", "facets", "gardener", "conductor", "cockpit", "rag-ops"}
+)
 
 # ---------------------------------------------------------------------------
 # conductor night-plan script closure (night-plan-conductor-deploy-sync-v0)
@@ -457,10 +474,31 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
         except Exception:
             pass
         try:
-            result = subprocess.run(
-                ["git", "-C", path, "pull", "--ff-only", "origin", "main"],
-                capture_output=True, text=True, timeout=30,
+            dirty_check = subprocess.run(
+                ["git", "-C", path, "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5,
             )
+            if dirty_check.returncode == 0 and dirty_check.stdout.strip():
+                print(
+                    f"[post-land-pull] dirty working tree at {path}, skipping pull "
+                    f"(uncommitted local changes present) — resolve manually",
+                    file=sys.stderr,
+                )
+                # falls through to the existing is_critical_repo / is_low_signal_repo notify
+                # branches below, exactly as a pull-command failure would — this only changes
+                # the LOGGED MESSAGE from git's generic ff-only-failure text to an actionable,
+                # specifically-named cause.
+                result = subprocess.CompletedProcess(
+                    args=["git", "-C", path, "pull", "--ff-only", "origin", "main"],
+                    returncode=1,
+                    stdout="",
+                    stderr="dirty working tree, pull skipped",
+                )
+            else:
+                result = subprocess.run(
+                    ["git", "-C", path, "pull", "--ff-only", "origin", "main"],
+                    capture_output=True, text=True, timeout=30,
+                )
             if result.returncode != 0:
                 print(
                     f"[post-land-pull] pull {path} failed rc={result.returncode}: "

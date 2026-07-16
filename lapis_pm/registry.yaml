@@ -38,16 +38,16 @@ shared_preamble: |
   When you confirm a non-obvious decision during your work, persist it:
     mem set "decision/<topic>" "<finding>" --tags "{repo},<other-tags>"
 
-# Local dispatch: fixer and fixer_retry route to 27B swarm via local-fixer engine.
-# Big mode (122B) available via --force-dispatch fixer_local:...
-# Reviewer/scout/spec_reviewer localization pending agents-core PR (Leg 2).
-# model: gravitywell-27b is a registry annotation — runtime routing depends on GW_URL endpoint.
+# Local dispatch: all roles route to 122B-A10B (llama.cpp) via local-fixer/local-reviewer engines.
+# 27B/vLLM fan-out posture RETIRED per decision/gw-122b-contact-starhouse-workers-2026-07-15.
+# 27B localization (localize-pm-dispatch-27b chain) superseded 2026-07-16.
+# model: gravitywell-122b is a registry annotation — runtime routing depends on GW_URL endpoint.
 
 agents:
   reviewer:
     chub_bundles: []
     engine: local-reviewer
-    model: gravitywell-27b
+    model: gravitywell-122b
     capture_meta: false
     notify: true
     notify_policy: infra-only
@@ -105,13 +105,12 @@ agents:
         "confidence": 0.0-1.0
       }}
       No prose outside the JSON.
-    model: sonnet
-    timeout_s: 900
+    timeout_s: 600
 
   reviewer_fresh:
     chub_bundles: []
     engine: local-reviewer
-    model: gravitywell-27b
+    model: gravitywell-122b
     capture_meta: false
     notify: false
     system_template: |
@@ -171,13 +170,12 @@ agents:
         "confidence": 0.0-1.0
       }}
       No prose outside the JSON.
-    model: opus
-    timeout_s: 900
+    timeout_s: 600
 
   spec_reviewer:
     chub_bundles: ["conductor/lapis-pm", "conductor/lapis-ecosystem"]
     engine: local-reviewer
-    model: gravitywell-27b
+    model: gravitywell-122b
     capture_meta: false
     notify: false
     system_template: |
@@ -234,13 +232,12 @@ agents:
       }}
 
       No prose outside the JSON.
-    model: sonnet
-    timeout_s: 2400
+    timeout_s: 1800
 
   fixer:
     chub_bundles: []
     engine: local-fixer
-    model: gravitywell-27b
+    model: gravitywell-122b
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -343,12 +340,12 @@ agents:
         when the spec is genuinely already implemented and you can cite specific
         evidence. Hallucinated verdicts waste Erah's review time and damage
         trust in the system.
-    timeout_s: 3600
+    timeout_s: 2700
 
   fixer_retry:
     chub_bundles: []
     engine: local-fixer
-    model: gravitywell-27b
+    model: gravitywell-122b
     capture_meta: false
     notify: false
     system_template: |
@@ -400,11 +397,10 @@ agents:
 
       Keep the diff minimal and scoped to the stated issues. No surrounding
       refactors. End your response with: "Pushed fixes to {existing_branch}."
-    timeout_s: 3600
+    timeout_s: 2700
 
-  # DEPRECATED: standard fixer now routes to 27B via local-fixer.
-  # This entry is kept for backwards compatibility (--force-dispatch fixer_local).
-  # Will be removed after Leg 2 lands and test_fixer_local_registry_and_guards.py is updated.
+  # DEPRECATED: standard fixer now routes to 122B directly, same target as this entry.
+  # Kept for backwards compatibility / explicit --force-dispatch fixer_local invocation.
   fixer_local:
     chub_bundles: []
     engine: local-fixer
@@ -438,7 +434,7 @@ agents:
   scout:
     chub_bundles: []
     engine: local-reviewer
-    model: gravitywell-27b
+    model: gravitywell-122b
     capture_meta: false
     notify: false
     system_template: |
@@ -458,5 +454,4 @@ agents:
 
       Investigate and return a concise answer (under 300 words). Cite
       file paths with line numbers. Do not make changes.
-    model: haiku
-    timeout_s: 600
+    timeout_s: 300

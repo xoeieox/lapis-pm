@@ -17,12 +17,12 @@
 shared_preamble: |
   ## Operating context
 
-  You run in {repo_cwd} (a {repo} working clone) as a `claude -p` subprocess
-  with full Bash, Read, Write, Edit, Grep, and mem-CLI tool access. You have
-  every permission the execution protocol below describes. Do NOT claim you
-  are read-only, need manual approval, or "would" do something — execute it.
-  Planning prose without tool use is the known failure mode this role checks
-  for; prefer a minimal, executed diff over a long explanation.
+  You run in {repo_cwd} (a {repo} working clone) as a shaped agent subprocess
+  with tool access defined by your role. Read the role invariant below for your
+  specific tool set. Do NOT claim you are read-only, need manual approval, or
+  "would" do something — execute it. Planning prose without tool use is the known
+  failure mode this role checks for; prefer a minimal, executed diff over a long
+  explanation.
 
   The repo's CLAUDE.md, its @chub: directives, and per-project auto-memory
   have already been injected into this session by the SessionStart hook.
@@ -37,6 +37,11 @@ shared_preamble: |
 
   When you confirm a non-obvious decision during your work, persist it:
     mem set "decision/<topic>" "<finding>" --tags "{repo},<other-tags>"
+
+# Local dispatch: fixer and fixer_retry route to 27B swarm via local-fixer engine.
+# Big mode (122B) available via --force-dispatch fixer_local:...
+# Reviewer/scout/spec_reviewer localization pending agents-core PR (Leg 2).
+# model: gravitywell-27b is a registry annotation — runtime routing depends on GW_URL endpoint.
 
 agents:
   reviewer:
@@ -228,6 +233,8 @@ agents:
 
   fixer:
     chub_bundles: []
+    engine: local-fixer
+    model: gravitywell-27b
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -330,11 +337,12 @@ agents:
         when the spec is genuinely already implemented and you can cite specific
         evidence. Hallucinated verdicts waste Erah's review time and damage
         trust in the system.
-    model: sonnet
-    timeout_s: 2700
+    timeout_s: 3600
 
   fixer_retry:
     chub_bundles: []
+    engine: local-fixer
+    model: gravitywell-27b
     capture_meta: false
     notify: false
     system_template: |
@@ -386,9 +394,11 @@ agents:
 
       Keep the diff minimal and scoped to the stated issues. No surrounding
       refactors. End your response with: "Pushed fixes to {existing_branch}."
-    model: sonnet
-    timeout_s: 2700
+    timeout_s: 3600
 
+  # DEPRECATED: standard fixer now routes to 27B via local-fixer.
+  # This entry is kept for backwards compatibility (--force-dispatch fixer_local).
+  # Will be removed after Leg 2 lands and test_fixer_local_registry_and_guards.py is updated.
   fixer_local:
     chub_bundles: []
     engine: local-fixer

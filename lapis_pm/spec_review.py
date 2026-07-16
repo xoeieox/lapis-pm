@@ -142,6 +142,7 @@ class SpecReviewBrief:
     # GravityWell reference leg fields (reference-only; never steer the recommendation)
     gw_verdict: str = "skip"  # verdict from GW, or "skip" if not dispatched
     gw_ran: bool = False  # whether the GW leg actually ran
+    gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname")
     gw_findings_count: int = 0  # number of findings/issues from GW
     elapsed_gw: float = 0.0  # wall-clock time for GW leg
     gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
@@ -514,15 +515,15 @@ def _dispatch_gw_reviewer(
     repo: str,
     run_id: str,
     gw_principal: str | None = None,
-) -> tuple[str | None, list[dict], float]:
+) -> tuple[str | None, list[dict], float, str]:
     """Dispatch and run the GW reference reviewer synchronously against Slot-2
     Devstral (:8082), lease-free — a distinct-model second opinion that runs
     concurrently with the 27B Facets/Council voicing on :8081 at zero lease
     contention.
 
-    Returns (text, transcript, elapsed_s) where text is the verdict string (or None
-    if GW did not run), transcript is the list of tool calls, and elapsed_s is the
-    wall-clock time for the run.
+    Returns (text, transcript, elapsed_s, skip_reason) where text is the verdict
+    string (or None if GW did not run), transcript is the list of tool calls,
+    elapsed_s is the wall-clock time, and skip_reason is set when GW is skipped.
 
     Stub-aware: if GW_REVIEW_STUB=1, uses GW_REVIEW_STUB_VERDICT env var.
     """
@@ -532,17 +533,18 @@ def _dispatch_gw_reviewer(
     if os.getenv("GW_REVIEW_STUB") == "1":
         verdict = os.getenv("GW_REVIEW_STUB_VERDICT", "clean")
         elapsed = time.time() - start_time
-        return verdict, [], elapsed
+        return verdict, [], elapsed, ""
 
     gw_slot2_url = _gw_slot2_url()
     if gw_slot2_url is None:
         elapsed = time.time() - start_time
         print(
-            f"[spec-review:gw-reviewer] GW_URL has no parseable hostname — "
-            f"Slot-2 unresolved, skipping GW leg",
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: GW_URL has no "
+            f"parseable hostname (Slot-2 unresolved). Spec-review will proceed with "
+            f"council voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "no_parseable_hostname"
 
     # Single bounded (4s) probe: doubles as the readiness gate AND the
     # provenance source (the served model), replacing the doorman-heartbeat
@@ -554,11 +556,12 @@ def _dispatch_gw_reviewer(
     if served_model is None:
         elapsed = time.time() - start_time
         print(
-            f"[spec-review:gw-reviewer] GW reviewer did not run: Slot-2 not serving "
-            f"(url={gw_slot2_url})",
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: Slot-2 not "
+            f"serving (probed {gw_slot2_url}). Spec-review will proceed with council "
+            f"voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "slot2_unavailable"
 
     print(
         f"[spec-review:gw-reviewer-provenance] endpoint={gw_slot2_url} "
@@ -574,7 +577,7 @@ def _dispatch_gw_reviewer(
             f"[spec-review:gw-reviewer] agents_core import failed: {e} — skipping GW leg",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "import_error"
 
     prompt = (
         f"Review this spec for technical soundness, implementability, and "
@@ -614,14 +617,14 @@ def _dispatch_gw_reviewer(
                 f"elapsed={elapsed:.1f}s",
                 file=sys.stderr,
             )
-        return text, transcript, elapsed
+        return text, transcript, elapsed, "on_wake_fail_skip"
     except Exception as e:
         elapsed = time.time() - start_time
         print(
             f"[spec-review:gw-reviewer] call_gw_agent failed: {e} — skipping",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "call_error"
 
 
 def _poll_sonnet_until_terminal(
@@ -899,6 +902,7 @@ def _build_brief(
         council_error_reason=council_error_reason,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=elapsed_gw,
         gw_transcript_ref=gw_transcript_ref,
@@ -1744,9 +1748,10 @@ def run_spec_review(
         gw_text: str | None = None
         gw_transcript: list[dict] = []
         gw_elapsed: float = 0.0
+        gw_skip_reason: str = ""
         if gw_future is not None:
             try:
-                gw_text, gw_transcript, gw_elapsed = gw_future.result(timeout=300)
+                gw_text, gw_transcript, gw_elapsed, gw_skip_reason = gw_future.result(timeout=300)
             except FuturesTimeoutError:
                 print(
                     f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
@@ -1754,12 +1759,14 @@ def run_spec_review(
                 )
                 gw_text = None
                 gw_elapsed = 300.0
+                gw_skip_reason = "timeout"
             except Exception as e:
                 print(
                     f"[spec-review:gw-reviewer-collect-error] {e}",
                     file=sys.stderr,
                 )
                 gw_text = None
+                gw_skip_reason = "collection_error"
             finally:
                 # Clean up executor to prevent thread pool leak
                 if executor is not None:

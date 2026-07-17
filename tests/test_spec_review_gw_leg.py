@@ -21,6 +21,7 @@ import pytest
 from lapis_pm.spec_review import (
     _combined_recommendation,
     _dispatch_gw_reviewer,
+    _gw_endpoints_collapsed,
     _gw_slot2_url,
     SpecReviewBrief,
 )
@@ -84,7 +85,7 @@ def test_gw_slot2_serving_runs_lease_free_against_slot2():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral") as mock_sm:
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -133,7 +134,7 @@ def test_gw_slot2_provenance_logged_on_successful_run(capsys):
 def test_gw_stub_returns_verdict():
     """GW_REVIEW_STUB=1 returns stubbed verdict without calling call_gw_agent."""
     with patch.dict(os.environ, {"GW_REVIEW_STUB": "1", "GW_REVIEW_STUB_VERDICT": "fixable"}):
-        text, transcript, elapsed = _dispatch_gw_reviewer(
+        text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
             spec_text="test spec",
             synth_target_id="test-tid",
             parsed_target_id="test-id",
@@ -144,6 +145,7 @@ def test_gw_stub_returns_verdict():
     assert text == "fixable"
     assert transcript == []
     assert elapsed >= 0
+    assert skip_reason == ""
 
 
 def test_gw_stub_default_verdict_clean():
@@ -151,7 +153,7 @@ def test_gw_stub_default_verdict_clean():
     env = {"GW_REVIEW_STUB": "1"}
     with patch.dict(os.environ, env, clear=False):
         os.environ.pop("GW_REVIEW_STUB_VERDICT", None)
-        text, transcript, elapsed = _dispatch_gw_reviewer(
+        text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
             spec_text="test",
             synth_target_id="tid",
             parsed_target_id="id",
@@ -366,38 +368,44 @@ def test_gw_slot2_not_serving_returns_none():
     mock_gw_module.call_gw_agent = mock_call_gw
     mock_gw_module.DEFAULT_READONLY_TOOLS = []
 
-    with patch("lapis_pm.spec_review.swarm_model", return_value=None):
-        with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-            text, transcript, elapsed = _dispatch_gw_reviewer(
-                spec_text="spec",
-                synth_target_id="tid",
-                parsed_target_id="id",
-                repo="repo",
-                run_id="run",
-            )
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value=None):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
 
     assert text is None
     assert transcript == []
     assert elapsed >= 0
+    assert skip_reason == "slot2_unavailable"
     mock_call_gw.assert_not_called()
 
 
 def test_gw_agents_core_import_failure_returns_none():
     """When agents_core import fails, _dispatch_gw_reviewer returns (None, [], elapsed)."""
     # Patch at the import site inside _dispatch_gw_reviewer
-    with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
-        with patch.dict("sys.modules", {"agents_core": None, "agents_core.gw_agent": None}):
-            text, transcript, elapsed = _dispatch_gw_reviewer(
-                spec_text="spec",
-                synth_target_id="tid",
-                parsed_target_id="id",
-                repo="repo",
-                run_id="run",
-            )
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
+            with patch.dict("sys.modules", {"agents_core": None, "agents_core.gw_agent": None}):
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
 
     # When import fails, we catch and return None
     assert text is None
     assert transcript == []
+    assert skip_reason == "import_error"
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +428,7 @@ def test_return_shape_is_tuple_when_return_transcript_true():
         )
 
     # Unpack: this is the critical pattern
-    text, transcript, elapsed = result
+    text, transcript, elapsed, skip_reason = result
 
     # text can be a string or None
     assert isinstance(text, str) or text is None
@@ -428,6 +436,8 @@ def test_return_shape_is_tuple_when_return_transcript_true():
     assert isinstance(transcript, list)
     # elapsed is a float
     assert isinstance(elapsed, float)
+    # skip_reason is always a string (empty when GW ran)
+    assert isinstance(skip_reason, str)
 
 
 def test_tuple_none_first_element_is_truthy():
@@ -446,14 +456,16 @@ def test_tuple_none_first_element_is_truthy():
 
 def test_slot2_not_serving_returns_none_not_empty_tuple():
     """When Slot-2 is not serving, gw_text is None, not an empty tuple."""
-    with patch("lapis_pm.spec_review.swarm_model", return_value=None):
-        gw_text, gw_transcript, gw_elapsed = _dispatch_gw_reviewer(
-            spec_text="spec",
-            synth_target_id="tid",
-            parsed_target_id="id",
-            repo="repo",
-            run_id="run",
-        )
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value=None):
+            gw_text, gw_transcript, gw_elapsed, gw_skip_reason = _dispatch_gw_reviewer(
+                spec_text="spec",
+                synth_target_id="tid",
+                parsed_target_id="id",
+                repo="repo",
+                run_id="run",
+            )
 
     # CRITICAL: check text is None, not whether the tuple is None
     assert gw_text is None
@@ -529,3 +541,168 @@ def test_brief_dataclass_has_gw_fields():
     assert brief.gw_findings_count == 0
     assert brief.elapsed_gw == 0.5
     assert brief.gw_transcript_ref == "/srv/lapis/spec-review-artifacts/abc/gw-transcript.json"
+
+
+# ---------------------------------------------------------------------------
+# Slot-2 collapsed onto primary GW endpoint (AC1, AC5)
+# ---------------------------------------------------------------------------
+
+def test_endpoints_collapsed_identical_url():
+    """Identical host:port strings collapse."""
+    assert _gw_endpoints_collapsed(
+        "http://203.0.113.11:8081", "http://203.0.113.11:8081"
+    ) is True
+
+
+def test_endpoints_collapsed_trailing_slash_and_case_variance():
+    """Trailing slash and host case differences don't defeat the fast-path check."""
+    assert _gw_endpoints_collapsed(
+        "http://203.0.113.11:8081/", "http://203.0.113.11:8081"
+    ) is True
+    assert _gw_endpoints_collapsed(
+        "http://GRAVITYWELL.example:8081", "http://gravitywell.example:8081"
+    ) is True
+
+
+def test_endpoints_collapsed_distinct_hostname_same_ip():
+    """Two distinct hostnames resolving to the same (ip, port) also collapse
+    (DNS-alias hardening, stage 2)."""
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        def fake_getaddrinfo(host, *_a, **_kw):
+            ip = "203.0.113.11" if host in ("primary-alias.example", "slot2-alias.example") else "9.9.9.9"
+            return [(None, None, None, "", (ip, 0))]
+        mock_getaddrinfo.side_effect = fake_getaddrinfo
+
+        assert _gw_endpoints_collapsed(
+            "http://slot2-alias.example:8081", "http://primary-alias.example:8081"
+        ) is True
+
+
+def test_endpoints_not_collapsed_genuinely_distinct():
+    """Default unset GW_SLOT2_URL (host:8082) vs primary host:8081 is NOT a collapse."""
+    assert _gw_endpoints_collapsed(
+        "http://203.0.113.11:8082", "http://203.0.113.11:8081"
+    ) is False
+
+
+def test_endpoints_not_collapsed_distinct_hosts_distinct_ips():
+    """Distinct hostnames resolving to distinct IPs are not a collapse."""
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        def fake_getaddrinfo(host, *_a, **_kw):
+            ip = "1.1.1.1" if host == "slot2.example" else "2.2.2.2"
+            return [(None, None, None, "", (ip, 0))]
+        mock_getaddrinfo.side_effect = fake_getaddrinfo
+
+        assert _gw_endpoints_collapsed(
+            "http://slot2.example:8081", "http://primary.example:8081"
+        ) is False
+
+
+def test_endpoints_collapsed_dns_resolution_error_falls_back_to_string_compare():
+    """A getaddrinfo failure (e.g. NXDOMAIN) falls back to the stage-1 (negative)
+    result rather than raising."""
+    with patch("socket.getaddrinfo", side_effect=OSError("nodename nor servname provided")):
+        assert _gw_endpoints_collapsed(
+            "http://unresolvable-a.example:8081", "http://unresolvable-b.example:8081"
+        ) is False
+
+
+def test_dispatch_gw_reviewer_skips_when_slot2_collapsed_to_primary():
+    """AC1: When GW_SLOT2_URL resolves to the same host:port as GW_URL,
+    _dispatch_gw_reviewer returns skip_reason=slot2_collapsed_to_primary and
+    never calls call_gw_agent (no swarm_model probe needed to decide this)."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_SLOT2_URL": "http://203.0.113.11:8081",
+                                  "GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        with patch("lapis_pm.spec_review.swarm_model", return_value="qwen3.6-35b-a3b") as mock_sm:
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    assert text is None
+    assert transcript == []
+    assert skip_reason == "slot2_collapsed_to_primary"
+    mock_call_gw.assert_not_called()
+    mock_sm.assert_not_called()
+
+
+def test_dispatch_gw_reviewer_runs_when_slot2_distinct_and_serving():
+    """AC2 (regression): a genuinely distinct, serving Slot-2 still runs the
+    reviewer and calls call_gw_agent."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    mock_call_gw.assert_called_once()
+    assert text == "clean"
+    assert skip_reason == ""
+
+
+def test_dispatch_gw_reviewer_slot2_unavailable_preserved_when_distinct():
+    """AC3: a distinct Slot-2 endpoint that isn't serving still skips with the
+    existing slot2_unavailable reason (not treated as a collapse)."""
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value=None):
+            text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                spec_text="spec",
+                synth_target_id="tid",
+                parsed_target_id="id",
+                repo="repo",
+                run_id="run",
+            )
+
+    assert text is None
+    assert skip_reason == "slot2_unavailable"
+
+
+def test_brief_render_shows_collapsed_skip_visibly():
+    """AC4: the rendered brief visibly surfaces a collapsed skip so no
+    operator can assume a second opinion ran when it did not."""
+    from lapis_pm.spec_review import format_brief
+
+    brief = SpecReviewBrief(
+        spec_path=Path("/tmp/spec.md"),
+        target_id="test",
+        repo="test",
+        council_status="resolved",
+        council_landing="",
+        council_open_questions=[],
+        council_confidence="",
+        council_positions=[],
+        council_run_id="",
+        elapsed_s=1.0,
+        combined_recommendation="proceed-to-bind",
+        gw_ran=False,
+        gw_verdict="skip",
+        gw_skip_reason="slot2_collapsed_to_primary",
+        gw_findings_count=0,
+        elapsed_gw=0.1,
+        gw_transcript_ref="",
+    )
+
+    rendered = format_brief(brief)
+    assert "skipped" in rendered.lower()
+    assert "slot2_collapsed_to_primary" in rendered

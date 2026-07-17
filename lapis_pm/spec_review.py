@@ -142,6 +142,7 @@ class SpecReviewBrief:
     # GravityWell reference leg fields (reference-only; never steer the recommendation)
     gw_verdict: str = "skip"  # verdict from GW, or "skip" if not dispatched
     gw_ran: bool = False  # whether the GW leg actually ran
+    gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname")
     gw_findings_count: int = 0  # number of findings/issues from GW
     elapsed_gw: float = 0.0  # wall-clock time for GW leg
     gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
@@ -507,6 +508,54 @@ def _gw_slot2_url() -> str | None:
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
+def _gw_primary_url() -> str:
+    """The primary GW voicing endpoint — same value Council/Facets voicing
+    resolves through call_operator("gravitywell")."""
+    return os.environ.get("GW_URL", "http://203.0.113.11:8081")
+
+
+def _normalized_host_port(url: str) -> tuple[str, int] | None:
+    """Parse url to a (lowercased-host, port) tuple, applying default-port
+    rules (80/443) when no port is present. Returns None if unparseable."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(url.rstrip("/"))
+    if not parts.hostname:
+        return None
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+    return (parts.hostname.lower(), port)
+
+
+def _gw_endpoints_collapsed(slot2_url: str, primary_url: str) -> bool:
+    """Two-stage collapse test: does slot2_url point at the same physical
+    endpoint as primary_url?
+
+    Stage 1 (fast path): normalized host:port string equality (trailing
+    slash stripped, host lowercased, default-port rules applied).
+
+    Stage 2 (DNS-alias hardening): if the host:port strings differ, resolve
+    both hostnames via socket.getaddrinfo and compare (ip, port) — two
+    distinct hostnames that resolve to the same physical IP:port are also a
+    collapse. Any resolution error falls back to the (already-negative)
+    stage 1 result rather than raising.
+    """
+    a = _normalized_host_port(slot2_url)
+    b = _normalized_host_port(primary_url)
+    if a is None or b is None:
+        return False
+    if a == b:
+        return True
+
+    try:
+        ips_a = {res[4][0] for res in socket.getaddrinfo(a[0], None)}
+        ips_b = {res[4][0] for res in socket.getaddrinfo(b[0], None)}
+    except OSError:
+        return False
+
+    return a[1] == b[1] and bool(ips_a & ips_b)
+
+
 def _dispatch_gw_reviewer(
     spec_text: str,
     synth_target_id: str,
@@ -514,15 +563,15 @@ def _dispatch_gw_reviewer(
     repo: str,
     run_id: str,
     gw_principal: str | None = None,
-) -> tuple[str | None, list[dict], float]:
+) -> tuple[str | None, list[dict], float, str]:
     """Dispatch and run the GW reference reviewer synchronously against Slot-2
     Devstral (:8082), lease-free — a distinct-model second opinion that runs
     concurrently with the 27B Facets/Council voicing on :8081 at zero lease
     contention.
 
-    Returns (text, transcript, elapsed_s) where text is the verdict string (or None
-    if GW did not run), transcript is the list of tool calls, and elapsed_s is the
-    wall-clock time for the run.
+    Returns (text, transcript, elapsed_s, skip_reason) where text is the verdict
+    string (or None if GW did not run), transcript is the list of tool calls,
+    elapsed_s is the wall-clock time, and skip_reason is set when GW is skipped.
 
     Stub-aware: if GW_REVIEW_STUB=1, uses GW_REVIEW_STUB_VERDICT env var.
     """
@@ -532,17 +581,30 @@ def _dispatch_gw_reviewer(
     if os.getenv("GW_REVIEW_STUB") == "1":
         verdict = os.getenv("GW_REVIEW_STUB_VERDICT", "clean")
         elapsed = time.time() - start_time
-        return verdict, [], elapsed
+        return verdict, [], elapsed, ""
 
     gw_slot2_url = _gw_slot2_url()
     if gw_slot2_url is None:
         elapsed = time.time() - start_time
         print(
-            f"[spec-review:gw-reviewer] GW_URL has no parseable hostname — "
-            f"Slot-2 unresolved, skipping GW leg",
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: GW_URL has no "
+            f"parseable hostname (Slot-2 unresolved). Spec-review will proceed with "
+            f"council voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "no_parseable_hostname"
+
+    primary_url = _gw_primary_url()
+    if _gw_endpoints_collapsed(gw_slot2_url, primary_url):
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: Slot-2 "
+            f"({gw_slot2_url}) has collapsed onto the primary GW endpoint "
+            f"({primary_url}) — a single-model topology gets Council/Facets "
+            f"voicing only, no self-contending reference leg.",
+            file=sys.stderr,
+        )
+        return None, [], elapsed, "slot2_collapsed_to_primary"
 
     # Single bounded (4s) probe: doubles as the readiness gate AND the
     # provenance source (the served model), replacing the doorman-heartbeat
@@ -554,11 +616,12 @@ def _dispatch_gw_reviewer(
     if served_model is None:
         elapsed = time.time() - start_time
         print(
-            f"[spec-review:gw-reviewer] GW reviewer did not run: Slot-2 not serving "
-            f"(url={gw_slot2_url})",
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: Slot-2 not "
+            f"serving (probed {gw_slot2_url}). Spec-review will proceed with council "
+            f"voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "slot2_unavailable"
 
     print(
         f"[spec-review:gw-reviewer-provenance] endpoint={gw_slot2_url} "
@@ -574,7 +637,7 @@ def _dispatch_gw_reviewer(
             f"[spec-review:gw-reviewer] agents_core import failed: {e} — skipping GW leg",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "import_error"
 
     prompt = (
         f"Review this spec for technical soundness, implementability, and "
@@ -608,20 +671,20 @@ def _dispatch_gw_reviewer(
                 f"elapsed={elapsed:.1f}s",
                 file=sys.stderr,
             )
-        else:
-            print(
-                f"[spec-review:gw-reviewer] GW did not run (on_wake_fail=skip) "
-                f"elapsed={elapsed:.1f}s",
-                file=sys.stderr,
-            )
-        return text, transcript, elapsed
+            return text, transcript, elapsed, ""
+        print(
+            f"[spec-review:gw-reviewer] GW did not run (on_wake_fail=skip) "
+            f"elapsed={elapsed:.1f}s",
+            file=sys.stderr,
+        )
+        return text, transcript, elapsed, "on_wake_fail_skip"
     except Exception as e:
         elapsed = time.time() - start_time
         print(
             f"[spec-review:gw-reviewer] call_gw_agent failed: {e} — skipping",
             file=sys.stderr,
         )
-        return None, [], elapsed
+        return None, [], elapsed, "call_error"
 
 
 def _poll_sonnet_until_terminal(
@@ -776,6 +839,7 @@ def _build_brief(
     council_voicing_requested: str = "gravitywell",
     gw_verdict: str = "skip",
     gw_ran: bool = False,
+    gw_skip_reason: str = "",
     gw_findings_count: int = 0,
     elapsed_gw: float = 0.0,
     gw_transcript_ref: str = "",
@@ -899,6 +963,7 @@ def _build_brief(
         council_error_reason=council_error_reason,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=elapsed_gw,
         gw_transcript_ref=gw_transcript_ref,
@@ -1170,6 +1235,11 @@ could not extract a JSON verdict from the output. See chain-sibling \
 - **Findings:** {brief.gw_findings_count}
 - **Elapsed:** {brief.elapsed_gw:.1f}s
 - **Transcript:** {brief.gw_transcript_ref or '(not persisted)'}
+"""
+    elif brief.gw_skip_reason:
+        gw_section = f"""
+## GravityWell reference leg — reference only (does not affect recommendation)
+- **GW reference reviewer: skipped — {brief.gw_skip_reason}**
 """
 
     # Render voicing section only if there's data to show
@@ -1744,9 +1814,10 @@ def run_spec_review(
         gw_text: str | None = None
         gw_transcript: list[dict] = []
         gw_elapsed: float = 0.0
+        gw_skip_reason: str = ""
         if gw_future is not None:
             try:
-                gw_text, gw_transcript, gw_elapsed = gw_future.result(timeout=300)
+                gw_text, gw_transcript, gw_elapsed, gw_skip_reason = gw_future.result(timeout=300)
             except FuturesTimeoutError:
                 print(
                     f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
@@ -1754,12 +1825,14 @@ def run_spec_review(
                 )
                 gw_text = None
                 gw_elapsed = 300.0
+                gw_skip_reason = "timeout"
             except Exception as e:
                 print(
                     f"[spec-review:gw-reviewer-collect-error] {e}",
                     file=sys.stderr,
                 )
                 gw_text = None
+                gw_skip_reason = "collection_error"
             finally:
                 # Clean up executor to prevent thread pool leak
                 if executor is not None:
@@ -1898,6 +1971,7 @@ def run_spec_review(
         council_voicing_requested=council_voicing,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=gw_elapsed,
         gw_transcript_ref=gw_transcript_ref,

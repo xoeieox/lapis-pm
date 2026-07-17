@@ -30,6 +30,7 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
 from __future__ import annotations
 
 import filecmp
+import fnmatch
 import hashlib
 import importlib
 import json
@@ -344,6 +345,32 @@ _CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = (
 _DEPLOY_LOG = room_path('lapis_state.deploy_log')
 _DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"
 _DEPLOY_CURRENCY_COOLDOWN_SECS = 3600  # alert at most once per hour
+# Quantitative commit-distance meter, written on every currency check (current
+# or stale) — §D of agents-core-deploy-drift-backstop-v0. A visible-surface
+# consumer (e.g. doorman's `/status`) reads this to render `stale: N`; wiring
+# that read side up lives in agents-core's own repo, out of this repo's scope.
+_DEPLOY_CURRENCY_STATUS_FILE = room_path('lapis_state') / "deploy-currency-status.json"
+
+# ---------------------------------------------------------------------------
+# Robust pull: graded collision-safety model (agents-core-deploy-drift-backstop-v0)
+# ---------------------------------------------------------------------------
+# Zones that carry legitimate runtime state in a deploy clone (queue DBs, config,
+# corpus mirrors, dashboard state, opencode context). An untracked file colliding
+# with an incoming tracked upstream file here is NEVER silently moved — see
+# _classify_untracked_collision. Filename-whitelisting alone is unsafe (a collision
+# on a whitelisted name could mask a real conflict), hence zone + pattern together.
+_DEPLOY_SACRED_ZONES: tuple[str, ...] = (
+    "config/", "data/", "corpus-mirrors/", "dashboard/", ".opencode/",
+)
+# Basename globs that mark genuine runtime state (queue DBs, large data blobs) as
+# opposed to stray debris (`0`, `0.7`, `=`) that happens to sit in a sacred zone.
+_DEPLOY_RUNTIME_PATTERNS: tuple[str, ...] = ("*.db", "claude_queue.db", "big")
+
+# Lock sentinel dir: written when a clone hits genuine lineage divergence (not an
+# untracked-file collision) after quarantine. Its presence stops subsequent
+# backstop ticks from re-attempting the pull (no loop, no `reset --hard`) until a
+# human resolves the divergence and clears the lock.
+_DEPLOY_PULL_LOCK_DIR = room_path('lapis_state') / "deploy-pull-lock"
 
 # Checked once at module load so tests can patch the env before import.
 _DEPLOY_HOOK_DISABLED = os.environ.get("LAPIS_PM_DEPLOY_HOOK_DISABLE") == "1"
@@ -437,6 +464,129 @@ def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> No
         print(f"[post-land-pull] deploy log write failed: {e}", file=sys.stderr)
 
 
+def _deploy_pull_lock_path(clone_path: str) -> Path:
+    name = clone_path.strip("/").replace("/", "_") + ".json"
+    return _DEPLOY_PULL_LOCK_DIR / name
+
+
+def _deploy_pull_locked(clone_path: str) -> dict | None:
+    """Return the lock record if `clone_path` is locked from a prior genuine
+    divergence, else None. Best-effort — unreadable/missing lock reads as unlocked.
+    """
+    try:
+        return json.loads(_deploy_pull_lock_path(clone_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_deploy_pull_lock(clone_path: str, reason: str, commits_behind: int | None) -> None:
+    """Persist the divergence lock so subsequent backstop ticks skip this clone
+    instead of re-attempting the ff-pull dance. Best-effort.
+    """
+    try:
+        _DEPLOY_PULL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        _deploy_pull_lock_path(clone_path).write_text(json.dumps({
+            "clone": clone_path,
+            "reason": reason,
+            "commits_behind": commits_behind,
+            "locked_at": _now_iso(),
+        }))
+    except OSError as e:
+        print(
+            f"[post-land-pull] failed to write deploy-pull lock for {clone_path}: {e}",
+            file=sys.stderr,
+        )
+
+
+def _clear_deploy_pull_lock(clone_path: str) -> None:
+    """Remove the divergence lock — the manual-recovery escape hatch. Best-effort."""
+    try:
+        _deploy_pull_lock_path(clone_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _commit_distance(clone_path: str, ref_range: str = "HEAD..origin/main") -> int | None:
+    """Count of commits in `ref_range` at `clone_path`. None if indeterminate."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", clone_path, "rev-list", "--count", ref_range],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return None
+
+
+def _in_sacred_zone(relpath: str) -> bool:
+    return any(relpath.startswith(zone) for zone in _DEPLOY_SACRED_ZONES)
+
+
+def _matches_runtime_pattern(relpath: str) -> bool:
+    basename = relpath.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(basename, pat) for pat in _DEPLOY_RUNTIME_PATTERNS)
+
+
+def _classify_untracked_collision(relpath: str) -> str:
+    """Classify one untracked-vs-incoming-tracked collision path.
+
+    Returns "sacred_runtime" (halt, never move — a genuine runtime-state
+    conflict), "sacred_junk" (inside a sacred zone but not a runtime pattern —
+    quarantine), or "debris" (outside every sacred zone — quarantine).
+    """
+    if _in_sacred_zone(relpath):
+        return "sacred_runtime" if _matches_runtime_pattern(relpath) else "sacred_junk"
+    return "debris"
+
+
+def _parse_untracked_collision_files(stderr: str) -> list[str]:
+    """Extract the file list from git's "would be overwritten by merge/checkout"
+    abort message. Returns [] if the message isn't present.
+    """
+    if "would be overwritten by" not in stderr:
+        return []
+    files: list[str] = []
+    collecting = False
+    for line in stderr.splitlines():
+        if "would be overwritten by" in line:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("Please", "Aborting", "error:", "hint:", "fatal:")):
+            if files:
+                break
+            continue
+        files.append(stripped)
+    return files
+
+
+def _quarantine_untracked_file(clone_path: str, relpath: str, batch_ts: str) -> bool:
+    """Move a colliding untracked file to a timestamped quarantine dir inside the
+    clone, clearing the way for the incoming tracked file. Never called for
+    sacred_runtime collisions — those halt instead (see _post_land_git_pull).
+    """
+    src = Path(clone_path) / relpath
+    dest = Path(clone_path) / ".deploy-quarantine" / batch_ts / relpath
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+        print(
+            f"[post-land-pull] quarantined debris {relpath} at {clone_path} -> {dest}",
+            file=sys.stderr,
+        )
+        return True
+    except OSError as e:
+        print(
+            f"[post-land-pull] quarantine failed for {relpath} at {clone_path}: {e}",
+            file=sys.stderr,
+        )
+        return False
+
+
 def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bool:
     """Git-pull each working clone mapped to `repo`.
 
@@ -463,6 +613,17 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
     is_low_signal_repo = repo in _POST_LAND_PULL_LOW_SIGNAL
     any_advanced = False
     for path in paths:
+        # A locked clone (prior genuine divergence) is skipped entirely — no
+        # re-attempted pull, no repeated quarantine dance. A human clears the
+        # lock (_clear_deploy_pull_lock) once the divergence is resolved.
+        if is_critical_repo and _deploy_pull_locked(path):
+            print(
+                f"[post-land-pull] {path} is locked (genuine divergence, manual "
+                f"intervention required) — skipping pull",
+                file=sys.stderr,
+            )
+            continue
+
         pre_head = ""
         try:
             pre_result = subprocess.run(
@@ -473,12 +634,35 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                 pre_head = pre_result.stdout.strip()
         except Exception:
             pass
+
+        def _finish_success(post_pre_head: str) -> None:
+            nonlocal any_advanced
+            post_result = subprocess.run(
+                ["git", "-C", path, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            post_head = (
+                post_result.stdout.strip() if post_result.returncode == 0 else ""
+            )
+            if post_head and post_head != post_pre_head:
+                any_advanced = True
+                _write_deploy_log(path, post_pre_head[:8], post_head[:8], trigger)
+
         try:
             dirty_check = subprocess.run(
                 ["git", "-C", path, "status", "--porcelain"],
                 capture_output=True, text=True, timeout=5,
             )
-            if dirty_check.returncode == 0 and dirty_check.stdout.strip():
+            # Untracked files alone are NOT "dirty" — the graded collision-safety
+            # model below handles untracked-vs-incoming-tracked collisions
+            # explicitly (quarantine or halt). Only actual tracked-file
+            # modifications ("??"-prefixed lines are untracked; everything else
+            # is a staged/unstaged change to a tracked file) block the pull.
+            dirty = dirty_check.returncode == 0 and any(
+                line and not line.startswith("??")
+                for line in dirty_check.stdout.splitlines()
+            )
+            if dirty:
                 print(
                     f"[post-land-pull] dirty working tree at {path}, skipping pull "
                     f"(uncommitted local changes present) — resolve manually",
@@ -505,6 +689,85 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                     f"{result.stderr[:200]}",
                     file=sys.stderr,
                 )
+                # Graded collision-safety model — critical clones only (agents-core-
+                # deploy-drift-backstop-v0 §B). Untracked-vs-incoming-tracked
+                # collisions are classified by zone + content, not blanket-
+                # whitelisted, before either quarantining debris or halting on a
+                # genuine runtime-state conflict. `dirty` failures (tracked-file
+                # modifications) are a different class and are NOT collision-
+                # handled here — they fall straight through to the generic alert.
+                if is_critical_repo and not dirty:
+                    collision_files = _parse_untracked_collision_files(result.stderr)
+                    if collision_files:
+                        classified = {
+                            f: _classify_untracked_collision(f) for f in collision_files
+                        }
+                        sacred_runtime = [
+                            f for f, cls in classified.items() if cls == "sacred_runtime"
+                        ]
+                        if sacred_runtime:
+                            print(
+                                f"[post-land-pull] HALT {path}: sacred runtime-state "
+                                f"collision on {sacred_runtime} — pull aborted, file(s) "
+                                f"NOT moved, manual resolution required",
+                                file=sys.stderr,
+                            )
+                            try:
+                                from agents_core.notify import send_notification, Priority as _P
+                                send_notification(
+                                    message=(
+                                        f"post-land pull for {path} halted: untracked "
+                                        f"runtime-state file(s) {sacred_runtime} collide "
+                                        f"with incoming upstream tracked file(s). Not "
+                                        f"auto-moved (data-loss risk) — needs manual "
+                                        f"reconciliation."
+                                    ),
+                                    title=f"{repo}: deploy pull halted (runtime collision)",
+                                    priority=_P.HIGH,
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        batch_ts = _now_iso().replace(":", "").replace("-", "")
+                        quarantined_ok = all(
+                            _quarantine_untracked_file(path, f, batch_ts)
+                            for f in collision_files
+                        )
+                        if quarantined_ok:
+                            retry = subprocess.run(
+                                ["git", "-C", path, "pull", "--ff-only", "origin", "main"],
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            if retry.returncode == 0:
+                                _finish_success(pre_head)
+                                continue
+                            result = retry  # fall through with the retry's failure below
+                    if "Not possible to fast-forward" in result.stderr:
+                        distance = _commit_distance(path)
+                        print(
+                            f"[post-land-pull] GENUINE DIVERGENCE at {path}: ff-only "
+                            f"impossible after quarantine (commits behind={distance}) — "
+                            f"locking, manual intervention required",
+                            file=sys.stderr,
+                        )
+                        _write_deploy_pull_lock(path, "genuine_divergence", distance)
+                        try:
+                            from agents_core.notify import send_notification, Priority as _P
+                            send_notification(
+                                message=(
+                                    f"post-land pull for {path} hit genuine lineage "
+                                    f"divergence (not an untracked collision) — "
+                                    f"{distance if distance is not None else '?'} commits "
+                                    f"behind origin/main. Locked; will NOT retry or "
+                                    f"reset --hard. Needs manual intervention, then "
+                                    f"clear the lock."
+                                ),
+                                title=f"{repo}: deploy pull diverged (locked)",
+                                priority=_P.HIGH,
+                            )
+                        except Exception:
+                            pass
+                        continue
                 if is_critical_repo:
                     try:
                         from agents_core.notify import send_notification, Priority as _P
@@ -538,16 +801,7 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                     except Exception:
                         pass
             elif pre_head:
-                post_result = subprocess.run(
-                    ["git", "-C", path, "rev-parse", "HEAD"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                post_head = (
-                    post_result.stdout.strip() if post_result.returncode == 0 else ""
-                )
-                if post_head and post_head != pre_head:
-                    any_advanced = True
-                    _write_deploy_log(path, pre_head[:8], post_head[:8], trigger)
+                _finish_success(pre_head)
         except (subprocess.TimeoutExpired, OSError) as e:
             print(f"[post-land-pull] pull {path} errored: {e}", file=sys.stderr)
             if is_critical_repo:
@@ -848,38 +1102,100 @@ def _issue_system_restart(unit: str) -> None:
         )
 
 
-def _check_deploy_currency() -> None:
-    """Alert via Pushover if the lapis-pm deploy clone is behind origin/main.
+def _clone_currency_shas(clone_path: str) -> tuple[str, str]:
+    """Fetch + return (local HEAD, origin/main HEAD) shas for `clone_path`.
 
-    Called once per tick_all(). Catches timer outage and persistent pull failures
-    that would otherwise be silent. Cooldown: at most one alert per hour to avoid
-    Pushover spam during a sustained outage.
+    Returns ("", "") on any check failure (network/git error, unparseable
+    output) — treated as indeterminate, never as "stale", so a transient error
+    never fires a false alert.
     """
-    repo = "/srv/git/lapis-pm"
     try:
         subprocess.run(
-            ["git", "-C", repo, "fetch", "origin", "main", "--quiet"],
+            ["git", "-C", clone_path, "fetch", "origin", "main", "--quiet"],
             capture_output=True, timeout=15,
         )
         local_proc = subprocess.run(
-            ["git", "-C", repo, "rev-parse", "HEAD"],
+            ["git", "-C", clone_path, "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=5,
         )
         remote_proc = subprocess.run(
-            ["git", "-C", repo, "rev-parse", "origin/main"],
+            ["git", "-C", clone_path, "rev-parse", "origin/main"],
             capture_output=True, text=True, timeout=5,
         )
         local = local_proc.stdout.strip() if local_proc.returncode == 0 else ""
         remote = remote_proc.stdout.strip() if remote_proc.returncode == 0 else ""
     except Exception:
-        return  # can't check — don't alert on transient errors
+        return "", ""
+    return local, remote
 
-    if not local or not remote or local == remote:
-        return  # up to date or indeterminate
 
-    # Enforce cooldown: alert at most once per _DEPLOY_CURRENCY_COOLDOWN_SECS.
+def _check_deploy_currency() -> None:
+    """Alert via Pushover for every critical clone that is behind origin/main.
+
+    Generalizes the original lapis-pm-only check to every path mapped for every
+    repo in `_POST_LAND_PULL_CRITICAL` (lapis-pm, agents-core's two clones,
+    synapse) — the un-loseable detector (agents-core-deploy-drift-backstop-v0
+    §A). Because this runs inside lapis-pm's own tick, and lapis-pm's own clone
+    is kept current by its own backstop timer (PR #116), it detects agents-core
+    or synapse drift even when their own hook-based alerting is itself among the
+    undeployed commits.
+
+    Called once per tick_all(). Catches timer outage and persistent pull
+    failures that would otherwise be silent. Cooldown: at most one alert per
+    clone per `_DEPLOY_CURRENCY_COOLDOWN_SECS` — a different drifted clone
+    alerts independently of another clone's cooldown.
+    """
+    for repo in sorted(_POST_LAND_PULL_CRITICAL):
+        for clone_path in _POST_LAND_PULL.get(repo, []):
+            _check_one_clone_currency(repo, clone_path)
+
+
+def _write_deploy_currency_status(
+    repo: str, clone_path: str, sha: str, distance: int | None,
+) -> None:
+    """Persist the latest per-clone currency snapshot to a shared status file.
+
+    §D (agents-core-deploy-drift-backstop-v0): a quantitative commit-distance
+    meter, not just a boolean alert. Written on every check (current or stale)
+    so a consumer (e.g. an agents-core-owned `/status` surface, out of this
+    repo's scope to wire up directly) can render `stale: N` without waiting for
+    an alert. Best-effort — a write failure never blocks the currency check.
+    """
     try:
-        last_raw = _mem().get(_DEPLOY_CURRENCY_STALE_KEY)
+        _DEPLOY_CURRENCY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(_DEPLOY_CURRENCY_STATUS_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        data[clone_path] = {
+            "repo": repo,
+            "sha": sha,
+            "commits_behind": distance,
+            "checked_at": _now_iso(),
+        }
+        _DEPLOY_CURRENCY_STATUS_FILE.write_text(json.dumps(data, indent=2, sort_keys=True))
+    except OSError as e:
+        print(
+            f"[deploy-currency] status file write failed for {clone_path}: {e}",
+            file=sys.stderr,
+        )
+
+
+def _check_one_clone_currency(repo: str, clone_path: str) -> None:
+    local, remote = _clone_currency_shas(clone_path)
+    if not local or not remote:
+        return  # indeterminate — never overwrite the status file on a transient error
+
+    distance = 0 if local == remote else _commit_distance(clone_path)
+    _write_deploy_currency_status(repo, clone_path, local, distance)
+
+    if local == remote:
+        return  # up to date
+
+    # Per-clone cooldown key: a different drifted clone alerts independently.
+    stale_key = f"{_DEPLOY_CURRENCY_STALE_KEY}:{clone_path}"
+    try:
+        last_raw = _mem().get(stale_key)
         if last_raw:
             last_ts = datetime.fromisoformat(last_raw)
             now_ts = datetime.now(last_ts.tzinfo)
@@ -888,9 +1204,12 @@ def _check_deploy_currency() -> None:
     except Exception:
         pass
 
+    distance_repr = distance if distance is not None else "?"
+
     print(
-        f"[deploy-currency] ALERT: deploy clone at {local[:8]} but "
-        f"origin/main is {remote[:8]} — deploy timer may be broken",
+        f"[deploy-currency] ALERT: {repo} clone at {clone_path} is at {local[:8]} "
+        f"but origin/main is {remote[:8]} ({distance_repr} commits behind) — "
+        f"deploy timer may be broken",
         file=sys.stderr,
         flush=True,
     )
@@ -898,18 +1217,18 @@ def _check_deploy_currency() -> None:
         from agents_core.notify import send_notification, Priority as _P
         send_notification(
             message=(
-                f"lapis-pm deploy clone is stale: running {local[:8]} but "
-                f"origin/main is {remote[:8]}. "
+                f"{repo} clone at {clone_path} is stale: running {local[:8]} but "
+                f"origin/main is {remote[:8]} ({distance_repr} commits behind). "
                 "Deploy timer may be broken or post-land pull failing silently."
             ),
-            title="lapis-pm: deploy currency stale",
+            title=f"{repo}: deploy currency stale",
             priority=_P.NORMAL,
         )
     except Exception:
         pass
     try:
         _mem().set(
-            _DEPLOY_CURRENCY_STALE_KEY,
+            stale_key,
             _now_iso(),
             tags=["lapis-pm", "deploy"],
         )

@@ -32,8 +32,11 @@ repos:
       - night_coordinator.py
       - flip_controller.py
       - gw_actuator.py
+      - gpu_queue_runner.py
     seed_manifests:
       - night_producers.yaml
     services:
       - unit: flip-controller.service
         scope: user
+      - unit: gpu-queue-runner.service
+        scope: system

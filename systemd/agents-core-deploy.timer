@@ -1,0 +1,11 @@
+[Unit]
+Description=agents-core — deploy sync timer (10-minute standing backstop, independent of land events)
+Requires=agents-core-deploy.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=agents-core-deploy.service
+
+[Install]
+WantedBy=timers.target

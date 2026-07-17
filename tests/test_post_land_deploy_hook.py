@@ -576,93 +576,157 @@ class TestPostLandGitPull:
 
 
 class TestDeployCurrencyCheck:
-    """Tests for _check_deploy_currency — deploy-currency health monitoring."""
+    """Tests for _check_deploy_currency — deploy-currency health monitoring.
 
-    def test_alerts_when_deploy_clone_is_behind(self):
-        """When local HEAD differs from origin/main, Pushover fires and mem is stamped."""
-        notify_calls = []
-        mem_sets = {}
+    Generalized (agents-core-deploy-drift-backstop-v0 §A) to iterate every
+    clone path across all _POST_LAND_PULL_CRITICAL repos (lapis-pm,
+    agents-core's two clones, synapse), not just the lapis-pm deploy clone.
+    `_by_path_fake_run` drives each clone's local/origin SHA independently so
+    tests can force exactly one clone stale while the rest stay current.
+    """
 
+    @pytest.fixture(autouse=True)
+    def _isolate_currency_status_file(self, tmp_path):
+        """Every check now also writes the §D commit-distance status file
+        (agents-core-deploy-drift-backstop-v0). Redirect it to tmp_path so these
+        tests never touch the real /srv/lapis/lapis-state/deploy-currency-status.json.
+        """
+        with patch.object(
+            pm_core, "_DEPLOY_CURRENCY_STATUS_FILE", tmp_path / "deploy-currency-status.json",
+        ):
+            yield
+
+    @staticmethod
+    def _by_path_fake_run(stale_paths, distance=5):
+        """subprocess.run stub: clones in `stale_paths` report local != origin/main
+        (and a fixed rev-list --count distance); every other mapped clone reports
+        current (local == origin/main)."""
         def fake_run(cmd, **kwargs):
+            path = cmd[2] if len(cmd) > 2 and cmd[1] == "-C" else None
             if "fetch" in cmd:
                 return _make_completed_process(returncode=0)
+            if "rev-list" in cmd:
+                return _make_completed_process(returncode=0, stdout=str(distance))
             if "rev-parse" in cmd:
-                if "origin/main" in cmd:
-                    return _make_completed_process(returncode=0, stdout="newsha0new")
-                return _make_completed_process(returncode=0, stdout="oldsha0old")
+                if path in stale_paths:
+                    if "origin/main" in cmd:
+                        return _make_completed_process(returncode=0, stdout="newsha0new")
+                    return _make_completed_process(returncode=0, stdout="oldsha0old")
+                return _make_completed_process(returncode=0, stdout="same1234same")
             return _make_completed_process(returncode=0)
+        return fake_run
+
+    def test_alerts_when_deploy_clone_is_behind(self):
+        """Exactly one clone forced N-behind: one NORMAL alert naming repo, path,
+        and commit-distance; mem is stamped with a per-clone key; no other
+        clone's currency is disturbed (AC1)."""
+        notify_calls = []
+        mem_sets = {}
 
         fake_mem = MagicMock()
         fake_mem.get.return_value = None  # no prior alert
         fake_mem.set.side_effect = lambda k, v, **kw: mem_sets.update({k: v})
 
         def fake_notify(message, title, priority, **kwargs):
-            notify_calls.append({"message": message, "title": title})
+            notify_calls.append({"message": message, "title": title, "priority": priority})
             return True
 
         with (
-            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch(
+                "lapis_pm.pm_core.subprocess.run",
+                side_effect=self._by_path_fake_run({"/srv/git/lapis-pm"}, distance=7),
+            ),
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("agents_core.notify.send_notification", fake_notify),
         ):
             pm_core._check_deploy_currency()
 
-        assert len(notify_calls) == 1, "Expected one Pushover alert on stale deploy clone"
+        assert len(notify_calls) == 1, "Expected exactly one Pushover alert on the one stale clone"
         assert "stale" in notify_calls[0]["title"]
-        assert pm_core._DEPLOY_CURRENCY_STALE_KEY in mem_sets
+        assert "lapis-pm" in notify_calls[0]["title"]
+        assert "/srv/git/lapis-pm" in notify_calls[0]["message"]
+        assert "7 commits behind" in notify_calls[0]["message"]
+        from agents_core.notify import Priority
+        assert notify_calls[0]["priority"] == Priority.NORMAL
+        assert f"{pm_core._DEPLOY_CURRENCY_STALE_KEY}:/srv/git/lapis-pm" in mem_sets
 
     def test_no_alert_when_deploy_clone_is_current(self):
-        """When local HEAD matches origin/main, no alert is sent."""
+        """When every critical clone's local HEAD matches origin/main, no alert fires."""
         notify_calls = []
-
-        def fake_run(cmd, **kwargs):
-            if "fetch" in cmd:
-                return _make_completed_process(returncode=0)
-            return _make_completed_process(returncode=0, stdout="same1234same")
 
         def fake_notify(message, title, priority, **kwargs):
             notify_calls.append(title)
             return True
 
         with (
-            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch(
+                "lapis_pm.pm_core.subprocess.run",
+                side_effect=self._by_path_fake_run(set()),
+            ),
             patch("agents_core.notify.send_notification", fake_notify),
         ):
             pm_core._check_deploy_currency()
 
         assert len(notify_calls) == 0
 
-    def test_cooldown_suppresses_repeat_alert(self):
-        """Within _DEPLOY_CURRENCY_COOLDOWN_SECS, a second staleness check does not re-alert."""
+    def test_multiple_stale_clones_alert_independently(self):
+        """Two distinct stale clones each fire their own alert in one check (AC1/AC2)."""
+        notify_calls = []
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title})
+            return True
+
+        with (
+            patch(
+                "lapis_pm.pm_core.subprocess.run",
+                side_effect=self._by_path_fake_run({"/srv/git/lapis-pm", "/data/agents"}),
+            ),
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._check_deploy_currency()
+
+        assert len(notify_calls) == 2
+        messages = [c["message"] for c in notify_calls]
+        assert any("/srv/git/lapis-pm" in m for m in messages)
+        assert any("/data/agents" in m for m in messages)
+
+    def test_cooldown_suppresses_repeat_alert_per_clone(self):
+        """Within cooldown, the previously-alerted clone stays silent, but a
+        DIFFERENT drifted clone still alerts independently (AC2)."""
         from datetime import datetime, timezone, timedelta
         notify_calls = []
-
-        def fake_run(cmd, **kwargs):
-            if "fetch" in cmd:
-                return _make_completed_process(returncode=0)
-            if "origin/main" in cmd:
-                return _make_completed_process(returncode=0, stdout="newsha0new")
-            return _make_completed_process(returncode=0, stdout="oldsha0old")
 
         recent_ts = (
             datetime.now(timezone.utc) - timedelta(seconds=60)
         ).isoformat()  # 1 minute ago, well within 1h cooldown
 
         fake_mem = MagicMock()
-        fake_mem.get.return_value = recent_ts
+        fake_mem.get.side_effect = (
+            lambda key: recent_ts if key.endswith("/srv/git/lapis-pm") else None
+        )
 
         def fake_notify(message, title, priority, **kwargs):
-            notify_calls.append(title)
+            notify_calls.append({"message": message, "title": title})
             return True
 
         with (
-            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch(
+                "lapis_pm.pm_core.subprocess.run",
+                side_effect=self._by_path_fake_run({"/srv/git/lapis-pm", "/data/agents"}),
+            ),
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("agents_core.notify.send_notification", fake_notify),
         ):
             pm_core._check_deploy_currency()
 
-        assert len(notify_calls) == 0, "Alert was suppressed by cooldown — no Pushover expected"
+        assert len(notify_calls) == 1, (
+            "Cooled-down clone stayed silent; the other stale clone still alerted"
+        )
+        assert "/data/agents" in notify_calls[0]["message"]
 
     def test_exception_during_check_does_not_raise(self):
         """Any exception in _check_deploy_currency must not propagate (best-effort)."""
@@ -671,6 +735,74 @@ class TestDeployCurrencyCheck:
 
         with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
             pm_core._check_deploy_currency()  # must not raise
+
+    def test_status_file_records_commit_distance_for_every_clone(self):
+        """§D: every check (current or stale) stamps a commit-distance snapshot for
+        every critical clone into the shared status file, keyed by clone path —
+        the quantitative meter a visible surface (e.g. doorman `/status`) reads."""
+        with patch(
+            "lapis_pm.pm_core.subprocess.run",
+            side_effect=self._by_path_fake_run({"/data/agents"}, distance=3),
+        ):
+            pm_core._check_deploy_currency()
+
+        data = json.loads(pm_core._DEPLOY_CURRENCY_STATUS_FILE.read_text())
+        assert data["/data/agents"]["commits_behind"] == 3
+        assert data["/data/agents"]["sha"] == "oldsha0old"
+        assert data["/data/agents"]["repo"] == "agents-core"
+        # A current clone is recorded too, with commits_behind == 0.
+        assert data["/srv/git/lapis-pm"]["commits_behind"] == 0
+
+    def test_status_file_write_failure_does_not_raise(self):
+        """A status-file write failure (e.g. unwritable path) is best-effort and must
+        not block the alert path."""
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        with (
+            patch(
+                "lapis_pm.pm_core.subprocess.run",
+                side_effect=self._by_path_fake_run({"/srv/git/lapis-pm"}),
+            ),
+            patch.object(
+                pm_core, "_DEPLOY_CURRENCY_STATUS_FILE",
+                Path("/nonexistent-root/deploy-currency-status.json"),
+            ),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._check_deploy_currency()  # must not raise
+
+        assert len(notify_calls) == 1
+
+
+class TestAgentsCoreDeployBackstopTimer:
+    """§C (agents-core-deploy-drift-backstop-v0): a standing ~10-min timer that
+    reconciles /data/agents (+ /srv/git/agents-core-working) independent of any
+    land event, mirroring lapis-pm-deploy.{service,timer} (AC5)."""
+
+    _SYSTEMD_DIR = Path(__file__).parent.parent / "systemd"
+
+    def test_timer_and_service_files_exist(self):
+        assert (self._SYSTEMD_DIR / "agents-core-deploy.timer").is_file()
+        assert (self._SYSTEMD_DIR / "agents-core-deploy.service").is_file()
+
+    def test_timer_fires_on_a_ten_minute_cadence_independent_of_land_events(self):
+        timer_text = (self._SYSTEMD_DIR / "agents-core-deploy.timer").read_text()
+        assert "OnUnitActiveSec=10min" in timer_text
+        assert "Unit=agents-core-deploy.service" in timer_text
+
+    def test_service_invokes_the_robust_pull_for_agents_core(self):
+        service_text = (self._SYSTEMD_DIR / "agents-core-deploy.service").read_text()
+        assert "_post_land_git_pull" in service_text
+        assert "'agents-core'" in service_text
+        # Runs from the lapis-pm deploy clone (kept current by its own PR #116
+        # backstop timer), not -working — so this detector can't be silenced by
+        # agents-core's own drift.
+        assert "WorkingDirectory=/srv/git/lapis-pm" in service_text
+        assert "/srv/lapis/lapis-pm" not in service_text
 
 
 class TestCodeReviewerDeploy:
@@ -1527,6 +1659,175 @@ class TestPostLandGitPullDirtyTreeAndDivergence:
         assert not (clone / ".git" / "MERGE_HEAD").exists()
         assert "both modified" not in status.stdout
         assert "Unmerged paths" not in status.stdout
+
+
+class TestGradedCollisionSafety:
+    """Tests for the graded collision-safety model in _post_land_git_pull
+    (agents-core-deploy-drift-backstop-v0 §B, AC3/AC4). Exercises the real git
+    binary against throwaway repo pairs — the load-bearing behavior is git's own
+    untracked-collision/divergence detection, same rationale as
+    TestPostLandGitPullDirtyTreeAndDivergence. Every test maps the throwaway
+    clone under repo="agents-core" (already in _POST_LAND_PULL_CRITICAL) so the
+    collision-handling branch is live without touching that frozenset.
+    """
+
+    @staticmethod
+    def _make_origin_and_clone(tmp_path):
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(origin)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=origin, check=True, capture_output=True)
+        (origin / "f.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=origin, check=True, capture_output=True)
+
+        clone = tmp_path / "clone"
+        subprocess.run(["git", "clone", str(origin), str(clone)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=clone, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=clone, check=True, capture_output=True)
+        return origin, clone
+
+    def test_debris_outside_sacred_zone_quarantined_and_pull_completes(self, tmp_path):
+        """AC3(a): an untracked collision OUTSIDE every sacred zone is quarantined
+        (moved aside) and the ff-pull then completes."""
+        origin, clone = self._make_origin_and_clone(tmp_path)
+        (origin / "junk.txt").write_text("from upstream\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add junk.txt"], cwd=origin, check=True, capture_output=True)
+        (clone / "junk.txt").write_text("local untracked debris\n")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"title": title, "priority": priority})
+            return True
+
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"agents-core": [str(clone)]}),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
+            patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", tmp_path / "lock"),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            advanced = pm_core._post_land_git_pull("agents-core")
+
+        assert advanced is True, "pull should self-recover once debris is quarantined"
+        assert (clone / "junk.txt").read_text() == "from upstream\n"
+        quarantined = list((clone / ".deploy-quarantine").rglob("junk.txt"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_text() == "local untracked debris\n"
+        assert notify_calls == [], "a silently self-healed collision must not alert"
+
+    def test_sacred_junk_quarantined(self, tmp_path):
+        """AC3(c): non-runtime-pattern junk inside a sacred zone (e.g. `0`) is
+        quarantined like any other debris."""
+        origin, clone = self._make_origin_and_clone(tmp_path)
+        (origin / "config").mkdir()
+        (origin / "config" / "0").write_text("from upstream\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add config/0"], cwd=origin, check=True, capture_output=True)
+        (clone / "config").mkdir()
+        (clone / "config" / "0").write_text("stray junk\n")
+
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"agents-core": [str(clone)]}),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
+            patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", tmp_path / "lock"),
+        ):
+            advanced = pm_core._post_land_git_pull("agents-core")
+
+        assert advanced is True
+        assert (clone / "config" / "0").read_text() == "from upstream\n"
+        assert list((clone / ".deploy-quarantine").rglob("0"))
+
+    def test_sacred_runtime_collision_halts_and_alerts(self, tmp_path):
+        """AC3(b): an untracked collision INSIDE a sacred zone matching a
+        RUNTIME_PATTERNS glob halts the pull and fires a CRITICAL (HIGH-priority)
+        alert naming the file — the file itself is NOT moved."""
+        origin, clone = self._make_origin_and_clone(tmp_path)
+        (origin / "data").mkdir()
+        (origin / "data" / "claude_queue.db").write_text("upstream schema\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add data/claude_queue.db"], cwd=origin, check=True, capture_output=True
+        )
+        (clone / "data").mkdir()
+        (clone / "data" / "claude_queue.db").write_text("live runtime queue state\n")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"agents-core": [str(clone)]}),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
+            patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", tmp_path / "lock"),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            advanced = pm_core._post_land_git_pull("agents-core")
+
+        assert advanced is False
+        # Sacred runtime state must never be moved.
+        assert (clone / "data" / "claude_queue.db").read_text() == "live runtime queue state\n"
+        assert not (clone / ".deploy-quarantine").exists()
+        assert len(notify_calls) == 1
+        from agents_core.notify import Priority
+        assert notify_calls[0]["priority"] == Priority.HIGH
+        assert "claude_queue.db" in notify_calls[0]["message"]
+        assert "halted" in notify_calls[0]["title"]
+        # No divergence lock — this is a collision halt, not a lineage divergence.
+        assert pm_core._deploy_pull_locked(str(clone)) is None
+
+    def test_genuine_divergence_locks_alerts_and_does_not_loop(self, tmp_path):
+        """AC4: real lineage divergence (not an untracked collision) writes a lock
+        sentinel and fires a CRITICAL (HIGH) alert with the commit-distance — and
+        a subsequent tick must not re-attempt the pull (no loop, no reset --hard)."""
+        origin, clone = self._make_origin_and_clone(tmp_path)
+        (origin / "f.txt").write_text("v2-on-origin\n")
+        subprocess.run(["git", "add", "."], cwd=origin, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "origin-advances"], cwd=origin, check=True, capture_output=True)
+        (clone / "g.txt").write_text("local-only commit\n")
+        subprocess.run(["git", "add", "."], cwd=clone, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "clone-diverges"], cwd=clone, check=True, capture_output=True)
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append({"message": message, "title": title, "priority": priority})
+            return True
+
+        lock_dir = tmp_path / "lock"
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"agents-core": [str(clone)]}),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
+            patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", lock_dir),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            advanced = pm_core._post_land_git_pull("agents-core")
+
+            assert advanced is False
+            lock = pm_core._deploy_pull_locked(str(clone))
+            assert lock is not None
+            assert lock["commits_behind"] == 1
+
+            assert len(notify_calls) == 1
+            from agents_core.notify import Priority
+            assert notify_calls[0]["priority"] == Priority.HIGH
+            assert "diverged" in notify_calls[0]["title"] or "divergence" in notify_calls[0]["message"]
+
+            # Second tick: locked clone must be skipped entirely — no subprocess
+            # call at all for it (no loop, no reset --hard).
+            with patch("lapis_pm.pm_core.subprocess.run") as spy_run:
+                advanced_again = pm_core._post_land_git_pull("agents-core")
+            spy_run.assert_not_called()
+            assert advanced_again is False
+            assert len(notify_calls) == 1, "locked clone must not re-alert on every tick"
+
+        # Manual-recovery escape hatch clears the lock.
+        pm_core._clear_deploy_pull_lock(str(clone))
+        assert pm_core._deploy_pull_locked(str(clone)) is None
 
 
 class TestMergeAndDeploy:

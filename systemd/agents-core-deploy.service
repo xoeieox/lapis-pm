@@ -1,0 +1,18 @@
+[Unit]
+Description=agents-core — deploy sync (robust pull for /srv/git/agents-core-working + /data/agents)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStart=/usr/bin/python3 -c "import sys; sys.path.insert(0, '/srv/git/lapis-pm'); from lapis_pm.pm_core import _post_land_git_pull; _post_land_git_pull('agents-core', trigger='backstop-timer')"
+EnvironmentFile=-/data/agents/config/conductor.env
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

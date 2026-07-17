@@ -432,6 +432,32 @@ class TestRealConductorClosure:
             )
 
 
+class TestManifestSchemaConductorEntries:
+    """The real daemon-manifest.yaml must explicitly list gpu_queue_runner.py
+    and gpu-queue-runner.service, mirroring the flip_controller/gw_actuator
+    entries — otherwise gpu_queue_runner.py silently falls out of the copy
+    closure the same way flip_controller.py did before Unit B
+    (gotcha/flip-controller-not-in-daemon-sync-copy-closure-2026-06-20)."""
+
+    def test_gpu_queue_runner_in_entry_points_and_services(self):
+        import yaml
+
+        manifest_path = REPO_ROOT / "deploy" / "daemon-manifest.yaml"
+        with open(manifest_path) as f:
+            manifest = yaml.safe_load(f)
+
+        conductor = manifest["repos"]["conductor"]
+
+        assert "gpu_queue_runner.py" in conductor["entry_points"]
+        # Prior entries must remain — this is additive, not a replacement.
+        assert "flip_controller.py" in conductor["entry_points"]
+        assert "gw_actuator.py" in conductor["entry_points"]
+
+        service_units = {s["unit"]: s["scope"] for s in conductor["services"]}
+        assert service_units.get("gpu-queue-runner.service") == "system"
+        assert service_units.get("flip-controller.service") == "user"
+
+
 class TestCopyModeRestartOnChange:
     """Coverage for copy-mode restart-on-change: RSYNC_CHANGES>0 + smoke-ok
     gate, restart hysteresis, and the --user-scope env prerequisite

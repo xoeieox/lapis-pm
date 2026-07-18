@@ -236,8 +236,8 @@ agents:
 
   fixer:
     chub_bundles: []
-    engine: local-fixer
-    model: gravitywell-122b
+    engine: claude
+    model: sonnet
     capture_meta: true
     notify: true
     notify_policy: infra-only

@@ -14,6 +14,7 @@ Commands:
     resume <target_id>
     list
     land <target_id> [--dry-run]
+    friction list [--target ID] [--repo REPO] [--limit N] [--json]
     brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
     brief-resolve <target_id> <option_id>
     review-gate {status,resume}
@@ -804,6 +805,43 @@ def cmd_list(args) -> int:
         print(f"{t.id:30s} {t.pm_repo or '-':20s} {t.pm_authority:10s} "
               f"{'yes' if t.paused else 'no':8s} "
               f"{outstanding[:10] if outstanding else '-':12s}")
+    return 0
+
+
+def cmd_friction_list(args) -> int:
+    """Operator/debug read of the friction capture queue — not the human-tongue
+    ratify surface (that's the Loupe Desk gem, Unit 3). Silent-gap records are
+    rendered as a visibly distinct class, never interleaved as reported friction.
+    """
+    records = pm_core.read_friction_records(
+        target_id=getattr(args, "target", None),
+        repo=getattr(args, "repo", None),
+        limit=getattr(args, "limit", None),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(records))
+        return 0
+    if not records:
+        print("(no friction records)")
+        return 0
+    for r in records:
+        prov = r.get("provenance") or {}
+        ts = prov.get("captured_at", "-")
+        tgt = prov.get("target_id", "-")
+        repo = prov.get("repo", "-")
+        pr = prov.get("pr", "-")
+        header = f"{ts}  target={tgt} repo={repo} pr={pr}"
+        if r.get("record_source") == "silent-gap":
+            print(f"{header}  [SILENT-GAP] derived_confidence={r.get('derived_confidence')}")
+            continue
+        print(header)
+        print(f"    obstacle:    {r.get('obstacle', '')}")
+        if r.get("path_taken"):
+            print(f"    path_taken:  {r['path_taken']}")
+        if r.get("artifact"):
+            print(f"    artifact:    {r['artifact']}")
+        if r.get("cost_hint") or r.get("confidence"):
+            print(f"    cost_hint={r.get('cost_hint')}  confidence={r.get('confidence')}")
     return 0
 
 
@@ -1949,6 +1987,15 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--dry-run", action="store_true",
                     help="Print arc doc to stdout instead of writing to /srv/lapis/lapis-state/")
     ld.set_defaults(func=cmd_land)
+
+    fr = sub.add_parser("friction", help="Friction capture queue operations (operator/debug surface).")
+    fr_sub = fr.add_subparsers(dest="friction_cmd", required=True)
+    frl = fr_sub.add_parser("list", help="List recent friction records, newest first.")
+    frl.add_argument("--target", default=None, help="Filter by target id")
+    frl.add_argument("--repo", default=None, help="Filter by repo")
+    frl.add_argument("--limit", type=int, default=20, help="Max records to show (default 20)")
+    frl.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    frl.set_defaults(func=cmd_friction_list)
 
     rat = sub.add_parser(
         "ratify",

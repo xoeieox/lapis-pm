@@ -39,6 +39,7 @@ from agents_core.targets import TargetStore
 
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer_mod
+from . import node_identity
 from .spec_review import _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
@@ -2731,6 +2732,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Resolve node identity once, before any command dispatch. Fail-closed:
+    # NodeIdentityViolation / NodeConfigError propagate and exit the process
+    # (spec: lapis-pm-node-write-ownership-v0, Design §1).
+    node_identity.resolve_node_identity()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

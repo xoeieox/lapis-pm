@@ -159,8 +159,8 @@ def peek_emergencies(target_id: str) -> list[dict]:
 
 
 def _mem():
-    from agents_core.mem import MemoryStore
-    return MemoryStore()
+    from . import node_identity
+    return node_identity.writable_store()
 
 
 def _overlay_key(target_id: str) -> str:

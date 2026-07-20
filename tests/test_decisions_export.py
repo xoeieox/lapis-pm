@@ -114,7 +114,7 @@ def test_collect_filters_by_date(monkeypatch):
         _make_row("decision/c", "2026-05-15"),   # -1d
     ]
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: rows})(),
     )
     since = datetime(2026, 5, 9, tzinfo=UTC)  # within -7d window
@@ -136,7 +136,7 @@ def test_collect_filters_by_tag(monkeypatch):
         _make_row("decision/c", "2026-05-14", tags=""),
     ]
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: rows})(),
     )
     since = datetime(2026, 5, 1, tzinfo=UTC)
@@ -160,7 +160,7 @@ def test_collect_sorts_newest_first(monkeypatch):
         _make_row("decision/b", "2026-05-12"),
     ]
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: rows})(),
     )
     since = datetime(2026, 5, 1, tzinfo=UTC)
@@ -181,7 +181,7 @@ def test_collect_tie_broken_by_key_ascending(monkeypatch):
         _make_row("decision/m-mid", tied_date),
     ]
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: rows})(),
     )
     since = datetime(2026, 5, 1, tzinfo=UTC)
@@ -263,7 +263,7 @@ def test_render_omits_updated_when_equal():
 
 def test_run_exit_0_empty_window(monkeypatch, capsys):
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: []})(),
     )
     code = run("1d", "decision,feedback,pattern", "", "", None)
@@ -290,7 +290,7 @@ def test_run_exit_2_bad_since(capsys):
 def test_run_out_writes_file(tmp_path, monkeypatch):
     row = _make_row("decision/smoke", "2026-05-15", content="the body", tags="smoke")
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: [row]})(),
     )
     out_path = str(tmp_path / "out.md")
@@ -313,7 +313,7 @@ def test_run_out_writes_file(tmp_path, monkeypatch):
 
 def test_run_exit_1_out_oserror(monkeypatch, capsys):
     monkeypatch.setattr(
-        "lapis_pm.decisions_export.MemoryStore",
+        "lapis_pm.node_identity.writable_store",
         lambda: type("MS", (), {"list_by_prefix": lambda self, p, limit=None: []})(),
     )
     code = run("1d", "decision", "", "", "/nonexistent-dir/foo.md")

@@ -73,6 +73,7 @@ except ImportError as _e:
     raise RuntimeError("agents_core.room_paths missing — agents-core seam must be deployed first") from _e
 
 from . import episodic, brief, authority, intent_artifact as _intent_artifact, steer
+from . import node_identity
 
 try:
     from . import eval_gate as _eval_gate
@@ -92,6 +93,7 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 COMPLETED_DIR = room_path('gpu_queue.completed')
 FAILED_DIR = room_path('gpu_queue.failed')
 SHAPED_DIR = room_path('gpu_queue.shaped')  # shaped_runner meta sidecars
+CLAUDE_QUEUE_DIR = room_path('claude_queue')  # claude-queue enqueue root
 CLAUDE_QUEUE_COMPLETED_DIR = room_path('claude_queue.completed')
 CLAUDE_QUEUE_FAILED_DIR = room_path('claude_queue.failed')
 MAX_DISPATCH_RETRIES = 2
@@ -412,7 +414,8 @@ def _ensure_head_branch_deleted(repo: str, pr_number: int, *, owner: str | None 
             import httpx
             default_owner = owner or (repo.split("/", 1)[0] if "/" in repo else "Erah")
             repo_name = repo.split("/", 1)[-1] if "/" in repo else repo
-            url = f"https://203.0.113.10:3000/api/v1/repos/{default_owner}/{repo_name}/branches/{ref}"
+            forgejo_base = node_identity.resolve_node_identity().owned_forgejo
+            url = f"{forgejo_base}/api/v1/repos/{default_owner}/{repo_name}/branches/{ref}"
             headers = {}
             token = os.environ.get("FORGEJO_TOKEN")
             if token:
@@ -443,6 +446,8 @@ def merge_and_deploy(repo: str, pr_number: int, *, owner: str | None = None) -> 
     idempotent backstop — firing twice is a no-op (ff-only pull of an
     already-current clone changes nothing).
     """
+    from agents_core.forgejo import FORGEJO_URL as _target_forgejo_url
+    node_identity.ensure_owned_forgejo(_target_forgejo_url)
     result = merge_pr(repo, pr_number, owner=owner)  # raises on real merge failure
     try:
         _post_land_deploy_hook(repo, trigger="post-merge-hook")
@@ -1490,7 +1495,15 @@ def _validate_already_satisfied_pr(repo: str, pr_num: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def _mem() -> MemoryStore:
-    return MemoryStore()
+    return node_identity.writable_store()
+
+
+def _ensure_dispatch_owned(repo: str) -> None:
+    """Gate a fixer/reviewer dispatch on owned_queue_root (Design §3d, I4)."""
+    paths = [str(SHAPED_DIR), str(CLAUDE_QUEUE_DIR)]
+    if repo:
+        paths.append(Shaper.resolve_repo_cwd(repo))
+    node_identity.ensure_dispatch_target_owned(*paths)
 
 
 def _cursor_key(target_id: str) -> str:
@@ -1967,6 +1980,7 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
     steer.inject_overlay(target_id, vars_, agent_type)
+    _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
     append_dispatched(target_id, {
         "gpu_id": res.task_id,
@@ -3909,6 +3923,7 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
     steer.inject_overlay(target_id, vars_, agent_type)
+    _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
     new_record = {
         "gpu_id": res.task_id,
@@ -4031,6 +4046,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     _increment_review_gate_counter()
 
     steer.inject_overlay(target_id, vars_, agent_type)
+    _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
 
     record = {
@@ -4099,6 +4115,7 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
     )
 
     steer.inject_overlay(target_id, vars_, "fixer_retry")
+    _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch("fixer_retry", target_id, user_prompt, vars_=vars_)
     _check_calcification(target_id)
 
@@ -4952,6 +4969,7 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
     steer.inject_overlay(target_id, vars_, agent_type)
+    _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, dispatch_intent, vars_=vars_)
     _check_calcification(target_id)
 

@@ -29,6 +29,13 @@ os.environ["SLOTS_DB_PATH"] = os.path.join(_test_substrate_dir, "slots.db")
 # DB_PATH at module load time). Setting it here — before sys.path manipulation and
 # any pytest import — mirrors the ZEPHYR_ATTRIBUTION_DB / SLOTS_DB_PATH pattern.
 os.environ["MEM_DB_PATH"] = os.path.join(_test_substrate_dir, "mem.db")
+# Default test posture = master (today's pre-node-identity behavior): the existing
+# suite exercises write/merge/dispatch/flip paths that were unconditional before
+# lapis_pm.node_identity existed and must keep behaving exactly as before (spec
+# lapis-pm-node-write-ownership-v0, I6). setdefault so a test/run that explicitly
+# wants the independent posture (e.g. the negative-smoke AC9 scenario) can still
+# set LAPIS_PM_NODE_ROLE=independent before this module is imported.
+os.environ.setdefault("LAPIS_PM_NODE_ROLE", "master")
 
 _site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
 
@@ -75,6 +82,22 @@ def _block_sleeping_node_http(monkeypatch):
 
     monkeypatch.setattr(httpx, "post", _guarded(_real_post))
     monkeypatch.setattr(httpx, "get", _guarded(_real_get))
+
+
+@_pytest.fixture(autouse=True)
+def _reset_node_identity_cache():
+    """lapis_pm.node_identity caches the resolved NodeIdentity as a module
+    global after the first call in a process. Reset it around every test so
+    env-var/monkeypatch changes a test makes are actually re-resolved instead
+    of leaking a stale identity from an earlier test."""
+    try:
+        from lapis_pm import node_identity
+    except Exception:
+        yield
+        return
+    node_identity._reset_for_tests()
+    yield
+    node_identity._reset_for_tests()
 
 
 @_pytest.fixture(autouse=True)

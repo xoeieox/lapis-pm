@@ -42,7 +42,13 @@ FLIP_SERVE_TIMEOUT = int(os.environ.get("FLIP_SERVE_TIMEOUT", "240"))
 # ---------------------------------------------------------------------------
 
 def flip_gw(mode: str, *, source: str = "gw-flip-gate") -> bool:
-    """POST to flip-controller; return True on success."""
+    """POST to flip-controller; return True on success.
+
+    Raises NodeIdentityViolation if this node is not authorized to flip the
+    physical GravityWell controller (Design §3b, I2).
+    """
+    from . import node_identity
+    node_identity.ensure_gw_flip_authorized(FLIP_CONTROLLER_URL)
     try:
         import httpx
         url = f"{FLIP_CONTROLLER_URL}/v0/nodes/gravitywell/flip"

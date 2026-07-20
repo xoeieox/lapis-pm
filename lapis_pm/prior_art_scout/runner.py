@@ -64,6 +64,8 @@ _DENYLIST_SUBSTRINGS = [
 
 
 def _flip_gw(mode: str) -> bool:
+    from .. import node_identity
+    node_identity.ensure_gw_flip_authorized(FLIP_CONTROLLER_URL)
     try:
         import httpx
         url = f"{FLIP_CONTROLLER_URL}/v0/nodes/gravitywell/flip"

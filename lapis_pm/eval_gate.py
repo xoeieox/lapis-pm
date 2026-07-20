@@ -768,8 +768,8 @@ def regenerate_baseline(
 # ---------------------------------------------------------------------------
 
 def _mem():
-    from agents_core.mem import MemoryStore
-    return MemoryStore()
+    from . import node_identity
+    return node_identity.writable_store()
 
 
 def should_regenerate_baseline(repo: str) -> bool:

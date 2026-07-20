@@ -137,8 +137,8 @@ def _retrieve_mem(query: str) -> tuple[list[BackcasterCitation], str]:
     Returns (citations, context_text). Fail-soft: returns ([], "") on error.
     """
     try:
-        from agents_core.mem import MemoryStore
-        mem = MemoryStore()
+        from .. import node_identity
+        mem = node_identity.writable_store()
         items = mem.search(query, limit=5)
         citations = []
         context_parts = []
@@ -213,8 +213,8 @@ def analyze_gaps(
             log.debug("gap_analyze: Synapse unreachable (allow_degraded) - skipping retrieval")
 
     try:
-        from agents_core.mem import MemoryStore
-        MemoryStore()
+        from .. import node_identity
+        node_identity.writable_store()
     except Exception:  # noqa: BLE001
         mem_ok = False
         degraded_paths.append("mem")

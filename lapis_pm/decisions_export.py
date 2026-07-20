@@ -7,7 +7,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta, timezone
 
-from agents_core.mem import MemoryStore
+from . import node_identity
 
 VALID_TYPES = ("decision", "feedback", "pattern")
 
@@ -45,7 +45,7 @@ def collect(types: list[str], since: datetime, tag: str = "") -> dict[str, list[
     Sort: newest-first by `created_at`, tie-broken by `key` ascending (Invariant 2).
     Implementation uses two stable sorts (key ascending, then created_at descending).
     """
-    store = MemoryStore()
+    store = node_identity.writable_store()
     result: dict[str, list[dict]] = {}
     for t in types:
         rows = store.list_by_prefix(f"{t}/", limit=_LIST_CAP)

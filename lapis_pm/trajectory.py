@@ -44,8 +44,8 @@ QWEN_MODEL = "qwen3.6-35b-a3b"
 # ---------------------------------------------------------------------------
 
 def _mem():
-    from agents_core.mem import MemoryStore
-    return MemoryStore()
+    from . import node_identity
+    return node_identity.writable_store()
 
 
 def _now_iso() -> str:

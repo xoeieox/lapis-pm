@@ -1936,18 +1936,26 @@ def run_spec_review(
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     try:
-        import subprocess as _subprocess
-        _subprocess.run(
-            ["mem", "set", f"router/gw-review-divergence/{gw_run_id}",
-             json.dumps(divergence_record)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        print(
-            f"[spec-review:gw-divergence-record] logged to mem",
-            file=sys.stderr,
-        )
+        from lapis_pm import node_identity as _node_identity
+        if _node_identity.resolve_node_identity().node_role != "master":
+            print(
+                "[spec-review:gw-divergence-record-skip] node_role != master; "
+                "not writing to the shared mem ledger",
+                file=sys.stderr,
+            )
+        else:
+            import subprocess as _subprocess
+            _subprocess.run(
+                ["mem", "set", f"router/gw-review-divergence/{gw_run_id}",
+                 json.dumps(divergence_record)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            print(
+                f"[spec-review:gw-divergence-record] logged to mem",
+                file=sys.stderr,
+            )
     except Exception as e:
         print(
             f"[spec-review:gw-divergence-record-error] {e}",

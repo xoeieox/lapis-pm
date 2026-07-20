@@ -78,9 +78,9 @@ _GARDENER_DAILY_CAP = 10
 # ---------------------------------------------------------------------------
 
 def _mem():
-    """Return a fresh MemoryStore instance."""
-    from agents_core.mem import MemoryStore
-    return MemoryStore()
+    """Return a fresh writable MemoryStore instance bound to owned_mem_store."""
+    from . import node_identity
+    return node_identity.writable_store()
 
 
 def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, list[str]]:

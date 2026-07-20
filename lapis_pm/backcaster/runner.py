@@ -44,8 +44,8 @@ def _check_grounding() -> list[str]:
         unreachable.append("synapse")
 
     try:
-        from agents_core.mem import MemoryStore
-        MemoryStore()
+        from .. import node_identity
+        node_identity.writable_store()
     except Exception:  # noqa: BLE001
         unreachable.append("mem")
 

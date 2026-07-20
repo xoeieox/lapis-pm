@@ -295,6 +295,25 @@ agents:
       Keep the diff minimal and scoped to the stated issue. No surrounding
       refactors. End your response with the PR URL returned by create_pr.
 
+      ## Optional friction capture
+
+      If you hit a real obstacle or found a non-obvious efficient path while
+      completing this task, write `$WORKTREE/friction.json` before your final
+      commit — a JSON array (max 8 entries) of objects using ONLY these keys:
+        [
+          {{
+            "obstacle": "<what blocked or slowed you, plain text, <=500 chars>",
+            "path_taken": "<the efficient path found / how it was resolved, <=500 chars>",
+            "artifact": "<skill/file/procedure this touches, optional, <=200 chars>",
+            "cost_hint": "trivial" | "minor" | "costly",
+            "confidence": "hunch" | "likely" | "certain"
+          }}
+        ]
+      `git add friction.json` along with your other changes so it lands in the PR.
+      This is entirely optional and never blocks or gates your work — skip it if
+      nothing notable happened. lapis-pm sanitizes this file at harvest; malformed
+      or oversized entries are dropped silently and never fed back to you.
+
       ## Already-satisfied verdict protocol
 
       If you inspect the target spec and discover the spec is ALREADY SATISFIED

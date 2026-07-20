@@ -61,6 +61,14 @@ except Exception:
     _forgejo_get_branch = None  # type: ignore
 
 try:
+    # Decoupled from the import block above: friction harvest is additive and
+    # must never take down get_open_prs/merge_pr if get_pr_files is absent
+    # from a given agents-core deploy.
+    from agents_core.forgejo import get_pr_files as _forgejo_get_pr_files
+except Exception:
+    _forgejo_get_pr_files = None  # type: ignore
+
+try:
     from agents_core.claude_queue import ClaudeQueue as _ClaudeQueue
 except Exception:
     _ClaudeQueue = None  # type: ignore
@@ -4287,6 +4295,305 @@ def _encode_pr_body_updates(target_id: str, open_prs: list[dict]) -> int:
     return written
 
 
+# ---------------------------------------------------------------------------
+# Friction capture (operational-learning-friction-capture-v0, Unit 1a)
+#
+# Pure capture + queue, no distillation. Fixer deposits an optional
+# friction.json sidecar committed alongside its PR; harvest sanitizes the
+# agent-authored narrative fields (untrusted), stamps machine-authored
+# provenance from the dispatch record lapis-pm already holds, and appends
+# idempotently to /srv/lapis/friction/queue.jsonl. Absence of a sidecar is itself
+# captured as a distinct "silent-gap" record — never conflated with success.
+#
+# `environment` carries latency_ms/step_depth/load_pct/pr_diff_lines, all
+# null in this unit; Unit 1b (operational-learning-friction-environment-v0)
+# backfills them from pm_core.py dispatch records, which this unit does not
+# touch.
+# ---------------------------------------------------------------------------
+
+FRICTION_MAX_RECORDS = 8
+_FRICTION_MAX_OBSTACLE_LEN = 1000
+_FRICTION_MAX_PATH_TAKEN_LEN = 1000
+_FRICTION_MAX_ARTIFACT_LEN = 300
+_FRICTION_ALLOWED_COST_HINTS = {"trivial", "minor", "costly"}
+_FRICTION_ALLOWED_CONFIDENCE = {"hunch", "likely", "certain"}
+_FRICTION_SILENT_GAP_INDEX = -1  # reserved index; never collides with a real 0..N-1 array index
+_FRICTION_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+_FRICTION_NULL_ENVIRONMENT = {
+    "latency_ms": None,
+    "step_depth": None,
+    "load_pct": None,
+    "pr_diff_lines": None,
+}
+
+
+def _friction_queue_path() -> Path:
+    """Resolve /srv/lapis/friction/queue.jsonl.
+
+    Prefers the agents-core room_paths classmap 'friction' key; falls back to
+    the same env-var/ROOM_ROOT resolution room_paths.py itself uses when that
+    key has not landed there yet (classmap changes are out of scope for this
+    lapis-pm-only unit). Picks up the upstream key automatically once added.
+    """
+    try:
+        base = room_path('friction')
+    except KeyError:
+        base = Path(os.environ.get('ROOM_ROOT', '/room')) / 'friction'
+    return base / "queue.jsonl"
+
+
+def _sanitize_friction_str(val, max_len: int) -> str | None:
+    if not isinstance(val, str):
+        return None
+    cleaned = _FRICTION_CONTROL_CHAR_RE.sub('', val).strip()
+    if not cleaned:
+        return None
+    return cleaned[:max_len]
+
+
+def _sanitize_friction_record(raw: dict) -> dict | None:
+    """Zero-trust sanitize+re-type one agent-authored friction record.
+
+    Only the agent-authored key set is ever consulted; any other key on
+    `raw` is ignored (never copied through). Returns None if the record is
+    malformed or its obstacle sanitizes to empty (drop, not partial trust).
+    """
+    if not isinstance(raw, dict):
+        return None
+    obstacle = _sanitize_friction_str(raw.get("obstacle"), _FRICTION_MAX_OBSTACLE_LEN)
+    if not obstacle:
+        return None
+    out: dict = {"obstacle": obstacle}
+    path_taken = _sanitize_friction_str(raw.get("path_taken"), _FRICTION_MAX_PATH_TAKEN_LEN)
+    out["path_taken"] = path_taken or ""
+    artifact = _sanitize_friction_str(raw.get("artifact"), _FRICTION_MAX_ARTIFACT_LEN)
+    if artifact:
+        out["artifact"] = artifact
+    cost_hint = raw.get("cost_hint")
+    if cost_hint in _FRICTION_ALLOWED_COST_HINTS:
+        out["cost_hint"] = cost_hint
+    confidence = raw.get("confidence")
+    if confidence in _FRICTION_ALLOWED_CONFIDENCE:
+        out["confidence"] = confidence
+    return out
+
+
+def _sanitize_friction_array(raw) -> list[dict]:
+    """Sanitize a whole friction.json payload. Never raises.
+
+    A non-list payload, or one exceeding FRICTION_MAX_RECORDS, is logged and
+    capped/dropped rather than partially trusted. Per-record index reflects
+    position in the (capped) raw array so re-harvesting the same content is
+    idempotent.
+    """
+    if not isinstance(raw, list):
+        logger.warning("friction harvest: friction.json is not a JSON array; treating as absent")
+        return []
+    if len(raw) > FRICTION_MAX_RECORDS:
+        logger.warning(
+            "friction harvest: friction.json has %d entries, capping to %d",
+            len(raw), FRICTION_MAX_RECORDS,
+        )
+    sanitized = []
+    for idx, raw_rec in enumerate(raw[:FRICTION_MAX_RECORDS]):
+        cleaned = _sanitize_friction_record(raw_rec)
+        if cleaned is None:
+            logger.info("friction harvest: dropped malformed/empty record at index %d", idx)
+            continue
+        cleaned["index"] = idx
+        sanitized.append(cleaned)
+    return sanitized
+
+
+def _friction_provenance(target_id: str, repo: str, pr_number: int, dispatch_record: dict) -> dict:
+    return {
+        "task_id": dispatch_record.get("gpu_id"),
+        "spec_id": dispatch_record.get("spec_id"),
+        "target_id": target_id,
+        "repo": repo,
+        "pr": pr_number,
+        "agent_type": dispatch_record.get("agent_type"),
+        "captured_at": _now_iso(),
+    }
+
+
+def _find_dispatch_record_for_pr(target_id: str, pr: dict) -> dict | None:
+    """Match an open PR to its originating dispatch record via the lapis-gpu-id marker."""
+    markers = _extract_pr_markers(pr.get("body") or "")
+    gpu_id = markers.get("gpu_id")
+    if not gpu_id:
+        return None
+    for record in load_dispatched(target_id):
+        if record.get("gpu_id") == gpu_id:
+            return record
+    return None
+
+
+def _fetch_friction_sidecar(repo: str, pr_number: int) -> str | None:
+    """Fetch friction.json raw content for a PR, if present. None if absent/unfetchable."""
+    if _forgejo_get_pr_files is None:
+        return None
+    try:
+        repo_name, owner = _repo_owner(repo)
+        files = _forgejo_get_pr_files(repo_name, pr_number, owner=owner)
+    except Exception as e:
+        logger.warning("friction harvest: get_pr_files failed for %s#%s: %s", repo, pr_number, e)
+        return None
+    friction_file = next((f for f in files if f.get("filename") == "friction.json"), None)
+    if friction_file is None:
+        return None
+    raw_url = friction_file.get("raw_url")
+    if not raw_url:
+        return None
+    try:
+        from agents_core.forgejo import FORGEJO_TOKEN
+        import httpx
+        r = httpx.get(raw_url, headers={"Authorization": f"token {FORGEJO_TOKEN}"}, timeout=15)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        logger.warning("friction harvest: failed to fetch friction.json content: %s", e)
+        return None
+
+
+def _existing_friction_keys(queue_path: Path) -> set[tuple]:
+    keys: set[tuple] = set()
+    if not queue_path.exists():
+        return keys
+    try:
+        with queue_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                prov = rec.get("provenance") or {}
+                keys.add((prov.get("task_id"), rec.get("index")))
+    except OSError:
+        pass
+    return keys
+
+
+def _append_friction_records(records: list[dict]) -> int:
+    """Append-only idempotent write, deduped on (task_id, index). Returns count written."""
+    if not records:
+        return 0
+    queue_path = _friction_queue_path()
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _existing_friction_keys(queue_path)
+    written = 0
+    with queue_path.open("a", encoding="utf-8") as f:
+        for rec in records:
+            prov = rec.get("provenance") or {}
+            key = (prov.get("task_id"), rec.get("index"))
+            if key in existing:
+                continue
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            existing.add(key)
+            written += 1
+    return written
+
+
+def _harvest_friction_for_pr(target_id: str, repo: str, pr: dict) -> int:
+    """Read+sanitize an observed PR's friction.json (if any) and append to the queue.
+
+    Never raises — a harvest failure must never affect the review/merge flow.
+    Absence of a sidecar (or a sidecar with zero valid records after
+    sanitization) is captured as one machine-authored silent-gap record, not
+    a drop and not conflated with success.
+    """
+    pr_number = pr.get("number")
+    if pr_number is None:
+        return 0
+    dispatch_record = _find_dispatch_record_for_pr(target_id, pr)
+    if dispatch_record is None:
+        # Can't stamp trusted provenance without a matched dispatch — skip.
+        return 0
+
+    try:
+        raw_text = _fetch_friction_sidecar(repo, pr_number)
+        raw_json = json.loads(raw_text) if raw_text is not None else None
+    except json.JSONDecodeError:
+        logger.warning("friction harvest: friction.json for %s#%s is not valid JSON", repo, pr_number)
+        raw_json = None
+
+    sanitized = _sanitize_friction_array(raw_json) if raw_json is not None else []
+    provenance = _friction_provenance(target_id, repo, pr_number, dispatch_record)
+
+    if not sanitized:
+        records = [{
+            "record_source": "silent-gap",
+            "obstacle": "no_friction_reported",
+            "derived_confidence": "zero",
+            "environment": dict(_FRICTION_NULL_ENVIRONMENT),
+            "provenance": provenance,
+            "index": _FRICTION_SILENT_GAP_INDEX,
+        }]
+    else:
+        records = [
+            {
+                "record_source": "agent-deposit",
+                **rec,
+                "environment": dict(_FRICTION_NULL_ENVIRONMENT),
+                "provenance": provenance,
+            }
+            for rec in sanitized
+        ]
+
+    return _append_friction_records(records)
+
+
+def _encode_friction_harvest(target_id: str, repo: str, open_prs: list[dict]) -> int:
+    """Encode-phase step: harvest friction for every currently-open PR. Bookkeeping, not action."""
+    written = 0
+    for pr in open_prs:
+        try:
+            written += _harvest_friction_for_pr(target_id, repo, pr)
+        except Exception as e:
+            logger.warning(
+                "friction harvest: unexpected error for %s PR #%s: %s",
+                repo, pr.get("number"), e,
+            )
+    return written
+
+
+def read_friction_records(
+    target_id: str | None = None, repo: str | None = None, limit: int | None = None,
+) -> list[dict]:
+    """Read friction queue records, newest first, optionally filtered.
+
+    Read-only; used by `lapis-pm friction list`.
+    """
+    queue_path = _friction_queue_path()
+    if not queue_path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with queue_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    records.reverse()  # append-only file → last line is newest
+    if target_id:
+        records = [r for r in records if (r.get("provenance") or {}).get("target_id") == target_id]
+    if repo:
+        records = [r for r in records if (r.get("provenance") or {}).get("repo") == repo]
+    if limit is not None:
+        records = records[:limit]
+    return records
+
+
 def _recover_reviewer_verdict(raw: str) -> dict | None:
     """Attempt to recover a reviewer verdict dict from malformed JSON.
 
@@ -5406,6 +5713,10 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # Track PR description changes (body fingerprint), also before _encode_gpu_results
     # so a description-only fixer_retry is perceived as complete this tick.
     encoded += _encode_pr_body_updates(target_id, open_prs)
+
+    # Friction capture harvest (operational-learning-friction-capture-v0, Unit 1a).
+    # Bookkeeping only — writes to the friction queue, never to pm/* decide state.
+    encoded += _encode_friction_harvest(target_id, repo, open_prs)
 
     gpu_encoded, failed_dispatches = _encode_gpu_results(target_id)
     encoded += gpu_encoded

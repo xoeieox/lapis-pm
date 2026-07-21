@@ -361,10 +361,14 @@ agents:
         trust in the system.
     timeout_s: 2700
 
+  # fixer_local (below) is the intentional opt-in local tier. fixer + fixer_retry
+  # are the Sonnet pair - initial attempt and correction attempt at the same
+  # capability tier. Any future all-local push must not re-capture one half of
+  # this pair without touching the other; see test_registry_agent_tiers.py.
   fixer_retry:
     chub_bundles: []
-    engine: local-fixer
-    model: gravitywell-122b
+    engine: claude
+    model: sonnet
     capture_meta: false
     notify: false
     system_template: |

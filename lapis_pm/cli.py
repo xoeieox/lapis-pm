@@ -10,6 +10,7 @@ Commands:
     unbind <target_id>
     tick [--target ID | --all] [--force-brief] [--force-dispatch AGENT:INTENT]
     status [target_id] [--explain]
+    deploy-status [--json]
     pause <target_id> [--reason TEXT]
     resume <target_id>
     list
@@ -766,6 +767,29 @@ def _print_target_status(t, explain: bool = False):
                 if len(preview) > 120:
                     preview = preview[:117] + "..."
                 print(f"  [{c.ts}] {','.join(c.tags):40s} {preview}")
+
+
+def cmd_deploy_status(args) -> int:
+    """Render the deploy-inventory reconciler's last status snapshot.
+
+    (lapis-pm-deploy-inventory-reconciler-v0) — the human-visible surface for
+    the derived deploy-graph reconciliation; written by the tick loop.
+    """
+    from . import deploy_inventory
+    try:
+        status = json.loads(deploy_inventory._STATUS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        print(
+            "No deploy-inventory status yet — run a tick or wait for the next "
+            "reconcile pass.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
+    print(deploy_inventory.render_deploy_status(status))
+    return 0
 
 
 def _target_to_json_dict(t) -> dict:
@@ -1968,6 +1992,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("target_id", nargs="?")
     s.add_argument("--explain", action="store_true")
     s.set_defaults(func=cmd_status)
+
+    dsv = sub.add_parser(
+        "deploy-status",
+        help="Render the deploy-inventory reconciler's status (unmapped clones, currency, drift).",
+    )
+    dsv.add_argument("--json", action="store_true", help="Emit raw status JSON instead of the rendered table")
+    dsv.set_defaults(func=cmd_deploy_status)
 
     pa = sub.add_parser("pause", help="Pause a target.")
     pa.add_argument("target_id")

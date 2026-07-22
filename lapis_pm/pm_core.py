@@ -1217,12 +1217,15 @@ def _check_one_clone_currency(repo: str, clone_path: str) -> None:
     try:
         last_raw = _mem().get(stale_key)
         if last_raw:
-            last_ts = datetime.fromisoformat(last_raw)
+            last_ts = datetime.fromisoformat(last_raw["content"])
             now_ts = datetime.now(last_ts.tzinfo)
             if (now_ts - last_ts).total_seconds() < _DEPLOY_CURRENCY_COOLDOWN_SECS:
                 return
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "[deploy-currency] cooldown read failed for %s (failing open, alerting): %s",
+            stale_key, e,
+        )
 
     distance_repr = distance if distance is not None else "?"
 
@@ -1264,23 +1267,64 @@ def _reconcile_deploy_inventory() -> None:
     against the live host" gap (lapis-pm-deploy-inventory-reconciler-v0).
     Fail-soft: a reconciler failure degrades to a logged warning and never
     stalls tick_all() (spec item 7).
+
+    Pushover notification is deduped against the prior status snapshot
+    (lapis-pm-deploy-inventory-notify-dedup-v0): only HIGH findings new since
+    the last pass are pushed. The stderr HIGH line is always emitted.
     """
     try:
         last_raw = _mem().get(_DEPLOY_INVENTORY_LAST_RUN_KEY)
         if last_raw:
-            last_ts = datetime.fromisoformat(last_raw)
+            last_ts = datetime.fromisoformat(last_raw["content"])
             now_ts = datetime.now(last_ts.tzinfo)
             if (now_ts - last_ts).total_seconds() < _DEPLOY_INVENTORY_COOLDOWN_SECS:
                 return
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "[deploy-inventory] cooldown read failed (failing open, running pass): %s", e,
+        )
 
     try:
         from . import deploy_inventory
+
+        # Dedup (lapis-pm-deploy-inventory-notify-dedup-v0): only Pushover HIGH
+        # findings that are new since the prior snapshot. `prior_high_keys` stays
+        # None for a legitimate first-ever pass (bootstrap: notify everything once)
+        # and also for a present-but-unparseable prior snapshot (corrupt: per-finding
+        # notifications are suppressed below in favor of one loud audit push - never
+        # fail-open to notifying every finding, never fail-silent about corruption).
+        prior_high_keys = None
+        corrupt = False
+        try:
+            prior_status = deploy_inventory.read_status_json()
+            if prior_status is not None:
+                prior_high_keys = deploy_inventory.high_finding_keys(prior_status)
+        except Exception as e:
+            corrupt = True
+            logger.warning(
+                "[deploy-inventory] prior status file unreadable, treating as corrupt: %s", e,
+            )
+
         status = deploy_inventory.run_reconcile_pass(
             _POST_LAND_PULL, _POST_LAND_RESTART, _POST_LAND_RESTART_USER,
         )
         deploy_inventory.write_status_json(status)
+
+        if corrupt:
+            try:
+                from agents_core.notify import send_notification, Priority as _P
+                send_notification(
+                    message=(
+                        "prior deploy-inventory-status.json is present but unreadable; "
+                        "per-finding notification dedup is suppressed for this pass "
+                        "(falls back to the coarse per-pass cooldown as rate limit)."
+                    ),
+                    title="deploy-inventory: status file unreadable",
+                    priority=_P.HIGH,
+                )
+            except Exception:
+                pass
+
         for clone in status.get("clones", []):
             for finding in clone.get("findings", []):
                 if finding.get("severity") != "HIGH":
@@ -1289,6 +1333,11 @@ def _reconcile_deploy_inventory() -> None:
                     f"[deploy-inventory] HIGH: {clone['path']} {finding['kind']}: {finding['detail']}",
                     file=sys.stderr, flush=True,
                 )
+                if corrupt:
+                    continue
+                key = (clone["path"], finding["kind"])
+                if prior_high_keys is not None and key in prior_high_keys:
+                    continue
                 try:
                     from agents_core.notify import send_notification, Priority as _P
                     send_notification(

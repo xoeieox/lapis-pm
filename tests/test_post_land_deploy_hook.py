@@ -706,7 +706,7 @@ class TestDeployCurrencyCheck:
 
         fake_mem = MagicMock()
         fake_mem.get.side_effect = (
-            lambda key: recent_ts if key.endswith("/srv/git/lapis-pm") else None
+            lambda key: {"content": recent_ts} if key.endswith("/srv/git/lapis-pm") else None
         )
 
         def fake_notify(message, title, priority, **kwargs):
@@ -776,6 +776,193 @@ class TestDeployCurrencyCheck:
             pm_core._check_deploy_currency()  # must not raise
 
         assert len(notify_calls) == 1
+
+
+class TestReconcileDeployInventoryDedup:
+    """Tests for _reconcile_deploy_inventory's cooldown-read fix (Defect A) and
+    Pushover notification dedup against the prior snapshot (Defect B) —
+    lapis-pm-deploy-inventory-notify-dedup-v0.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_status_file(self, tmp_path):
+        from lapis_pm import deploy_inventory
+        with patch.object(
+            deploy_inventory, "_STATUS_FILE", tmp_path / "deploy-inventory-status.json",
+        ):
+            yield
+
+    @staticmethod
+    def _status(findings_by_clone):
+        """{clone_path: [(kind, severity, detail), ...]} -> a minimal status dict."""
+        clones = []
+        for path, findings in findings_by_clone.items():
+            clones.append({
+                "path": path,
+                "findings": [
+                    {"kind": kind, "severity": sev, "detail": detail}
+                    for kind, sev, detail in findings
+                ],
+            })
+        return {"generated": "2026-07-22T00:00:00+00:00", "clones": clones}
+
+    def test_cooldown_within_window_skips_reconcile_pass(self):
+        """A last-run key read via the correct ["content"] idiom, within the
+        cooldown window, skips the pass entirely (Defect A)."""
+        from datetime import datetime, timezone, timedelta
+        recent_ts = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = {"content": recent_ts}
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass") as fake_run_pass,
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        fake_run_pass.assert_not_called()
+
+    def test_cooldown_stale_runs_reconcile_pass(self):
+        """A last-run key older than the cooldown window runs the pass (Defect A)."""
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = {"content": old_ts}
+
+        status = self._status({})
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=status) as fake_run_pass,
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        fake_run_pass.assert_called_once()
+
+    def test_finding_unchanged_since_prior_pass_does_not_notify(self):
+        from lapis_pm import deploy_inventory
+        prior = self._status({"/srv/git/lapis-pm": [("tracked_dirty_tree", "HIGH", "dirty")]})
+        deploy_inventory.write_status_json(prior)
+
+        current = self._status({"/srv/git/lapis-pm": [("tracked_dirty_tree", "HIGH", "dirty")]})
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None  # cooldown clear
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert notify_calls == []
+
+    def test_new_finding_since_prior_pass_notifies(self):
+        from lapis_pm import deploy_inventory
+        prior = self._status({"/srv/git/lapis-pm": [("tracked_dirty_tree", "HIGH", "dirty")]})
+        deploy_inventory.write_status_json(prior)
+
+        current = self._status({
+            "/srv/git/lapis-pm": [
+                ("tracked_dirty_tree", "HIGH", "dirty"),
+                ("stray_branch", "HIGH", "on a branch"),
+            ],
+        })
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert notify_calls == ["deploy-inventory: stray_branch"]
+
+    def test_first_ever_pass_notifies_all_current_high_findings(self):
+        """No prior snapshot on disk: every current HIGH finding notifies once,
+        not suppressed (spec item 2)."""
+        current = self._status({
+            "/srv/git/lapis-pm": [("tracked_dirty_tree", "HIGH", "dirty")],
+            "/data/agents": [("stale_behind_origin", "HIGH", "behind")],
+        })
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert len(notify_calls) == 2
+
+    def test_corrupt_prior_snapshot_fires_single_audit_and_suppresses_per_finding_pushes(
+        self, tmp_path,
+    ):
+        """A present-but-unparseable prior snapshot must not fail-open (notifying
+        every current finding) nor fail-silent (no signal at all): exactly one
+        HIGH audit push fires, and per-finding pushes are suppressed for this
+        pass. The next pass is gated by the (now-functioning) coarse cooldown."""
+        status_path = tmp_path / "deploy-inventory-status.json"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text("{not valid json")
+
+        current = self._status({
+            "/srv/git/lapis-pm": [("tracked_dirty_tree", "HIGH", "dirty")],
+            "/data/agents": [("stray_branch", "HIGH", "branch")],
+        })
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert notify_calls == ["deploy-inventory: status file unreadable"]
+
+        # Next tick: the coarse cooldown (now correctly reading ["content"])
+        # gates the pass before the corrupt-snapshot logic ever re-runs.
+        fake_mem.get.return_value = {"content": pm_core._now_iso()}
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass") as fake_run_pass_2,
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        fake_run_pass_2.assert_not_called()
 
 
 class TestAgentsCoreDeployBackstopTimer:

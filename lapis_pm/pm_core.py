@@ -361,6 +361,13 @@ _DEPLOY_CURRENCY_COOLDOWN_SECS = 3600  # alert at most once per hour
 # that read side up lives in agents-core's own repo, out of this repo's scope.
 _DEPLOY_CURRENCY_STATUS_FILE = room_path('lapis_state') / "deploy-currency-status.json"
 
+# Deploy-inventory reconciler (lapis-pm-deploy-inventory-reconciler-v0): derives
+# the real deployment surface (systemd units + editable installs) and reconciles
+# it against the maps above. Systemctl/unit enumeration is not free — cooldown
+# gated like _DEPLOY_CURRENCY_COOLDOWN_SECS, not run every tick (spec item 7).
+_DEPLOY_INVENTORY_COOLDOWN_SECS = 3600  # at most one full pass per hour
+_DEPLOY_INVENTORY_LAST_RUN_KEY = "pm/deploy-inventory/last-run"
+
 # ---------------------------------------------------------------------------
 # Robust pull: graded collision-safety model (agents-core-deploy-drift-backstop-v0)
 # ---------------------------------------------------------------------------
@@ -1245,6 +1252,58 @@ def _check_one_clone_currency(repo: str, clone_path: str) -> None:
             _now_iso(),
             tags=["lapis-pm", "deploy"],
         )
+    except Exception:
+        pass
+
+
+def _reconcile_deploy_inventory() -> None:
+    """Cooldown-gated wrapper around deploy_inventory.run_reconcile_pass().
+
+    Extends _check_deploy_currency (critical-repos-only) to every mapped-or-
+    derived load-bearing clone, and closes the "no one ever compares the maps
+    against the live host" gap (lapis-pm-deploy-inventory-reconciler-v0).
+    Fail-soft: a reconciler failure degrades to a logged warning and never
+    stalls tick_all() (spec item 7).
+    """
+    try:
+        last_raw = _mem().get(_DEPLOY_INVENTORY_LAST_RUN_KEY)
+        if last_raw:
+            last_ts = datetime.fromisoformat(last_raw)
+            now_ts = datetime.now(last_ts.tzinfo)
+            if (now_ts - last_ts).total_seconds() < _DEPLOY_INVENTORY_COOLDOWN_SECS:
+                return
+    except Exception:
+        pass
+
+    try:
+        from . import deploy_inventory
+        status = deploy_inventory.run_reconcile_pass(
+            _POST_LAND_PULL, _POST_LAND_RESTART, _POST_LAND_RESTART_USER,
+        )
+        deploy_inventory.write_status_json(status)
+        for clone in status.get("clones", []):
+            for finding in clone.get("findings", []):
+                if finding.get("severity") != "HIGH":
+                    continue
+                print(
+                    f"[deploy-inventory] HIGH: {clone['path']} {finding['kind']}: {finding['detail']}",
+                    file=sys.stderr, flush=True,
+                )
+                try:
+                    from agents_core.notify import send_notification, Priority as _P
+                    send_notification(
+                        message=finding["detail"],
+                        title=f"deploy-inventory: {finding['kind']}",
+                        priority=_P.HIGH,
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("[deploy-inventory] reconcile pass failed (non-fatal): %s", e)
+        return
+
+    try:
+        _mem().set(_DEPLOY_INVENTORY_LAST_RUN_KEY, _now_iso(), tags=["lapis-pm", "deploy"])
     except Exception:
         pass
 
@@ -5967,6 +6026,14 @@ def tick_all() -> list[TickResult]:
     # Runs once per tick_all so timer outages or persistent pull failures are never silent.
     try:
         _check_deploy_currency()
+    except Exception:
+        pass  # best-effort — must not block target processing
+
+    # Deploy-inventory reconciler — derives the real deployment surface and
+    # reconciles it against the maps above (lapis-pm-deploy-inventory-reconciler-v0).
+    # Cooldown-gated internally; runs once per tick_all so a full pass is cheap.
+    try:
+        _reconcile_deploy_inventory()
     except Exception:
         pass  # best-effort — must not block target processing
 

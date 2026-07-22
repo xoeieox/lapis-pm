@@ -19,6 +19,13 @@ Weekly briefs omit the Gardener bucket header, but a 7-day Gardener
 observation window is appended as a raw data block for Weekly Arc
 synthesis (see state_brief_prompts.py).
 
+Weekly briefs additionally render a "Climate" bucket (gardener-arc-climate-v0,
+Unit 1) — a deterministic arc-reconciler that joins each on-disk lapis_state
+arc-doc's declared NEXT against ground truth (Forgejo PRs, deploy-inventory,
+systemd timers, weaver digests) and classifies it as silently-advanced,
+gone-quiet, or unresolvable. Omitted entirely for daily cadences (v0 is
+weekly-only) and omitted from weekly output when every arc is moving.
+
 Temporal compression hierarchy (Gardener observations only):
   daily cadences (morning/afternoon/live) → single latest gardener/derived
   entry, capped at 10 observations ("weather today")
@@ -63,6 +70,7 @@ B_IN_FLIGHT = "In flight"
 B_CAPTURED = "Captured — not yet built"
 B_AWAITING = "Awaiting your call"
 B_GARDENER = "Gardener Cross-Cutting Observations"
+B_CLIMATE = "Climate"
 
 # Parses flat markdown bullets from gardener/writeback.py:derive_context output, e.g.
 # "- [Critical] <text>  (evidence: ...)". Info/Unclassified are filtered out upstream
@@ -71,6 +79,28 @@ B_GARDENER = "Gardener Cross-Cutting Observations"
 _GARDENER_BULLET_RE = re.compile(r'^- \[(Critical|Warning)\]\s+(.+?)(?:\s+\(evidence:\s*(.+?)\))?$')
 _GARDENER_DERIVED_PREFIX = "gardener/derived/"
 _GARDENER_DAILY_CAP = 10
+
+# --- Arc-Climate reconciler (gardener-arc-climate-v0, Unit 1) ---
+# Global staleness threshold — a single named constant, trivially tunable
+# (OQ-2 RESOLVED: Facets-endorsed 21 days; per-arc importance-scaling deferred
+# to Unit 1.5's mem.db arc-registry schema).
+_ARC_STALE_DAYS = 21
+
+_NEXT_LINE_RE = re.compile(r'^\s*(?:\*\*)?NEXT(?:\*\*)?[:=]\s*(.+?)\s*$', re.IGNORECASE)
+_NEXT_HEADER_RE = re.compile(r'^\s*(?:#+\s*Next\b|\*\*NEXT\*\*)\s*$', re.IGNORECASE)
+_BULLET_LINE_RE = re.compile(r'^\s*[-*]\s+(.+?)\s*$')
+# Repo token must contain a hyphen (Lapis repos are consistently
+# hyphenated: lapis-pm, agents-core, lapis-engine, ...) so ordinary prose
+# words immediately preceding "PR #n" (e.g. "merge PR #219") never get
+# mistaken for a repo name; the parenthetical form is the fallback anchor.
+_PR_ANCHOR_RE = re.compile(
+    r'([A-Za-z][\w]*-[\w.-]*)\s+PR\s*#(\d+)|PR\s*#(\d+)\s*\(([A-Za-z][\w.-]*)\)',
+    re.IGNORECASE,
+)
+_UNIT_ANCHOR_RE = re.compile(r'\b([\w-]+\.(?:timer|service))\b')
+_TARGET_ID_RE = re.compile(r'\b([a-z][a-z0-9]*(?:-[a-z0-9]+){2,})\b')
+_SILENTLY_ADVANCED_NEXT_RE = re.compile(r'review|merge|land|pm-pr-review', re.IGNORECASE)
+_WEAVER_BIN = "/home/user/.local/bin/weaver"
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +204,16 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
     except Exception:
         gardener_items = []
 
+    # --- Climate: arc-reconciler bullets (weekly cadence only — v0) ---
+    # Degrades to [] on any catastrophic failure, matching Gardener's guard.
+    # Per-source degrade for individual ground-truth signals happens inside
+    # _read_arc_climate itself (each source wrapped in its own try/except).
+    try:
+        climate_entries = _read_arc_climate(start_ts, period=period)
+    except Exception:
+        climate_entries = []
+    climate_items = [entry["text"] for entry in climate_entries]
+
     return {
         B_BUILT: built_items,
         B_RATIFICATIONS: ratification_items,
@@ -181,6 +221,7 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
         B_CAPTURED: captured_items,
         B_AWAITING: awaiting_items,
         B_GARDENER: gardener_items,
+        B_CLIMATE: climate_items,
     }
 
 
@@ -258,6 +299,288 @@ def _read_gardener_observations(period: str = "daily") -> list[str]:
     # Weekly: uncapped — the LLM synthesizes patterns from the full window.
     # Non-weekly: cap to avoid prompt bloat.
     return observations if period == "weekly" else observations[:_GARDENER_DAILY_CAP]
+
+
+# --- Arc-Climate reconciler helpers (gardener-arc-climate-v0, Unit 1) ------
+
+
+def _parse_declared_next(text: str) -> str | None:
+    """First line matching NEXT[:=]..., else the first bullet (or line) under
+    a '## Next' / '**NEXT**' marker. None if neither is present."""
+    lines = text.splitlines()
+    for line in lines:
+        m = _NEXT_LINE_RE.match(line)
+        if m:
+            return m.group(1).strip()
+    for i, line in enumerate(lines):
+        if _NEXT_HEADER_RE.match(line):
+            for follow in lines[i + 1:]:
+                if not follow.strip():
+                    continue
+                bm = _BULLET_LINE_RE.match(follow)
+                return (bm.group(1) if bm else follow).strip()
+    return None
+
+
+def _parse_arc_anchors(text: str) -> dict:
+    """Regex-extract PR anchors, *.timer/*.service names, and target-id-shaped
+    slugs mentioned in an arc-doc. Best-effort, never raises."""
+    prs: list[tuple[str | None, int]] = []
+    for m in _PR_ANCHOR_RE.finditer(text):
+        if m.group(2):
+            prs.append((m.group(1), int(m.group(2))))
+        else:
+            prs.append((m.group(4), int(m.group(3))))
+    units = sorted(set(_UNIT_ANCHOR_RE.findall(text)))
+    target_ids = sorted(set(_TARGET_ID_RE.findall(text)))
+    return {"prs": prs, "units": units, "target_ids": target_ids}
+
+
+def _parse_iso_ts(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _arc_pr_ground_truth(repo: str, pr_number: int) -> dict | None:
+    """get_pr(repo, pr_number) wrapped for per-source degrade. None on any failure.
+
+    Arc-doc anchors carry a bare repo token (never an "owner/repo" prefix — see
+    _PR_ANCHOR_RE), so the owner namespace is unknown up front. get_pr defaults
+    to the Erah namespace when owner is omitted; agent-managed repos that
+    instead live under the lapis org (per feedback/merge-and-deploy-owner-kwarg)
+    404 on that first attempt. Retry once against the lapis org before giving
+    up, rather than silently dropping the signal for every non-Erah repo."""
+    import httpx
+    from agents_core.forgejo import LAPIS_ORG, get_pr
+    try:
+        return get_pr(repo, pr_number)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            try:
+                return get_pr(repo, pr_number, owner=LAPIS_ORG)
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def _arc_deploy_signal(anchors: dict) -> datetime | None:
+    """Best-effort: the deploy-inventory status timestamp, if a HIGH finding's
+    clone path intersects one of this arc's anchor tokens (target-id or repo).
+    None if no match, or the status has no parseable 'generated' timestamp —
+    never fabricates a timestamp to avoid a spurious freshness signal."""
+    from . import deploy_inventory
+    anchor_tokens = {tid for tid in anchors.get("target_ids", [])} | {
+        repo for repo, _num in anchors.get("prs", []) if repo
+    }
+    if not anchor_tokens:
+        return None
+    try:
+        status = deploy_inventory.read_status_json()
+        if not status:
+            return None
+        keys = deploy_inventory.high_finding_keys(status)
+    except Exception:
+        return None
+    for clone_path, _kind in keys:
+        if clone_path and any(tok in clone_path for tok in anchor_tokens):
+            return _parse_iso_ts(status.get("generated"))
+    return None
+
+
+def _arc_timer_resolves(units: list[str]) -> bool:
+    """Best-effort: True if any *.timer/*.service anchor successfully answers
+    `systemctl show` (system or user scope) — evidence the anchor is real and
+    queryable. The reused property set carries no last-triggered timestamp,
+    so a resolving timer only proves ground-truth *availability* (keeps the
+    arc out of 'unresolvable') — it never contributes a fabricated freshness
+    timestamp, since timer/service units are typically active/waiting at
+    nearly all times regardless of whether the arc itself has moved."""
+    from . import deploy_inventory
+    for unit in units:
+        for scope in ("system", "user"):
+            try:
+                props = deploy_inventory._show_unit(unit, scope)
+            except Exception:
+                props = None
+            if props:
+                return True
+    return False
+
+
+def _arc_weaver_signal(slug: str) -> datetime | None:
+    """Best-effort thread match: `weaver get <slug> --json` -> latest digest ts.
+    Advisory-only per spec — never cited as ratified. None on any failure
+    (binary missing, no matching thread, malformed JSON)."""
+    import json
+    import subprocess
+    try:
+        result = subprocess.run(
+            [_WEAVER_BIN, "get", slug, "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("updated_at", "last_updated", "updated", "timestamp", "digest_ts"):
+        ts = _parse_iso_ts(data.get(key))
+        if ts:
+            return ts
+    return None
+
+
+def _read_arc_climate(start_ts: datetime, *, period: str = "daily") -> list[dict]:
+    """Reconcile each on-disk arc-doc's declared NEXT against ground truth and
+    classify it. Deterministic reader — no LLM call; the weekly prose stage
+    narrates the returned bullets in narrative-mirror / debt-of-time voice.
+
+    Weekly cadence only for v0 (Design decisions): non-weekly periods return
+    [] immediately without touching Forgejo/deploy-inventory/systemd/weaver,
+    so daily/morning/afternoon/live briefs never pay this network cost.
+
+    Each ground-truth source (Forgejo PR, deploy-inventory, systemd timer,
+    weaver digest) is wrapped in its own try/except — a failing source drops
+    only that signal; an arc with zero available external signals classifies
+    as unresolvable (once past _ARC_STALE_DAYS) rather than aborting the pass.
+    Catastrophic failure (e.g. the arc-doc directory itself is unreadable)
+    degrades to [] via the caller's try/except in _read_buckets.
+
+    Returns a list of {"slug", "classification", "text"} dicts — "moving"
+    arcs (age_days <= _ARC_STALE_DAYS) are omitted entirely (silence is not
+    churn), matching the "omit empty section" behaviour DoD requires.
+    """
+    if period != "weekly":
+        return []
+
+    arc_dir = room_path('lapis_state')
+    if not arc_dir.exists():
+        return []
+
+    now = datetime.now(tz=timezone.utc)
+    results: list[dict] = []
+
+    for doc_path in sorted(arc_dir.glob("*.md")):
+        try:
+            text = doc_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        slug = doc_path.stem
+        declared_next = _parse_declared_next(text)
+        anchors = _parse_arc_anchors(text)
+
+        try:
+            doc_mtime = datetime.fromtimestamp(doc_path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            doc_mtime = now
+
+        # external_signals feeds the freshness/age calculation (real
+        # timestamps only). has_ground_truth tracks whether *any* source
+        # resolved at all — including timer/service anchors, which prove
+        # queryability but carry no usable timestamp (see _arc_timer_resolves).
+        external_signals: list[datetime] = []
+        has_ground_truth = False
+        pr_hits: list[tuple[str, int, dict]] = []
+
+        for repo, num in anchors["prs"]:
+            if not repo:
+                continue
+            pr = _arc_pr_ground_truth(repo, num)
+            if pr:
+                pr_hits.append((repo, num, pr))
+                has_ground_truth = True
+                ts = _parse_iso_ts(pr.get("merged_at")) or _parse_iso_ts(pr.get("updated_at"))
+                if ts:
+                    external_signals.append(ts)
+
+        try:
+            deploy_ts = _arc_deploy_signal(anchors)
+        except Exception:
+            deploy_ts = None
+        if deploy_ts:
+            external_signals.append(deploy_ts)
+            has_ground_truth = True
+
+        try:
+            timer_resolved = _arc_timer_resolves(anchors["units"])
+        except Exception:
+            timer_resolved = False
+        if timer_resolved:
+            has_ground_truth = True
+
+        try:
+            weaver_ts = _arc_weaver_signal(slug)
+        except Exception:
+            weaver_ts = None
+        if weaver_ts:
+            external_signals.append(weaver_ts)
+            has_ground_truth = True
+
+        last_activity = max([doc_mtime, *external_signals])
+        age_days = max((now - last_activity).days, 0)
+
+        # --- silently-advanced (Realized Intent): fires on detection,
+        # independent of _ARC_STALE_DAYS (Council round-2). ---
+        advanced: dict | None = None
+        if declared_next and _SILENTLY_ADVANCED_NEXT_RE.search(declared_next):
+            for repo, num, pr in pr_hits:
+                state = (pr.get("state") or "").lower()
+                if pr.get("merged") or state in ("closed", "merged"):
+                    merged_at = _parse_iso_ts(pr.get("merged_at")) or _parse_iso_ts(pr.get("updated_at"))
+                    delta_repr = str((now - merged_at).days) if merged_at else "?"
+                    advanced = {
+                        "slug": slug,
+                        "classification": "silently-advanced",
+                        "text": (
+                            f"{slug}: PR #{num} merged {delta_repr}d ago; the arc reads "
+                            f"complete. Update the record? [CONTEXT DRIFT: declared NEXT "
+                            f"still says '{declared_next}']"
+                        ),
+                    }
+                    break
+        if advanced:
+            results.append(advanced)
+            continue
+
+        if age_days <= _ARC_STALE_DAYS:
+            continue  # moving — signal is silence, not churn
+
+        if has_ground_truth:
+            results.append({
+                "slug": slug,
+                "classification": "gone-quiet",
+                "text": (
+                    f"{slug}: {age_days}d of silence since "
+                    f"'{declared_next or 'no declared NEXT'}'. The thread has gone slack "
+                    f"— shall we pull it taut again?"
+                ),
+            })
+        else:
+            results.append({
+                "slug": slug,
+                "classification": "unresolvable",
+                "text": (
+                    f"{slug}: cannot verify — {age_days}d since the arc-doc was touched, "
+                    f"no PR/timer/thread anchor."
+                ),
+            })
+
+    return results
 
 
 def _arc_docs_since(start_ts: datetime) -> list[str]:

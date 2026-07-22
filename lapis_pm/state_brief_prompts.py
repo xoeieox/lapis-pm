@@ -16,6 +16,13 @@ Weekly briefs omit the Gardener bucket *header* (six-bucket ordering above
 is daily-cadence only) but receive a 7-day Gardener observation data block
 appended below the five rendered buckets, for the Weekly Arc synthesis to
 consume (see format_bucket_sections `period` arg).
+
+Weekly briefs also render a "Climate" bucket (gardener-arc-climate-v0) as a
+normal header + bullets section — unlike Gardener, its content is *not*
+folded into a raw synthesis block; the arc-reconciler's bullets are already
+classified prose-ready text. Climate is omitted entirely for daily cadences
+(v0 is weekly-only) and omitted from weekly output when it has no items (no
+empty-section noise — every tracked arc is "moving").
 """
 
 from __future__ import annotations
@@ -27,9 +34,11 @@ BUCKET_ORDER = [
     "Captured — not yet built",
     "Awaiting your call",
     "Gardener Cross-Cutting Observations",
+    "Climate",
 ]
 
 _GARDENER_BUCKET = "Gardener Cross-Cutting Observations"
+_CLIMATE_BUCKET = "Climate"
 
 DAILY_SYSTEM = """You are the Lapis PM state-brief narrator. Your job is to write
 clear, terse prose for Erah — the principal engineer — summarising the current
@@ -70,7 +79,19 @@ TONE MANDATE: the Weekly arc's Gardener synthesis is a narrative mirror —
 reveal patterns without accusation. Weave the story of decay, but do not
 name the rotter. The Gardener shows the cliff; the human chooses to turn.
 Avoid language that triggers defensiveness or assigns blame. Present the
-pattern as a story that invites reflection, not an indictment."""
+pattern as a story that invites reflection, not an indictment.
+
+The Climate block reports a relationship status between intent and reality,
+never accusation. Two kinds. DRIFT (gone-quiet): the thread has gone slack;
+diagnose disconnection and offer one humble first step; do not name a
+culprit. REALIZED INTENT (silently-advanced): the work lives in the world
+but the record holds a ghost; acknowledge the outcome and pose the ledger
+update as an immediate question, preserving the [CONTEXT DRIFT] marker —
+cut the ghost, do not celebrate it. Write in short breath-driven lines
+structured Observation / Disruption / Invitation ('The river moved / You
+hold the gate / Open it'): a friend offering rescue, not a machine auditing
+compliance. Plain text only — no TTS cadence or prosody markers (those
+belong to Unit 3)."""
 
 WEEKLY_TEMPLATE = """\
 Write a short prose paragraph under each header exactly as given below.
@@ -80,7 +101,8 @@ Be terse — each paragraph should be 2–4 sentences.
 
 {bucket_sections}
 
-After the five buckets, add a "## Weekly arc" section:
+After the five buckets (and the Climate section, if present), add a
+"## Weekly arc" section:
 identify the dominant theme across the landed work, describe where the
 Distributed Grounding spine stands, and name what is newly unblocked in active
 chains (note: unblockings outside of explicit chain depends_on are model-inferred
@@ -114,6 +136,15 @@ def format_bucket_sections(buckets: dict[str, list[str]], start_label: str, *, p
     for name in BUCKET_ORDER:
         if name == _GARDENER_BUCKET and period == "weekly":
             gardener_data = buckets.get(name, [])
+            continue
+        if name == _CLIMATE_BUCKET:
+            if period != "weekly":
+                continue  # v0 is weekly-only — no header, no data, on daily cadences
+            items = buckets.get(name, [])
+            if not items:
+                continue  # every tracked arc is moving — no empty-section noise
+            body = "\n".join(f"- {item}" for item in items)
+            sections.append(f"## {name}\n{body}")
             continue
         if name in ("Built", "Notable ratifications"):
             header = f"## {name} (since {start_label})"

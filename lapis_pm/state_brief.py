@@ -349,10 +349,25 @@ def _parse_iso_ts(raw: str | None) -> datetime | None:
 
 
 def _arc_pr_ground_truth(repo: str, pr_number: int) -> dict | None:
-    """get_pr(repo, pr_number) wrapped for per-source degrade. None on any failure."""
-    from agents_core.forgejo import get_pr
+    """get_pr(repo, pr_number) wrapped for per-source degrade. None on any failure.
+
+    Arc-doc anchors carry a bare repo token (never an "owner/repo" prefix — see
+    _PR_ANCHOR_RE), so the owner namespace is unknown up front. get_pr defaults
+    to the Erah namespace when owner is omitted; agent-managed repos that
+    instead live under the lapis org (per feedback/merge-and-deploy-owner-kwarg)
+    404 on that first attempt. Retry once against the lapis org before giving
+    up, rather than silently dropping the signal for every non-Erah repo."""
+    import httpx
+    from agents_core.forgejo import LAPIS_ORG, get_pr
     try:
         return get_pr(repo, pr_number)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            try:
+                return get_pr(repo, pr_number, owner=LAPIS_ORG)
+            except Exception:
+                return None
+        return None
     except Exception:
         return None
 

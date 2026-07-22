@@ -623,6 +623,41 @@ class TestReadArcClimate:
         assert result[0]["classification"] == "gone-quiet"
         assert result[0]["slug"] == "partial-failure-arc"
 
+    def test_pr_ground_truth_retries_lapis_org_on_404(self, tmp_path):
+        """A repo living under the lapis org 404s on the default (Erah) owner lookup;
+        _arc_pr_ground_truth must retry with owner=LAPIS_ORG rather than silently
+        dropping the signal (PR #225 review finding)."""
+        self._write_arc_doc(
+            tmp_path, "cross-repo-arc",
+            "# Cross Repo Arc\n\nNEXT: schema design discussion\n\nagents-core PR #42\n",
+            age_days=30,
+        )
+        old_ts = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
+        fake_pr = {"state": "open", "merged": False, "updated_at": old_ts}
+
+        import httpx
+        req = httpx.Request("GET", "http://forgejo/api/v1/repos/Erah/agents-core/pulls/42")
+        resp = httpx.Response(404, request=req)
+        not_found = httpx.HTTPStatusError("404 Not Found", request=req, response=resp)
+
+        def fake_get_pr(repo, pr_number, owner=None):
+            if owner is None:
+                raise not_found
+            assert owner == "lapis"
+            return fake_pr
+
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("agents_core.forgejo.get_pr", side_effect=fake_get_pr),
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert len(result) == 1
+        assert result[0]["classification"] == "gone-quiet"
+        assert result[0]["slug"] == "cross-repo-arc"
+
     def test_zero_available_signals_is_unresolvable_not_catastrophic(self, tmp_path):
         """DoD #4: an arc with zero available signals classifies unresolvable, not []."""
         self._write_arc_doc(

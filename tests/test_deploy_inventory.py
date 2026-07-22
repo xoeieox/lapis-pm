@@ -505,6 +505,38 @@ class TestStatusOutput:
         di.write_status_json(status, path=target)
         assert json.loads(target.read_text()) == status
 
+    def test_read_status_json_returns_none_when_absent(self, tmp_path):
+        assert di.read_status_json(path=tmp_path / "missing.json") is None
+
+    def test_read_status_json_roundtrips_write(self, tmp_path):
+        status = {"generated": "2026-07-22T00:00:00+00:00", "clones": []}
+        target = tmp_path / "status.json"
+        di.write_status_json(status, path=target)
+        assert di.read_status_json(path=target) == status
+
+    def test_read_status_json_raises_on_corrupt_content(self, tmp_path):
+        target = tmp_path / "status.json"
+        target.write_text("{not valid json")
+        with pytest.raises(json.JSONDecodeError):
+            di.read_status_json(path=target)
+
+    def test_high_finding_keys_extracts_only_high_severity(self):
+        status = {
+            "clones": [
+                {"path": "/srv/git/a", "findings": [
+                    {"kind": "tracked_dirty_tree", "severity": "HIGH", "detail": "x"},
+                    {"kind": "unmapped_live_clone", "severity": "NORMAL", "detail": "y"},
+                ]},
+                {"path": "/srv/git/b", "findings": [
+                    {"kind": "stray_branch", "severity": "HIGH", "detail": "z"},
+                ]},
+            ],
+        }
+        assert di.high_finding_keys(status) == {
+            ("/srv/git/a", "tracked_dirty_tree"),
+            ("/srv/git/b", "stray_branch"),
+        }
+
     def test_render_deploy_status_sorts_high_first(self):
         status = {
             "generated": "now",

@@ -628,6 +628,34 @@ def write_status_json(status: dict, path: Path | None = None) -> None:
         logger.warning("[deploy-inventory] status file write failed: %s", e)
 
 
+def read_status_json(path: Path | None = None) -> dict | None:
+    """Read the previously-written status JSON.
+
+    Returns None when no file exists yet (legitimate first-ever-pass
+    bootstrap). Raises (OSError, json.JSONDecodeError) when the file is
+    present but unreadable/unparseable, so callers can distinguish bootstrap
+    (quiet) from corruption (loud) - lapis-pm-deploy-inventory-notify-dedup-v0
+    spec item 4.
+    """
+    target = path or _STATUS_FILE
+    if not target.exists():
+        return None
+    return json.loads(target.read_text())
+
+
+def high_finding_keys(status: dict) -> set[tuple[str, str]]:
+    """(clone_path, finding_kind) pairs for every HIGH-severity finding in
+    `status` — the identity used for cross-pass Pushover dedup
+    (lapis-pm-deploy-inventory-notify-dedup-v0 spec item 2).
+    """
+    keys: set[tuple[str, str]] = set()
+    for clone in status.get("clones", []):
+        for finding in clone.get("findings", []):
+            if finding.get("severity") == "HIGH":
+                keys.add((clone.get("path"), finding.get("kind")))
+    return keys
+
+
 # ---------------------------------------------------------------------------
 # `lapis-pm deploy-status` rendering (spec item 6 — human affordance)
 # ---------------------------------------------------------------------------

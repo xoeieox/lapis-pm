@@ -10,8 +10,9 @@ Tests verify:
 
 from __future__ import annotations
 
+import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
@@ -491,3 +492,231 @@ class TestWeeklyDryRunAndDegraded:
         assert "## Gardener Cross-Cutting Observations" not in result
         assert "Gardener Observations (7-day window for synthesis)" in result
         assert "weekly pattern item" in result
+
+
+class TestReadArcClimate:
+    """Tests for _read_arc_climate() — the arc-reconciler (gardener-arc-climate-v0)."""
+
+    def _write_arc_doc(self, tmp_path, slug: str, body: str, *, age_days: int = 0):
+        lapis_state = tmp_path / "lapis_state"
+        lapis_state.mkdir(parents=True, exist_ok=True)
+        doc = lapis_state / f"{slug}.md"
+        doc.write_text(body, encoding="utf-8")
+        if age_days:
+            mtime = (datetime.now(tz=timezone.utc) - timedelta(days=age_days)).timestamp()
+            os.utime(doc, (mtime, mtime))
+        return doc
+
+    def test_non_weekly_period_short_circuits(self, tmp_path):
+        """Non-weekly periods return [] immediately without touching disk (v0 is weekly-only)."""
+        self._write_arc_doc(tmp_path, "some-arc", "NEXT: do the thing", age_days=30)
+        room_path_mock = MagicMock()
+        with patch("lapis_pm.state_brief.room_path", room_path_mock):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="daily")
+
+        assert result == []
+        room_path_mock.assert_not_called()
+
+    def test_gone_quiet_classification(self, tmp_path):
+        """A stale arc with a queryable (but timestamp-less) timer anchor classifies gone-quiet."""
+        self._write_arc_doc(
+            tmp_path, "gone-quiet-arc",
+            "# Gone Quiet Arc\n\nNEXT: write the follow-up docs\n\nAnchors: foo.service\n",
+            age_days=30,
+        )
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("lapis_pm.deploy_inventory._show_unit", return_value={"ActiveState": "active"}),
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert len(result) == 1
+        assert result[0]["classification"] == "gone-quiet"
+        assert result[0]["slug"] == "gone-quiet-arc"
+        assert "gone-quiet-arc" in result[0]["text"]
+        assert "30d of silence" in result[0]["text"]
+        assert "write the follow-up docs" in result[0]["text"]
+
+    def test_silently_advanced_fires_regardless_of_age(self, tmp_path):
+        """A merged PR whose declared NEXT still reads as pending action fires immediately,
+        even though the doc was touched moments ago (independent of _ARC_STALE_DAYS)."""
+        self._write_arc_doc(
+            tmp_path, "realized-arc",
+            "# Realized Arc\n\nNEXT: review and merge PR #219 (lapis-pm)\n",
+            age_days=0,
+        )
+        merged_at = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+        fake_pr = {"state": "closed", "merged": True, "merged_at": merged_at, "updated_at": merged_at}
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("agents_core.forgejo.get_pr", return_value=fake_pr) as mock_get_pr,
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        # "merge" (the prose word immediately before "PR #219") must never be
+        # mistaken for the repo — only a hyphenated token or the "(repo)"
+        # parenthetical form counts. This doc uses the parenthetical form.
+        mock_get_pr.assert_called_once_with("lapis-pm", 219)
+        assert len(result) == 1
+        assert result[0]["classification"] == "silently-advanced"
+        assert "PR #219 merged 5d ago" in result[0]["text"]
+        assert "[CONTEXT DRIFT: declared NEXT still says" in result[0]["text"]
+
+    def test_unresolvable_classification(self, tmp_path):
+        """A stale arc with no PR/timer/weaver anchor at all classifies unresolvable."""
+        self._write_arc_doc(
+            tmp_path, "orphan-arc",
+            "# Orphan Arc\n\nNEXT: think about this more\n",
+            age_days=25,
+        )
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert len(result) == 1
+        assert result[0]["classification"] == "unresolvable"
+        assert "cannot verify" in result[0]["text"]
+        assert "25d since the arc-doc was touched" in result[0]["text"]
+
+    def test_moving_arc_is_omitted(self, tmp_path):
+        """An arc touched within _ARC_STALE_DAYS is omitted entirely — silence is not churn."""
+        self._write_arc_doc(
+            tmp_path, "moving-arc",
+            "# Moving Arc\n\nNEXT: keep iterating\n",
+            age_days=3,
+        )
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert result == []
+
+    def test_partial_failure_forgejo_up_weaver_down_still_classifies(self, tmp_path):
+        """DoD #4: one ground-truth source failing (weaver) drops only that signal —
+        the arc is still classified using the Forgejo signal that succeeded."""
+        self._write_arc_doc(
+            tmp_path, "partial-failure-arc",
+            "# Partial Failure Arc\n\nNEXT: schema design discussion\n\nlapis-pm PR #300\n",
+            age_days=30,
+        )
+        old_ts = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
+        fake_pr = {"state": "open", "merged": False, "updated_at": old_ts}
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("agents_core.forgejo.get_pr", return_value=fake_pr),
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", side_effect=OSError("weaver down")),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert len(result) == 1
+        assert result[0]["classification"] == "gone-quiet"
+        assert result[0]["slug"] == "partial-failure-arc"
+
+    def test_zero_available_signals_is_unresolvable_not_catastrophic(self, tmp_path):
+        """DoD #4: an arc with zero available signals classifies unresolvable, not []."""
+        self._write_arc_doc(
+            tmp_path, "no-signal-arc",
+            "# No Signal Arc\n\nNEXT: figure this out\n",
+            age_days=40,
+        )
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("lapis_pm.deploy_inventory.read_status_json", side_effect=OSError("unreachable")),
+            patch("lapis_pm.state_brief._arc_weaver_signal", side_effect=Exception("weaver down")),
+        ):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert len(result) == 1
+        assert result[0]["classification"] == "unresolvable"
+
+    def test_no_lapis_state_dir_returns_empty(self, tmp_path):
+        """Missing arc-doc directory degrades to [] (best-effort, matches _arc_docs_since)."""
+        missing = tmp_path / "does-not-exist"
+        with patch("lapis_pm.state_brief.room_path", return_value=missing):
+            result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert result == []
+
+    def test_read_buckets_wires_climate_text_only(self, tmp_path):
+        """_read_buckets() threads _read_arc_climate's bullet text into B_CLIMATE."""
+        with (
+            patch("lapis_pm.state_brief._mem") as mock_mem,
+            patch(
+                "lapis_pm.state_brief._read_arc_climate",
+                return_value=[{"slug": "x", "classification": "gone-quiet", "text": "x: stale"}],
+            ) as mock_climate,
+        ):
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.return_value = []
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc), period="weekly")
+
+        mock_climate.assert_called_once()
+        assert buckets[state_brief.B_CLIMATE] == ["x: stale"]
+
+    def test_read_buckets_degrades_climate_on_catastrophic_failure(self, tmp_path):
+        """_read_buckets() swallows exceptions from _read_arc_climate and shows []."""
+        with (
+            patch("lapis_pm.state_brief._mem") as mock_mem,
+            patch(
+                "lapis_pm.state_brief._read_arc_climate",
+                side_effect=OSError("catastrophic"),
+            ),
+        ):
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.return_value = []
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc), period="weekly")
+
+        assert buckets[state_brief.B_CLIMATE] == []
+
+
+class TestClimateBucketRendering:
+    """Tests for Climate bucket special-casing in format_bucket_sections()."""
+
+    def _buckets(self, climate_items=None):
+        return {
+            "Built": [],
+            "Notable ratifications": [],
+            "In flight": [],
+            "Captured — not yet built": [],
+            "Awaiting your call": [],
+            "Gardener Cross-Cutting Observations": [],
+            "Climate": climate_items or [],
+        }
+
+    def test_daily_omits_climate_entirely(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets(["some-arc: 30d of silence"]), "2026-07-06 08:00 PT", period="daily",
+        )
+        assert "Climate" not in sections
+
+    def test_weekly_renders_climate_when_present(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets(["some-arc: 30d of silence"]), "2026-07-06 08:00 PT", period="weekly",
+        )
+        assert "## Climate" in sections
+        assert "some-arc: 30d of silence" in sections
+
+    def test_weekly_omits_climate_when_empty(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets([]), "2026-07-06 08:00 PT", period="weekly",
+        )
+        assert "Climate" not in sections
+
+    def test_climate_appears_after_gardener_data_block(self):
+        sections = state_brief_prompts.format_bucket_sections(
+            self._buckets(["some-arc: 30d of silence"]), "2026-07-06 08:00 PT", period="weekly",
+        )
+        assert sections.index("## Climate") > sections.index("Awaiting your call")

@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
@@ -955,7 +956,7 @@ class TestReconcileDeployInventoryDedup:
 
         # Next tick: the coarse cooldown (now correctly reading ["content"])
         # gates the pass before the corrupt-snapshot logic ever re-runs.
-        fake_mem.get.return_value = {"content": pm_core._now_iso()}
+        fake_mem.get.return_value = {"content": datetime.now(timezone.utc).isoformat()}
         with (
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass") as fake_run_pass_2,

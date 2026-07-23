@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -161,6 +162,13 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
     # making restart-failure loud is a cross-cutting concern deferred to
     # lapis-pm-deploy-restart-gate-on-advance-v0 — see §2.
     "synapse": ("synapse.service",),
+    # inertia-expert.service + lapis-expert.service are both Type=simple, System unit,
+    # WorkingDirectory=/srv/git/experts (confirmed live via `systemctl show
+    # inertia-expert.service lapis-expert.service -p Type,WorkingDirectory` 2026-07-23) —
+    # a pull alone leaves them serving stale code until restarted, same as synapse above.
+    # Closes the FOURTH deploy-currency gap (found 2026-07-10, manually fixed; never
+    # closed at the map level until now — lapis-pm-deploy-inventory-auto-recovery-v0).
+    "experts": ("inertia-expert.service", "lapis-expert.service"),
 }
 
 # --user units that import agents_core from /data/agents. Restarted via
@@ -265,6 +273,13 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # every rag-ops PR's own existing "Deploy note" convention) — this hook only prevents the git
     # tree itself from silently drifting behind what's merged. Spec: lapis-pm-deploy-pull-rag-ops-v0.
     "rag-ops":        ["/data/rag"],
+    # experts: self-host Zephyr Expert production service (Dustin-facing, :8412),
+    # WorkingDirectory=/srv/git/experts. Same signal tier as cockpit/synapse's restart
+    # handling — see _POST_LAND_RESTART's experts entry for why a pull alone is
+    # insufficient. Intentionally NOT in _POST_LAND_PULL_CRITICAL or
+    # _POST_LAND_PULL_LOW_SIGNAL (spec: lapis-pm-deploy-inventory-auto-recovery-v0 Part A
+    # item 3 — nothing in that spec depends on the critical/low-signal distinction here).
+    "experts":        ["/srv/git/experts"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -367,6 +382,16 @@ _DEPLOY_CURRENCY_STATUS_FILE = room_path('lapis_state') / "deploy-currency-statu
 # gated like _DEPLOY_CURRENCY_COOLDOWN_SECS, not run every tick (spec item 7).
 _DEPLOY_INVENTORY_COOLDOWN_SECS = 3600  # at most one full pass per hour
 _DEPLOY_INVENTORY_LAST_RUN_KEY = "pm/deploy-inventory/last-run"
+
+# Script-tier auto-recovery (lapis-pm-deploy-inventory-auto-recovery-v0): a mapped,
+# stale-only, unlocked clone is pulled + restarted automatically via the existing
+# _post_land_deploy_hook primitive rather than just alerted. _issue_system_restart is
+# fire-and-forget and systemd restarts are asynchronous, so post-recovery verification
+# polls `systemctl is-active` rather than trusting the restart call's return — checking
+# immediately after issuing the restart would race the transition and false-positive as
+# failed almost every time.
+_AUTO_RECOVERY_RESTART_POLL_INTERVAL_SECS = 1.0
+_AUTO_RECOVERY_RESTART_POLL_WINDOW_SECS = 10.0
 
 # ---------------------------------------------------------------------------
 # Robust pull: graded collision-safety model (agents-core-deploy-drift-backstop-v0)
@@ -1259,6 +1284,154 @@ def _check_one_clone_currency(repo: str, clone_path: str) -> None:
         pass
 
 
+def _deploy_inventory_high_kinds(clone: dict) -> set[str]:
+    return {f["kind"] for f in clone.get("findings", []) if f.get("severity") == "HIGH"}
+
+
+def _auto_recovery_eligible(clone: dict) -> bool:
+    """A clone qualifies for script-tier auto-recovery iff it's mapped, its only
+    HIGH finding is `stale_behind_origin` (no `stray_branch`/`tracked_dirty_tree`
+    — equivalent to "on main, tree clean, only stale"), and no deploy-pull-lock
+    is present. The lock check is independent and unconditional — it does not
+    rely on _post_land_git_pull's own critical-repo-only lock check
+    (pm_core.py:639), since an automated timer-fired trigger deserves the more
+    conservative rule regardless of the lock's age or the repo's critical status.
+    """
+    if not clone.get("mapped"):
+        return False
+    if _deploy_inventory_high_kinds(clone) != {"stale_behind_origin"}:
+        return False
+    if _deploy_pull_locked(clone["path"]):
+        return False
+    return True
+
+
+def _poll_unit_active(unit: str, *, user: bool) -> bool:
+    """Poll `systemctl [--user] is-active <unit>` at most once per
+    _AUTO_RECOVERY_RESTART_POLL_INTERVAL_SECS until it reports active or
+    _AUTO_RECOVERY_RESTART_POLL_WINDOW_SECS elapses.
+    """
+    cmd = ["systemctl"] + (["--user"] if user else []) + ["is-active", unit]
+    deadline = time.monotonic() + _AUTO_RECOVERY_RESTART_POLL_WINDOW_SECS
+    while True:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip() == "active":
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_AUTO_RECOVERY_RESTART_POLL_INTERVAL_SECS)
+
+
+def _poll_restart_covered_units(repo: str) -> tuple[bool, list[str]]:
+    """(all_active, failed_units) across every unit `repo` maps to in
+    _POST_LAND_RESTART / _POST_LAND_RESTART_USER. An empty restart-covered set
+    (code-reviewer, facets, gardener, conductor, rag-ops, lapis-pm — all
+    timer-oneshot/per-invocation re-import, no restart needed) is vacuously
+    successful by design: `all(...)` over `[]` is True, matching how
+    _post_land_deploy_hook itself already treats these repos — not a gap to
+    guard against.
+    """
+    failed: list[str] = []
+    for unit in _POST_LAND_RESTART.get(repo, ()):
+        if not _poll_unit_active(unit, user=False):
+            failed.append(unit)
+    for unit in _POST_LAND_RESTART_USER.get(repo, ()):
+        if not _poll_unit_active(unit, user=True):
+            failed.append(unit)
+    return not failed, failed
+
+
+def _run_deploy_inventory_auto_recovery(status: dict) -> None:
+    """Script-tier auto-recovery pass (lapis-pm-deploy-inventory-auto-recovery-v0).
+
+    For every eligible clone in `status["clones"]` (see _auto_recovery_eligible),
+    pull + restart via the existing _post_land_deploy_hook primitive — never
+    reimplement pull/restart logic here — then re-verify both git currency and
+    restart-covered unit health before deciding success. _issue_system_restart is
+    fire-and-forget, so relying on git currency alone would let a drifted-map
+    restart failure silently read as a full success.
+
+    Mutates each attempted clone's entry in `status["clones"]` in place with the
+    fresh post-recovery state, so both the persisted status JSON and the
+    HIGH-finding notify loop that runs after this see reality, not the stale
+    pre-recovery snapshot.
+
+    Success sends one Priority.LOW "auto-recovered" ping per clone. Failure
+    (pull still fails, a new HIGH finding, or a restart-covered unit never
+    reaches active) leaves the finding in place — or, if git currency alone
+    looks clean but a restart did not take, synthesizes an
+    `auto_recovery_restart_failed` HIGH finding so a drifted _POST_LAND_RESTART
+    entry is never silently reported as success. Either way it flows through
+    the existing alert path unchanged.
+
+    Fail-soft per clone: an exception recovering one clone is logged and does
+    not prevent other clones from being attempted.
+    """
+    from . import deploy_inventory
+
+    reverse_map = deploy_inventory._reverse_pull_map(_POST_LAND_PULL)
+
+    for clone in status.get("clones", []):
+        try:
+            if not _auto_recovery_eligible(clone):
+                continue
+
+            path = clone["path"]
+            repo = reverse_map.get(path)
+            if repo is None:
+                continue
+
+            pre_commits_behind = clone.get("commits_behind")
+
+            _post_land_deploy_hook(repo, trigger="deploy-inventory-auto-recovery")
+
+            currency = deploy_inventory.check_currency(path)
+            clone["head"] = currency.head
+            clone["branch"] = currency.branch
+            clone["commits_behind"] = currency.commits_behind
+            clone["tracked_dirty"] = currency.tracked_dirty
+            clone["untracked_present"] = currency.untracked_present
+            clone["findings"] = [asdict(f) for f in currency.findings]
+
+            git_clean = currency.commits_behind == 0 and not any(
+                f.severity == "HIGH" for f in currency.findings
+            )
+            restart_ok, failed_units = _poll_restart_covered_units(repo)
+
+            if git_clean and restart_ok:
+                try:
+                    from agents_core.notify import send_notification, Priority as _P
+                    behind_repr = pre_commits_behind if pre_commits_behind is not None else "?"
+                    send_notification(
+                        message=(
+                            f"{path} was {behind_repr} commit(s) behind origin/main - "
+                            f"auto-pulled and restarted."
+                        ),
+                        title="deploy-inventory: auto-recovered",
+                        priority=_P.LOW,
+                    )
+                except Exception:
+                    pass
+            elif git_clean and not restart_ok:
+                clone["findings"].append(asdict(deploy_inventory.Finding(
+                    "auto_recovery_restart_failed", "HIGH",
+                    f"{path} auto-recovery pulled to origin/main but "
+                    f"{failed_units} did not reach active within "
+                    f"{_AUTO_RECOVERY_RESTART_POLL_WINDOW_SECS:.0f}s",
+                )))
+            # else: git currency alone still shows a HIGH finding (pull failed,
+            # still behind, or a new stray/dirty finding) — leave as-is; the
+            # existing HIGH-finding notify loop below handles it unchanged.
+        except Exception as e:
+            logger.warning(
+                "[deploy-inventory] auto-recovery failed for %s (non-fatal): %s",
+                clone.get("path"), e,
+            )
+
+
 def _reconcile_deploy_inventory() -> None:
     """Cooldown-gated wrapper around deploy_inventory.run_reconcile_pass().
 
@@ -1308,6 +1481,14 @@ def _reconcile_deploy_inventory() -> None:
         status = deploy_inventory.run_reconcile_pass(
             _POST_LAND_PULL, _POST_LAND_RESTART, _POST_LAND_RESTART_USER,
         )
+
+        try:
+            _run_deploy_inventory_auto_recovery(status)
+        except Exception as e:
+            logger.warning(
+                "[deploy-inventory] auto-recovery step failed (non-fatal): %s", e,
+            )
+
         deploy_inventory.write_status_json(status)
 
         if corrupt:
@@ -1336,7 +1517,19 @@ def _reconcile_deploy_inventory() -> None:
                 if corrupt:
                     continue
                 key = (clone["path"], finding["kind"])
-                if prior_high_keys is not None and key in prior_high_keys:
+                # auto_recovery_restart_failed is exempt from the cross-pass dedup:
+                # it exists only because this unit's own automation pulled new code
+                # and then failed to restart the service — a strictly worse,
+                # unattended state, not passive drift a human was already pinged
+                # about. Every other HIGH kind still follows the 2026-07-22
+                # no-re-alert-floor ruling exactly (lapis-pm-deploy-inventory-
+                # notify-dedup-v0) — new-since-prior-snapshot pings once, then
+                # silent while unresolved.
+                if (
+                    finding["kind"] != "auto_recovery_restart_failed"
+                    and prior_high_keys is not None
+                    and key in prior_high_keys
+                ):
                     continue
                 try:
                     from agents_core.notify import send_notification, Priority as _P

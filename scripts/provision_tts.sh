@@ -273,7 +273,9 @@ provision_kokoro() {
 # =========================================================================
 # PyAV (gardener-tts-feed-v0 MP3 encoder — runs inside the lapis-pm CLI's
 # own system-python3 process, so unlike Piper this can't be routed through a
-# private venv; a --user install is the only option for that interpreter)
+# private venv. Per design decision #8, PyAV is NEVER auto-installed by this
+# script — no --user, no --break-system-packages, no PEP-668 override of any
+# kind. Importability is checked only; if absent, fail loud and stop this leg.
 # =========================================================================
 
 provision_pyav() {
@@ -284,20 +286,8 @@ provision_pyav() {
         return 0
     fi
 
-    log "pyav: installing av==${PYAV_PIN} (--user — no shared/system dirs touched, same mechanism this host's existing PyAV install already uses)"
-    if python3 -m pip install --user --break-system-packages "av==${PYAV_PIN}" \
-        || python3 -m pip install --user "av==${PYAV_PIN}"; then
-        :
-    else
-        log "pyav: pip install FAILED — MP3 encoding unavailable (podcast publish will fail loud, per R2)"
-        return 1
-    fi
-
-    if ! python3 -c "import av" >/dev/null 2>&1; then
-        log "pyav: import verification FAILED after install"
-        return 1
-    fi
-    log "pyav: installed and importable"
+    log "ERROR: pyav: av==${PYAV_PIN} is not importable under $(command -v python3) — this script does not install PyAV (design decision #8: no --user, no --break-system-packages). Install it manually into the CLI's system-python3 interpreter before publishing episodes."
+    return 1
 }
 
 # =========================================================================

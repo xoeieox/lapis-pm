@@ -35,7 +35,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from email.utils import format_datetime
 from pathlib import Path
 
@@ -401,6 +401,15 @@ def _resolve_brief_timestamp(brief_path: Path, period: str) -> datetime:
     return datetime.now(tz=PACIFIC)
 
 
+def _today_pacific() -> date:
+    """Today's Pacific calendar date — the R5a anchor for stale-brief detection.
+
+    Split out as its own function (rather than inlining `datetime.now(...)`)
+    so tests can monkeypatch a fixed "today" instead of racing the real clock.
+    """
+    return datetime.now(tz=PACIFIC).date()
+
+
 def _find_existing_mp3(audio_dir: Path, basename: str) -> Path | None:
     matches = sorted(audio_dir.glob(f"{basename}.*.mp3"))
     return matches[0] if matches else None
@@ -436,6 +445,11 @@ def publish_episode(period: str = "morning") -> PublishResult:
     if not body.strip():
         msg = f"no {period} brief to publish — run `lapis-pm brief --period {period}` first"
         logger.error("tts_feed: %s", msg)
+        send_notification(
+            message=f"Gardener TTS feed: no {period} episode published today — {msg}",
+            title="Gardener TTS feed — no brief to publish",
+            source="tts-episode-publish",
+        )
         return PublishResult(ok=False, period=period, error=msg)
 
     brief_dt = _resolve_brief_timestamp(brief_path, period)
@@ -451,6 +465,21 @@ def publish_episode(period: str = "morning") -> PublishResult:
             feed_path, feed_url = regenerate_feed(audio_dir, period)
         except PodcastConfigError as e:
             return PublishResult(ok=False, period=period, error=str(e))
+        if brief_dt.date() != _today_pacific():
+            # R5a: latest-<period>.md still resolves to an earlier calendar
+            # day — the upstream brief job stalled/failed, so no NEW episode
+            # shipped today even though this run "succeeded" (true no-op
+            # same-day re-runs stay silent; this is not one of those).
+            send_notification(
+                message=(
+                    f"Gardener TTS feed: no NEW {period} episode published today — "
+                    f"latest-{period}.md still resolves to {brief_dt.date().isoformat()} "
+                    f"(serving existing episode {existing.name}). "
+                    f"The upstream brief generator may have stalled or failed."
+                ),
+                title="Gardener TTS feed — stale brief, no new episode today",
+                source="tts-episode-publish",
+            )
         return PublishResult(
             ok=True, period=period, mp3_path=existing, engine=engine,
             feed_path=feed_path, feed_url=feed_url, pruned=pruned, skipped_idempotent=True,

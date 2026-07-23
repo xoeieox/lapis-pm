@@ -16,7 +16,7 @@ Coverage:
 from __future__ import annotations
 
 import wave
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -282,8 +282,14 @@ class TestPublishEpisode:
         assert "BOTH engines failed" in notify_calls[0]["title"]
 
     def test_idempotent_rerun_does_not_rerender(self, tmp_path, monkeypatch):
+        # brief_ts defaults to "2026-07-21" — pin "today" to match so this
+        # exercises the true same-day idempotent no-op path (R5a: the only
+        # case that stays silent-success).
         self._setup_room(tmp_path, monkeypatch)
+        monkeypatch.setattr(tts_feed, "_today_pacific", lambda: date(2026, 7, 21))
         calls = []
+        notify_calls = []
+        monkeypatch.setattr(tts_feed, "send_notification", lambda **kw: notify_calls.append(kw) or True)
 
         def fake_bakeoff(body, *, voices, out_dir, period, now=None):
             calls.append(list(voices))
@@ -296,14 +302,16 @@ class TestPublishEpisode:
         monkeypatch.setattr(tts_episode, "run_episode_bakeoff", fake_bakeoff)
 
         first = tts_feed.publish_episode(period="morning")
+        notify_calls.clear()
         second = tts_feed.publish_episode(period="morning")
 
         assert first.ok and second.ok
         assert second.skipped_idempotent
         assert calls == [["kokoro"]]  # only rendered once across both calls
         assert first.mp3_path == second.mp3_path
+        assert notify_calls == []  # same-day idempotent re-run stays silent-success (R5a)
 
-    def test_no_brief_fails_without_notify(self, tmp_path, monkeypatch):
+    def test_no_brief_fails_and_notifies(self, tmp_path, monkeypatch):
         briefs_root = tmp_path / "briefs"
         (briefs_root / "audio").mkdir(parents=True)
         monkeypatch.setattr(
@@ -317,7 +325,43 @@ class TestPublishEpisode:
 
         assert not result.ok
         assert "no morning brief" in result.error
-        assert notify_calls == []
+        # R5a: a run that produces no new episode for today must notify —
+        # the empty-brief case is one of the two covered branches.
+        assert len(notify_calls) == 1
+        assert "no brief to publish" in notify_calls[0]["title"].lower()
+
+    def test_stale_idempotent_skip_notifies(self, tmp_path, monkeypatch):
+        # latest-morning.md resolves to 2026-07-21, but "today" is 2026-07-23
+        # (the upstream brief job stalled) — a re-run against this unchanged,
+        # already-published stale brief must notify every time, not just once.
+        self._setup_room(tmp_path, monkeypatch, brief_ts="2026-07-21-0800")
+        monkeypatch.setattr(tts_feed, "_today_pacific", lambda: date(2026, 7, 23))
+        notify_calls = []
+        monkeypatch.setattr(tts_feed, "send_notification", lambda **kw: notify_calls.append(kw) or True)
+
+        def fake_bakeoff(body, *, voices, out_dir, period, now=None):
+            wav_path = out_dir / f"{now.strftime('%Y-%m-%d-%H%M')}-{period}.{voices[0]}.wav"
+            _write_dummy_wav(wav_path, seconds=0.2)
+            return tts_episode.BakeoffOutcome(engines=[
+                tts_episode.EngineOutcome(voice=voices[0], path=wav_path, elapsed_sec=1.0)
+            ])
+
+        monkeypatch.setattr(tts_episode, "run_episode_bakeoff", fake_bakeoff)
+
+        first = tts_feed.publish_episode(period="morning")  # fresh render of the stale brief
+        notify_calls.clear()
+        second = tts_feed.publish_episode(period="morning")  # idempotent-skip, still stale -> notify
+
+        assert first.ok and second.ok
+        assert second.skipped_idempotent
+        assert len(notify_calls) == 1
+        assert "stale" in notify_calls[0]["title"].lower()
+
+        notify_calls.clear()
+        third = tts_feed.publish_episode(period="morning")  # still stale on a later re-run -> notify again
+
+        assert third.ok and third.skipped_idempotent
+        assert len(notify_calls) == 1
 
 
 # ---------------------------------------------------------------------------

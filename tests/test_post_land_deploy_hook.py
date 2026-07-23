@@ -966,6 +966,392 @@ class TestReconcileDeployInventoryDedup:
         fake_run_pass_2.assert_not_called()
 
 
+class TestExpertsDeployMapEntry:
+    """Part A regression coverage (lapis-pm-deploy-inventory-auto-recovery-v0):
+    experts must be pull- and restart-mapped, and absent from the critical/
+    low-signal sets (spec item 3 — nothing depends on that distinction here).
+    """
+
+    def test_experts_in_post_land_pull(self):
+        assert pm_core._POST_LAND_PULL.get("experts") == ["/srv/git/experts"]
+
+    def test_experts_in_post_land_restart_system_scope_not_user(self):
+        assert pm_core._POST_LAND_RESTART.get("experts") == (
+            "inertia-expert.service", "lapis-expert.service",
+        )
+        assert "experts" not in pm_core._POST_LAND_RESTART_USER
+
+    def test_experts_not_critical_or_low_signal(self):
+        assert "experts" not in pm_core._POST_LAND_PULL_CRITICAL
+        assert "experts" not in pm_core._POST_LAND_PULL_LOW_SIGNAL
+
+    def test_experts_mapped_true_in_synthetic_inventory_fixture(self, tmp_path):
+        from lapis_pm import deploy_inventory
+        clone_dir = tmp_path / "experts"
+        clone_dir.mkdir()
+        reverse_map = deploy_inventory._reverse_pull_map({"experts": [str(clone_dir)]})
+        assert reverse_map[str(clone_dir.resolve())] == "experts"
+
+
+class TestDeployInventoryAutoRecovery:
+    """Tests for script-tier auto-recovery in _reconcile_deploy_inventory
+    (lapis-pm-deploy-inventory-auto-recovery-v0)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path):
+        from lapis_pm import deploy_inventory
+        with (
+            patch.object(deploy_inventory, "_STATUS_FILE", tmp_path / "deploy-inventory-status.json"),
+            patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", tmp_path / "lock"),
+            patch.object(pm_core, "_AUTO_RECOVERY_RESTART_POLL_INTERVAL_SECS", 0.001),
+            patch.object(pm_core, "_AUTO_RECOVERY_RESTART_POLL_WINDOW_SECS", 0.01),
+        ):
+            yield
+
+    @staticmethod
+    def _clone(path, *, mapped=True, commits_behind=0, branch="main",
+               tracked_dirty=False, untracked_present=False, findings=()):
+        return {
+            "path": path,
+            "remote": "origin",
+            "mapped": mapped,
+            "acked": False,
+            "backing_units": [],
+            "head": "abc123",
+            "branch": branch,
+            "commits_behind": commits_behind,
+            "tracked_dirty": tracked_dirty,
+            "untracked_present": untracked_present,
+            "lock_age_secs": None,
+            "findings": [{"kind": k, "severity": s, "detail": d} for k, s, d in findings],
+        }
+
+    @staticmethod
+    def _status(clones):
+        return {"generated": "2026-07-23T00:00:00+00:00", "clones": clones}
+
+    @staticmethod
+    def _clean_currency():
+        from lapis_pm import deploy_inventory
+        return deploy_inventory.CurrencyResult(
+            head="deadbeef", branch="main", commits_behind=0,
+            tracked_dirty=False, untracked_present=False, findings=[],
+        )
+
+    # --- eligibility gate (item 4) ---
+
+    def test_stale_only_mapped_unlocked_eligible(self):
+        clone = self._clone("/srv/git/experts", commits_behind=3,
+                             findings=[("stale_behind_origin", "HIGH", "3 behind")])
+        assert pm_core._auto_recovery_eligible(clone) is True
+
+    def test_stray_branch_alongside_stale_not_eligible(self):
+        clone = self._clone("/srv/git/experts", branch="feature-x",
+                             findings=[
+                                 ("stale_behind_origin", "HIGH", "3 behind"),
+                                 ("stray_branch", "HIGH", "on feature-x"),
+                             ])
+        assert pm_core._auto_recovery_eligible(clone) is False
+
+    def test_tracked_dirty_alongside_stale_not_eligible(self):
+        clone = self._clone("/srv/git/experts", tracked_dirty=True,
+                             findings=[
+                                 ("stale_behind_origin", "HIGH", "3 behind"),
+                                 ("tracked_dirty_tree", "HIGH", "dirty"),
+                             ])
+        assert pm_core._auto_recovery_eligible(clone) is False
+
+    def test_detached_head_already_excluded_via_stray_branch_finding(self):
+        """A mid-rebase/bisect clone shows a DETACHED branch, which already
+        trips stray_branch — no separate in-progress-op marker check needed."""
+        clone = self._clone("/srv/git/experts", branch="DETACHED",
+                             findings=[
+                                 ("stale_behind_origin", "HIGH", "3 behind"),
+                                 ("stray_branch", "HIGH", "on 'DETACHED'"),
+                             ])
+        assert pm_core._auto_recovery_eligible(clone) is False
+
+    def test_conflicted_tree_already_excluded_via_tracked_dirty_finding(self):
+        """A conflicted cherry-pick/am/merge leaves tracked modifications,
+        which already trips tracked_dirty_tree — same reasoning as above."""
+        clone = self._clone("/srv/git/experts", tracked_dirty=True,
+                             findings=[
+                                 ("stale_behind_origin", "HIGH", "3 behind"),
+                                 ("tracked_dirty_tree", "HIGH", "conflict markers present"),
+                             ])
+        assert pm_core._auto_recovery_eligible(clone) is False
+
+    def test_unmapped_clone_not_eligible(self):
+        clone = self._clone("/srv/git/experts", mapped=False,
+                             findings=[("stale_behind_origin", "HIGH", "3 behind")])
+        assert pm_core._auto_recovery_eligible(clone) is False
+
+    def test_locked_clone_not_eligible_regardless_of_critical(self):
+        clone_path = "/srv/git/lapis-pm"  # a _POST_LAND_PULL_CRITICAL repo
+        pm_core._write_deploy_pull_lock(clone_path, "genuine divergence", 5)
+        clone = self._clone(clone_path,
+                             findings=[("stale_behind_origin", "HIGH", "3 behind")])
+        assert pm_core._auto_recovery_eligible(clone) is False
+
+    # --- full recovery step (items 5, 6, 7) ---
+
+    def test_recovery_attempted_calls_hook_with_repo_and_trigger(self):
+        clone = self._clone("/srv/git/experts", commits_behind=3,
+                             findings=[("stale_behind_origin", "HIGH", "3 behind")])
+        status = self._status([clone])
+
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"experts": ["/srv/git/experts"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART",
+                         {"experts": ("inertia-expert.service", "lapis-expert.service")}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch.object(pm_core, "_post_land_deploy_hook") as fake_hook,
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=self._clean_currency()),
+            patch("lapis_pm.pm_core.subprocess.run",
+                  return_value=MagicMock(returncode=0, stdout="active\n")),
+            patch("agents_core.notify.send_notification", lambda **kw: True),
+        ):
+            pm_core._run_deploy_inventory_auto_recovery(status)
+
+        fake_hook.assert_called_once_with("experts", trigger="deploy-inventory-auto-recovery")
+
+    def test_ffonly_refusal_leaves_finding_no_crash_no_low_ping(self):
+        """A diverged clone (ff-only refuses) is treated like any other failed
+        pull: post-recheck still shows the HIGH finding, no exception raised,
+        no LOW ping sent."""
+        clone = self._clone("/srv/git/experts", commits_behind=3,
+                             findings=[("stale_behind_origin", "HIGH", "3 behind")])
+        status = self._status([clone])
+        from lapis_pm import deploy_inventory
+        still_stale = deploy_inventory.CurrencyResult(
+            head="oldsha", branch="main", commits_behind=3, tracked_dirty=False,
+            untracked_present=False,
+            findings=[deploy_inventory.Finding("stale_behind_origin", "HIGH", "still 3 behind")],
+        )
+
+        notify_calls = []
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"experts": ["/srv/git/experts"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART", {}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch.object(pm_core, "_post_land_deploy_hook"),
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=still_stale),
+            patch("agents_core.notify.send_notification",
+                  lambda **kw: notify_calls.append(kw) or True),
+        ):
+            pm_core._run_deploy_inventory_auto_recovery(status)
+
+        assert notify_calls == []
+        assert status["clones"][0]["commits_behind"] == 3
+        assert status["clones"][0]["findings"][0]["kind"] == "stale_behind_origin"
+
+    def test_restart_unit_never_active_synthesizes_high_finding_no_low_ping(self):
+        clone = self._clone("/srv/git/experts", commits_behind=2,
+                             findings=[("stale_behind_origin", "HIGH", "2 behind")])
+        status = self._status([clone])
+
+        notify_calls = []
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"experts": ["/srv/git/experts"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART",
+                         {"experts": ("inertia-expert.service", "lapis-expert.service")}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch.object(pm_core, "_post_land_deploy_hook"),
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=self._clean_currency()),
+            patch("lapis_pm.pm_core.subprocess.run",
+                  return_value=MagicMock(returncode=0, stdout="inactive\n")),
+            patch("agents_core.notify.send_notification",
+                  lambda **kw: notify_calls.append(kw) or True),
+        ):
+            pm_core._run_deploy_inventory_auto_recovery(status)
+
+        assert notify_calls == []
+        findings = status["clones"][0]["findings"]
+        kinds = [f["kind"] for f in findings]
+        assert "auto_recovery_restart_failed" in kinds
+        high = next(f for f in findings if f["kind"] == "auto_recovery_restart_failed")
+        assert high["severity"] == "HIGH"
+
+    def test_restart_unit_activating_then_active_treated_as_success(self):
+        """The retry window absorbs normal restart latency instead of
+        false-positiving on an immediate first check (spec-review R2)."""
+        clone = self._clone("/srv/git/experts", commits_behind=1,
+                             findings=[("stale_behind_origin", "HIGH", "1 behind")])
+        status = self._status([clone])
+
+        notify_calls = []
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"experts": ["/srv/git/experts"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART", {"experts": ("inertia-expert.service",)}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch.object(pm_core, "_post_land_deploy_hook"),
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=self._clean_currency()),
+            patch(
+                "lapis_pm.pm_core.subprocess.run",
+                side_effect=[
+                    MagicMock(returncode=0, stdout="activating\n"),
+                    MagicMock(returncode=0, stdout="activating\n"),
+                    MagicMock(returncode=0, stdout="active\n"),
+                ],
+            ),
+            patch("agents_core.notify.send_notification",
+                  lambda **kw: notify_calls.append(kw) or True),
+        ):
+            pm_core._run_deploy_inventory_auto_recovery(status)
+
+        assert len(notify_calls) == 1
+        from agents_core.notify import Priority
+        assert notify_calls[0]["priority"] == Priority.LOW
+        kinds = [f["kind"] for f in status["clones"][0]["findings"]]
+        assert "auto_recovery_restart_failed" not in kinds
+
+    def test_empty_restart_covered_set_is_vacuously_successful(self):
+        """code-reviewer/facets/gardener/conductor/rag-ops/lapis-pm style repos
+        (no restart entry) recover on git currency alone — an empty
+        restart-covered set must read as success, not as drift."""
+        clone = self._clone("/srv/git/code-reviewer-working", commits_behind=1,
+                             findings=[("stale_behind_origin", "HIGH", "1 behind")])
+        status = self._status([clone])
+
+        notify_calls = []
+        with (
+            patch.object(pm_core, "_POST_LAND_PULL", {"code-reviewer": ["/srv/git/code-reviewer-working"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART", {}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch.object(pm_core, "_post_land_deploy_hook"),
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=self._clean_currency()),
+            patch("lapis_pm.pm_core.subprocess.run") as fake_run,
+            patch("agents_core.notify.send_notification",
+                  lambda **kw: notify_calls.append(kw) or True),
+        ):
+            pm_core._run_deploy_inventory_auto_recovery(status)
+
+        fake_run.assert_not_called()  # nothing to poll — never even called
+        assert len(notify_calls) == 1
+        from agents_core.notify import Priority
+        assert notify_calls[0]["priority"] == Priority.LOW
+        kinds = [f["kind"] for f in status["clones"][0]["findings"]]
+        assert "auto_recovery_restart_failed" not in kinds
+
+    # --- integration through _reconcile_deploy_inventory (items 7, 8) ---
+
+    def test_reconcile_integration_success_persists_fresh_state_and_low_ping(self):
+        from lapis_pm import deploy_inventory
+        current = self._status([
+            self._clone("/srv/git/experts", commits_behind=2,
+                        findings=[("stale_behind_origin", "HIGH", "2 behind")]),
+        ])
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append((title, priority))
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch.object(pm_core, "_POST_LAND_PULL", {"experts": ["/srv/git/experts"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART",
+                         {"experts": ("inertia-expert.service", "lapis-expert.service")}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch.object(pm_core, "_post_land_deploy_hook"),
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=self._clean_currency()),
+            patch("lapis_pm.pm_core.subprocess.run",
+                  return_value=MagicMock(returncode=0, stdout="active\n")),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        from agents_core.notify import Priority
+        assert notify_calls == [("deploy-inventory: auto-recovered", Priority.LOW)]
+
+        persisted = deploy_inventory.read_status_json()
+        assert persisted["clones"][0]["commits_behind"] == 0
+        assert persisted["clones"][0]["findings"] == []
+
+    def test_reconcile_integration_failed_recovery_falls_through_to_existing_alert(self):
+        from lapis_pm import deploy_inventory
+        current = self._status([
+            self._clone("/srv/git/experts", commits_behind=2,
+                        findings=[("stale_behind_origin", "HIGH", "2 behind")]),
+        ])
+        still_stale = deploy_inventory.CurrencyResult(
+            head="oldsha", branch="main", commits_behind=2, tracked_dirty=False,
+            untracked_present=False,
+            findings=[deploy_inventory.Finding("stale_behind_origin", "HIGH", "still 2 behind")],
+        )
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch.object(pm_core, "_POST_LAND_PULL", {"experts": ["/srv/git/experts"]}),
+            patch.object(pm_core, "_POST_LAND_RESTART", {}),
+            patch.object(pm_core, "_POST_LAND_RESTART_USER", {}),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch.object(pm_core, "_post_land_deploy_hook"),
+            patch("lapis_pm.deploy_inventory.check_currency", return_value=still_stale),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert notify_calls == ["deploy-inventory: stale_behind_origin"]
+
+    def test_auto_recovery_restart_failed_exempt_from_dedup_fires_every_pass(self):
+        """auto_recovery_restart_failed is the one HIGH kind that does NOT go
+        quiet while persisting (spec-review R4 dedup exemption) — every other
+        kind still follows the 2026-07-22 no-re-alert-floor ruling unchanged."""
+        from lapis_pm import deploy_inventory
+        finding = ("auto_recovery_restart_failed", "HIGH", "restart did not take")
+        # mapped: False so the auto-recovery step itself is a no-op here —
+        # isolates the notify-loop dedup-exemption behavior specifically.
+        current = self._status([self._clone("/srv/git/experts", mapped=False, findings=[finding])])
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(title)
+            return True
+
+        fake_mem = MagicMock()
+        fake_mem.get.return_value = None
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert notify_calls == ["deploy-inventory: auto_recovery_restart_failed"]
+
+        # Second pass: the prior snapshot on disk (written by pass 1) now equals
+        # `current`, same (clone_path, kind) key persists — it fires again,
+        # unlike every other HIGH kind (see test_finding_unchanged_since_prior_pass_does_not_notify).
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=fake_mem),
+            patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._reconcile_deploy_inventory()
+
+        assert notify_calls == [
+            "deploy-inventory: auto_recovery_restart_failed",
+            "deploy-inventory: auto_recovery_restart_failed",
+        ]
+
+
 class TestAgentsCoreDeployBackstopTimer:
     """§C (agents-core-deploy-drift-backstop-v0): a standing ~10-min timer that
     reconciles /data/agents (+ /srv/git/agents-core-working) independent of any

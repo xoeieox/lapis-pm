@@ -1131,6 +1131,30 @@ def cmd_tts_episode(args) -> int:
     return 0
 
 
+def cmd_tts_episode_publish(args) -> int:
+    """Handle `lapis-pm tts-episode-publish [--period morning]`.
+
+    Durable private podcast feed publish (Unit 3b, gardener-tts-feed-v0):
+    Kokoro-primary / Piper-automatic-fallback render (reusing
+    tts_episode.run_episode_bakeoff read-only), MP3 transcode, stateless
+    feed.xml regeneration, and retention prune. See lapis_pm.tts_feed.
+    """
+    from . import tts_feed
+
+    result = tts_feed.publish_episode(period=args.period)
+
+    if not result.ok:
+        print(f"tts-episode-publish: FAILED — {result.error}", file=sys.stderr)
+        return 1
+
+    note = " (idempotent no-op — episode already published)" if result.skipped_idempotent else ""
+    print(f"tts-episode-publish: {result.engine} -> {result.mp3_path}{note}")
+    print(f"feed: {result.feed_url}")
+    if result.pruned:
+        print(f"pruned {len(result.pruned)} old file(s)")
+    return 0
+
+
 def cmd_decisions_export(args) -> int:
     from lapis_pm.decisions_export import run
     return run(
@@ -2142,6 +2166,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which engine(s) to render (default: both, for the bakeoff).",
     )
     te.set_defaults(func=cmd_tts_episode)
+
+    tep = sub.add_parser(
+        "tts-episode-publish",
+        help="Publish the latest brief to the durable private podcast RSS feed (Unit 3b).",
+    )
+    tep.add_argument(
+        "--period",
+        default="morning",
+        choices=["morning"],
+        help="Brief cadence to publish (default: morning — v0's only supported feed).",
+    )
+    tep.set_defaults(func=cmd_tts_episode_publish)
 
     rg = sub.add_parser("review-gate",
                         help="Manage the Opus reviewer kill-switch.")

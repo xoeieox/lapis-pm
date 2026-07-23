@@ -32,6 +32,15 @@ PIPER_TTS_PIN="${PIPER_TTS_PIN:-1.5.0}"
 PIPER_VOICE_NAME="${TTS_PIPER_VOICE_NAME:-en_US-lessac-medium}"
 PIPER_VOICE_DIR="${TTS_PIPER_VOICE_DIR:-$HOME/.local/share/piper-voices}"
 PIPER_VOICE_BASE_URL="${PIPER_VOICE_BASE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium}"
+# Dedicated venv, not system pip --user — BRIX's system python3 is PEP-668
+# externally-managed and rejects 'pip install --user' outright (see
+# infra/brix-pep668-externally-managed-python). Defaults to the path already
+# staged manually as a workaround so this script becomes a no-op there and a
+# real from-scratch provisioner everywhere else.
+PIPER_VENV_DIR="${TTS_PIPER_VENV_DIR:-/data/agents/tts/piper-venv}"
+
+# --- PyAV pin (gardener-tts-feed-v0 MP3 encoder) -------------------------
+PYAV_PIN="${PYAV_PIN:-17.1.0}"
 
 # --- Kokoro pins ---------------------------------------------------------
 GW_SSH_HOST="${TTS_GW_SSH_HOST:-gravitywell}"
@@ -57,21 +66,32 @@ log() { echo "[provision_tts] $*" >&2; }
 # =========================================================================
 
 provision_piper() {
-    log "piper: checking piper-tts==${PIPER_TTS_PIN} import"
-    if python3 -c "import piper" >/dev/null 2>&1; then
-        installed_ver="$(python3 -c 'import importlib.metadata as m; print(m.version("piper-tts"))' 2>/dev/null || echo unknown)"
-        log "piper: piper-tts already importable (version ${installed_ver})"
+    log "piper: checking piper-tts==${PIPER_TTS_PIN} import in dedicated venv ${PIPER_VENV_DIR}"
+    if [[ ! -x "${PIPER_VENV_DIR}/bin/python" ]]; then
+        log "piper: creating dedicated venv at ${PIPER_VENV_DIR}"
+        mkdir -p "$(dirname "${PIPER_VENV_DIR}")"
+        python3 -m venv "${PIPER_VENV_DIR}"
+    fi
+
+    if "${PIPER_VENV_DIR}/bin/python" -c "import piper" >/dev/null 2>&1; then
+        installed_ver="$("${PIPER_VENV_DIR}/bin/python" -c 'import importlib.metadata as m; print(m.version("piper-tts"))' 2>/dev/null || echo unknown)"
+        log "piper: piper-tts already importable in venv (version ${installed_ver})"
     else
-        log "piper: installing piper-tts==${PIPER_TTS_PIN}"
-        if ! python3 -m pip install --user "piper-tts==${PIPER_TTS_PIN}"; then
+        log "piper: installing piper-tts==${PIPER_TTS_PIN} into dedicated venv"
+        # PIP_USER=no: a venv has no --user site-packages, and some hosts force
+        # --user installs via a global env var even inside an activated venv
+        # (same landmine as the GW Kokoro leg below) — override defensively.
+        PIP_USER=no "${PIPER_VENV_DIR}/bin/python" -m pip install --quiet --upgrade pip || true
+        if ! PIP_USER=no "${PIPER_VENV_DIR}/bin/python" -m pip install --quiet "piper-tts==${PIPER_TTS_PIN}"; then
             log "piper: pip install FAILED — skipping Piper leg (per-engine fallback)"
             return 1
         fi
-        if ! python3 -c "import piper" >/dev/null 2>&1; then
+        if ! "${PIPER_VENV_DIR}/bin/python" -c "import piper" >/dev/null 2>&1; then
             log "piper: import verification FAILED after install — skipping Piper leg"
             return 1
         fi
     fi
+    log "piper: set TTS_PIPER_BIN=${PIPER_VENV_DIR}/bin/piper (shells out to the binary, not an import — no code change needed)"
 
     mkdir -p "${PIPER_VOICE_DIR}"
     model_path="${PIPER_VOICE_DIR}/${PIPER_VOICE_NAME}.onnx"
@@ -251,14 +271,46 @@ provision_kokoro() {
 }
 
 # =========================================================================
+# PyAV (gardener-tts-feed-v0 MP3 encoder — runs inside the lapis-pm CLI's
+# own system-python3 process, so unlike Piper this can't be routed through a
+# private venv; a --user install is the only option for that interpreter)
+# =========================================================================
+
+provision_pyav() {
+    log "pyav: checking av==${PYAV_PIN} import"
+    if python3 -c "import av" >/dev/null 2>&1; then
+        installed_ver="$(python3 -c 'import importlib.metadata as m; print(m.version("av"))' 2>/dev/null || echo unknown)"
+        log "pyav: already importable (version ${installed_ver})"
+        return 0
+    fi
+
+    log "pyav: installing av==${PYAV_PIN} (--user — no shared/system dirs touched, same mechanism this host's existing PyAV install already uses)"
+    if python3 -m pip install --user --break-system-packages "av==${PYAV_PIN}" \
+        || python3 -m pip install --user "av==${PYAV_PIN}"; then
+        :
+    else
+        log "pyav: pip install FAILED — MP3 encoding unavailable (podcast publish will fail loud, per R2)"
+        return 1
+    fi
+
+    if ! python3 -c "import av" >/dev/null 2>&1; then
+        log "pyav: import verification FAILED after install"
+        return 1
+    fi
+    log "pyav: installed and importable"
+}
+
+# =========================================================================
 
 main() {
     piper_ok=0
     kokoro_ok=0
+    pyav_ok=0
     provision_piper && piper_ok=1 || true
     provision_kokoro && kokoro_ok=1 || true
+    provision_pyav && pyav_ok=1 || true
 
-    log "summary: piper=$([[ $piper_ok == 1 ]] && echo ok || echo unavailable) kokoro=$([[ $kokoro_ok == 1 ]] && echo ok || echo unavailable)"
+    log "summary: piper=$([[ $piper_ok == 1 ]] && echo ok || echo unavailable) kokoro=$([[ $kokoro_ok == 1 ]] && echo ok || echo unavailable) pyav=$([[ $pyav_ok == 1 ]] && echo ok || echo unavailable)"
 
     if [[ $piper_ok == 0 && $kokoro_ok == 0 ]]; then
         log "both engines unavailable — nothing provisioned"

@@ -1,0 +1,30 @@
+[Unit]
+Description=Gardener TTS podcast feed publish (Unit 3b, gardener-tts-feed-v0) — Kokoro-primary, Piper-fallback
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+EnvironmentFile=-/data/agents/config/conductor.env
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=TTS_PIPER_BIN=/data/agents/tts/piper-venv/bin/piper
+# PODCAST_FEED_TOKEN (persistent, operator-set — see project docs) must be
+# supplied via conductor.env; there is no runtime-random fallback by design
+# (gate refinement: a random segment would silently break the subscription
+# on every restart).
+# GW readiness: wake + place a keepawake hold BEFORE the render starts, so
+# the render's own doorman acquire (inside tts_episode._synthesize_kokoro)
+# finds GW already serving rather than racing a cold wake itself. Leading
+# '-': a GW-wake failure must NOT abort the unit — Piper fallback must still
+# get a chance to run (per-engine fallback, R5).
+ExecStartPre=-/usr/bin/python3 /data/agents/scripts/gw-night-pre.py --work-id gardener-tts-episode --ttl-sec 900
+ExecStart=/srv/git/lapis-pm/scripts/run_gardener_tts_episode.sh
+TimeoutStartSec=1500
+
+[Install]
+WantedBy=multi-user.target

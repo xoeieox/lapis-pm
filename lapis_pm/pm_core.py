@@ -82,6 +82,7 @@ except ImportError as _e:
 
 from . import episodic, brief, authority, intent_artifact as _intent_artifact, steer
 from . import node_identity
+from . import signed_directive
 
 try:
     from . import eval_gate as _eval_gate
@@ -4332,9 +4333,53 @@ def _encode_user_comments(target_id: str, comments: list) -> list:
     """Return list of comments that triggered any state change worth acting on.
 
     User comments themselves are already in the JSONL — we don't re-encode
-    them as observations. We return the directive comments for `decide` use.
+    them as observations. We return the honored directive comments for
+    `decide` use.
+
+    Acceptance gate (Bridge A, spec lapis-pm-signed-directive-acceptance-v0
+    §4.3): every human:directive comment is verified via
+    signed_directive.verify_directive — five checks (deposit tag present,
+    row exists, signature verified, anchored to Erah's root, content-bound to
+    this live comment). A fault is always surfaced (a diagnostic held-fault
+    observation, plus a brief when well-formed per LAPIS_PM_DIRECTIVE_BRIEF_ON)
+    — never silently dropped. Only the *consequence* of a fault depends on
+    LAPIS_PM_DIRECTIVE_ENFORCEMENT: 'observe' (default) still honors it
+    (loud warning, no lockout while keys are provisioned); 'enforce'
+    quarantines it.
     """
-    directives = [c for c in comments if episodic.TAG_HUMAN_DIRECTIVE in c.tags]
+    enforcement = signed_directive.directive_enforcement_mode()
+    brief_on = signed_directive.directive_brief_on()
+    directives = []
+    for c in comments:
+        if episodic.TAG_HUMAN_DIRECTIVE not in c.tags:
+            continue
+        verdict = signed_directive.verify_directive(target_id, c)
+        if verdict.ok:
+            directives.append(c)
+            continue
+
+        quarantined = enforcement == "enforce"
+        fault_tag = "directive:quarantined" if quarantined else "directive:observed-unsigned"
+        episodic.write_observation(
+            target_id,
+            f"HELD FAULT: directive {c.id} — {verdict.reason} "
+            f"(signer={verdict.pubkey_id or 'none'}). Re-anchor: {signed_directive.RUNBOOK_HINT}",
+            extra_tags=["pm:held-fault", fault_tag],
+        )
+        if not quarantined:
+            directives.append(c)  # observe mode: honor with loud warning
+
+        well_formed = signed_directive.deposit_ref(c.tags) is not None
+        should_brief = brief_on == "all" or (brief_on == "well_formed" and well_formed)
+        if should_brief:
+            b = brief.synthesize(
+                target_id,
+                trigger=f"directive held fault: {verdict.reason}",
+                query=c.content,
+                notify=NotifyPriority.HIGH,
+            )
+            _set_brief_outstanding(target_id, b)
+
     acks = [c for c in comments if episodic.TAG_HUMAN_ACK in c.tags]
     if acks:
         clear_outstanding_brief(target_id, reason="user_ack")
@@ -5881,6 +5926,10 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     if directives:
         # v1: surface directives as a brief if any are recent and we don't
         # already have an outstanding brief; never auto-execute imperatives.
+        # Held-fault diagnostics (unanchored/tampered/etc.) are already
+        # surfaced by _encode_user_comments (spec
+        # lapis-pm-signed-directive-acceptance-v0 §4.4); this is just the
+        # routine "a directive arrived" observation.
         d = directives[-1]
         episodic.write_observation(
             target_id,

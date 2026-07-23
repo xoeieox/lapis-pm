@@ -152,11 +152,31 @@ def latest_ts(target_id: str) -> str | None:
     return cs[-1].ts if cs else None
 
 
+def _has_deposit_tag(c: Comment) -> bool:
+    return any(t.startswith("zephyr:deposit=") for t in c.tags)
+
+
+def is_honored_directive(c: Comment) -> bool:
+    """True if *c* counts as a directive for outstanding/ack bookkeeping.
+
+    A legacy human-typed comment (author_type=="user") counts exactly as it
+    did before Bridge A. A signed agent directive (author_type=="agent")
+    counts too, as long as it carries a zephyr:deposit= tag - i.e. a real
+    signing attempt was made. Bookkeeping only: whether the directive is
+    actually *honored* (vs quarantined as a held fault) is
+    pm_core._encode_user_comments' job via signed_directive.verify_directive,
+    not this filter's.
+    """
+    if TAG_HUMAN_DIRECTIVE not in c.tags:
+        return False
+    return c.author_type == "user" or (c.author_type == "agent" and _has_deposit_tag(c))
+
+
 def has_outstanding_directive(target_id: str, since_ts: str | None) -> Comment | None:
     """Return latest unprocessed human:directive comment (after since_ts)."""
     out = None
     for c in since(target_id, since_ts):
-        if TAG_HUMAN_DIRECTIVE in c.tags and c.author_type == "user":
+        if is_honored_directive(c):
             out = c
     return out
 

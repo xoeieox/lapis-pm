@@ -42,6 +42,7 @@ from agents_core.targets import TargetStore
 # Package imports work because the CLI is launched via `python -m lapis_pm.cli`.
 from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer_mod
 from . import node_identity
+from . import signed_directive
 from .spec_review import _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
@@ -1047,6 +1048,35 @@ def cmd_ratify(args) -> int:
         print(json.dumps({"key": key}))
     else:
         print(f"Ratified {target_id} ({outcome}): {key}")
+    return 0
+
+
+def cmd_directive(args) -> int:
+    """Emit a signed human:directive comment under the pm-review agent key
+    (spec lapis-pm-signed-directive-acceptance-v0, D2). Replaces hand-writing
+    raw JSONL under an unbacked author:"Erah" claim — capture is always
+    permitted; acceptance is verified by the daemon at read time.
+
+    lapis-pm directive <target_id> --content TEXT [--json]
+    """
+    target_id = args.target_id
+    content = args.content
+    as_json = getattr(args, "json", False)
+
+    try:
+        result = signed_directive.emit_signed_directive(target_id, content)
+    except Exception as e:
+        print(f"ERROR: emit_signed_directive failed: {e}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(json.dumps({
+            "manifest_hash": result["manifest_hash"],
+            "pubkey_id": result.get("pubkey_id"),
+            "comment_id": result["comment"].id,
+        }))
+    else:
+        print(f"Directive recorded for {target_id}: deposit={result['manifest_hash']}")
     return 0
 
 
@@ -2132,6 +2162,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print written mem key as JSON {\"key\": ...}",
     )
     rat.set_defaults(func=cmd_ratify)
+
+    dirp = sub.add_parser(
+        "directive",
+        help="Emit a signed human:directive comment under the pm-review agent key.",
+    )
+    dirp.add_argument("target_id", help="Target ID to post the directive on")
+    dirp.add_argument(
+        "--content",
+        required=True,
+        metavar="TEXT",
+        help="One-paragraph directive: what to change, why",
+    )
+    dirp.add_argument(
+        "--json",
+        action="store_true",
+        help="Print {\"manifest_hash\", \"pubkey_id\", \"comment_id\"} as JSON",
+    )
+    dirp.set_defaults(func=cmd_directive)
 
     br = sub.add_parser("brief", help="Generate a state-of-work brief.")
     br.add_argument(

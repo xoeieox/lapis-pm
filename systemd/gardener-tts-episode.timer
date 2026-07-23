@@ -1,0 +1,9 @@
+[Unit]
+Description=Gardener TTS podcast feed publish — daily at 08:15 America/Los_Angeles (post-brief)
+
+[Timer]
+OnCalendar=*-*-* 08:15:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target

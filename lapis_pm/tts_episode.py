@@ -17,6 +17,13 @@ v0 scope: WAV only (no ffmpeg/MP3 — that's 3b), on-demand (no timer-fire —
 3b), vault-drop + Pushover delivery (interim bakeoff surface — the durable
 RSS feed is 3b). No LLM call anywhere in this module; the normalizer is
 pure string manipulation and Piper/Kokoro are local TTS models, not LLMs.
+
+gardener-tts-humanize-v0 (follow-on) extends normalize_for_speech with two
+post-passes over its markup-stripped output: absolute timestamps become
+relative day + time-of-day phrasing, and literal target-ids are substituted
+with their TargetStore title (or a deterministic de-hyphenated fallback if
+unknown). Still no LLM call, no network beyond the existing local
+TargetStore read.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo
@@ -95,6 +102,27 @@ _TRUNCATED_ID_PREFIX_RE = re.compile(r'^[0-9a-f]{6,40}:\s*', re.IGNORECASE)
 _EMPHASIS_RE = re.compile(r'[*_`]+')
 _WHITESPACE_RE = re.compile(r'[ \t]{2,}')
 
+# Absolute timestamp shape emitted by state_brief_prompts.py headers/date
+# labels (e.g. "Lapis Morning Brief — 2026-07-22 08:00 PT"). Other date-ish
+# strings are already stripped upstream by _EVIDENCE_PAREN_RE/_BARE_PATH_RE.
+_TIMESTAMP_RE = re.compile(r'\b(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) PT\b')
+
+# Target-id-shaped token, restricted to the `-vN` version-suffix convention
+# nearly every lapis-pm target-id follows (confirmed live: ~84% of /srv/lapis/targets
+# entries). This is deliberately narrower than a generic kebab-case heuristic
+# (e.g. state_brief.py's _TARGET_ID_RE) — it exists only to catch *unknown*
+# ids (no TargetStore title) for the deterministic fallback, and an untethered
+# 3-segment heuristic false-positives on ordinary kebab-case prose (chain-ids,
+# slugs) that were never meant to be humanized here.
+_TARGET_ID_SHAPE_RE = re.compile(r'\b[a-z][a-z0-9]*(?:-[a-z0-9]+)*-v\d+\b')
+_VERSION_SUFFIX_RE = re.compile(r'-v\d+$')
+
+# Paragraph flood safety net (Erah-ratified, closes the Mirror Council
+# stand-aside on Unit 3a's DEGRADED-mode raw-bullet dump): no single flowing
+# paragraph accumulates more than this many source items before a forced
+# break, even without a source blank line.
+_FLOW_FLOOD_CAP = 8
+
 
 def _clean_text(text: str) -> str:
     """Strip evidence parentheticals, bare paths, id-prefixes, markdown emphasis."""
@@ -115,7 +143,87 @@ def _as_sentence(text: str) -> str:
     return text
 
 
-def normalize_for_speech(body: str) -> str:
+def _time_of_day(hour: int) -> str:
+    if hour < 12:
+        return "morning"
+    if hour < 17:
+        return "afternoon"
+    return "evening"
+
+
+def _humanize_timestamps(text: str, now: datetime) -> str:
+    """Replace `YYYY-MM-DD HH:MM PT` timestamps with relative day + time-of-day
+    phrasing, computed against `now` (day-delta 0/1/2/3+, tod from the
+    timestamp's own hour, not `now`'s)."""
+    today = now.date()
+
+    def _replace(m: re.Match) -> str:
+        year, month, day, hour, _minute = (int(g) for g in m.groups())
+        try:
+            ts_date = date(year, month, day)
+        except ValueError:
+            return m.group(0)
+        tod = _time_of_day(hour)
+        delta = (today - ts_date).days
+        if delta == 0:
+            return f"this {tod}"
+        if delta == 1:
+            return f"yesterday {tod}"
+        if delta == 2:
+            return f"two days ago, in the {tod}"
+        return f"{delta} days ago, in the {tod}"
+
+    return _TIMESTAMP_RE.sub(_replace, text)
+
+
+def _fallback_target_title(target_id: str) -> str:
+    """Deterministic humanization for a target-id with no known title: strip
+    a trailing version suffix, de-hyphenate the rest."""
+    return _VERSION_SUFFIX_RE.sub('', target_id).replace('-', ' ')
+
+
+def _humanize_target_ids(text: str, title_lookup: dict[str, str]) -> str:
+    """Substitute target-ids with their TargetStore title.
+
+    Two passes: (1) exact-string alternation over every known (titled) id,
+    longest-id-first so a shorter id that happens to be a substring-prefix
+    of a longer one never wins the match first; (2) a `-vN`-shaped fallback
+    pass over whatever's left, for ids with no known title (unknown/archived)
+    — deterministic de-hyphenated/de-versioned humanization rather than the
+    raw untouched slug.
+    """
+    if title_lookup:
+        known_ids = sorted(title_lookup, key=len, reverse=True)
+        known_re = re.compile(r'\b(?:' + '|'.join(re.escape(tid) for tid in known_ids) + r')\b')
+        text = known_re.sub(lambda m: title_lookup[m.group(0)], text)
+
+    return _TARGET_ID_SHAPE_RE.sub(lambda m: _fallback_target_title(m.group(0)), text)
+
+
+def _build_title_lookup() -> dict[str, str]:
+    """Live target-id -> title dict from TargetStore. Fail-open: any load
+    error (or an empty store) yields an empty dict rather than raising, so
+    target-ids simply fall through to the deterministic fallback rather than
+    crashing episode delivery."""
+    try:
+        from agents_core.targets import TargetStore
+
+        targets = TargetStore().load_all()
+    except Exception as e:
+        logger.warning(
+            "tts_episode: TargetStore load failed (%s) — target-ids will use "
+            "the deterministic de-hyphenated fallback", e,
+        )
+        return {}
+    return {t.id: t.data.get("title") for t in targets if t.data.get("title")}
+
+
+def normalize_for_speech(
+    body: str,
+    *,
+    now: datetime | None = None,
+    title_lookup: dict[str, str] | None = None,
+) -> str:
     """Convert a markdown brief body into clean spoken prose.
 
     Strips visual markup (headers, bullet markers, emphasis), evidence
@@ -128,8 +236,17 @@ def normalize_for_speech(body: str) -> str:
     plain — becomes its own isolated declarative-sentence paragraph
     ("Critical: <text>."), never merged with surrounding prose. Everything
     else (climate/narrative bullets and paragraph text) accumulates into
-    flowing paragraphs, broken only by headers, warning items, or blank
-    lines in the source — paragraph structure is preserved, not flattened.
+    flowing paragraphs, broken only by headers, warning items, blank lines
+    in the source, or a forced break every `_FLOW_FLOOD_CAP` accumulated
+    items — paragraph structure is preserved, not flattened, but no single
+    paragraph runs unbounded.
+
+    Two post-passes then run on the assembled output (gardener-tts-humanize-v0):
+    absolute `YYYY-MM-DD HH:MM PT` timestamps become relative day + time-of-day
+    phrasing against `now` (defaults to the live Pacific clock), and literal
+    target-ids are substituted with their `TargetStore` title via
+    `title_lookup` (defaults to a live `TargetStore().load_all()` build), or a
+    deterministic de-hyphenated fallback if unknown.
     """
     lines = body.replace("\r\n", "\n").split("\n")
     paragraphs: list[str] = []
@@ -172,9 +289,20 @@ def normalize_for_speech(body: str) -> str:
             continue
 
         flow_buffer.append(_as_sentence(cleaned))
+        if len(flow_buffer) >= _FLOW_FLOOD_CAP:
+            flush_flow()
 
     flush_flow()
-    return "\n\n".join(paragraphs)
+    text = "\n\n".join(paragraphs)
+
+    if now is None:
+        now = datetime.now(tz=PACIFIC)
+    if title_lookup is None:
+        title_lookup = _build_title_lookup()
+
+    text = _humanize_timestamps(text, now)
+    text = _humanize_target_ids(text, title_lookup)
+    return text
 
 
 # ---------------------------------------------------------------------------

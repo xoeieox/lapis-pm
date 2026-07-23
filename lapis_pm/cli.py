@@ -1085,6 +1085,52 @@ def cmd_brief(args) -> int:
     return 0
 
 
+def cmd_tts_episode(args) -> int:
+    """Handle `lapis-pm tts-episode [--period morning] [--voice both|piper|kokoro]`.
+
+    Renders the latest existing brief for `--period` to spoken WAV via the
+    Piper/Kokoro bakeoff (gardener-tts-episode-v0, Unit 3a). Delivery is
+    vault-drop + one Pushover ping; see lapis_pm.tts_episode for the
+    per-engine fallback and Piper latency soft-fail rules.
+    """
+    from agents_core.room_paths import room_path
+    from . import tts_episode
+
+    period = args.period
+    voices = list(tts_episode.VOICES) if args.voice == "both" else [args.voice]
+
+    briefs_root = room_path("briefs")
+    brief_path = briefs_root / f"latest-{period}.md"
+    body = brief_path.read_text(encoding="utf-8") if brief_path.exists() else ""
+    if not body.strip():
+        print(
+            f"no {period} brief to synthesize — run `lapis-pm brief --period {period}` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    out_dir = briefs_root / "audio"
+    outcome = tts_episode.run_episode_bakeoff(body, voices=voices, out_dir=out_dir, period=period)
+
+    for e in outcome.engines:
+        if e.path is not None:
+            print(f"{e.voice}: {e.path} ({e.elapsed_sec:.1f}s)")
+        elif e.soft_failed:
+            print(
+                f"{e.voice}: soft-failed — render exceeded "
+                f"{tts_episode.PIPER_LATENCY_SOFT_FAIL_SEC:.0f}s ({e.elapsed_sec:.1f}s), withheld"
+            )
+        else:
+            print(f"{e.voice}: failed — {e.error}")
+
+    if not outcome.ok:
+        print("tts-episode: all requested engines failed — no episode delivered", file=sys.stderr)
+        return 1
+
+    print(f"Pushover sent: {outcome.notified}")
+    return 0
+
+
 def cmd_decisions_export(args) -> int:
     from lapis_pm.decisions_export import run
     return run(
@@ -2079,6 +2125,23 @@ def build_parser() -> argparse.ArgumentParser:
     brs.add_argument("target_id", help="Target ID with an outstanding brief.")
     brs.add_argument("option_id", help="Option ID to apply (e.g. A, B, C).")
     brs.set_defaults(func=cmd_brief_resolve)
+
+    te = sub.add_parser(
+        "tts-episode",
+        help="Render the latest brief to spoken WAV via a Piper/Kokoro bakeoff (Unit 3a).",
+    )
+    te.add_argument(
+        "--period",
+        default="morning",
+        help="Brief cadence to synthesize (default: morning — v0's only exercised path).",
+    )
+    te.add_argument(
+        "--voice",
+        default="both",
+        choices=["both", "piper", "kokoro"],
+        help="Which engine(s) to render (default: both, for the bakeoff).",
+    )
+    te.set_defaults(func=cmd_tts_episode)
 
     rg = sub.add_parser("review-gate",
                         help="Manage the Opus reviewer kill-switch.")

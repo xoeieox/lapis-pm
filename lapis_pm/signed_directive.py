@@ -198,19 +198,29 @@ def verify_directive(target_id: str, comment) -> DirectiveVerdict:
             False, f"state={verdict['state']}", pubkey_id=row.get("pubkey_id")
         )
 
+    # provenance_json is the JSON-serialized `Provenance.to_dict()` written by
+    # zephyr.attribution.record_signed: scope_id/job_id/input_refs are
+    # top-level keys there, and every input_refs entry is a plain dict (JSON
+    # deserialization never reconstructs the archetypes_core.provenance.
+    # InputRef dataclass), so `.get()` is the correct accessor throughout.
+    # A signing agent fully controls its own payload shape though, so this
+    # parse still runs over untrusted data — any unexpected shape (missing
+    # keys, non-dict input_refs entries, etc.) must fail closed as
+    # content_mismatch rather than raise out of the acceptance gate.
     try:
         prov = json.loads(row.get("provenance_json") or "{}")
-    except json.JSONDecodeError:
-        return DirectiveVerdict(False, "content_mismatch", pubkey_id=row.get("pubkey_id"))
+        input_refs = prov.get("input_refs") or []
+        stored_content = input_refs[0].get("ref") if input_refs else None
+        live_cid = _cid_ref(comment.tags)
+        content_bound = (
+            prov.get("scope_id") == target_id
+            and prov.get("job_id") == live_cid
+            and stored_content == comment.content
+        )
+    except (json.JSONDecodeError, AttributeError, TypeError, IndexError, KeyError):
+        content_bound = False
 
-    input_refs = prov.get("input_refs") or []
-    stored_content = input_refs[0].get("ref") if input_refs else None
-    live_cid = _cid_ref(comment.tags)
-    if (
-        prov.get("scope_id") != target_id
-        or prov.get("job_id") != live_cid
-        or stored_content != comment.content
-    ):
+    if not content_bound:
         return DirectiveVerdict(False, "content_mismatch", pubkey_id=row.get("pubkey_id"))
 
     return DirectiveVerdict(

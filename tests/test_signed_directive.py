@@ -11,7 +11,9 @@ in this test session) — never the real /data/zephyr/*.
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -134,6 +136,12 @@ def test_emit_signed_directive_writes_deposit_and_signed_comment(
     stored = episodic._store().list("my-target")
     assert len(stored) == 1
     assert stored[0].id == comment.id
+    # Round-trip through the on-disk JSONL store (agents_core.comments._KNOWN_FIELDS
+    # filters known top-level Comment fields, not individual tag strings — both the
+    # deposit tag and the cid tag are members of the same `tags` list and must
+    # survive persistence identically).
+    assert f"zephyr:deposit={result['manifest_hash']}" in stored[0].tags
+    assert signed_directive._cid_ref(stored[0].tags) == signed_directive._cid_ref(comment.tags)
 
 
 def test_emit_signed_directive_deposit_first_orphan_on_comment_failure(
@@ -290,6 +298,38 @@ def test_verify_directive_content_mismatch_is_rejected(
     )
 
     verdict = signed_directive.verify_directive("my-target", forged)
+    assert verdict.ok is False
+    assert verdict.reason == "content_mismatch"
+
+
+def test_verify_directive_malformed_provenance_shape_fails_closed(
+    scratch_zephyr, root_signer, agent_signer, pinned_root
+):
+    """A signing agent fully controls its own deposit payload shape (the
+    signature covers manifest_hash, not a live re-hash of provenance_json —
+    see zephyr.attribution.verify_row). An adversarial-but-anchored agent
+    could shape input_refs as anything; the content-binding parse must fail
+    closed as content_mismatch instead of raising AttributeError/TypeError
+    out of the acceptance gate."""
+    _vouched_agent(scratch_zephyr, root_signer, agent_signer, pinned_root)
+    result = signed_directive.emit_signed_directive(
+        "my-target", "original content", signer=agent_signer
+    )
+
+    conn = sqlite3.connect(scratch_zephyr.db_path)
+    try:
+        conn.execute(
+            "UPDATE deposits SET provenance_json = ? WHERE manifest_hash = ?",
+            (
+                json.dumps({"scope_id": "my-target", "job_id": "whatever", "input_refs": ["not-a-dict"]}),
+                result["manifest_hash"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    verdict = signed_directive.verify_directive("my-target", result["comment"])
     assert verdict.ok is False
     assert verdict.reason == "content_mismatch"
 

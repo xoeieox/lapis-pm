@@ -1,9 +1,15 @@
-"""Tests for lapis_pm.tts_episode (gardener-tts-episode-v0, Unit 3a).
+"""Tests for lapis_pm.tts_episode (gardener-tts-episode-v0, Unit 3a; extended
+by gardener-tts-humanize-v0).
 
 Coverage:
   - normalize_for_speech: markup stripping + the warning-impact invariant
     (Council: `[Critical]`/`[Warning]` isolated declarative paragraphs;
-    climate/narrative flows).
+    climate/narrative flows); the flood safety net (forced paragraph break
+    every 8 accumulated flowing items).
+  - _humanize_timestamps: absolute `YYYY-MM-DD HH:MM PT` -> relative day +
+    time-of-day phrasing, against an injected `now`.
+  - _humanize_target_ids: known-id -> title substitution (longest-match-first),
+    deterministic fallback for unknown ids, injected `title_lookup`.
   - synthesize_episode: unknown-voice guard, Piper missing-model failure,
     a real Piper cold-render smoke test (integration-marked, skipped if
     piper-tts isn't provisioned).
@@ -17,8 +23,11 @@ Coverage:
 from __future__ import annotations
 
 import argparse
+import re
 import textwrap
+from datetime import datetime
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -82,9 +91,15 @@ class TestNormalizeForSpeech:
         assert "gardener-podcast-briefing-arc" in climate_paragraphs[0]
 
     def test_headers_become_own_paragraph(self):
+        """Headers still become their own paragraph. The exact timestamp text
+        is no longer asserted verbatim here (gardener-tts-humanize-v0 now
+        humanizes it against the real default clock) — see
+        TestHumanizeTimestamps for the dedicated, deterministic coverage."""
         result = tts_episode.normalize_for_speech(FIXTURE_BODY)
         paragraphs = result.split("\n\n")
-        assert "Lapis Morning Brief — 2026-07-22 08:00 PT" in paragraphs
+        brief_header = next((p for p in paragraphs if p.startswith("Lapis Morning Brief")), None)
+        assert brief_header is not None
+        assert "2026-07-22" not in brief_header
         assert any(p.startswith("Built (since") for p in paragraphs)
 
     def test_paragraph_breaks_preserved(self):
@@ -98,6 +113,154 @@ class TestNormalizeForSpeech:
     def test_case_insensitive_warning_tag(self):
         result = tts_episode.normalize_for_speech("- [critical] lowercase tag test")
         assert result == "Critical: lowercase tag test."
+
+
+# ---------------------------------------------------------------------------
+# Flood safety net (gardener-tts-humanize-v0, Erah-ratified) — a forced
+# paragraph break every 8 accumulated flowing items, even with no source
+# blank line.
+# ---------------------------------------------------------------------------
+
+class TestFlowFloodCap:
+    def test_20_item_flood_splits_into_capped_paragraphs(self):
+        items = "\n".join(f"- Climate item number {i} continues to develop." for i in range(1, 21))
+        result = tts_episode.normalize_for_speech(items, title_lookup={})
+        paragraphs = [p for p in result.split("\n\n") if p.strip()]
+        assert len(paragraphs) == 3  # ceil(20/8)
+        counts = [p.count("Climate item number") for p in paragraphs]
+        assert counts == [8, 8, 4]
+
+    def test_fewer_than_cap_items_single_paragraph(self):
+        """Regression: fewer than the cap still produces one paragraph,
+        matching TestNormalizeForSpeech.test_paragraph_breaks_preserved's
+        existing expectations for small flowing runs."""
+        items = "\n".join(f"- Climate item number {i} continues to develop." for i in range(1, 6))
+        result = tts_episode.normalize_for_speech(items, title_lookup={})
+        paragraphs = [p for p in result.split("\n\n") if p.strip()]
+        assert len(paragraphs) == 1
+        assert paragraphs[0].count("Climate item number") == 5
+
+
+# ---------------------------------------------------------------------------
+# _humanize_timestamps (gardener-tts-humanize-v0)
+# ---------------------------------------------------------------------------
+
+class TestHumanizeTimestamps:
+    FIXED_NOW = datetime(2026, 7, 22, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+    @pytest.mark.parametrize("date_str, hour, expected", [
+        ("2026-07-22", "08:00", "this morning"),
+        ("2026-07-22", "14:00", "this afternoon"),
+        ("2026-07-22", "20:00", "this evening"),
+        ("2026-07-21", "08:00", "yesterday morning"),
+        ("2026-07-21", "14:00", "yesterday afternoon"),
+        ("2026-07-21", "20:00", "yesterday evening"),
+        ("2026-07-20", "08:00", "two days ago, in the morning"),
+        ("2026-07-20", "14:00", "two days ago, in the afternoon"),
+        ("2026-07-20", "20:00", "two days ago, in the evening"),
+        ("2026-07-19", "08:00", "3 days ago, in the morning"),
+        ("2026-07-12", "14:00", "10 days ago, in the afternoon"),
+    ])
+    def test_relative_phrasing_all_buckets(self, date_str, hour, expected):
+        text = f"{date_str} {hour} PT"
+        assert tts_episode._humanize_timestamps(text, self.FIXED_NOW) == expected
+
+    def test_time_of_day_boundary_hours(self):
+        assert tts_episode._time_of_day(11) == "morning"
+        assert tts_episode._time_of_day(12) == "afternoon"
+        assert tts_episode._time_of_day(16) == "afternoon"
+        assert tts_episode._time_of_day(17) == "evening"
+
+    def test_non_matching_date_shape_left_alone(self):
+        """Out of scope per design decision: only the exact `YYYY-MM-DD
+        HH:MM PT` shape is recognized; other date-ish text is untouched."""
+        text = "released on 2026-07-22, a Wednesday"
+        assert tts_episode._humanize_timestamps(text, self.FIXED_NOW) == text
+
+    def test_full_brief_fixture_no_raw_digit_date_survives(self):
+        result = tts_episode.normalize_for_speech(FIXTURE_BODY, now=self.FIXED_NOW, title_lookup={})
+        assert not re.search(r'\b\d{4}-\d{2}-\d{2}\b', result)
+        assert "this morning" in result
+        assert "yesterday morning" in result
+
+
+# ---------------------------------------------------------------------------
+# _humanize_target_ids / _build_title_lookup (gardener-tts-humanize-v0)
+# ---------------------------------------------------------------------------
+
+class TestHumanizeTargetIds:
+    LOOKUP = {
+        "zephyr-route-manifest-v0": "Route Manifest v0 - claims-as-deposits + compiler (rail U0+U1)",
+        "gardener-tts-humanize-v0": "Gardener TTS humanize follow-on",
+        "gardener-tts-humanize-v0-extended": "Gardener TTS humanize extended follow-up",
+    }
+
+    def test_known_id_substituted_with_title(self):
+        text = "the 'zephyr-route-manifest-v0' target exhibits drift."
+        result = tts_episode._humanize_target_ids(text, self.LOOKUP)
+        assert "zephyr-route-manifest-v0" not in result
+        assert self.LOOKUP["zephyr-route-manifest-v0"] in result
+
+    def test_longest_match_first_prefix_collision(self):
+        """gardener-tts-humanize-v0 is a literal substring-prefix of
+        gardener-tts-humanize-v0-extended; the longer id actually present in
+        the text must win the match, not the shorter prefix."""
+        text = "see 'gardener-tts-humanize-v0-extended' for detail."
+        result = tts_episode._humanize_target_ids(text, self.LOOKUP)
+        assert result == f"see '{self.LOOKUP['gardener-tts-humanize-v0-extended']}' for detail."
+        assert "gardener-tts-humanize-v0-extended" not in result
+        assert self.LOOKUP["gardener-tts-humanize-v0"] not in result
+
+    def test_unknown_id_falls_back_to_dehyphenated_form(self):
+        text = "the 'gardener-archived-thing-v3' target was archived."
+        result = tts_episode._humanize_target_ids(text, self.LOOKUP)
+        assert "gardener-archived-thing-v3" not in result
+        assert "gardener archived thing" in result
+
+    def test_id_absent_from_text_does_not_corrupt_content(self):
+        text = "ordinary prose with no target-id mentions at all."
+        result = tts_episode._humanize_target_ids(text, self.LOOKUP)
+        assert result == text
+
+    def test_non_target_shaped_hyphenated_prose_left_alone(self):
+        """A hyphenated chain/slug reference with no -vN suffix is not
+        mistaken for a target-id (regression guard for FIXTURE_BODY's
+        'gardener-podcast-briefing-arc' chain reference)."""
+        text = "chain: gardener-podcast-briefing-arc"
+        assert tts_episode._humanize_target_ids(text, {}) == text
+
+    def test_build_title_lookup_only_includes_explicit_titles(self, monkeypatch):
+        fake_target = MagicMock()
+        fake_target.id = "fake-target-v0"
+        fake_target.data = {"title": "Fake Target"}
+        fake_target_no_title = MagicMock()
+        fake_target_no_title.id = "fake-notitle-v0"
+        fake_target_no_title.data = {}
+
+        fake_store = MagicMock()
+        fake_store.load_all.return_value = [fake_target, fake_target_no_title]
+        monkeypatch.setattr("agents_core.targets.TargetStore", lambda: fake_store)
+
+        assert tts_episode._build_title_lookup() == {"fake-target-v0": "Fake Target"}
+
+    def test_targetstore_load_failure_fails_open_to_empty_dict(self, monkeypatch):
+        fake_store = MagicMock()
+        fake_store.load_all.side_effect = RuntimeError("room unreachable")
+        monkeypatch.setattr("agents_core.targets.TargetStore", lambda: fake_store)
+
+        assert tts_episode._build_title_lookup() == {}
+
+    def test_known_id_in_full_normalize_pipeline(self):
+        body = "- The 'gardener-tts-humanize-v0' target needs attention."
+        result = tts_episode.normalize_for_speech(body, title_lookup=self.LOOKUP)
+        assert "Gardener TTS humanize follow-on" in result
+        assert "gardener-tts-humanize-v0" not in result
+
+    def test_unknown_id_in_full_normalize_pipeline_uses_fallback(self):
+        body = "- The 'totally-unknown-archived-v2' target was archived."
+        result = tts_episode.normalize_for_speech(body, title_lookup={})
+        assert "totally-unknown-archived-v2" not in result
+        assert "totally unknown archived" in result
 
 
 # ---------------------------------------------------------------------------

@@ -366,6 +366,7 @@ _CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = (
     "enlightenment_reader.py",
     "research_headings.py",
     "night_producers.yaml",
+    "night_task_menu.py", "night-task-menu.yaml", "night_plan_manager.py",   # Rung B menu (leftover) + Rung C.0 manager
 )
 
 _DEPLOY_LOG = room_path('lapis_state.deploy_log')

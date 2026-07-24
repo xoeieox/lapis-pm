@@ -2960,7 +2960,9 @@ class TestConductorNightPlanDeploy:
             return f.read_text() if f.is_file() else None
 
         closure = _compute_import_closure(seed, source_for)
-        expected_files = {f"{mod}.py" for mod in closure} | {"night_producers.yaml"}
+        expected_files = {f"{mod}.py" for mod in closure} | {
+            "night_producers.yaml", "night-task-menu.yaml",
+        }
         assert set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) == expected_files
 
     def test_load_test_gpu_lane_registers_and_deferred_siblings_import(self):
@@ -3060,7 +3062,9 @@ class TestConductorNightPlanDeploy:
             p["module"] for p in producers["producers"]
         }
         closure = _compute_import_closure(seed, source_for)
-        expected_files = {f"{mod}.py" for mod in closure} | {"night_producers.yaml"}
+        expected_files = {f"{mod}.py" for mod in closure} | {
+            "night_producers.yaml", "night-task-menu.yaml",
+        }
         assert set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) == expected_files
 
     # --- R7: source-freshness gate ---

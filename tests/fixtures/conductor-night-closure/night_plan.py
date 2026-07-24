@@ -6,6 +6,11 @@ import of agents_core.slots, plus deferred (function-local) imports of
 night_coordinator symbols and importlib.import_module of producer modules. Business
 logic is intentionally NOT reproduced — this fixture exists solely to exercise the
 scripts/-local import graph the R4 closure test walks.
+
+Also carries `import night_plan_manager` (real file :2047 imports it deferred,
+inside a function, behind NIGHT_PLAN_MANAGER_ENABLED; reproduced here at top
+level per night-manager-deploy-manifest-wiring-v0 R2b — _IMPORT_RE is
+indent-agnostic so the simpler top-level form is an equally valid edge).
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from __future__ import annotations
 import importlib
 
 from agents_core.slots import IS_MASTER, TERMINAL_STATUSES, SlotStore  # noqa: F401
+import night_plan_manager  # noqa: F401
 
 
 def _dispatch_lane(lane: str, node_id: str):

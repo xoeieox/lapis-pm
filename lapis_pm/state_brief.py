@@ -80,6 +80,11 @@ _GARDENER_BULLET_RE = re.compile(r'^- \[(Critical|Warning)\]\s+(.+?)(?:\s+\(evid
 _GARDENER_DERIVED_PREFIX = "gardener/derived/"
 _GARDENER_DAILY_CAP = 10
 
+# In-flight landed-join scan limit (brief-inflight-landed-join-v0). Well above
+# the live 626 dual dispatched+landed keys so the landed set is never
+# truncated and a landed target never mis-counts as in-flight.
+_LANDED_PREFIX_LIMIT = 10_000
+
 # --- Arc-Climate reconciler (gardener-arc-climate-v0, Unit 1) ---
 # Global staleness threshold — a single named constant, trivially tunable
 # (OQ-2 RESOLVED: Facets-endorsed 21 days; per-arc importance-scaling deferred
@@ -162,12 +167,34 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
             ratification_items.append(f"{label}: {val[:120]}" if val else label)
 
     # --- In flight: dispatched + chain keys (all time — not time-windowed) ---
+    # Landed-beats-dispatched join: a pm/dispatched/<tid> is in-flight only if
+    # no pm/landed/<tid> exists. Landing is asymmetric — clear_landed_state
+    # keeps the dispatched key for audit-query — so key presence alone
+    # over-reports. Same precedence rule as the reference oracle,
+    # trajectory._derive_node_state ("landed if pm/landed/<tid> exists" wins
+    # over any dispatched signal). Built from a dedicated pm/landed/ prefix
+    # scan (limit well above the current 626 dual-key count) rather than a
+    # per-target mem round-trip inside the loop below. Degrades to an empty
+    # landed set on failure (matches the Gardener/Climate degrade pattern
+    # below) rather than blocking the whole brief on a mem outage.
+    try:
+        landed_entries = mem.list_by_prefix("pm/landed/", limit=_LANDED_PREFIX_LIMIT)
+    except Exception:
+        landed_entries = []
+    landed_set = {
+        e.get("key", "").removeprefix("pm/landed/")
+        for e in landed_entries
+        if e.get("key", "").startswith("pm/landed/")
+    }
+
     all_keys = mem.list_all(tag="lapis-pm", limit=1000)
     in_flight_items: list[str] = []
     for entry in all_keys:
         k = entry.get("key", "")
         if k.startswith("pm/dispatched/"):
             tid = k.removeprefix("pm/dispatched/")
+            if tid in landed_set:
+                continue
             rec = mem.get(k)
             val = rec.get("value", "") if rec else ""
             in_flight_items.append(f"{tid}: {val[:120]}" if val else tid)

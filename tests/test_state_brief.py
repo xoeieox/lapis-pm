@@ -717,6 +717,91 @@ class TestReadArcClimate:
         assert buckets[state_brief.B_CLIMATE] == []
 
 
+class TestInFlightLandedJoin:
+    """Tests for the landed-beats-dispatched join in the In-flight bucket
+    (brief-inflight-landed-join-v0). Landing is asymmetric: auto-land writes
+    pm/landed/<tid> but clear_landed_state keeps pm/dispatched/<tid> for
+    audit-query, so key-prefix-only selection over-reports "in flight"."""
+
+    def _list_by_prefix(self, prefix, limit=50):
+        if prefix == "pm/landed/":
+            return [{"key": "pm/landed/both-tid", "value": "{}"}]
+        return []
+
+    def test_dispatched_and_landed_tid_excluded_from_in_flight(self):
+        """DoD-3: a tid with BOTH pm/dispatched and pm/landed keys is NOT
+        counted in the In-flight bucket."""
+        entries = [
+            {"key": "pm/dispatched/both-tid", "value": ""},
+            {"key": "pm/dispatched/dispatched-only-tid", "value": ""},
+        ]
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = entries
+            mock_mem.return_value.list_by_prefix.side_effect = self._list_by_prefix
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        in_flight = buckets[state_brief.B_IN_FLIGHT]
+        assert not any(item.startswith("both-tid") for item in in_flight), (
+            f"landed tid leaked into In-flight: {in_flight}"
+        )
+
+    def test_dispatched_only_tid_is_counted(self):
+        """DoD-3: a tid with pm/dispatched but no pm/landed key IS counted."""
+        entries = [
+            {"key": "pm/dispatched/both-tid", "value": ""},
+            {"key": "pm/dispatched/dispatched-only-tid", "value": ""},
+        ]
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = entries
+            mock_mem.return_value.list_by_prefix.side_effect = self._list_by_prefix
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        in_flight = buckets[state_brief.B_IN_FLIGHT]
+        assert any(item.startswith("dispatched-only-tid") for item in in_flight), (
+            f"dispatched-only tid missing from In-flight: {in_flight}"
+        )
+
+    def test_chain_keys_unaffected_by_landed_join(self):
+        """DoD-4: chain/* entries are unaffected by the landed join."""
+        entries = [{"key": "chain/some-chain-group", "value": ""}]
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = entries
+            mock_mem.return_value.list_by_prefix.return_value = []
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        assert buckets[state_brief.B_IN_FLIGHT] == ["chain:some-chain-group"]
+
+    def test_landed_scan_failure_degrades_to_old_behavior_not_crash(self):
+        """If the pm/landed/ prefix scan itself fails, _read_buckets degrades
+        (empty landed set) rather than raising — matches the Gardener/Climate
+        degrade pattern elsewhere in this module."""
+        entries = [{"key": "pm/dispatched/some-tid", "value": ""}]
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = entries
+            mock_mem.return_value.list_by_prefix.side_effect = OSError("mem unreachable")
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        assert any(item.startswith("some-tid") for item in buckets[state_brief.B_IN_FLIGHT])
+
+    def test_derive_node_state_unaffected(self):
+        """DoD-4: trajectory._derive_node_state (the reference oracle this
+        join mirrors) is untouched by this change — landed still wins."""
+        from lapis_pm import trajectory
+
+        assert trajectory._derive_node_state("landed-tid", {}, {"landed-tid": {}}) == "landed"
+
+        with patch("lapis_pm.trajectory._mem") as mock_mem:
+            mock_mem.return_value.get.return_value = None
+            assert trajectory._derive_node_state("bound-tid", {}, {}) == "bound"
+
+
 class TestClimateBucketRendering:
     """Tests for Climate bucket special-casing in format_bucket_sections()."""
 

@@ -319,6 +319,52 @@ class TestReadGardenerObservations:
 
         assert len(result) == 10
 
+    def test_full_observation_text_survives_no_mid_word_truncation(self):
+        """Observations longer than 200 chars must not be sliced mid-word.
+
+        brief-gardener-obs-truncation-v0: the old `text[:200]` hard slice cut
+        bullets mid-word. The count cap (_GARDENER_DAILY_CAP) is the sole
+        prompt-size guard; per-item text is no longer truncated.
+        """
+        long_text = (
+            "This observation deliberately runs well past the two hundred "
+            "character mark that the old hard slice used to cut off mid-word, "
+            "so that the assertion below can confirm the full sentence, "
+            "including this final word, survives intact"
+        )
+        assert len(long_text) > 200
+        entry = {
+            "key": "gardener/derived/2026-07-24-1431",
+            "value": f"- [Critical] {long_text}  (evidence: mem:foo, mem:bar)\n",
+        }
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [entry]
+
+            result = state_brief._read_gardener_observations()
+
+        assert result == [
+            f"[Critical] {long_text}  (evidence: mem:foo, mem:bar)"
+        ]
+        assert result[0].endswith("intact  (evidence: mem:foo, mem:bar)")
+
+    def test_gardener_section_bounded_by_count_cap_not_char_slice(self):
+        """D5: even with long observations, the section is bounded by the
+        count cap (_GARDENER_DAILY_CAP), not by per-item character slicing.
+        """
+        long_text = "Word " * 150  # well over the old 200-char slice threshold
+        bullets = "\n".join(
+            f"- [Warning] {long_text.strip()} item{i}." for i in range(15)
+        )
+        entry = {"key": "gardener/derived/2026-07-24-1431", "value": bullets}
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_by_prefix.return_value = [entry]
+
+            result = state_brief._read_gardener_observations(period="morning")
+
+        assert len(result) == state_brief._GARDENER_DAILY_CAP
+        for obs in result:
+            assert len(obs) > 200
+
     def test_weekly_window_includes_all_entries_within_7_days_uncapped(self):
         """Weekly period pulls every entry in the trailing 7 days, uncapped."""
         entries = [

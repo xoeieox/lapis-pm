@@ -292,9 +292,9 @@ def _read_gardener_observations(period: str = "daily") -> list[str]:
             if not text:
                 continue
             if evidence:
-                observations.append(f"[{urgency}] {text[:200]}  (evidence: {evidence})")
+                observations.append(f"[{urgency}] {text}  (evidence: {evidence})")
             else:
-                observations.append(f"[{urgency}] {text[:200]}")
+                observations.append(f"[{urgency}] {text}")
 
     # Weekly: uncapped — the LLM synthesizes patterns from the full window.
     # Non-weekly: cap to avoid prompt bloat.

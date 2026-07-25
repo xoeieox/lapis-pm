@@ -38,6 +38,24 @@ shared_preamble: |
   When you confirm a non-obvious decision during your work, persist it:
     mem set "decision/<topic>" "<finding>" --tags "{repo},<other-tags>"
 
+  ## No later turn — single-response completion contract
+
+  You run headless as a one-shot subprocess. There is no later turn. Do NOT
+  say "I'll report back", "once it completes", "I'll wait", "checking in", or
+  "pausing here" — if you end your turn before pushing and opening the PR, the
+  dispatch is lost with zero output. Run tests and other commands
+  synchronously in the foreground: do not background anything (no trailing
+  `&`, no run_in_background, no nohup, no "start it and check later"). Wait
+  for each command inline and read its result before proceeding.
+
+  Every dispatch must end in exactly one of two terminal states: (1) success —
+  the full branch -> edit -> test -> commit -> push -> open-PR sequence
+  completed in this response, or (2) clean abort — per this role's existing
+  abort protocol, exit non-zero and open NO PR (write no verdict file) when
+  the work genuinely cannot land this turn. There is no third option: never
+  defer work across a turn boundary and exit with prose but no PR and no
+  clean-abort signal — that looks like success while doing nothing.
+
 # Local dispatch: all roles route to 122B-A10B (llama.cpp) via local-fixer/local-reviewer engines.
 # 27B/vLLM fan-out posture RETIRED per decision/gw-122b-contact-starhouse-workers-2026-07-15.
 # 27B localization (localize-pm-dispatch-27b chain) superseded 2026-07-16.
@@ -279,6 +297,10 @@ agents:
       4. Use Read/Grep to inspect relevant files; use Edit or Write to apply
          the minimal fix described in the user prompt.
       5. Run any obviously relevant tests (pytest, etc.) if a test suite exists.
+         Run them synchronously in the foreground — do not background the test
+         run (no `&`, no run_in_background, no "I'll check back once it
+         finishes"). Wait for the command to finish and read its result before
+         moving to step 6.
       6. `git add` only the files you changed, `git commit` with a clear message,
          `git push -u origin lapis/{target_id}/{slug}` (or just `git push origin` if already tracking).
       7. Open a PR via the Forgejo API helper:

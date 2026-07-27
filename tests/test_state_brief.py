@@ -763,6 +763,75 @@ class TestReadArcClimate:
         assert buckets[state_brief.B_CLIMATE] == []
 
 
+class TestArcSourceParam:
+    """Tests for D4 (arc-registry-contract-schema-v0): the additive
+    `arc_source` parameter on _read_arc_climate. Off by default -- DoD 11
+    requires prose output to be byte-identical before and after this unit."""
+
+    def _write_arc_doc(self, tmp_path, slug: str, body: str, *, age_days: int = 0):
+        lapis_state = tmp_path / "lapis_state"
+        lapis_state.mkdir(parents=True, exist_ok=True)
+        doc = lapis_state / f"{slug}.md"
+        doc.write_text(body, encoding="utf-8")
+        if age_days:
+            mtime = (datetime.now(tz=timezone.utc) - timedelta(days=age_days)).timestamp()
+            os.utime(doc, (mtime, mtime))
+        return doc
+
+    def test_default_arc_source_is_prose_and_output_is_unchanged(self, tmp_path):
+        """DoD 11: _read_arc_climate(..., arc_source="prose") over a fixed
+        fixture is byte-identical to the pre-existing no-arg call."""
+        self._write_arc_doc(
+            tmp_path, "gone-quiet-arc",
+            "# Gone Quiet Arc\n\nNEXT: write the follow-up docs\n\nAnchors: foo.service\n",
+            age_days=30,
+        )
+        with (
+            patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
+            patch("lapis_pm.deploy_inventory._show_unit", return_value={"ActiveState": "active"}),
+            patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
+            patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
+        ):
+            default_result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
+            explicit_prose_result = state_brief._read_arc_climate(
+                datetime.now(tz=timezone.utc), period="weekly", arc_source="prose",
+            )
+
+        assert default_result == explicit_prose_result
+        assert len(default_result) == 1
+        assert default_result[0]["classification"] == "gone-quiet"
+
+    def test_registry_arc_source_never_touches_disk(self, tmp_path):
+        """The registry path is additive: selecting it must not fall through
+        to prose parsing (room_path must never be touched)."""
+        room_path_mock = MagicMock()
+        with (
+            patch("lapis_pm.state_brief.room_path", room_path_mock),
+            patch("lapis_pm.arc_registry.read_arc_climate_from_registry", return_value=[]) as mock_registry,
+        ):
+            result = state_brief._read_arc_climate(
+                datetime.now(tz=timezone.utc), period="weekly", arc_source="registry",
+            )
+
+        assert result == []
+        mock_registry.assert_called_once()
+        room_path_mock.assert_not_called()
+
+    def test_non_weekly_short_circuits_regardless_of_arc_source(self, tmp_path):
+        room_path_mock = MagicMock()
+        with (
+            patch("lapis_pm.state_brief.room_path", room_path_mock),
+            patch("lapis_pm.arc_registry.read_arc_climate_from_registry") as mock_registry,
+        ):
+            result = state_brief._read_arc_climate(
+                datetime.now(tz=timezone.utc), period="daily", arc_source="registry",
+            )
+
+        assert result == []
+        mock_registry.assert_not_called()
+        room_path_mock.assert_not_called()
+
+
 class TestInFlightLandedJoin:
     """Tests for the landed-beats-dispatched join in the In-flight bucket
     (brief-inflight-landed-join-v0). Landing is asymmetric: auto-land writes

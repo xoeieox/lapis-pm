@@ -243,6 +243,30 @@ def _parse_spec_authority(spec_path: Path) -> str:
     return m.group(1)
 
 
+_AUTHORITY_TEXT_RE = re.compile(
+    r"^\*\*Authority:\*\*\s+(\S+)",
+    re.MULTILINE,
+)
+_AUTHORITY_TEXT_ALIASES = {"auto-merge": "auto", "auto": "auto", "advisory": "advisory", "hold": "hold"}
+
+
+def _parse_spec_authority_text(text: str) -> str | None:
+    """Extract Authority from spec text (first 50 lines).
+
+    Returns 'advisory' | 'auto' | 'hold', or None if the header is absent or
+    unrecognized. Unlike _parse_spec_verification_text, this has NO safe default —
+    callers own the fallback, because bind and the spec-review gate need different
+    fallback semantics (see cmd_bind below vs. the existing _parse_spec_authority
+    path-based function, which is untouched by this spec).
+    """
+    first_50 = "\n".join(text.splitlines()[:50])
+    m = _AUTHORITY_TEXT_RE.search(first_50)
+    if not m:
+        return None
+    val = m.group(1).lower().rstrip(".,;:!)")
+    return _AUTHORITY_TEXT_ALIASES.get(val)
+
+
 _VERIFICATION_RE = re.compile(
     r"^\*\*Verification:\*\*\s+(\S+)",
     re.MULTILINE,

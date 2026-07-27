@@ -6,13 +6,27 @@ Coverage:
   - pm_core._REVIEW_CYCLE_BUDGETS has hold → 4 entries
   - Fresh-reviewer mode selected for hold authority (not same-reviewer)
   - hold authority accepted in cli.build_parser()
+  - _parse_spec_authority_text: parses **Authority:** header from spec text,
+    including auto-merge/auto alias normalization, absent/unrecognized => None,
+    only first 50 lines scanned (lapis-pm-bind-authority-header-parity-v0)
+  - cmd_bind resolves --authority as: flag > spec header > advisory fallback,
+    and errors (exit 2, nothing written) on flag/header mismatch
 """
 
 from __future__ import annotations
 
-import pytest
+import io
+import textwrap
+from contextlib import redirect_stdout, redirect_stderr
+from pathlib import Path
+from unittest.mock import patch
 
-from lapis_pm.cli import build_parser
+import pytest
+import yaml
+
+from agents_core.targets import TargetStore
+from lapis_pm.cli import build_parser, main
+from lapis_pm.spec_review import _parse_spec_authority_text
 from lapis_pm import pm_core
 
 
@@ -134,3 +148,218 @@ class TestBindPmAcceptsHoldAuthority:
                 "merge agents-core PR widening bind_pm first"
             )
         assert t.pm_authority == "hold"
+
+
+# ---------------------------------------------------------------------------
+# _parse_spec_authority_text unit tests (mirrors _parse_spec_verification_text
+# test shape in tests/test_verification_eligibility.py)
+# ---------------------------------------------------------------------------
+
+
+class TestParseSpecAuthorityText:
+    def test_hold_returns_hold(self):
+        text = "# Spec\n**Authority:** hold\n"
+        assert _parse_spec_authority_text(text) == "hold"
+
+    def test_advisory_returns_advisory(self):
+        text = "# Spec\n**Authority:** advisory\n"
+        assert _parse_spec_authority_text(text) == "advisory"
+
+    def test_auto_returns_auto(self):
+        text = "# Spec\n**Authority:** auto\n"
+        assert _parse_spec_authority_text(text) == "auto"
+
+    def test_auto_merge_alias_returns_auto(self):
+        text = "# Spec\n**Authority:** auto-merge\n"
+        assert _parse_spec_authority_text(text) == "auto"
+
+    def test_absent_returns_none(self):
+        text = "# Spec\n**Verification:** machine\n"
+        assert _parse_spec_authority_text(text) is None
+
+    def test_unrecognized_returns_none(self):
+        text = "# Spec\n**Authority:** maybe\n"
+        assert _parse_spec_authority_text(text) is None
+
+    def test_only_first_50_lines_scanned(self):
+        """Authority field beyond line 50 must be ignored, same as verification."""
+        header = "\n".join(f"line {i}" for i in range(55))
+        text = header + "\n**Authority:** hold\n"
+        assert _parse_spec_authority_text(text) is None
+
+    def test_hold_inline_with_extra_text(self):
+        """hold followed by prose description must still parse."""
+        text = "**Authority:** hold — this touches the secure spine\n"
+        assert _parse_spec_authority_text(text) == "hold"
+
+    def test_empty_text_returns_none(self):
+        assert _parse_spec_authority_text("") is None
+
+
+# ---------------------------------------------------------------------------
+# cmd_bind authority resolution: flag > spec header > advisory fallback
+# ---------------------------------------------------------------------------
+
+SPEC_BODY_HOLD = textwrap.dedent("""\
+    # Test spec
+
+    **Authority:** hold
+
+    A minimal spec body declaring hold authority.
+""")
+
+SPEC_BODY_ADVISORY = textwrap.dedent("""\
+    # Test spec
+
+    **Authority:** advisory
+
+    A minimal spec body declaring advisory authority.
+""")
+
+SPEC_BODY_AUTO_MERGE_ALIAS = textwrap.dedent("""\
+    # Test spec
+
+    **Authority:** auto-merge
+
+    A minimal spec body declaring the auto-merge alias.
+""")
+
+SPEC_BODY_NO_HEADER = textwrap.dedent("""\
+    # Test spec
+
+    A minimal spec body with no Authority header at all.
+""")
+
+
+def _write_spec(tmp_path: Path, body: str, name: str = "spec.md") -> Path:
+    p = tmp_path / name
+    p.write_text(body)
+    return p
+
+
+def _run(argv: list[str], targets_dir: Path) -> tuple[int, str, str]:
+    """Run main() with a patched TargetStore and stubbed episodic/pm_core."""
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+
+    with (
+        patch("lapis_pm.cli.TargetStore", lambda: TargetStore(targets_dir)),
+        patch("lapis_pm.cli.episodic.spec", return_value=None),
+        patch("lapis_pm.cli.episodic.write_spec", return_value=None),
+        patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
+        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+        redirect_stdout(out_buf),
+        redirect_stderr(err_buf),
+    ):
+        rc = main(argv)
+
+    return rc, out_buf.getvalue(), err_buf.getvalue()
+
+
+class TestCmdBindAuthorityResolution:
+    def test_hold_header_no_flag_resolves_hold(self, tmp_path):
+        """Regression test for both secure-spine incidents: spec says hold, no
+        --authority flag passed, bound authority must be hold, not advisory."""
+        spec_path = _write_spec(tmp_path, SPEC_BODY_HOLD)
+        store = TargetStore(tmp_path)
+        store.create("my-target", title="My Target")
+
+        rc, out, err = _run([
+            "bind", "my-target",
+            "--spec-from", str(spec_path),
+            "--repo", "lapis-pm",
+            "--force",
+        ], tmp_path)
+
+        assert rc == 0, f"stderr={err!r}"
+        data = yaml.safe_load((tmp_path / "my-target.yaml").read_text())
+        assert data["pm_authority"] == "hold"
+
+    def test_advisory_header_no_flag_stays_advisory(self, tmp_path):
+        spec_path = _write_spec(tmp_path, SPEC_BODY_ADVISORY)
+        store = TargetStore(tmp_path)
+        store.create("my-target", title="My Target")
+
+        rc, out, err = _run([
+            "bind", "my-target",
+            "--spec-from", str(spec_path),
+            "--repo", "lapis-pm",
+            "--force",
+        ], tmp_path)
+
+        assert rc == 0, f"stderr={err!r}"
+        data = yaml.safe_load((tmp_path / "my-target.yaml").read_text())
+        assert data["pm_authority"] == "advisory"
+
+    def test_no_header_no_flag_defaults_advisory(self, tmp_path):
+        """Fail-safe default preserved for specs that predate this convention."""
+        spec_path = _write_spec(tmp_path, SPEC_BODY_NO_HEADER)
+        store = TargetStore(tmp_path)
+        store.create("my-target", title="My Target")
+
+        rc, out, err = _run([
+            "bind", "my-target",
+            "--spec-from", str(spec_path),
+            "--repo", "lapis-pm",
+            "--force",
+        ], tmp_path)
+
+        assert rc == 0, f"stderr={err!r}"
+        data = yaml.safe_load((tmp_path / "my-target.yaml").read_text())
+        assert data["pm_authority"] == "advisory"
+
+    def test_hold_header_advisory_flag_mismatch_errors(self, tmp_path):
+        """Explicit --authority disagreeing with the spec header must abort the
+        bind before anything is written, naming both values."""
+        spec_path = _write_spec(tmp_path, SPEC_BODY_HOLD)
+        store = TargetStore(tmp_path)
+        store.create("my-target", title="My Target")
+
+        with patch("agents_core.targets.Target.bind_pm") as mock_bind_pm:
+            rc, out, err = _run([
+                "bind", "my-target",
+                "--spec-from", str(spec_path),
+                "--repo", "lapis-pm",
+                "--authority", "advisory",
+                "--force",
+            ], tmp_path)
+
+        assert rc == 2
+        assert "hold" in err
+        assert "advisory" in err
+        mock_bind_pm.assert_not_called()
+
+    def test_hold_header_hold_flag_matches_no_error(self, tmp_path):
+        spec_path = _write_spec(tmp_path, SPEC_BODY_HOLD)
+        store = TargetStore(tmp_path)
+        store.create("my-target", title="My Target")
+
+        rc, out, err = _run([
+            "bind", "my-target",
+            "--spec-from", str(spec_path),
+            "--repo", "lapis-pm",
+            "--authority", "hold",
+            "--force",
+        ], tmp_path)
+
+        assert rc == 0, f"stderr={err!r}"
+        data = yaml.safe_load((tmp_path / "my-target.yaml").read_text())
+        assert data["pm_authority"] == "hold"
+
+    def test_auto_merge_header_auto_flag_alias_matches_no_error(self, tmp_path):
+        """auto-merge header + --authority auto is a match via alias normalization."""
+        spec_path = _write_spec(tmp_path, SPEC_BODY_AUTO_MERGE_ALIAS)
+        store = TargetStore(tmp_path)
+        store.create("my-target", title="My Target")
+
+        rc, out, err = _run([
+            "bind", "my-target",
+            "--spec-from", str(spec_path),
+            "--repo", "lapis-pm",
+            "--authority", "auto",
+            "--force",
+        ], tmp_path)
+
+        assert rc == 0, f"stderr={err!r}"
+        data = yaml.safe_load((tmp_path / "my-target.yaml").read_text())
+        assert data["pm_authority"] == "auto"

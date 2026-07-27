@@ -43,7 +43,7 @@ from agents_core.targets import TargetStore
 from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer_mod
 from . import node_identity
 from . import signed_directive
-from .spec_review import _parse_spec_verification_text
+from .spec_review import _parse_spec_authority_text, _parse_spec_verification_text
 from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .research_quest import cmd_research_quest
@@ -114,9 +114,6 @@ def cmd_bind(args) -> int:
     if not args.repo:
         print("ERROR: --repo is required for single-target bind", file=sys.stderr)
         return 2
-
-    if args.authority is None:
-        args.authority = "advisory"
 
     # Validate --adopt-pr early so we fail before creating or mutating state.
     _adopted_pr_number: int | None = getattr(args, "adopt_pr", None)
@@ -233,6 +230,19 @@ def cmd_bind(args) -> int:
     if not spec_body:
         print("ERROR: empty spec body", file=sys.stderr)
         return 2
+
+    _spec_authority = _parse_spec_authority_text(spec_body)
+    if args.authority is not None and _spec_authority is not None and args.authority != _spec_authority:
+        print(
+            f"ERROR: spec declares **Authority:** {_spec_authority} but --authority "
+            f"{args.authority} was passed. Pass --authority {_spec_authority} to match "
+            "the spec, or fix the spec's Authority header if the spec is wrong. "
+            "Bind aborted; nothing was written.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.authority is None:
+        args.authority = _spec_authority if _spec_authority is not None else "advisory"
 
     # Resolve pr_count: explicit flag > auto-detect (on --create) > preserve existing
     pr_count = getattr(args, "pr_count", None)
@@ -2036,7 +2046,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--spec-from", required=True, help="Path to spec, or '-' for stdin")
     b.add_argument("--repo", default=None, help="Forgejo repo name (required for single-target)")
     b.add_argument("--authority", default=None, choices=["advisory", "auto", "hold"],
-                   help="Authority level (default: advisory; hold = fresh-reviewer + 4-cycle budget)")
+                   help="Authority level. Precedence: --authority flag > spec's **Authority:** "
+                        "header > advisory (fail-safe default). If both are given and disagree, "
+                        "bind errors (exit 2, nothing written) naming both values. "
+                        "hold = fresh-reviewer + 4-cycle budget.")
     b.add_argument("--verification", default=None, choices=["machine", "pm-live-test"],
                    help="Verification mode override (default: parsed from spec, else pm-live-test). "
                         "'machine' = auto-merge eligible; 'pm-live-test' = always routes to PM.")

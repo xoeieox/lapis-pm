@@ -471,14 +471,34 @@ def _arc_weaver_signal(slug: str) -> datetime | None:
     return None
 
 
-def _read_arc_climate(start_ts: datetime, *, period: str = "daily") -> list[dict]:
+def _read_arc_climate(
+    start_ts: datetime, *, period: str = "daily",
+    arc_source: str = "prose",
+    prefix: str = "arc/",
+) -> list[dict]:
+    """Reconcile each arc's declared NEXT against ground truth and classify
+    it. `arc_source` selects where the declared/observed state comes from --
+    "prose" (default, on-disk arc-doc parsing, unchanged this unit) or
+    "registry" (arc_registry.py's structured mem.db rows). Additive per D4:
+    the reconciler keeps prose as the behavior under test; registry is off
+    by default and does not change prose output.
+
+    `prefix` selects which mem-key prefix the "registry" source reads from
+    (e.g. a scratch prefix for a DoD 14-15 verification run). Ignored by the
+    "prose" source. Defaults to arc_registry.DEFAULT_PREFIX's value ("arc/").
+    """
+    if period != "weekly":
+        return []
+    if arc_source == "registry":
+        from . import arc_registry
+        return arc_registry.read_arc_climate_from_registry(prefix)
+    return _read_arc_climate_from_prose(start_ts)
+
+
+def _read_arc_climate_from_prose(start_ts: datetime) -> list[dict]:
     """Reconcile each on-disk arc-doc's declared NEXT against ground truth and
     classify it. Deterministic reader — no LLM call; the weekly prose stage
     narrates the returned bullets in narrative-mirror / debt-of-time voice.
-
-    Weekly cadence only for v0 (Design decisions): non-weekly periods return
-    [] immediately without touching Forgejo/deploy-inventory/systemd/weaver,
-    so daily/morning/afternoon/live briefs never pay this network cost.
 
     Each ground-truth source (Forgejo PR, deploy-inventory, systemd timer,
     weaver digest) is wrapped in its own try/except — a failing source drops
@@ -491,9 +511,6 @@ def _read_arc_climate(start_ts: datetime, *, period: str = "daily") -> list[dict
     arcs (age_days <= _ARC_STALE_DAYS) are omitted entirely (silence is not
     churn), matching the "omit empty section" behaviour DoD requires.
     """
-    if period != "weekly":
-        return []
-
     arc_dir = room_path('lapis_state')
     if not arc_dir.exists():
         return []

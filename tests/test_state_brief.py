@@ -817,6 +817,19 @@ class TestArcSourceParam:
         mock_registry.assert_called_once()
         room_path_mock.assert_not_called()
 
+    def test_registry_arc_source_forwards_prefix(self, tmp_path):
+        """DoD 14-15: the registry source must be able to read a scratch
+        prefix, not just the hardcoded live 'arc/' prefix."""
+        with (
+            patch("lapis_pm.state_brief.room_path", MagicMock()),
+            patch("lapis_pm.arc_registry.read_arc_climate_from_registry", return_value=[]) as mock_registry,
+        ):
+            state_brief._read_arc_climate(
+                datetime.now(tz=timezone.utc), period="weekly", arc_source="registry", prefix="scratch/",
+            )
+
+        mock_registry.assert_called_once_with("scratch/")
+
     def test_non_weekly_short_circuits_regardless_of_arc_source(self, tmp_path):
         room_path_mock = MagicMock()
         with (

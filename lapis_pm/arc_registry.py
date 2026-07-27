@@ -408,20 +408,24 @@ def read_arc_climate_from_registry(prefix: str = DEFAULT_PREFIX, *, mem=None, no
 # D5/D5a: automated drift cross-check
 # ---------------------------------------------------------------------------
 
-def compare_sources(start_ts: datetime, period: str = "weekly") -> dict:
+def compare_sources(start_ts: datetime, period: str = "weekly", *, prefix: str = DEFAULT_PREFIX) -> dict:
     """Run _read_arc_climate with arc_source="prose" and "registry" over the
     same inputs and return a structural diff. Reports only -- never raises,
     never mutates, never auto-fails a night pass.
 
+    `prefix` selects which mem-key prefix the registry side reads from, so a
+    PM can run this against a scratch prefix (DoD 14-15) before ever
+    comparing against the live `arc/` prefix. Defaults to DEFAULT_PREFIX.
+
     D5a: `blind_spots` names slugs where the prose path produced a definite
-    classification while the registry produced >= 1 "unobserved" delta for
-    that same slug -- the mechanical fingerprint of "the declaration lives
-    somewhere the registry cannot see."
+    classification while the registry either has no row at all for that slug
+    or produced >= 1 "unobserved" delta for it -- the mechanical fingerprint
+    of "the declaration lives somewhere the registry cannot see."
     """
     from . import state_brief
 
     prose = state_brief._read_arc_climate(start_ts, period=period, arc_source="prose")
-    registry = state_brief._read_arc_climate(start_ts, period=period, arc_source="registry")
+    registry = state_brief._read_arc_climate(start_ts, period=period, arc_source="registry", prefix=prefix)
 
     prose_by_slug = {e["slug"]: e for e in prose}
     registry_by_slug = {e["slug"]: e for e in registry}
@@ -454,13 +458,11 @@ def compare_sources(start_ts: datetime, period: str = "weekly") -> dict:
         else:
             disagreements.append({"slug": slug, "prose": p["classification"], "registry": r["classification"]})
 
-    raw_rows = read_registry_rows()
+    raw_rows = read_registry_rows(prefix)
     blind_spots: list[str] = []
     for slug in prose_by_slug:
         row = raw_rows.get(slug)
-        if row is None:
-            continue
-        if any(d.kind == "unobserved" for d in _row_deltas(row)):
+        if row is None or any(d.kind == "unobserved" for d in _row_deltas(row)):
             blind_spots.append(slug)
     blind_spots.sort()
 

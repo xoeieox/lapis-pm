@@ -276,11 +276,13 @@ class TestCompareSources:
     and the registry shows an unobserved delta for that slug."""
 
     def test_agreement_yields_no_disagreements_or_blind_spots(self, monkeypatch):
-        def fake_read(start_ts, *, period="weekly", arc_source="prose"):
+        def fake_read(start_ts, *, period="weekly", arc_source="prose", prefix="arc/"):
             return [{"slug": "a", "classification": "gone-quiet", "text": "a"}]
 
         monkeypatch.setattr(state_brief, "_read_arc_climate", fake_read)
-        monkeypatch.setattr(arc_registry, "read_registry_rows", lambda *a, **kw: {})
+        # "a" has a row (no contract -> no deltas at all), matching the fact
+        # that the registry classified it too -- not a blind spot.
+        monkeypatch.setattr(arc_registry, "read_registry_rows", lambda *a, **kw: {"a": {"slug": "a"}})
 
         result = arc_registry.compare_sources(datetime.now(tz=timezone.utc))
 
@@ -291,7 +293,7 @@ class TestCompareSources:
         assert result["blind_spots"] == []
 
     def test_seeded_divergence_names_the_slug_and_fires_blind_spot(self, monkeypatch):
-        def fake_read(start_ts, *, period="weekly", arc_source="prose"):
+        def fake_read(start_ts, *, period="weekly", arc_source="prose", prefix="arc/"):
             if arc_source == "prose":
                 return [
                     {"slug": "a", "classification": "gone-quiet", "text": "a"},
@@ -301,6 +303,14 @@ class TestCompareSources:
 
         monkeypatch.setattr(state_brief, "_read_arc_climate", fake_read)
 
+        # "a" was observed and contradicted (not unobserved) -- consistent
+        # with the registry having produced a definite classification for it.
+        seen_contract = Contract(
+            subject=SubjectRef(kind="arc", id="a"),
+            declaration="do X",
+            elaboration={"next": "do X"},
+            observed=(Observation(source="s", key="next", value="do Y", ts="2026-01-01T00:00:00Z"),),
+        )
         blind_contract = Contract(
             subject=SubjectRef(kind="arc", id="b"),
             declaration="do X",
@@ -309,7 +319,10 @@ class TestCompareSources:
         )
         monkeypatch.setattr(
             arc_registry, "read_registry_rows",
-            lambda *a, **kw: {"b": {"slug": "b", "contract": blind_contract.to_dict()}},
+            lambda *a, **kw: {
+                "a": {"slug": "a", "contract": seen_contract.to_dict()},
+                "b": {"slug": "b", "contract": blind_contract.to_dict()},
+            },
         )
 
         result = arc_registry.compare_sources(datetime.now(tz=timezone.utc))
@@ -318,12 +331,51 @@ class TestCompareSources:
         assert result["only_in_prose"] == ["b"]
         assert result["blind_spots"] == ["b"]
 
+    def test_missing_registry_row_is_also_a_blind_spot(self, monkeypatch):
+        """A slug prose classifies confidently but the registry has zero
+        visibility into (no row at all) is the most extreme form of "the
+        registry cannot see this" and must be named, not silently skipped."""
+        def fake_read(start_ts, *, period="weekly", arc_source="prose", prefix="arc/"):
+            if arc_source == "prose":
+                return [{"slug": "a", "classification": "gone-quiet", "text": "a"}]
+            return []
+
+        monkeypatch.setattr(state_brief, "_read_arc_climate", fake_read)
+        monkeypatch.setattr(arc_registry, "read_registry_rows", lambda *a, **kw: {})
+
+        result = arc_registry.compare_sources(datetime.now(tz=timezone.utc))
+
+        assert result["only_in_prose"] == ["a"]
+        assert result["blind_spots"] == ["a"]
+
     def test_never_raises_on_empty_sources(self, monkeypatch):
         monkeypatch.setattr(state_brief, "_read_arc_climate", lambda *a, **kw: [])
         monkeypatch.setattr(arc_registry, "read_registry_rows", lambda *a, **kw: {})
         result = arc_registry.compare_sources(datetime.now(tz=timezone.utc))
         assert result["agreements"] == []
         assert result["blind_spots"] == []
+
+    def test_prefix_is_forwarded_to_registry_source_and_row_read(self, monkeypatch):
+        """DoD 14-15: compare_sources must be runnable against a scratch
+        prefix, not hardcoded to the live 'arc/' prefix."""
+        seen_prefixes = []
+
+        def fake_read(start_ts, *, period="weekly", arc_source="prose", prefix="arc/"):
+            if arc_source == "registry":
+                seen_prefixes.append(("read_arc_climate", prefix))
+            return []
+
+        def fake_rows(prefix=arc_registry.DEFAULT_PREFIX, **kw):
+            seen_prefixes.append(("read_registry_rows", prefix))
+            return {}
+
+        monkeypatch.setattr(state_brief, "_read_arc_climate", fake_read)
+        monkeypatch.setattr(arc_registry, "read_registry_rows", fake_rows)
+
+        arc_registry.compare_sources(datetime.now(tz=timezone.utc), prefix="scratch/")
+
+        assert ("read_arc_climate", "scratch/") in seen_prefixes
+        assert ("read_registry_rows", "scratch/") in seen_prefixes
 
 
 class TestNoNewMutableGlobalOrEnvVar:

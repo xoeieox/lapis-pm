@@ -474,6 +474,7 @@ def _arc_weaver_signal(slug: str) -> datetime | None:
 def _read_arc_climate(
     start_ts: datetime, *, period: str = "daily",
     arc_source: str = "prose",
+    prefix: str = "arc/",
 ) -> list[dict]:
     """Reconcile each arc's declared NEXT against ground truth and classify
     it. `arc_source` selects where the declared/observed state comes from --
@@ -481,12 +482,16 @@ def _read_arc_climate(
     "registry" (arc_registry.py's structured mem.db rows). Additive per D4:
     the reconciler keeps prose as the behavior under test; registry is off
     by default and does not change prose output.
+
+    `prefix` selects which mem-key prefix the "registry" source reads from
+    (e.g. a scratch prefix for a DoD 14-15 verification run). Ignored by the
+    "prose" source. Defaults to arc_registry.DEFAULT_PREFIX's value ("arc/").
     """
     if period != "weekly":
         return []
     if arc_source == "registry":
         from . import arc_registry
-        return arc_registry.read_arc_climate_from_registry()
+        return arc_registry.read_arc_climate_from_registry(prefix)
     return _read_arc_climate_from_prose(start_ts)
 
 

@@ -29,6 +29,8 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import filecmp
 import fnmatch
 import hashlib
@@ -4804,10 +4806,37 @@ def _fetch_friction_sidecar(repo: str, pr_number: int) -> str | None:
         return None
 
 
-def _existing_friction_keys(queue_path: Path) -> set[tuple]:
-    keys: set[tuple] = set()
+def _friction_normalize_text(s: str | None) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+
+def _friction_content_key(obstacle: str | None, path_taken: str | None) -> str:
+    """Content key for cross-target inheritance detection (D2/D3).
+
+    sha256(normalize(obstacle) + NUL + normalize(path_taken))[:16]. Deliberately
+    excludes silent-gap records from every call site — see finding 5: they
+    share identical text by design and are not obstacle content.
+    """
+    norm = _friction_normalize_text(obstacle) + "\x00" + _friction_normalize_text(path_taken)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def _existing_friction_keys(queue_path: Path) -> tuple[set[tuple], dict[str, dict]]:
+    """Scan the queue for identity keys and content keys.
+
+    Identity keys are (task_id, index) across all record sources — the
+    existing same-task idempotence guard, unchanged.
+
+    Content keys map a normalized (obstacle, path_taken) hash to the
+    provenance of the first `agent-deposit` record found with that content —
+    used to suppress entries inherited (with false provenance) from an
+    earlier target (finding 2). Silent-gap records never participate: they
+    share identical text by design (finding 5).
+    """
+    identity_keys: set[tuple] = set()
+    content_index: dict[str, dict] = {}
     if not queue_path.exists():
-        return keys
+        return identity_keys, content_index
     try:
         with queue_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -4819,30 +4848,144 @@ def _existing_friction_keys(queue_path: Path) -> set[tuple]:
                 except json.JSONDecodeError:
                     continue
                 prov = rec.get("provenance") or {}
-                keys.add((prov.get("task_id"), rec.get("index")))
+                identity_keys.add((prov.get("task_id"), rec.get("index")))
+                if rec.get("record_source") == "agent-deposit":
+                    ckey = _friction_content_key(rec.get("obstacle"), rec.get("path_taken"))
+                    if ckey not in content_index:
+                        content_index[ckey] = prov
     except OSError:
         pass
-    return keys
+    return identity_keys, content_index
+
+
+_FRICTION_LOCK_TIMEOUT_DEFAULT = 10.0
+
+
+class _FrictionLockTimeout(Exception):
+    """Raised when the friction queue flock is not acquired within the timeout."""
+
+
+def _friction_lock_path() -> Path:
+    return _friction_queue_path().parent / ".queue.lock"
+
+
+@contextlib.contextmanager
+def _friction_queue_lock(timeout_s: float | None = None):
+    """Exclusive flock serializing the friction queue's two writers (D2a):
+    harvest append (`_append_friction_records`) and the D3 backfill's
+    whole-file rewrite. Prevents a backfill rewrite from silently dropping a
+    concurrently-appended record.
+
+    Raises `_FrictionLockTimeout` if not acquired within `timeout_s`. Callers
+    decide the failure mode: harvest must never raise (warn + skip — safe to
+    retry since harvest is idempotent); backfill fails closed (abort, zero
+    bytes changed — see `friction_backfill_provenance`).
+
+    `timeout_s` defaults to `_FRICTION_LOCK_TIMEOUT_DEFAULT`, read at call
+    time (not bound as a function-signature default) so tests can override
+    the module-level constant and have it take effect immediately.
+    """
+    if timeout_s is None:
+        timeout_s = _FRICTION_LOCK_TIMEOUT_DEFAULT
+    lock_path = _friction_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise _FrictionLockTimeout(
+                        f"friction queue lock timed out after {timeout_s}s: {lock_path}"
+                    )
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _write_inherited_entries_marker(task_id: str | None, suppressed: list[dict]) -> None:
+    """Durable marker for a harvest that suppressed >=1 inherited entry (D2 fold).
+
+    Loud by design — never called on the clean path (no suppression -> no
+    marker, no noise).
+    """
+    marker_path = _friction_queue_path().parent / f"inherited-entries-{task_id or 'unknown'}.json"
+    try:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(suppressed, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        logger.warning("friction harvest: failed to write inherited-entries marker %s: %s", marker_path, e)
+
+
+def _append_friction_records_locked(records: list[dict], queue_path: Path) -> int:
+    identity_keys, content_index = _existing_friction_keys(queue_path)
+    written = 0
+    suppressed: list[dict] = []
+    incoming_task_id = None
+    with queue_path.open("a", encoding="utf-8") as f:
+        for rec in records:
+            prov = rec.get("provenance") or {}
+            incoming_task_id = incoming_task_id or prov.get("task_id")
+            ikey = (prov.get("task_id"), rec.get("index"))
+            if ikey in identity_keys:
+                continue
+            if rec.get("record_source") == "agent-deposit":
+                ckey = _friction_content_key(rec.get("obstacle"), rec.get("path_taken"))
+                existing_prov = content_index.get(ckey)
+                if existing_prov is not None and existing_prov.get("task_id") != prov.get("task_id"):
+                    logger.warning(
+                        "friction harvest: suppressed inherited entry %s "
+                        "(incoming task=%s target=%s) already recorded under task=%s target=%s",
+                        ckey, prov.get("task_id"), prov.get("target_id"),
+                        existing_prov.get("task_id"), existing_prov.get("target_id"),
+                    )
+                    suppressed.append({
+                        "hash": ckey,
+                        "incoming": {
+                            "task_id": prov.get("task_id"), "target_id": prov.get("target_id"),
+                            "repo": prov.get("repo"), "pr": prov.get("pr"),
+                        },
+                        "existing": {
+                            "task_id": existing_prov.get("task_id"), "target_id": existing_prov.get("target_id"),
+                            "repo": existing_prov.get("repo"), "pr": existing_prov.get("pr"),
+                        },
+                    })
+                    continue
+                content_index[ckey] = prov
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            identity_keys.add(ikey)
+            written += 1
+    if suppressed:
+        _write_inherited_entries_marker(incoming_task_id, suppressed)
+    return written
 
 
 def _append_friction_records(records: list[dict]) -> int:
-    """Append-only idempotent write, deduped on (task_id, index). Returns count written."""
+    """Append-only idempotent write, deduped on (task_id, index) plus
+    content-level suppression of cross-target inherited entries (D2).
+
+    Guarded by the D2a lock shared with the backfill rewrite. Never raises —
+    on lock timeout, logs a WARNING and returns 0; the caller (harvest) will
+    observe the same PR again next tick and safely re-append (harvest is
+    idempotent), so no data is lost, only delayed.
+    """
     if not records:
         return 0
     queue_path = _friction_queue_path()
     queue_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _existing_friction_keys(queue_path)
-    written = 0
-    with queue_path.open("a", encoding="utf-8") as f:
-        for rec in records:
-            prov = rec.get("provenance") or {}
-            key = (prov.get("task_id"), rec.get("index"))
-            if key in existing:
-                continue
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            existing.add(key)
-            written += 1
-    return written
+    try:
+        with _friction_queue_lock():
+            return _append_friction_records_locked(records, queue_path)
+    except _FrictionLockTimeout as e:
+        logger.warning("friction harvest: %s — skipping this batch, will retry next observation", e)
+        return 0
 
 
 def _harvest_friction_for_pr(target_id: str, repo: str, pr: dict) -> int:
@@ -4939,6 +5082,117 @@ def read_friction_records(
     if limit is not None:
         records = records[:limit]
     return records
+
+
+# ---------------------------------------------------------------------------
+# D3 — one-shot provenance backfill (friction-sidecar-per-pr-provenance-v0)
+#
+# Post-deploy archaeology for the corpus written before D1+D2 closed the
+# inheritance hole: tags (never deletes or reorders) non-canonical members of
+# a cross-target content group with provenance_suspect + canonical_task_id.
+# Manual-only — invoked by hand, once, by a PM session. No systemd unit, no
+# timer, no daemon/night-pass call site (see
+# tests/test_friction_capture.py::TestBackfillManualOnly).
+# ---------------------------------------------------------------------------
+
+def _friction_group_key_for_backfill(rec) -> str | None:
+    """Content key for D3 grouping, or None if this record is excluded from
+    grouping entirely (finding 5 / D3 fold): only `agent-deposit` records are
+    grouped. Silent-gap records (`obstacle == "no_friction_reported"`) share
+    identical text across every target by design and must never collapse
+    into a bogus group.
+    """
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("record_source") != "agent-deposit":
+        return None
+    return _friction_content_key(rec.get("obstacle"), rec.get("path_taken"))
+
+
+def _compute_friction_backfill_tags(records: list) -> tuple[dict[int, dict], int]:
+    """Pure function: given the parsed queue in file order (index == line
+    number; malformed lines are `None`), return {index: tag_dict} for every
+    non-canonical member of a group whose content key is shared across >=2
+    distinct task_ids, plus the number of such cross-attribution groups.
+
+    Canonical = earliest by `provenance.captured_at` within the group;
+    canonical members are never present in the returned tags dict.
+    """
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for idx, rec in enumerate(records):
+        key = _friction_group_key_for_backfill(rec)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append((idx, rec))
+
+    tags: dict[int, dict] = {}
+    group_count = 0
+    for members in groups.values():
+        task_ids = {(rec.get("provenance") or {}).get("task_id") for _, rec in members}
+        if len(task_ids) < 2:
+            continue  # same-task repeats only — not cross-attribution
+        group_count += 1
+        ordered = sorted(members, key=lambda m: (m[1].get("provenance") or {}).get("captured_at") or "")
+        canonical_task_id = (ordered[0][1].get("provenance") or {}).get("task_id")
+        for idx, _rec in ordered[1:]:
+            tags[idx] = {"provenance_suspect": True, "canonical_task_id": canonical_task_id}
+    return tags, group_count
+
+
+def friction_backfill_provenance(*, apply: bool = False) -> dict:
+    """One-shot D3 backfill. Dry-run by default; `apply=True` writes tags.
+
+    Rewrites the queue atomically (tmp + rename) under the D2a lock shared
+    with harvest appends. No record is ever deleted or reordered — line
+    count and ordering are identical before/after. Idempotent: re-running
+    against an already-tagged queue recomputes the same tags and leaves the
+    file byte-identical.
+
+    Raises `_FrictionLockTimeout` on lock contention — unlike harvest, the
+    backfill does NOT swallow it: callers (the CLI) must abort non-zero
+    having changed zero bytes, per D2a.
+    """
+    queue_path = _friction_queue_path()
+    with _friction_queue_lock():
+        if not queue_path.exists():
+            return {"total_records": 0, "tagged": 0, "groups": 0, "applied": False}
+
+        raw_lines = queue_path.read_text(encoding="utf-8").splitlines()
+        records: list[dict | None] = []
+        for line in raw_lines:
+            stripped = line.strip()
+            if not stripped:
+                records.append(None)
+                continue
+            try:
+                records.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                records.append(None)
+
+        tags, group_count = _compute_friction_backfill_tags(records)
+        result = {
+            "total_records": len(records),
+            "tagged": len(tags),
+            "groups": group_count,
+            "applied": False,
+        }
+        if not apply:
+            return result
+
+        new_lines = []
+        for idx, raw_line in enumerate(raw_lines):
+            tag = tags.get(idx)
+            rec = records[idx]
+            if tag is not None and rec is not None:
+                new_lines.append(json.dumps({**rec, **tag}, ensure_ascii=False))
+            else:
+                new_lines.append(raw_line)
+
+        tmp_path = queue_path.with_name(queue_path.name + ".tmp")
+        tmp_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+        os.replace(tmp_path, queue_path)
+        result["applied"] = True
+        return result
 
 
 def _recover_reviewer_verdict(raw: str) -> dict | None:

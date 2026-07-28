@@ -336,6 +336,14 @@ agents:
       nothing notable happened. lapis-pm sanitizes this file at harvest; malformed
       or oversized entries are dropped silently and never fed back to you.
 
+      `friction.json` is a **per-PR sidecar, not a running log.** It must
+      contain **only** obstacles from *this* task. If the file already exists
+      in your worktree with entries from earlier work, **replace its entire
+      contents with your own entries** — do not append to, merge with, or
+      preserve them. Those entries were already captured when their own PR
+      was reviewed; re-submitting them files them under the wrong task. If
+      you hit nothing notable, leave the file untouched or delete it.
+
       ## Already-satisfied verdict protocol
 
       If you inspect the target spec and discover the spec is ALREADY SATISFIED

@@ -15,7 +15,8 @@ Commands:
     resume <target_id>
     list
     land <target_id> [--dry-run]
-    friction list [--target ID] [--repo REPO] [--limit N] [--json]
+    friction list [--target ID] [--repo REPO] [--limit N] [--json] [--exclude-suspect]
+    friction backfill-provenance [--apply]
     brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
     brief-resolve <target_id> <option_id>
     review-gate {status,resume}
@@ -847,12 +848,16 @@ def cmd_friction_list(args) -> int:
     """Operator/debug read of the friction capture queue — not the human-tongue
     ratify surface (that's the Loupe Desk gem, Unit 3). Silent-gap records are
     rendered as a visibly distinct class, never interleaved as reported friction.
+    provenance_suspect records (D3 backfill) render with a visible marker and
+    are excluded entirely when --exclude-suspect is passed.
     """
     records = pm_core.read_friction_records(
         target_id=getattr(args, "target", None),
         repo=getattr(args, "repo", None),
         limit=getattr(args, "limit", None),
     )
+    if getattr(args, "exclude_suspect", False):
+        records = [r for r in records if not r.get("provenance_suspect")]
     if getattr(args, "json", False):
         print(json.dumps(records))
         return 0
@@ -869,6 +874,8 @@ def cmd_friction_list(args) -> int:
         if r.get("record_source") == "silent-gap":
             print(f"{header}  [SILENT-GAP] derived_confidence={r.get('derived_confidence')}")
             continue
+        if r.get("provenance_suspect"):
+            header += f"  [PROVENANCE-SUSPECT canonical_task_id={r.get('canonical_task_id')}]"
         print(header)
         print(f"    obstacle:    {r.get('obstacle', '')}")
         if r.get("path_taken"):
@@ -877,6 +884,29 @@ def cmd_friction_list(args) -> int:
             print(f"    artifact:    {r['artifact']}")
         if r.get("cost_hint") or r.get("confidence"):
             print(f"    cost_hint={r.get('cost_hint')}  confidence={r.get('confidence')}")
+    return 0
+
+
+def cmd_friction_backfill(args) -> int:
+    """One-shot D3 backfill: tag (never delete) queue records whose content
+    matches an earlier record under a different task_id — the mechanism by
+    which a fixer's inherited friction.json entries picked up false
+    provenance before D1+D2 closed the hole. Manual-only: invoked by hand,
+    once, post-deploy — no scheduled artifact calls this.
+    """
+    apply = getattr(args, "apply", False)
+    try:
+        result = pm_core.friction_backfill_provenance(apply=apply)
+    except pm_core._FrictionLockTimeout as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    mode = "APPLIED" if apply else "DRY-RUN"
+    print(
+        f"[{mode}] total_records={result['total_records']} "
+        f"cross_attribution_groups={result['groups']} tagged={result['tagged']}"
+    )
+    if not apply and result["tagged"]:
+        print("Re-run with --apply to write tags to the queue.")
     return 0
 
 
@@ -2139,7 +2169,18 @@ def build_parser() -> argparse.ArgumentParser:
     frl.add_argument("--repo", default=None, help="Filter by repo")
     frl.add_argument("--limit", type=int, default=20, help="Max records to show (default 20)")
     frl.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    frl.add_argument("--exclude-suspect", action="store_true",
+                      help="Omit records tagged provenance_suspect by the D3 backfill (default: shown)")
     frl.set_defaults(func=cmd_friction_list)
+
+    frb = fr_sub.add_parser(
+        "backfill-provenance",
+        help="One-shot: tag (never delete) queue records inherited under false cross-target "
+             "provenance. Manual-only, dry-run by default.",
+    )
+    frb.add_argument("--apply", action="store_true",
+                      help="Write tags to the queue (default: dry-run, prints summary only).")
+    frb.set_defaults(func=cmd_friction_backfill)
 
     rat = sub.add_parser(
         "ratify",

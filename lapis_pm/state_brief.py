@@ -26,6 +26,15 @@ systemd timers, weaver digests) and classifies it as silently-advanced,
 gone-quiet, or unresolvable. Omitted entirely for daily cadences (v0 is
 weekly-only) and omitted from weekly output when every arc is moving.
 
+Weekly briefs additionally render a "Locality" bucket (locality-ledger-chain-v0,
+Leg 2) — % local, cost-class split, and fallback breakdown read from
+agents_core.locality.summarize() (Leg 1's per-call ledger). Lazily imported;
+degrades to no section if Leg 1 is unavailable. A stale ledger (no record in
+24h) renders a health warning instead of a percentage — silence must never
+read as a good week. A reading below threshold deposits a Desk gem per the
+ratified OK->BAD state machine (fire on crossing, silent while BAD, escalate
+once per streak, re-arm on recovery) — see _evaluate_locality_gem.
+
 Temporal compression hierarchy (Gardener observations only):
   daily cadences (morning/afternoon/live) → single latest gardener/derived
   entry, capped at 10 observations ("weather today")
@@ -50,6 +59,8 @@ Pushover:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import sys
@@ -59,6 +70,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agents_core.room_paths import room_path, room_str
+
+logger = logging.getLogger(__name__)
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 BRIEFS_ROOT = room_path('briefs')
@@ -71,6 +84,7 @@ B_CAPTURED = "Captured — not yet built"
 B_AWAITING = "Awaiting your call"
 B_GARDENER = "Gardener Cross-Cutting Observations"
 B_CLIMATE = "Climate"
+B_LOCALITY = "Locality"
 
 # Parses flat markdown bullets from gardener/writeback.py:derive_context output, e.g.
 # "- [Critical] <text>  (evidence: ...)". Info/Unclassified are filtered out upstream
@@ -241,6 +255,13 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
         climate_entries = []
     climate_items = [entry["text"] for entry in climate_entries]
 
+    # --- Locality: % local / cost-class / fallback bucket (weekly cadence only) ---
+    # A brief must never fail because the ledger's source is unavailable.
+    try:
+        locality_items = _read_locality(start_ts, period=period)
+    except Exception:
+        locality_items = []
+
     return {
         B_BUILT: built_items,
         B_RATIFICATIONS: ratification_items,
@@ -249,6 +270,7 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
         B_AWAITING: awaiting_items,
         B_GARDENER: gardener_items,
         B_CLIMATE: climate_items,
+        B_LOCALITY: locality_items,
     }
 
 
@@ -641,6 +663,370 @@ def _arc_docs_since(start_ts: datetime) -> list[str]:
         except OSError:
             pass
     return sorted(results)
+
+
+# ---------------------------------------------------------------------------
+# Locality bucket (locality-ledger-chain-v0, Leg 2)
+# ---------------------------------------------------------------------------
+#
+# Reads agents_core.locality.summarize() / is_ledger_healthy() (Leg 1, landed
+# 2026-07-28 as agents-core-locality-ledger-v0). agents-core is NOT a declared
+# dependency of lapis-pm -- always import it lazily and degrade to [] on
+# ImportError, exactly like every other bucket source degrades on failure.
+
+_LOCALITY_PCT_FLOOR_DEFAULT = 50.0
+_LOCALITY_FALLBACK_CEILING_DEFAULT = 25
+_LOCALITY_ESCALATION_WEEKS_DEFAULT = 4
+_LOCALITY_STATE_KEY = "pm/locality/gem-state"
+_LOCALITY_NEVER_WRITTEN_MARKER = "no records ever written"
+_WEAVER_BASE_DEFAULT = "http://203.0.113.10:8403"
+
+
+def _weaver_base_url() -> str:
+    """Resolve weaver base URL: WEAVER_BASE_URL > WEAVER_BIND_PORT > BRIX default.
+    Mirrors brief_gem._weaver_base_url's resolution order (kept local rather
+    than imported -- locality gems are a distinct, non-reconciled write path)."""
+    base = os.environ.get("WEAVER_BASE_URL")
+    if base:
+        return base.rstrip("/")
+    port = os.environ.get("WEAVER_BIND_PORT")
+    if port:
+        return f"http://127.0.0.1:{port}"
+    return _WEAVER_BASE_DEFAULT
+
+
+def _locality_thresholds() -> dict:
+    """Active threshold values, env-overridable. Conservative defaults --
+    there is no prior locality data at ship time, so the first
+    LOCALITY_ESCALATION_WEEKS (default 4) BAD readings are calibration, not
+    judgment (see PR body)."""
+    return {
+        "pct_local_floor": float(os.environ.get(
+            "LOCALITY_PCT_LOCAL_FLOOR", _LOCALITY_PCT_FLOOR_DEFAULT)),
+        "fallback_ceiling": int(os.environ.get(
+            "LOCALITY_FALLBACK_CEILING", _LOCALITY_FALLBACK_CEILING_DEFAULT)),
+        "escalation_weeks": int(os.environ.get(
+            "LOCALITY_ESCALATION_WEEKS", _LOCALITY_ESCALATION_WEEKS_DEFAULT)),
+    }
+
+
+def _locality_is_bad(summary: dict, thresholds: dict) -> bool:
+    pct = summary.get("pct_local")
+    fallback_count = summary.get("fallback_count", 0) or 0
+    if pct is not None and pct < thresholds["pct_local_floor"]:
+        return True
+    if fallback_count > thresholds["fallback_ceiling"]:
+        return True
+    return False
+
+
+def _format_locality_lines(summary: dict) -> list[str]:
+    """Spoken-aloud lines for the Locality bucket -- no tables, spelled-out
+    numbers (this block lands in the weekly TTS episode via tts_episode.py).
+    A ledger that is healthy but reports 0% local still renders loudly here
+    (total > 0 is the only gate); only a genuinely empty ledger is omitted
+    upstream in _read_locality."""
+    total = summary.get("total", 0) or 0
+    if total == 0:
+        return ["The locality ledger is healthy but recorded no calls this week."]
+
+    pct = summary.get("pct_local") or 0.0
+    lines = [f"{pct:.0f} percent of calls this week were served locally."]
+
+    by_cost_class = summary.get("by_cost_class") or {}
+    if by_cost_class:
+        parts = ", ".join(f"{count} {cls}" for cls, count in sorted(by_cost_class.items()))
+        lines.append(f"Breakdown by cost class: {parts}.")
+
+    fallback_count = summary.get("fallback_count", 0) or 0
+    lines.append(f"{fallback_count} calls fell back to a paid model this week.")
+
+    by_reason = summary.get("by_fallback_reason") or {}
+    if by_reason:
+        top = sorted(by_reason.items(), key=lambda kv: -kv[1])[:3]
+        reasons = ", ".join(f"{reason} ({count})" for reason, count in top)
+        lines.append(f"Top fallback reasons: {reasons}.")
+
+    paid_cost_usd = summary.get("paid_cost_usd")
+    if paid_cost_usd is not None:
+        lines.append(f"Paid spend recorded this week: {paid_cost_usd:.2f} dollars.")
+
+    lines.append(
+        "Note: roughly twenty call sites bypass this ledger's seams entirely "
+        "and are all local, so the true percent local is at least the figure "
+        "reported here."
+    )
+    return lines
+
+
+def _default_locality_state() -> dict:
+    return {
+        "state": "ok",
+        "consecutive_bad": 0,
+        "escalated": False,
+        "open_gem_id": None,
+        "last_pct_local": None,
+        "last_fallback_count": None,
+    }
+
+
+def _load_locality_state(mem) -> dict:
+    """Persisted in mem under pm/locality/gem-state (the brief already reads
+    mem via _mem() elsewhere in this module). Defaults to a fresh 'ok' state
+    on any read/parse failure -- see _evaluate_locality_gem's docstring for
+    what that means for the firing rule if state is ever lost."""
+    rec = mem.get(_LOCALITY_STATE_KEY)
+    content = rec.get("content") if rec else None
+    if not content:
+        return _default_locality_state()
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return _default_locality_state()
+    state = _default_locality_state()
+    if isinstance(data, dict):
+        state.update({k: v for k, v in data.items() if k in state})
+    return state
+
+
+def _save_locality_state(mem, state: dict) -> None:
+    mem.set(_LOCALITY_STATE_KEY, json.dumps(state, ensure_ascii=False),
+             tags=["lapis-pm", "locality"])
+
+
+def _locality_transition(prior: dict, is_bad: bool, escalation_weeks: int) -> tuple[dict, str | None]:
+    """Ratified firing rule (locality-ledger-chain-v0, Erah 2026-07-28) --
+    NOT a content dedup, a state machine:
+
+      fire on the OK->BAD transition ("crossing")
+      stay silent while it remains BAD
+      escalate exactly once per BAD streak, at the Nth consecutive BAD
+      reading ("escalation")
+      re-arm on recovery to OK
+
+    Returns (new_state, fire) where fire is None, "crossing", or "escalation".
+    """
+    new_state = dict(prior)
+    fire: str | None = None
+    if is_bad:
+        if prior.get("state") != "bad":
+            new_state["state"] = "bad"
+            new_state["consecutive_bad"] = 1
+            new_state["escalated"] = False
+            fire = "crossing"
+        else:
+            new_state["consecutive_bad"] = prior.get("consecutive_bad", 0) + 1
+            if not prior.get("escalated") and new_state["consecutive_bad"] >= escalation_weeks:
+                new_state["escalated"] = True
+                fire = "escalation"
+    else:
+        new_state["state"] = "ok"
+        new_state["consecutive_bad"] = 0
+        new_state["escalated"] = False
+    return new_state, fire
+
+
+def _locality_gem_text(kind: str, summary: dict, thresholds: dict, prior_state: dict) -> dict:
+    """Plain, factual gem payload -- ratified 2026-07-28: Erah sided with the
+    Mirror Council stand-aside against the majority's escalating/accusatory
+    narrative. No surprise->accusation->verdict progression, no 'Cloud-
+    Dependent by default' burden shift. Just the number, the delta from the
+    prior reading, the top fallback reasons, and one direct question. This
+    text is spoken aloud in the weekly TTS episode.
+
+    Active threshold values are recorded in the context block on every fire
+    (provenance, not prevention -- a later reading of the gem shows whether
+    the line moved, rather than the code trying to guard against retuning)."""
+    pct = summary.get("pct_local") or 0.0
+    fallback_count = summary.get("fallback_count", 0) or 0
+    prior_pct = prior_state.get("last_pct_local")
+    if prior_pct is None:
+        delta_str = "no prior reading to compare against"
+    else:
+        delta_str = f"{pct - prior_pct:+.1f} points from last week's {prior_pct:.1f} percent"
+
+    by_reason = summary.get("by_fallback_reason") or {}
+    top_reasons = sorted(by_reason.items(), key=lambda kv: -kv[1])[:3]
+    reasons_str = ", ".join(f"{k} ({v})" for k, v in top_reasons) if top_reasons else "none recorded"
+
+    if kind == "escalation":
+        weeks = prior_state.get("consecutive_bad", thresholds["escalation_weeks"]) + 1
+        title = f"Locality has stayed below the floor for {weeks} weeks running"
+        ask = "Fix the fallback defaults, or adjust the threshold?"
+    else:
+        title = "Locality reading crossed below the floor this week"
+        ask = "Is this expected, or should the fallback defaults change?"
+
+    why = (
+        f"{pct:.1f} percent local this week, {delta_str}. "
+        f"Fallback count: {fallback_count}. Top fallback reasons: {reasons_str}."
+    )
+
+    context = [
+        {
+            "label": "This week",
+            "lines": [
+                f"% local: {pct:.1f}",
+                f"Fallback count: {fallback_count}",
+                f"Top fallback reasons: {reasons_str}",
+            ],
+        },
+        {
+            "label": "Active thresholds",
+            "lines": [
+                f"Floor: {thresholds['pct_local_floor']}% local",
+                f"Fallback ceiling: {thresholds['fallback_ceiling']} per week",
+                f"Escalation: {thresholds['escalation_weeks']} consecutive weeks",
+            ],
+        },
+    ]
+
+    return {
+        "title": title[:200],
+        "ask": ask[:500],
+        "why": why,
+        "context": context,
+        "options": [],
+        "agent": "locality-ledger",
+        "origin": "from · weekly brief",
+    }
+
+
+def _post_locality_gem(payload: dict) -> str | None:
+    """POST /v0/decision-gems. Fail-soft: weaver unreachable or any error ->
+    logs a WARNING, returns None. Never raises -- a Weaver outage must not
+    stop the weekly brief from being written."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("WEAVER_BASE_URL"):
+        return None  # under pytest with no explicit (mock/test) weaver target -> do NOT hit live prod
+    try:
+        import httpx
+        base = _weaver_base_url()
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(f"{base}/v0/decision-gems", json=payload)
+            resp.raise_for_status()
+            return resp.json().get("gem_id")
+    except Exception as exc:
+        logger.warning("locality: gem deposit failed (weaver unreachable or error): %s", exc)
+        return None
+
+
+def _supersede_locality_gem(gem_id: str, reason: str) -> None:
+    """POST /v0/decision-gems/{gem_id}/supersede. Best-effort -- swallows any
+    failure (404/409/network) with a WARNING; superseding is housekeeping,
+    not load-bearing for the new gem's deposit."""
+    if not gem_id:
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("WEAVER_BASE_URL"):
+        return
+    try:
+        import httpx
+        base = _weaver_base_url()
+        with httpx.Client(timeout=10.0) as client:
+            client.post(
+                f"{base}/v0/decision-gems/{gem_id}/supersede",
+                json={"reason": reason, "by": "lapis-pm:locality-ledger"},
+            )
+    except Exception as exc:
+        logger.warning("locality: gem supersede failed for %s: %s", gem_id, exc)
+
+
+def _evaluate_locality_gem(summary: dict) -> None:
+    """Decide whether this week's reading fires a Desk gem per the ratified
+    state machine, and deposit it if so. State (current OK/BAD, consecutive-
+    BAD count, escalation flag, open gem id, last reading) is persisted in
+    mem at pm/locality/gem-state.
+
+    If that state is lost (mem entry missing/corrupt), it re-derives from a
+    fresh 'ok' baseline: a genuinely-OK week stays silent as normal, but a
+    week that is still BAD will look like a fresh OK->BAD crossing and fire
+    again -- and since the old open_gem_id is lost too, any still-open prior
+    gem cannot be superseded (a possible duplicate open gem, self-healing on
+    the next transition). This is a deliberate simplicity tradeoff: a small
+    mem key beside the brief output is judged reliable enough not to warrant
+    a second, file-based durability path for a weekly-cadence signal.
+
+    Never raises -- wrapped by the caller (_read_locality) with a WARNING.
+    """
+    thresholds = _locality_thresholds()
+    is_bad = _locality_is_bad(summary, thresholds)
+
+    mem = _mem()
+    prior = _load_locality_state(mem)
+    new_state, fire = _locality_transition(prior, is_bad, thresholds["escalation_weeks"])
+
+    logger.info(
+        "locality: pct_local=%.1f fallback_count=%s is_bad=%s fire=%s",
+        summary.get("pct_local") or 0.0, summary.get("fallback_count", 0), is_bad, fire,
+    )
+
+    if fire:
+        payload = _locality_gem_text(fire, summary, thresholds, prior)
+        prior_gem_id = prior.get("open_gem_id")
+        if prior_gem_id:
+            _supersede_locality_gem(prior_gem_id, reason=f"superseded by new {fire} reading")
+        gem_id = _post_locality_gem(payload)
+        new_state["open_gem_id"] = gem_id or prior_gem_id
+
+    new_state["last_pct_local"] = summary.get("pct_local")
+    new_state["last_fallback_count"] = summary.get("fallback_count", 0)
+    _save_locality_state(mem, new_state)
+
+
+def _read_locality(start_ts: datetime, *, period: str = "weekly") -> list[str]:
+    """Locality bucket (locality-ledger-chain-v0, Leg 2): % local, cost-class
+    split, and fallback breakdown from agents_core.locality's per-call ledger
+    (Leg 1, landed). Weekly-only, mirroring Climate.
+
+    Silence and zero are different findings and must render differently:
+      - agents_core.locality unimportable, or is_ledger_healthy()/summarize()
+        raise, or the ledger has literally never been written -> [] (no
+        section at all -- same as an absent Leg 1 install; the brief still
+        generates).
+      - the ledger exists but has gone stale (no record in 24h) -> a health
+        warning line, no percentage. An empty week must never read as a
+        good week.
+      - the ledger is healthy and reports 0% local -> that 0% renders,
+        loudly (see _format_locality_lines).
+
+    A healthy reading also runs the threshold/gem evaluation as a side
+    effect (weekly-cadence only, matching the ratified DoD) -- wrapped in
+    its own try/except so a Weaver outage or gem-logic bug never blocks the
+    brief.
+    """
+    if period != "weekly":
+        return []
+
+    try:
+        from agents_core.locality import summarize, is_ledger_healthy
+    except ImportError:
+        return []
+
+    try:
+        healthy, health_reason = is_ledger_healthy()
+    except Exception:
+        return []
+
+    if not healthy:
+        if _LOCALITY_NEVER_WRITTEN_MARKER in health_reason:
+            return []  # never written at all -- treat as no data, not silence
+        return [
+            f"The locality ledger has gone silent: {health_reason}. "
+            "Treat this as missing data, not a good week -- no percentage below."
+        ]
+
+    try:
+        summary = summarize(since=start_ts)
+    except Exception:
+        return []
+
+    lines = _format_locality_lines(summary)
+
+    try:
+        _evaluate_locality_gem(summary)
+    except Exception as exc:
+        logger.warning("locality: gem evaluation failed: %s", exc)
+
+    return lines
 
 
 # ---------------------------------------------------------------------------

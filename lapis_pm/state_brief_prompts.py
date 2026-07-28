@@ -23,6 +23,15 @@ folded into a raw synthesis block; the arc-reconciler's bullets are already
 classified prose-ready text. Climate is omitted entirely for daily cadences
 (v0 is weekly-only) and omitted from weekly output when it has no items (no
 empty-section noise — every tracked arc is "moving").
+
+Weekly briefs also render a "Locality" bucket (locality-ledger-chain-v0, Leg
+2) the same way — a normal header + already-composed prose-ready lines, not
+folded into a raw synthesis block. Omitted entirely for daily cadences and
+omitted from weekly output when the reader has nothing to say (Leg 1
+unavailable or the ledger has literally never been written). Unlike Climate,
+an empty *reading* is not the same as an empty *section* — a healthy ledger
+reporting 0% local, or a stale ledger, both produce non-empty lines and are
+rendered; see state_brief._read_locality.
 """
 
 from __future__ import annotations
@@ -35,10 +44,12 @@ BUCKET_ORDER = [
     "Awaiting your call",
     "Gardener Cross-Cutting Observations",
     "Climate",
+    "Locality",
 ]
 
 _GARDENER_BUCKET = "Gardener Cross-Cutting Observations"
 _CLIMATE_BUCKET = "Climate"
+_LOCALITY_BUCKET = "Locality"
 
 DAILY_SYSTEM = """You are the Lapis PM state-brief narrator. Your job is to write
 clear, terse prose for Erah — the principal engineer — summarising the current
@@ -91,7 +102,13 @@ cut the ghost, do not celebrate it. Write in short breath-driven lines
 structured Observation / Disruption / Invitation ('The river moved / You
 hold the gate / Open it'): a friend offering rescue, not a machine auditing
 compliance. Plain text only — no TTS cadence or prosody markers (those
-belong to Unit 3)."""
+belong to Unit 3).
+
+The Locality block reports measured fact — percent of calls served locally,
+cost-class split, fallback count. State it plainly, exactly as the lines are
+given; do not editorialize, escalate, or add urgency the lines themselves
+don't carry. If the block is a ledger-silence warning, treat the silence
+itself as the finding, not as cause for alarm."""
 
 WEEKLY_TEMPLATE = """\
 Write a short prose paragraph under each header exactly as given below.
@@ -143,6 +160,15 @@ def format_bucket_sections(buckets: dict[str, list[str]], start_label: str, *, p
             items = buckets.get(name, [])
             if not items:
                 continue  # every tracked arc is moving — no empty-section noise
+            body = "\n".join(f"- {item}" for item in items)
+            sections.append(f"## {name}\n{body}")
+            continue
+        if name == _LOCALITY_BUCKET:
+            if period != "weekly":
+                continue  # weekly-only, mirroring Climate
+            items = buckets.get(name, [])
+            if not items:
+                continue  # reader had nothing to say (Leg 1 absent / never written)
             body = "\n".join(f"- {item}" for item in items)
             sections.append(f"## {name}\n{body}")
             continue

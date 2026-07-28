@@ -358,47 +358,29 @@ def check_chain_advance(just_landed_tid: str) -> list[str]:
 
 
 def _fire_initial_dispatch(target, intent: str, chain_group: str, triggered_by: str) -> None:
-    """Fire initial_dispatch for a chain leg via the same path as --force-dispatch."""
-    from lapis_pm import pm_core, episodic
+    """Fire initial_dispatch for a chain leg via pm_core.force_dispatch — the
+    same guarded path (adopted-PR guard, open-PR branch reuse, concurrency
+    guard, append_dispatched, _check_calcification) that --force-dispatch
+    uses, with chain-specific episodic tags/message layered on top so only
+    one episodic.write_dispatch call happens per chain dispatch."""
+    from lapis_pm import pm_core
 
-    spec_sum = episodic.spec_summary(target.id)
-    vars_ = {
-        "target_id": target.id,
-        "spec_summary": spec_sum,
-        "repo": target.pm_repo or "",
-        "question": intent,
-        "pr_number": "",
-        "slug": "chain-auto",
-    }
-    res = pm_core._SHAPER.dispatch("fixer", target.id, intent, vars_=vars_)
-    pm_core.append_dispatched(target.id, {
-        "gpu_id": res.task_id,
-        "spec_id": res.spec_id,
-        "agent_type": "fixer",
-        "intent": intent,
-        "repo": target.pm_repo or "",
-        "ts": pm_core._now_iso(),
-        "status": "pending",
-        "retry_count": 0,
-    })
-    episodic.write_dispatch(
-        target.id,
-        (
-            f"Chain auto-dispatch: fixer → {res.task_id}\n"
-            f"Triggered by: {triggered_by}\nIntent: {intent}"
-        ),
-        extra_tags=[
-            f"pm:gpu={res.task_id}",
-            "pm:agent=fixer",
+    task_id = pm_core.force_dispatch(
+        target.id, "fixer", intent,
+        extra_episodic_tags=[
             f"pm:chain-group={chain_group}",
             f"pm:chain-triggered-by={triggered_by}",
         ],
+        episodic_message=(
+            f"Chain auto-dispatch: fixer\n"
+            f"Triggered by: {triggered_by}\nIntent: {intent}"
+        ),
     )
 
     # Emit chain event + update state snapshot
     emit_chain_event(
         chain_group, "auto_dispatch", target.id,
-        details={"triggered_by": triggered_by, "task_id": res.task_id},
+        details={"triggered_by": triggered_by, "task_id": task_id},
     )
     _update_leg_status_in_state(chain_group, target.id, "dispatched")
     # chain_quiet YAML field is deprecated and currently a no-op (Pushover auto-dispatch removed).

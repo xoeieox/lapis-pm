@@ -279,6 +279,13 @@ class TestCheckChainAdvance:
         return t
 
     def test_fires_when_single_dep_satisfied(self):
+        """check_chain_advance's leg-advance fire must route through
+        pm_core.force_dispatch — same guarded path as --force-dispatch — not a
+        hand-rolled vars_ dict missing intent_block (regression for the
+        chain-dispatch intent_block KeyError bug).
+        """
+        from lapis_pm import pm_core
+
         mem = _make_mem_store()
         # Set up: leg_b depends on leg_a; leg_a is now landed
         leg_b = self._make_target("leg_b", ["leg_a"], "implement B", "grp")
@@ -298,24 +305,50 @@ class TestCheckChainAdvance:
             mock_store = MagicMock()
             mock_store.load_all.return_value = [leg_b]
 
+            # pm_core.force_dispatch does its own TargetStore().get(target_id)
+            # lookup (guard checks) independent of chain.py's iteration store.
+            pm_core_store = MagicMock()
+            pm_core_store.get.return_value = leg_b
+
             dispatch_result = MagicMock()
             dispatch_result.task_id = "task-123"
             dispatch_result.spec_id = "spec-abc"
+            mock_dispatch = MagicMock(return_value=dispatch_result)
 
-            mock_shaper = MagicMock()
-            mock_shaper.dispatch.return_value = dispatch_result
+            write_dispatch_mock = MagicMock()
 
             with (
                 patch("lapis_pm.chain.TargetStore", return_value=mock_store),
-                patch("lapis_pm.pm_core._SHAPER", mock_shaper),
-                patch("lapis_pm.pm_core.append_dispatched"),
+                patch("lapis_pm.pm_core.TargetStore", return_value=pm_core_store),
+                patch.object(pm_core._SHAPER, "dispatch", mock_dispatch),
                 patch("lapis_pm.pm_core._now_iso", return_value="2026-04-30T00:00:00+00:00"),
-                patch("lapis_pm.episodic.write_dispatch"),
+                patch("lapis_pm.episodic.write_dispatch", write_dispatch_mock),
                 patch("lapis_pm.episodic.spec_summary", return_value="spec text"),
             ):
                 fired = check_chain_advance("leg_a")
 
-        assert "leg_b" in fired
+                assert "leg_b" in fired
+
+                # No KeyError: force_dispatch supplied intent_block (and everything
+                # else the real fixer system_template requires) — prove it against
+                # the actual registry contract, not just a mock.
+                mock_dispatch.assert_called_once()
+                vars_ = mock_dispatch.call_args.kwargs["vars_"]
+                assert "intent_block" in vars_
+                fixer_agent = pm_core._SHAPER.get_agent("fixer")
+                fixer_agent.system_template.format(**vars_)  # must not raise KeyError
+
+                # dispatched >= 1 via the store (not just the chain-advance return value)
+                dispatched = pm_core.load_dispatched("leg_b")
+                assert len(dispatched) >= 1
+                assert dispatched[0]["gpu_id"] == "task-123"
+
+                # Exactly one episodic write, carrying chain-specific tags.
+                write_dispatch_mock.assert_called_once()
+                _, wkwargs = write_dispatch_mock.call_args
+                extra_tags = wkwargs["extra_tags"]
+                assert "pm:chain-group=grp" in extra_tags
+                assert "pm:chain-triggered-by=leg_a" in extra_tags
 
     def test_does_not_fire_when_not_all_deps_satisfied(self):
         mem = _make_mem_store()
@@ -582,6 +615,82 @@ class TestChainBindAtomicity:
         )
         # Child depends on root → pending regardless.
         assert legs_by_tid["child"]["status"] == "pending"
+
+    def test_auto_fire_dispatches_leg1_with_no_keyerror(self, tmp_path, monkeypatch):
+        """cmd_bind_chain's initial-fire loop (leg 1, no depends_on) must route
+        through pm_core.force_dispatch — not a hand-rolled vars_ dict missing
+        intent_block. Regression for the chain-dispatch intent_block KeyError
+        bug: pre-fix, this crashed inside _SHAPER.dispatch -> _compose_system
+        with KeyError('intent_block'), silently, after the chain legs were
+        already written — bind reported success but no fixer ever dispatched.
+        """
+        from lapis_pm import cli as cli_mod, pm_core
+        from agents_core.targets import TargetStore
+
+        monkeypatch.setattr("agents_core.targets.TARGETS_DIR", tmp_path)
+        monkeypatch.setattr("lapis_pm.cli.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+        monkeypatch.setattr("lapis_pm.pm_core.TargetStore",
+                            lambda: TargetStore(targets_dir=tmp_path))
+
+        mem = _make_mem_store()
+        monkeypatch.setattr("lapis_pm.chain._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.pm_core._mem", lambda: mem)
+        monkeypatch.setattr("lapis_pm.episodic.spec", lambda tid: None)
+        monkeypatch.setattr("lapis_pm.episodic.write_spec",
+                            lambda tid, body: None)
+        monkeypatch.setattr("lapis_pm.pm_core.clear_classified_prs",
+                            lambda tid: None)
+        monkeypatch.setattr("lapis_pm.episodic.spec_summary",
+                            lambda tid, max_chars=None: "spec text")
+
+        dispatch_result = MagicMock()
+        dispatch_result.task_id = "task-leg1"
+        dispatch_result.spec_id = "spec-leg1"
+        mock_dispatch = MagicMock(return_value=dispatch_result)
+        monkeypatch.setattr(pm_core._SHAPER, "dispatch", mock_dispatch)
+
+        write_dispatch_mock = MagicMock()
+        monkeypatch.setattr("lapis_pm.episodic.write_dispatch", write_dispatch_mock)
+
+        legs_path = self._write_legs_yaml(tmp_path, {
+            "legs": [
+                {"tid": "leg1", "repo": "r", "authority": "advisory",
+                 "intent": "do leg1", "branch_slug": "implement"},
+            ]
+        })
+        spec_path = self._write_spec(tmp_path)
+
+        parser = cli_mod.build_parser()
+        args = parser.parse_args([
+            "bind", "grp3",
+            "--spec-from", spec_path,
+            "--legs-from", legs_path,
+            "--create",
+        ])
+        rc = cli_mod.cmd_bind(args)
+        assert rc == 0, "bind should succeed"
+
+        # No KeyError: force_dispatch supplied intent_block (and everything
+        # else the real fixer system_template requires) — prove it against
+        # the actual registry contract, not just a mock.
+        mock_dispatch.assert_called_once()
+        vars_ = mock_dispatch.call_args.kwargs["vars_"]
+        assert "intent_block" in vars_
+        fixer_agent = pm_core._SHAPER.get_agent("fixer")
+        fixer_agent.system_template.format(**vars_)  # must not raise KeyError
+
+        # dispatched >= 1 via the store — leg 1 actually dispatches, not just binds.
+        dispatched = pm_core.load_dispatched("leg1")
+        assert len(dispatched) >= 1
+        assert dispatched[0]["gpu_id"] == "task-leg1"
+
+        # Exactly one episodic write, carrying chain-specific tags.
+        write_dispatch_mock.assert_called_once()
+        _, wkwargs = write_dispatch_mock.call_args
+        extra_tags = wkwargs["extra_tags"]
+        assert "pm:chain-group=grp3" in extra_tags
+        assert "pm:chain-initial" in extra_tags
 
 
 # ---------------------------------------------------------------------------

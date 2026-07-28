@@ -2356,6 +2356,39 @@ def set_outstanding_brief(target_id: str, comment_id: str):
     _mem().set(_brief_key(target_id), comment_id, tags=["lapis-pm", "outstanding-brief"])
 
 
+def _supersede_gem_for_cleared_brief(target_id: str, comment_id: str, reason: str) -> None:
+    """Best-effort: supersede any live brief-gem tied to (target_id, comment_id).
+
+    Fail-soft — any error here must never block the outstanding-brief clear.
+    Uses brief_gem's own reverse-index lookup (the same one deposit_brief_gem
+    uses for idempotency) so this is a single choke-point rather than four
+    call-site patches.
+    """
+    import sys
+    try:
+        from . import brief_gem as _brief_gem
+
+        mem = _mem()
+        rkey = _brief_gem._reverse_key(target_id, comment_id)
+        existing = mem.get(rkey)
+        if not existing:
+            return  # no gem ever deposited for this brief
+        gem_id = existing["content"]
+        result = _brief_gem._call_supersede_endpoint(
+            gem_id, reason=f"brief cleared: {reason}", by="lapis-pm:brief-cleared",
+        )
+        if result is True:
+            _brief_gem._update_map_status(
+                gem_id, "superseded", annotation=f"brief cleared: {reason}",
+            )
+    except Exception as exc:
+        print(
+            f"[outstanding-brief:supersede-gem-error] tid={target_id} "
+            f"cid={comment_id} err={exc!r}",
+            file=sys.stderr,
+        )
+
+
 def clear_outstanding_brief(target_id: str, reason: str = "unspecified") -> None:
     import sys
     # Read the current value for the audit line. A read failure must not
@@ -2375,6 +2408,7 @@ def clear_outstanding_brief(target_id: str, reason: str = "unspecified") -> None
             f"reason={reason}",
             file=sys.stderr,
         )
+        _supersede_gem_for_cleared_brief(target_id, observed, reason)
     else:
         print(
             f"[outstanding-brief:clearing:already-absent] tid={target_id} "

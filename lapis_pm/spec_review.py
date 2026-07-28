@@ -129,7 +129,7 @@ class SpecReviewBrief:
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
     # True whenever the Sonnet leg ran (always reference-only now)
     sonnet_advisory_only: bool = False
-    facets_operator: str = "haiku"  # operator used for Facets personas + synthesis
+    facets_operator: str = "gravitywell"  # operator used for Facets personas + synthesis
     # Effective voicing/operator fields (read from provenance, unknown if absent)
     council_voicing_requested: str = "gravitywell"  # what was requested
     council_voicing_effective: str = "unknown"  # what actually ran (from run YAML)
@@ -859,7 +859,7 @@ def _build_brief(
     facets_deliberation: dict | None = None,
     authority: str = "advisory",
     sonnet_advisory_only: bool = False,
-    facets_operator: str = "haiku",
+    facets_operator: str = "gravitywell",
     council_voicing_requested: str = "gravitywell",
     gw_verdict: str = "skip",
     gw_ran: bool = False,

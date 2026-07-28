@@ -59,6 +59,15 @@ def _reverse_key(target_id: str, brief_comment_id: str) -> str:
     return f"pm/brief-gem/by-brief/{target_id}/{brief_comment_id}"
 
 
+_PR_NUMBER_RE = re.compile(r"PR\s*#\s*(\d+)", re.IGNORECASE)
+
+
+def _extract_pr_number(text: str) -> int | None:
+    """Best-effort scan for a 'PR #<N>' mention in brief text. None if not found."""
+    m = _PR_NUMBER_RE.search(text or "")
+    return int(m.group(1)) if m else None
+
+
 def _parse_brief_title_and_ask(body: str) -> tuple[str, str]:
     """Extract the first line of '## State' and '## Decision needed' from brief markdown."""
     state_m = re.search(r"^## State\s*\n(.+?)(?=\n##|\Z)", body, re.DOTALL | re.MULTILINE)
@@ -119,6 +128,19 @@ def deposit_brief_gem(
             })
             if o.get("action", {}).get("kind") == "merge_pr" and extracted_pr is None:
                 extracted_pr = o["action"].get("pr")
+
+    if not gem_options:
+        # No pm:brief-options comment backs this ask (or its options list was
+        # empty) — synthesize a default set so the gem is never a dead end.
+        if extracted_pr is None:
+            extracted_pr = _extract_pr_number(b.body)
+        if extracted_pr is not None:
+            gem_options.append({
+                "key": "merge_pr",
+                "title": f"Merge PR #{extracted_pr}",
+                "sub": "",
+            })
+        gem_options.append({"key": "ack", "title": "Acknowledge", "sub": ""})
 
     title, ask = _parse_brief_title_and_ask(b.body)
     why = f"Brief for target {target_id}" + (f" PR #{extracted_pr}" if extracted_pr else "")

@@ -747,8 +747,114 @@ class TestNonMergeActionExecutes:
 
 
 # ---------------------------------------------------------------------------
+# Default-options synthesis (lapis-pm-hold-brief-optionless-gem-fix-v0, Fix 1 + 3)
+# ---------------------------------------------------------------------------
+
+class TestDefaultOptionsSynthesis:
+
+    def _deposit(self, b, opts, mock_mem):
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"gem_id": "gem-synth-001"}
+        fake_resp.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+
+        deposited: list[dict] = []
+
+        def _capture_post(url, json=None, **kwargs):
+            deposited.append(json or {})
+            return fake_resp
+
+        mock_client.post.side_effect = _capture_post
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=mock_mem),
+            patch("lapis_pm.brief_gem._brief.read_options", return_value=opts),
+            patch("httpx.Client", return_value=mock_client),
+            patch.dict(os.environ, {"WEAVER_BASE_URL": "http://mock-weaver:9999"}),
+        ):
+            gem_id = brief_gem.deposit_brief_gem(b.target_id, b)
+
+        assert gem_id == "gem-synth-001"
+        return deposited[0]
+
+    def test_no_options_comment_deposits_ack_only(self):
+        """No pm:brief-options comment, no PR mention -> ack-only, non-empty options."""
+        b = _make_brief(body=(
+            "## State\nSomething needs a call.\n"
+            "## Decision needed\nRetry or escalate?\n"
+        ))
+        mock_mem = _make_mock_mem()
+
+        payload = self._deposit(b, None, mock_mem)
+
+        assert payload["options"] == [{"key": "ack", "title": "Acknowledge", "sub": ""}]
+        assert payload["why"] == "Brief for target my-target"
+
+    def test_empty_options_list_also_synthesizes_ack(self):
+        """read_options returns a shape with an empty options list -> same as None case."""
+        b = _make_brief(body=(
+            "## State\nSomething needs a call.\n"
+            "## Decision needed\nRetry or escalate?\n"
+        ))
+        mock_mem = _make_mock_mem()
+        opts = {"brief_id": b.comment_id, "options": []}
+
+        payload = self._deposit(b, opts, mock_mem)
+
+        assert payload["options"] == [{"key": "ack", "title": "Acknowledge", "sub": ""}]
+
+    def test_pr_number_in_title_synthesizes_merge_option_and_why(self):
+        """Title/body names 'PR #N' with no options comment -> merge option + why names it."""
+        b = _make_brief(body=(
+            "## State\nPR #11 is held after static checks passed.\n"
+            "## Decision needed\nMerge PR #11?\n"
+        ))
+        mock_mem = _make_mock_mem()
+
+        payload = self._deposit(b, None, mock_mem)
+
+        assert payload["options"] == [
+            {"key": "merge_pr", "title": "Merge PR #11", "sub": ""},
+            {"key": "ack", "title": "Acknowledge", "sub": ""},
+        ]
+        assert payload["why"] == "Brief for target my-target PR #11"
+
+        fwd_rec = json.loads(next(
+            v for k, v in mock_mem._set_calls if k.startswith("pm/brief-gem/map/")
+        ))
+        assert fwd_rec["pr_number"] == 11
+
+    def test_real_options_present_skips_synthesis(self):
+        """When read_options returns real options, no synthesis happens (unchanged behavior)."""
+        b = _make_brief()
+        opts = _make_advisory_opts(b.comment_id)
+        mock_mem = _make_mock_mem()
+
+        payload = self._deposit(b, opts, mock_mem)
+
+        keys = [o["key"] for o in payload["options"]]
+        assert "ack" not in keys
+        assert keys == ["A", "B"]
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for internal helpers
 # ---------------------------------------------------------------------------
+
+class TestExtractPrNumber:
+
+    def test_extracts_pr_number(self):
+        assert brief_gem._extract_pr_number("Merge PR #11?") == 11
+
+    def test_no_match_returns_none(self):
+        assert brief_gem._extract_pr_number("Retry or escalate?") is None
+
+    def test_case_insensitive_and_spacing(self):
+        assert brief_gem._extract_pr_number("please merge pr # 7 now") == 7
+
 
 class TestParseBriefTitleAndAsk:
 

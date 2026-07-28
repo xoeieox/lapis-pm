@@ -45,7 +45,7 @@ from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer
 from . import node_identity
 from . import signed_directive
 from .spec_review import _parse_spec_authority_text, _parse_spec_verification_text
-from .router_portfolio import emit_decision_kickoff, emit_decision_dispatch, emit_decision_land
+from .router_portfolio import emit_decision_kickoff, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .research_quest import cmd_research_quest
 from .scout.cli import cmd_scout
@@ -569,60 +569,19 @@ def cmd_bind_chain(args) -> int:
                 if target is None:
                     continue
                 intent = leg["intent"].strip()
-                spec_sum = episodic.spec_summary(tid)
-                vars_ = {
-                    "target_id": tid,
-                    "spec_summary": spec_sum,
-                    "repo": target.pm_repo or "",
-                    "question": intent,
-                    "pr_number": "",
-                    "slug": "chain-init",
-                }
-                res = pm_core._SHAPER.dispatch("fixer", tid, intent, vars_=vars_)
-                pm_core.append_dispatched(tid, {
-                    "gpu_id": res.task_id,
-                    "spec_id": res.spec_id,
-                    "agent_type": "fixer",
-                    "intent": intent,
-                    "repo": target.pm_repo or "",
-                    "ts": pm_core._now_iso(),
-                    "status": "pending",
-                    "retry_count": 0,
-                })
-                episodic.write_dispatch(
-                    tid,
-                    f"Chain initial dispatch: fixer → {res.task_id}\nIntent: {intent}",
-                    extra_tags=[
-                        f"pm:gpu={res.task_id}",
-                        "pm:agent=fixer",
+                task_id = pm_core.force_dispatch(
+                    tid, "fixer", intent,
+                    extra_episodic_tags=[
                         f"pm:chain-group={chain_group}",
                         "pm:chain-initial",
                     ],
+                    episodic_message=f"Chain initial dispatch: fixer\nIntent: {intent}",
                 )
-                try:
-                    _model = "unknown"
-                    try:
-                        _model = pm_core._SHAPER.get_agent("fixer").model
-                    except Exception:
-                        pass
-                    _TIER_MAP = {
-                        "haiku": "haiku", "sonnet": "sonnet", "opus": "opus",
-                        "qwen-3.6-35b-a3b": "qwen-local", "qwen3.6-35b-a3b": "qwen-local",
-                    }
-                    emit_decision_dispatch(
-                        target_id=tid,
-                        fragment_id="kickoff",
-                        expert_chosen=_TIER_MAP.get(_model.lower(), _model.lower()),
-                        intent_summary=intent[:200],
-                    )
-                except Exception as _e:
-                    print(f"[router-portfolio:emit-failed] chain dispatch {tid}: {_e}",
-                          file=sys.stderr)
                 chain_mod.emit_chain_event(
                     chain_group, "dispatch", tid,
-                    details={"task_id": res.task_id, "initial": True},
+                    details={"task_id": task_id, "initial": True},
                 )
-                print(f"  Dispatched leg {tid}: fixer task_id={res.task_id}")
+                print(f"  Dispatched leg {tid}: fixer task_id={task_id}")
 
     return 0
 

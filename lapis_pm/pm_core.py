@@ -2201,11 +2201,25 @@ def compact_eligible_targets(min_age_days: int = 30) -> list[tuple[str, str]]:
     return results
 
 
-def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
+def force_dispatch(
+    target_id: str,
+    agent_type: str,
+    intent: str,
+    *,
+    extra_episodic_tags: list[str] | None = None,
+    episodic_message: str | None = None,
+) -> str:
     """Dispatch a shaped agent, record it, and emit a router-portfolio event.
 
     Extracted from cmd_tick's force-dispatch block so that both the CLI and
     _act_force_dispatch_retry can call the same path.  Returns task_id.
+
+    ``extra_episodic_tags`` and ``episodic_message`` let chain-mode callers
+    (lapis_pm/cli.py's cmd_bind_chain, lapis_pm/chain.py's
+    _fire_initial_dispatch) fold their chain-specific episodic write into
+    this call's single ``episodic.write_dispatch`` instead of writing a
+    second, competing entry. Non-chain callers get today's generic
+    behavior unchanged.
     """
     target = TargetStore().get(target_id)
     if target is None:
@@ -2306,10 +2320,15 @@ def force_dispatch(target_id: str, agent_type: str, intent: str) -> str:
         "retry_count": 0,
     })
     _check_calcification(target_id)
+    message = (
+        episodic_message
+        if episodic_message is not None
+        else f"Forced dispatch: {agent_type} → {res.task_id}\nIntent: {intent}"
+    )
     episodic.write_dispatch(
         target_id,
-        f"Forced dispatch: {agent_type} → {res.task_id}\nIntent: {intent}",
-        extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"],
+        message,
+        extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"] + (extra_episodic_tags or []),
     )
     try:
         from .router_portfolio import emit_decision_dispatch as _emit_dispatch

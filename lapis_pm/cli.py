@@ -2724,12 +2724,13 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument(
         "--facets-operator",
         choices=["haiku", "sonnet", "opus", "qwen", "gravitywell"],
-        default="haiku",
+        default="gravitywell",
         dest="facets_operator",
         help=(
-            "Model operator for Facets personas and synthesis (default: haiku). gravitywell = owned 122B local, "
-            "zero paid spend, opt-in; degrades to haiku when unavailable. Pass sonnet for a more thorough paid "
-            "technical pass."
+            "Model operator for Facets personas and synthesis (default: gravitywell). gravitywell = owned 122B "
+            "local, zero paid spend; degrades to haiku when GW is unavailable, and the degrade is reported in "
+            "the gate output (⚠️ DEGRADED banner + requested → effective voicing line). Pass sonnet or haiku "
+            "to deliberately spend money on a paid pass instead."
         ),
     )
     sr.set_defaults(func=cmd_spec_review)

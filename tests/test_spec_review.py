@@ -629,6 +629,129 @@ def test_format_brief_lists_failed_personas(tmp_path):
 # facets-operator-v0: _dispatch_facets operator flag injection
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# facets-operator-local-default-v0: gravitywell is the default, not haiku
+# ---------------------------------------------------------------------------
+
+def test_cli_facets_operator_default_gravitywell():
+    """`lapis-pm spec-review <spec>` with no --facets-operator parses to gravitywell."""
+    from lapis_pm.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["spec-review", "some-spec.md"])
+    assert args.facets_operator == "gravitywell", (
+        f"Expected parsed default 'gravitywell', got {args.facets_operator!r}"
+    )
+
+
+@pytest.mark.parametrize("operator", ["haiku", "sonnet"])
+def test_cli_facets_operator_explicit_choice_still_works(operator):
+    """--facets-operator haiku|sonnet still parses through and overrides the default."""
+    from lapis_pm.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["spec-review", "some-spec.md", "--facets-operator", operator])
+    assert args.facets_operator == operator
+
+
+def test_build_brief_dataclass_field_default_gravitywell():
+    """SpecReviewBrief.facets_operator dataclass field defaults to gravitywell."""
+    import dataclasses
+
+    field_map = {f.name: f for f in dataclasses.fields(SpecReviewBrief)}
+    assert field_map["facets_operator"].default == "gravitywell"
+
+
+def test_build_brief_function_parameter_default_gravitywell():
+    """_build_brief()'s facets_operator parameter defaults to gravitywell."""
+    import inspect
+
+    sig = inspect.signature(_build_brief)
+    assert sig.parameters["facets_operator"].default == "gravitywell"
+
+
+def test_format_brief_facets_degraded_banner_and_voicing_line(tmp_path):
+    """GravityWell unavailable → Facets degrades to haiku; banner + voicing line both render.
+
+    This is the DoD item that has never fired in production: with a haiku default,
+    nothing was ever *requested* from GravityWell, so facets_operator_degraded was
+    always False. Force the degraded path directly via methodology provenance.
+    """
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_fixture(escalation="proceed", consensus="consensus")
+    fd["methodology"] = {
+        "operator_requested": "gravitywell",
+        "persona_operators": {"Trickster": "haiku", "Technical-Integrity": "haiku"},
+        "synthesis_operator": "haiku",
+    }
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-degrade-facets",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    assert brief.facets_operator_requested == "gravitywell"
+    assert brief.facets_operator_effective == "haiku"
+    assert brief.facets_operator_degraded is True
+
+    output = format_brief(brief)
+    assert "gravitywell → haiku (degraded)" in output, (
+        f"Expected requested → effective (degraded) voicing line; got:\n{output}"
+    )
+    assert "⚠️ DEGRADED: 1+ leg fell off GravityWell to paid Claude (Facets)." in output, (
+        f"Expected DEGRADED banner naming Facets; got:\n{output}"
+    )
+
+
+def test_format_brief_facets_not_degraded_when_gw_serving(tmp_path):
+    """GravityWell serving → Facets leg is non-degraded; no DEGRADED banner for Facets."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fd = _facets_deliberation_fixture(escalation="proceed", consensus="consensus")
+    fd["methodology"] = {
+        "operator_requested": "gravitywell",
+        "persona_operators": {"Trickster": "gravitywell", "Technical-Integrity": "gravitywell"},
+        "synthesis_operator": "gravitywell",
+    }
+    council_raw = {
+        "status": "resolved",
+        "landing": "",
+        "open_questions": [],
+        "confidence": "converged",
+        "positions": [],
+        "run_id": "council-nodegrade-facets",
+    }
+    brief = _build_brief(
+        council_raw=council_raw,
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=5.0,
+        facets_deliberation=fd,
+        authority="advisory",
+    )
+    assert brief.facets_operator_degraded is False
+
+    output = format_brief(brief)
+    assert "⚠️ DEGRADED" not in output, (
+        f"No DEGRADED banner expected when GW is serving; got:\n{output}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # facets-operator-v0: format_brief operator header
 # ---------------------------------------------------------------------------
 

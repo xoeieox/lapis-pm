@@ -2277,8 +2277,12 @@ def force_dispatch(
     existing_branch = _adopted_branch if _adopted_branch else f"lapis/{target_id}/forced"
     base_branch = "main"
     slug = "forced"
-    # L1.D2: Widen open-PR/canonical-branch reuse lookup to include fixer (not just fixer_retry)
-    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry",) and target.pm_repo:
+    pr_number: int | None = None
+    # L1.D2: Widen open-PR/canonical-branch reuse lookup to include fixer (not just fixer_retry).
+    # Also resolve pr_number here for reviewer/reviewer_fresh/fixer_retry so cycle accounting
+    # (_fixer_retry_count / _reviewer_cycle_count) can attribute force-dispatched records
+    # to the correct PR, same as the daemon's own _act_dispatch_fixer_retry/_act_dispatch_reviewer.
+    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry", "reviewer", "reviewer_fresh") and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -2289,6 +2293,7 @@ def force_dispatch(
                 ):
                     existing_branch = pr_ref
                     base_branch = (pr.get("base") or {}).get("ref", "main")
+                    pr_number = pr.get("number")
                     # Extract slug from the branch name (last component after /)
                     if pr_ref.startswith(f"lapis/{target_id}/"):
                         slug = pr_ref.split("/")[-1]
@@ -2309,7 +2314,7 @@ def force_dispatch(
     steer.inject_overlay(target_id, vars_, agent_type)
     _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
-    append_dispatched(target_id, {
+    record = {
         "gpu_id": res.task_id,
         "spec_id": res.spec_id,
         "agent_type": agent_type,
@@ -2318,7 +2323,19 @@ def force_dispatch(
         "ts": _now_iso(),
         "status": "pending",
         "retry_count": 0,
-    })
+    }
+    reviewer_cycle: int | None = None
+    reviewer_tags: list[str] = []
+    if pr_number is not None:
+        if agent_type == "fixer_retry":
+            record["pr_number"] = pr_number
+            record["cycle"] = _reviewer_cycle_count(target_id, pr_number)
+        elif agent_type in ("reviewer", "reviewer_fresh"):
+            reviewer_cycle = _reviewer_cycle_count(target_id, pr_number) + 1
+            record["pr_number"] = pr_number
+            record["cycle"] = reviewer_cycle
+            reviewer_tags = [f"pm:reviewer:pr={pr_number}:cycle={reviewer_cycle}:verdict=pending"]
+    append_dispatched(target_id, record)
     _check_calcification(target_id)
     message = (
         episodic_message
@@ -2328,7 +2345,7 @@ def force_dispatch(
     episodic.write_dispatch(
         target_id,
         message,
-        extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"] + (extra_episodic_tags or []),
+        extra_tags=[f"pm:gpu={res.task_id}", f"pm:agent={agent_type}"] + reviewer_tags + (extra_episodic_tags or []),
     )
     try:
         from .router_portfolio import emit_decision_dispatch as _emit_dispatch
@@ -3806,6 +3823,18 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
                 "pr": pr, "cls": cls, "history": history,
             })
         # Check kill-switch threshold before dispatching Opus reviewer
+        if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
+            _set_review_gate_paused(True)
+            return Decision("review_gate_pause", {"pr": pr, "cls": cls})
+        next_cycle = reviewer_count + 1
+        return Decision("dispatch_reviewer", {
+            "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
+        })
+
+    if reviewer_count < fixer_count:
+        # One or more fixer_retry dispatches landed without an intervening review
+        # (e.g. rapid force-dispatches against an open PR). Self-heal by dispatching
+        # the next reviewer cycle rather than falling through to a silent noop.
         if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
             _set_review_gate_paused(True)
             return Decision("review_gate_pause", {"pr": pr, "cls": cls})

@@ -2300,17 +2300,34 @@ def force_dispatch(
                     break
         except Exception:
             pass
+    # Resolve the reviewer cycle (and, for agent_type == "reviewer", the matching
+    # prior_review text) BEFORE building vars_/dispatching, so the template a
+    # force-dispatched reviewer actually sees matches the cycle its record claims.
+    # The `reviewer` template requires {prior_review} — `_SHAPER.dispatch` calls
+    # str.format(**vars_) with no fallback, so a missing key raises KeyError before
+    # this function ever reaches the record-construction code below. Build it the
+    # same way the daemon's own _act_dispatch_reviewer does.
+    reviewer_cycle: int | None = None
+    if agent_type in ("reviewer", "reviewer_fresh"):
+        reviewer_cycle = (_reviewer_cycle_count(target_id, pr_number) + 1) if pr_number is not None else 1
+
+    prior_review_text = ""
+    if agent_type == "reviewer":
+        prior_review_text = _build_prior_review_text(target_id, pr_number, reviewer_cycle)
+
     vars_ = {
         "target_id": target_id,
         "spec_summary": spec_sum,
         "repo": target.pm_repo or "",
         "question": intent,
-        "pr_number": "",
+        "pr_number": str(pr_number) if pr_number is not None else "",
         "slug": slug,
         "existing_branch": existing_branch,
         "base_branch": base_branch,
         "intent_block": _intent_artifact.dispatch_block(target_id),
     }
+    if agent_type == "reviewer":
+        vars_["prior_review"] = prior_review_text
     steer.inject_overlay(target_id, vars_, agent_type)
     _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, intent, vars_=vars_)
@@ -2324,14 +2341,12 @@ def force_dispatch(
         "status": "pending",
         "retry_count": 0,
     }
-    reviewer_cycle: int | None = None
     reviewer_tags: list[str] = []
     if pr_number is not None:
         if agent_type == "fixer_retry":
             record["pr_number"] = pr_number
             record["cycle"] = _reviewer_cycle_count(target_id, pr_number)
         elif agent_type in ("reviewer", "reviewer_fresh"):
-            reviewer_cycle = _reviewer_cycle_count(target_id, pr_number) + 1
             record["pr_number"] = pr_number
             record["cycle"] = reviewer_cycle
             reviewer_tags = [f"pm:reviewer:pr={pr_number}:cycle={reviewer_cycle}:verdict=pending"]
@@ -4342,6 +4357,51 @@ def _act_retry(target_id: str, dispatch_record: dict) -> str:
     return f"action:fixer_dispatched:source=init:dispatch={res.task_id}"
 
 
+def _build_prior_review_text(target_id: str, pr_number: int, cycle: int) -> str:
+    """Build the '## Prior review context' block for same-reviewer mode, cycle > 1.
+
+    Shared by _act_dispatch_reviewer (daemon path) and force_dispatch (manual
+    --force-dispatch path) so the ``reviewer`` template's {prior_review}
+    placeholder is populated identically regardless of dispatch path.
+    """
+    if cycle <= 1:
+        return ""
+    prior = _review_verdict_for_cycle(target_id, pr_number, cycle - 1)
+    if not prior:
+        return ""
+    prior_issues = prior.get("issues", [])
+    indexed_issues = "\n".join(
+        f"  [{i}] {iss.get('severity', '?').upper()} {iss.get('path', '?')} — {iss.get('note', '')}"
+        for i, iss in enumerate(prior_issues)
+    ) if prior_issues else "  (none)"
+    return (
+        f"\n## Prior review context (cycle {cycle - 1})\n\n"
+        f"The prior reviewer cycle returned this verdict on an EARLIER state of this branch:\n\n"
+        f"Verdict: {prior.get('verdict')}\n"
+        f"Prior issues (indexed):\n{indexed_issues}\n\n"
+        f"The diff in the user prompt is the CURRENT state. Your task is to classify\n"
+        f"EACH prior issue against the current diff. Then return your own fresh\n"
+        f"verdict on the current diff.\n\n"
+        f"For each prior issue, you MUST emit a `prior_resolution` entry with:\n"
+        f'  - "prior_index": the index above\n'
+        f'  - "status": "addressed" | "still_present" | "not_applicable"\n'
+        f'  - "evidence": for "still_present", a current-diff line/path citation;\n'
+        f'                for "addressed", the line/path that fixes it;\n'
+        f'                for "not_applicable", a one-sentence reason\n'
+        f'                (empty string is NOT acceptable for any status)\n\n'
+        f"Then your `issues` array must contain ONLY:\n"
+        f'  - prior issues you classified as "still_present" (re-stated, with the\n'
+        f"    same path/severity, but `note` updated to reference the current-diff\n"
+        f"    evidence), AND\n"
+        f"  - any new issues you find in the current diff that were not in the\n"
+        f"    prior set.\n\n"
+        f'Issues you classified as "addressed" or "not_applicable" must NOT appear\n'
+        f"in `issues`. Reviewer cycles are explicit deltas, not stateless re-reads.\n\n"
+        f'When re-stating a prior issue in `issues`, include `prior_index: <i>`\n'
+        f"pointing to the prior set; new issues omit `prior_index`.\n"
+    )
+
+
 def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassification,
                             mode: str = "same", cycle: int = 1) -> str:
     """Dispatch a reviewer agent for the given PR."""
@@ -4352,41 +4412,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     agent_type = "reviewer_fresh" if mode == "fresh" else "reviewer"
 
     # Build prior_review context for same-reviewer mode
-    prior_review_text = ""
-    if mode == "same" and cycle > 1:
-        prior = _review_verdict_for_cycle(target_id, pr_number, cycle - 1)
-        if prior:
-            prior_issues = prior.get("issues", [])
-            indexed_issues = "\n".join(
-                f"  [{i}] {iss.get('severity', '?').upper()} {iss.get('path', '?')} — {iss.get('note', '')}"
-                for i, iss in enumerate(prior_issues)
-            ) if prior_issues else "  (none)"
-            prior_review_text = (
-                f"\n## Prior review context (cycle {cycle - 1})\n\n"
-                f"The prior reviewer cycle returned this verdict on an EARLIER state of this branch:\n\n"
-                f"Verdict: {prior.get('verdict')}\n"
-                f"Prior issues (indexed):\n{indexed_issues}\n\n"
-                f"The diff in the user prompt is the CURRENT state. Your task is to classify\n"
-                f"EACH prior issue against the current diff. Then return your own fresh\n"
-                f"verdict on the current diff.\n\n"
-                f"For each prior issue, you MUST emit a `prior_resolution` entry with:\n"
-                f'  - "prior_index": the index above\n'
-                f'  - "status": "addressed" | "still_present" | "not_applicable"\n'
-                f'  - "evidence": for "still_present", a current-diff line/path citation;\n'
-                f'                for "addressed", the line/path that fixes it;\n'
-                f'                for "not_applicable", a one-sentence reason\n'
-                f'                (empty string is NOT acceptable for any status)\n\n'
-                f"Then your `issues` array must contain ONLY:\n"
-                f'  - prior issues you classified as "still_present" (re-stated, with the\n'
-                f"    same path/severity, but `note` updated to reference the current-diff\n"
-                f"    evidence), AND\n"
-                f"  - any new issues you find in the current diff that were not in the\n"
-                f"    prior set.\n\n"
-                f'Issues you classified as "addressed" or "not_applicable" must NOT appear\n'
-                f"in `issues`. Reviewer cycles are explicit deltas, not stateless re-reads.\n\n"
-                f'When re-stating a prior issue in `issues`, include `prior_index: <i>`\n'
-                f"pointing to the prior set; new issues omit `prior_index`.\n"
-            )
+    prior_review_text = _build_prior_review_text(target_id, pr_number, cycle) if mode == "same" else ""
 
     existing_branch = (pr.get("head") or {}).get("ref") or f"lapis/{target_id}/pr{pr_number}"
     base_branch = (pr.get("base") or {}).get("ref") or "main"

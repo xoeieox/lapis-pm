@@ -10,10 +10,19 @@ Coverage:
   - _decide_for_pr self-heals a reviewer_count < fixer_count skew (the 2026-07-30 incident)
   - replay-style integration: two force-dispatched fixer_retry calls against the same open
     PR followed by a tick dispatches a reviewer instead of no-op'ing
+
+AMENDED 2026-07-30 additions (cycle-1 review found the reviewer half couldn't execute):
+  - vars_["pr_number"] must carry the resolved PR number, not a hardcoded ""
+  - agent_type == "reviewer" must not raise KeyError('prior_review') inside
+    _SHAPER.dispatch's system-template render
+  - template-render test: every {placeholder} in the REAL reviewer/reviewer_fresh/
+    fixer_retry system_template (registry.yaml) must be present in the vars_ dict
+    force_dispatch builds -- catches the next unthreaded template var too
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
 
@@ -101,6 +110,41 @@ def _force_dispatch(
 
     record = captured[-1] if captured else None
     return task_id, record, write_dispatch_mock
+
+
+def _force_dispatch_capture_vars(
+    target_id: str,
+    agent_type: str,
+    intent: str,
+    *,
+    open_prs: list[dict] | None = None,
+    reviewer_cycle_count_return: int = 0,
+    review_verdict_for_cycle_return: dict | None = None,
+) -> dict:
+    """Call force_dispatch mocking only _SHAPER.dispatch (NOT get_agent), so the
+    REAL registry.yaml system_template is used when the caller composes it
+    against the captured vars_. This is what the 8 original tests never did --
+    they mocked get_agent too, which is exactly why the KeyError('prior_review')
+    and hardcoded pr_number="" defects both slipped past review.
+    """
+    dispatch_mock = MagicMock(return_value=_make_dispatch_result())
+
+    with (
+        patch("lapis_pm.pm_core.TargetStore") as mock_store_cls,
+        patch.object(pm_core._SHAPER, "dispatch", dispatch_mock),
+        patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec summary"),
+        patch("lapis_pm.pm_core.episodic.write_dispatch"),
+        patch("lapis_pm.pm_core.append_dispatched"),
+        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+        patch("agents_core.forgejo.get_open_prs", return_value=open_prs or []),
+        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_cycle_count_return),
+        patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=review_verdict_for_cycle_return),
+        patch("lapis_pm.router_portfolio.emit_decision_dispatch"),
+    ):
+        mock_store_cls.return_value.get.return_value = _make_target(target_id)
+        pm_core.force_dispatch(target_id, agent_type, intent)
+
+    return dispatch_mock.call_args.kwargs["vars_"]
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +360,111 @@ def test_replay_two_force_dispatched_fixer_retries_then_tick_dispatches_reviewer
         "self-heal the reviewer_count < fixer_count skew instead of no-op'ing."
     )
     assert decision.payload["cycle"] == 2
+
+
+# ---------------------------------------------------------------------------
+# AMENDED 2026-07-30: vars_["pr_number"] must be the resolved PR number, not ""
+# ---------------------------------------------------------------------------
+
+def test_reviewer_fresh_vars_carry_resolved_pr_number_not_blank():
+    """Defect (1): vars_["pr_number"] was hardcoded "" and never updated from the
+    pr_number force_dispatch had just resolved -- a force-dispatched reviewer_fresh
+    was dispatched successfully but told to review PR "" while its record claimed
+    a real pr_number/cycle."""
+    pr = _make_pr(number=820)
+    vars_ = _force_dispatch_capture_vars(
+        "test-tid", "reviewer_fresh", "review it",
+        open_prs=[pr], reviewer_cycle_count_return=1,
+    )
+    assert vars_["pr_number"] == "820"
+    assert vars_["pr_number"] != ""
+
+
+def test_fixer_no_open_pr_vars_pr_number_stays_blank():
+    """Regression guard for the true initial-dispatch case: no open PR resolved
+    means vars_["pr_number"] must stay "", matching the reviewer template's
+    long-standing contract for a not-yet-existing PR."""
+    vars_ = _force_dispatch_capture_vars(
+        "test-tid", "fixer", "implement it",
+        open_prs=[],
+    )
+    assert vars_["pr_number"] == ""
+
+
+# ---------------------------------------------------------------------------
+# AMENDED 2026-07-30: agent_type == "reviewer" must not raise KeyError('prior_review')
+# ---------------------------------------------------------------------------
+
+def test_reviewer_dispatch_does_not_raise_missing_prior_review():
+    """Defect (2): the `reviewer` template requires {prior_review}, but force_dispatch's
+    vars_ never supplied it, so _SHAPER.dispatch -> _compose_system ->
+    system_template.format(**vars_) raised KeyError('prior_review') before the new
+    record-construction code was ever reached -- making the whole `reviewer` branch
+    dead code when invoked via --force-dispatch. This test renders the REAL template
+    (not a mock) against the vars_ force_dispatch builds, so a regression here fails
+    loud rather than crashing silently at runtime."""
+    pr = _make_pr(number=820)
+    vars_ = _force_dispatch_capture_vars(
+        "test-tid", "reviewer", "review it",
+        open_prs=[pr], reviewer_cycle_count_return=1,
+    )
+    assert "prior_review" in vars_
+
+    agent = pm_core._SHAPER.get_agent("reviewer")
+    vars_.setdefault("repo_cwd", "/tmp/fake-cwd")
+    # Must not raise KeyError — this is the exact crash reproduced live 2026-07-30 21:26 PT.
+    rendered = pm_core._SHAPER._compose_system(agent, vars_)
+    assert "PR 820" in rendered
+
+
+def test_reviewer_first_cycle_has_empty_prior_review():
+    """cycle == 1 (no prior verdict yet) must fall back to prior_review="" rather
+    than raising or fabricating a prior verdict."""
+    pr = _make_pr(number=820)
+    vars_ = _force_dispatch_capture_vars(
+        "test-tid", "reviewer", "review it",
+        open_prs=[pr], reviewer_cycle_count_return=0,
+    )
+    assert vars_["prior_review"] == ""
+
+
+def test_reviewer_second_cycle_populates_prior_review_from_verdict():
+    """cycle > 1 must build the prior-review block the same way
+    _act_dispatch_reviewer does (same-reviewer mode), from the previous cycle's
+    recorded verdict."""
+    pr = _make_pr(number=820)
+    prior_verdict = {
+        "verdict": "fixable",
+        "issues": [{"severity": "high", "path": "foo.py", "note": "bug"}],
+    }
+    vars_ = _force_dispatch_capture_vars(
+        "test-tid", "reviewer", "review it",
+        open_prs=[pr], reviewer_cycle_count_return=1,
+        review_verdict_for_cycle_return=prior_verdict,
+    )
+    assert "Prior review context (cycle 1)" in vars_["prior_review"]
+    assert "foo.py" in vars_["prior_review"]
+
+
+# ---------------------------------------------------------------------------
+# AMENDED 2026-07-30: template-render test -- every real placeholder must be threaded
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "agent_type,reviewer_cycle_count_return",
+    [("reviewer", 1), ("reviewer_fresh", 1), ("fixer_retry", 0)],
+)
+def test_template_placeholders_all_present_in_vars(agent_type, reviewer_cycle_count_return):
+    """Cheap structural test, no GPU/network: take the agent's REAL system_template
+    from registry.yaml, extract its {placeholder} names, and assert every one is
+    present in the vars_ dict force_dispatch builds. Generalizes -- catches the
+    next template that grows a placeholder nobody threaded into force_dispatch."""
+    pr = _make_pr(number=820, target_id="test-tid")
+    vars_ = _force_dispatch_capture_vars(
+        "test-tid", agent_type, "do it",
+        open_prs=[pr], reviewer_cycle_count_return=reviewer_cycle_count_return,
+    )
+    agent = pm_core._SHAPER.get_agent(agent_type)
+    placeholders = set(re.findall(r"\{(\w+)\}", agent.system_template))
+    missing = placeholders - set(vars_.keys())
+    assert not missing, f"{agent_type} template placeholders not in vars_: {missing}"

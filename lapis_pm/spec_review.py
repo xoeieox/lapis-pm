@@ -146,6 +146,8 @@ class SpecReviewBrief:
     gw_findings_count: int = 0  # number of findings/issues from GW
     elapsed_gw: float = 0.0  # wall-clock time for GW leg
     gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
+    gw_parse_error: dict | None = None  # parse_failed envelope's parse_error, if any
+    gw_raw_output_ref: str = ""  # absolute path to the verbatim gw-raw-output.txt
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -404,8 +406,8 @@ def _iter_balanced_json_candidates(text: str) -> list[str]:
     return candidates
 
 
-def _read_verdict_from_output(output_path: Path) -> dict:
-    """Parse the verdict JSON from the spec_reviewer output file.
+def _extract_verdict_from_text(content: str) -> dict:
+    """Parse the verdict JSON out of raw model output text.
 
     Multi-strategy pipeline — handles model narrate-then-emit patterns:
     1. Extract from ```(json)? fenced blocks (handles "narration + fence" pattern).
@@ -414,7 +416,6 @@ def _read_verdict_from_output(output_path: Path) -> dict:
        (handles fence-less JSON embedded in prose).
     4. Return parse_failed envelope (richer diagnostics than bare "error").
     """
-    content = output_path.read_text(encoding="utf-8")
     stripped = content.strip()
 
     # Strategy 1: fenced extraction
@@ -450,6 +451,12 @@ def _read_verdict_from_output(output_path: Path) -> dict:
             "tail": content[-200:],
         },
     }
+
+
+def _read_verdict_from_output(output_path: Path) -> dict:
+    """Parse the verdict JSON from the spec_reviewer output file."""
+    content = output_path.read_text(encoding="utf-8", errors="replace")
+    return _extract_verdict_from_text(content)
 
 
 def _dispatch_spec_reviewer(
@@ -578,6 +585,51 @@ def _gw_endpoints_collapsed(slot2_url: str, primary_url: str) -> bool:
         return False
 
     return a[1] == b[1] and bool(ips_a & ips_b)
+
+
+def _process_gw_verdict(gw_text: str) -> tuple[str, int, dict | None]:
+    """Parse the GW leg's raw output tolerantly, via the same strategy pipeline
+    the local leg uses. Returns (verdict, findings_count, parse_error).
+
+    parse_error is None unless the pipeline could not extract a verdict at all,
+    in which case verdict is "parse_failed" — distinct from "error", which means
+    the model itself ran and reported a failure or an unusable verdict value.
+    """
+    verdict_obj = _extract_verdict_from_text(gw_text)
+    if verdict_obj.get("verdict") == "parse_failed":
+        return "parse_failed", 0, verdict_obj.get("parse_error")
+    return verdict_obj.get("verdict", "error"), len(verdict_obj.get("issues", [])), None
+
+
+def _persist_gw_artifacts(
+    artifacts_dir: Path, gw_text: str, gw_transcript: list[dict]
+) -> tuple[str, str]:
+    """Best-effort persistence of the GW leg's raw output and tool transcript.
+
+    Writes gw-raw-output.txt verbatim (on every run, not only on parse failure)
+    and gw-transcript.json beside it. Returns (raw_output_ref, transcript_ref);
+    either is empty string if its write failed. A write failure here must never
+    raise or alter the verdict.
+    """
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_output_ref = ""
+    raw_output_path = artifacts_dir / "gw-raw-output.txt"
+    try:
+        raw_output_path.write_text(gw_text, encoding="utf-8")
+        raw_output_ref = str(raw_output_path.resolve())
+    except Exception as e:
+        print(f"[spec-review:gw-raw-output-write-error] {e}", file=sys.stderr)
+
+    transcript_ref = ""
+    transcript_path = artifacts_dir / "gw-transcript.json"
+    try:
+        transcript_path.write_text(json.dumps(gw_transcript, indent=2), encoding="utf-8")
+        transcript_ref = str(transcript_path.resolve())
+    except Exception as e:
+        print(f"[spec-review:gw-transcript-write-error] {e}", file=sys.stderr)
+
+    return raw_output_ref, transcript_ref
 
 
 def _dispatch_gw_reviewer(
@@ -882,6 +934,8 @@ def _build_brief(
     gw_findings_count: int = 0,
     elapsed_gw: float = 0.0,
     gw_transcript_ref: str = "",
+    gw_parse_error: dict | None = None,
+    gw_raw_output_ref: str = "",
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
@@ -1006,6 +1060,8 @@ def _build_brief(
         gw_findings_count=gw_findings_count,
         elapsed_gw=elapsed_gw,
         gw_transcript_ref=gw_transcript_ref,
+        gw_parse_error=gw_parse_error,
+        gw_raw_output_ref=gw_raw_output_ref,
     )
 
 
@@ -1268,13 +1324,24 @@ could not extract a JSON verdict from the output. See chain-sibling \
     # Like Sonnet, this is always reference-only and never steers the recommendation.
     gw_section = ""
     if brief.gw_ran:
+        gw_parse_failed_block = ""
+        if brief.gw_verdict == "parse_failed" and brief.gw_parse_error:
+            gpe = brief.gw_parse_error
+            gw_parse_failed_block = f"""
+- **File size:** {gpe.get('file_size', 0)} bytes
+- **Head (first 200 chars):** {gpe.get('head', '')}
+- **Tail (last 200 chars):** {gpe.get('tail', '')}
+- **Note:** the GW leg produced output; the orchestration could not extract a JSON \
+verdict from it. See raw output below for what the model actually said.
+"""
         gw_section = f"""
 ## GravityWell reference leg — reference only (does not affect recommendation)
 - **Verdict:** {brief.gw_verdict}
 - **Findings:** {brief.gw_findings_count}
 - **Elapsed:** {brief.elapsed_gw:.1f}s
 - **Transcript:** {brief.gw_transcript_ref or '(not persisted)'}
-"""
+- **Raw output:** {brief.gw_raw_output_ref or '(not persisted)'}
+{gw_parse_failed_block}"""
     elif brief.gw_skip_reason:
         gw_section = f"""
 ## GravityWell reference leg — reference only (does not affect recommendation)
@@ -1934,28 +2001,18 @@ def run_spec_review(
     gw_ran: bool = gw_text is not None
     gw_findings_count: int = 0
     gw_transcript_ref: str = ""
+    gw_parse_error: dict | None = None
+    gw_raw_output_ref: str = ""
 
     if gw_ran and gw_text:
-        try:
-            gw_verdict_obj = json.loads(gw_text)
-            gw_verdict = gw_verdict_obj.get("verdict", "error")
-            gw_findings_count = len(gw_verdict_obj.get("issues", []))
-        except json.JSONDecodeError:
-            gw_verdict = "error"
-            gw_findings_count = 0
+        gw_verdict, gw_findings_count, gw_parse_error = _process_gw_verdict(gw_text)
 
-        # Write transcript JSON to /srv/lapis/spec-review-artifacts/<run_id>/gw-transcript.json
+        # Persist artifacts to /srv/lapis/spec-review-artifacts/<run_id>/ — best-effort,
+        # a write failure here must never break the gate or alter the verdict.
         artifacts_dir = room_path('spec_review_artifacts', gw_run_id)
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        transcript_path = artifacts_dir / "gw-transcript.json"
-        try:
-            transcript_path.write_text(json.dumps(gw_transcript, indent=2), encoding="utf-8")
-            gw_transcript_ref = str(transcript_path.resolve())
-        except Exception as e:
-            print(
-                f"[spec-review:gw-transcript-write-error] {e}",
-                file=sys.stderr,
-            )
+        gw_raw_output_ref, gw_transcript_ref = _persist_gw_artifacts(
+            artifacts_dir, gw_text, gw_transcript
+        )
 
     # Write divergence record to mem via subprocess — always, even when gw_ran=False,
     # so that skip-rate visibility is preserved (gw_ran: bool field tracks success/failure)
@@ -2022,4 +2079,6 @@ def run_spec_review(
         gw_findings_count=gw_findings_count,
         elapsed_gw=gw_elapsed,
         gw_transcript_ref=gw_transcript_ref,
+        gw_parse_error=gw_parse_error,
+        gw_raw_output_ref=gw_raw_output_ref,
     )

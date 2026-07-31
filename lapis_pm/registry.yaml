@@ -59,13 +59,28 @@ shared_preamble: |
 # Local dispatch: all roles route to 122B-A10B (llama.cpp) via local-fixer/local-reviewer engines.
 # 27B/vLLM fan-out posture RETIRED per decision/gw-122b-contact-starhouse-workers-2026-07-15.
 # 27B localization (localize-pm-dispatch-27b chain) superseded 2026-07-16.
-# model: gravitywell-122b is a registry annotation — runtime routing depends on GW_URL endpoint.
+# model is passed straight into the /v1/chat/completions request body and
+# validated by the model server - it must be a slot alias (e.g. gravitywell-slot1),
+# never a concrete model id. A concrete id gets rejected by vLLM, call_gw_agent
+# returns None, and shaped_runner's `result or ""` turns that into a silent
+# empty-string success. See lapis-pm-spec-review-leg-hotfix-reconcile-v0.
 
 agents:
+  # reviewer / reviewer_fresh: PR-review legs the merge path runs on. These
+  # were pinned to the dead gravitywell-122b (retired when GravityWell moved to
+  # the dual a3b pair) and unpinned to the gravitywell-slot1 alias 2026-07-30.
+  # Do NOT add acquire_lease: false here. Unlike spec_reviewer (dispatched
+  # concurrently with Facets/Council, which hold GW awake via `protected`
+  # leases), these run as a single agent on a PM tick with nothing else
+  # holding GW awake - they need their own deferrable lease to wake and hold
+  # it. Confirmed empirically: the reviewer_fresh 10:10 run held its lease and
+  # completed in 49s; starvation would have returned in 0.0s like spec_reviewer
+  # did. Dropping the lease here would introduce a new failure mode on a quiet
+  # box. See lapis-pm-spec-review-leg-hotfix-reconcile-v0 Change 4.
   reviewer:
     chub_bundles: []
     engine: local-reviewer
-    model: gravitywell-122b
+    model: gravitywell-slot1
     capture_meta: false
     notify: true
     notify_policy: infra-only
@@ -125,10 +140,13 @@ agents:
       No prose outside the JSON.
     timeout_s: 600
 
+  # See the "reviewer" entry above: same dead-pin fix, same reasoning for why
+  # acquire_lease: false is NOT added here (no lease-starvation dynamics on
+  # this dispatch path, and dropping it would be actively harmful).
   reviewer_fresh:
     chub_bundles: []
     engine: local-reviewer
-    model: gravitywell-122b
+    model: gravitywell-slot1
     capture_meta: false
     notify: false
     system_template: |
@@ -190,10 +208,29 @@ agents:
       No prose outside the JSON.
     timeout_s: 600
 
+  # model: gravitywell-slot1 is the slot ALIAS, not a model name - every vLLM
+  # slot advertises both its model id and a stable alias (:8081 also answers
+  # to gravitywell-a3b-nvfp4, :8082 to gravitywell-a3b-coder/gravitywell-slot2).
+  # The alias survives model swaps; a concrete model id does not - vLLM
+  # rejects an unknown id, call_gw_agent returns None, and `result or ""`
+  # converts that into a silent successful empty string. Never pin a
+  # concrete model id here again.
+  #
+  # acquire_lease: false + backend_url: this leg is dispatched concurrently
+  # with Facets and Council, which hold `protected` doorman leases. A
+  # `deferrable` lease request under active `protected` leases returns
+  # pending_defer in 0.0s -> on_wake_fail=skip -> None -> "" -> a 1s
+  # "completed" no-op that starves the leg silently. Safe to drop the lease
+  # here specifically because Facets and Council hold GravityWell awake for
+  # the whole gate run (mirrors the GW reference leg, which already runs this
+  # way). Do NOT drop the lease on reviewer/reviewer_fresh above - they have
+  # no such companion. See lapis-pm-spec-review-leg-hotfix-reconcile-v0.
   spec_reviewer:
     chub_bundles: ["conductor/lapis-pm", "conductor/lapis-ecosystem"]
     engine: local-reviewer
-    model: gravitywell-122b
+    model: gravitywell-slot1
+    acquire_lease: false
+    backend_url: "http://203.0.113.11:8081"
     capture_meta: false
     notify: false
     system_template: |

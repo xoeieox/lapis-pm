@@ -673,6 +673,16 @@ def _dispatch_gw_reviewer(
         f"=== SPEC ===\n{spec_text}"
     )
 
+    # Slot 2 moved from Devstral (32k) to the a3b-coder (262k); gw_agent derives
+    # each step's timeout from the *remaining* budget, so a tight total squeezes
+    # late steps until one read-times-out and the whole leg dies - after burning
+    # most of the budget getting there. A higher ceiling costs nothing on a
+    # healthy run (it returns when it returns); do NOT tune this down on the
+    # evidence that successful runs finish quickly - that reasoning inverts the
+    # actual failure mode. See spec lapis-pm-spec-review-leg-hotfix-reconcile-v0.
+    gw_timeout = int(os.environ.get("GW_REVIEWER_TIMEOUT_SEC", "1800"))
+
+    gw_reason: list[str] = []
     try:
         text, transcript = call_gw_agent(
             prompt=prompt,
@@ -683,10 +693,11 @@ def _dispatch_gw_reviewer(
             on_wake_fail="skip",
             return_transcript=True,
             work_id=run_id,
-            timeout=300,
+            timeout=gw_timeout,
             principal=gw_principal,
             backend_url=gw_slot2_url,
             acquire_lease=False,
+            reason_out=gw_reason,
         )
         elapsed = time.time() - start_time
         if text is not None:
@@ -696,12 +707,16 @@ def _dispatch_gw_reviewer(
                 file=sys.stderr,
             )
             return text, transcript, elapsed, ""
+        # on_wake_fail=skip cannot fire on this call path (acquire_lease=False
+        # never consults the doorman) - report the real reason_out cause
+        # instead of fabricating one this function cannot know.
+        reason = gw_reason[0] if gw_reason else "no_content_no_reason"
         print(
-            f"[spec-review:gw-reviewer] GW did not run (on_wake_fail=skip) "
-            f"elapsed={elapsed:.1f}s",
+            f"[spec-review:gw-reviewer] GW produced no verdict (reason={reason}) "
+            f"elapsed={elapsed:.1f}s timeout={gw_timeout}s",
             file=sys.stderr,
         )
-        return text, transcript, elapsed, "on_wake_fail_skip"
+        return text, transcript, elapsed, f"gw_no_content:{reason}"
     except Exception as e:
         elapsed = time.time() - start_time
         print(

@@ -678,6 +678,140 @@ def test_dispatch_gw_reviewer_slot2_unavailable_preserved_when_distinct():
     assert skip_reason == "slot2_unavailable"
 
 
+# ---------------------------------------------------------------------------
+# GW_REVIEWER_TIMEOUT_SEC (spec: lapis-pm-spec-review-leg-hotfix-reconcile-v0)
+# ---------------------------------------------------------------------------
+
+def test_gw_reviewer_timeout_default_1800():
+    """Default GW_REVIEWER_TIMEOUT_SEC is 1800, not the original 900 hotfix
+    value - raising it made a 22k-char spec finish in 332s instead of dying
+    at 720s (gw_agent derives each step's timeout from the *remaining*
+    budget, so a tight total squeezes late steps until one read-times-out).
+    Do not tune this back down on the evidence that healthy runs finish
+    quickly - that reasoning is exactly backwards."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        os.environ.pop("GW_REVIEWER_TIMEOUT_SEC", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    assert mock_call_gw.call_args.kwargs.get("timeout") == 1800
+
+
+def test_gw_reviewer_timeout_honours_env_override():
+    """GW_REVIEWER_TIMEOUT_SEC is honoured when explicitly set."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(
+        os.environ,
+        {"GW_URL": "http://203.0.113.11:8081", "GW_REVIEWER_TIMEOUT_SEC": "2100"},
+        clear=False,
+    ):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    assert mock_call_gw.call_args.kwargs.get("timeout") == 2100
+
+
+# ---------------------------------------------------------------------------
+# Real reason_out reporting, not a fabricated on_wake_fail_skip
+# (spec: lapis-pm-spec-review-leg-hotfix-reconcile-v0)
+# ---------------------------------------------------------------------------
+
+def test_gw_no_content_reports_real_reason_request_failed():
+    """When call_gw_agent yields no text, the returned status string carries
+    the real reason_out cause, not the fabricated on_wake_fail_skip label -
+    that cause cannot even occur on this call path (acquire_lease=False
+    never consults the doorman)."""
+    def fake_call_gw_agent(*args, **kwargs):
+        reason_out = kwargs.get("reason_out")
+        if reason_out is not None:
+            reason_out.append("request_failed")
+        return None, []
+
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = fake_call_gw_agent
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    assert text is None
+    assert skip_reason == "gw_no_content:request_failed"
+    assert "on_wake_fail_skip" not in skip_reason
+
+
+def test_gw_no_content_no_reason_fallback_when_reason_out_empty():
+    """When reason_out is genuinely empty (unknown cause), the fallback is
+    the explicit no_content_no_reason string - never a plausible-but-wrong
+    substitute. That substitution is the bug class this fix cleans up."""
+    def fake_call_gw_agent(*args, **kwargs):
+        return None, []
+
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = fake_call_gw_agent
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                )
+
+    assert text is None
+    assert skip_reason == "gw_no_content:no_content_no_reason"
+
+
+def test_on_wake_fail_skip_string_removed_from_dispatch_gw_reviewer():
+    """Static check: the literal 'on_wake_fail_skip' string no longer appears
+    in _dispatch_gw_reviewer's source - it named a cause the function cannot
+    know and cannot even observe on this call path."""
+    import inspect
+
+    from lapis_pm import spec_review
+
+    source = inspect.getsource(spec_review._dispatch_gw_reviewer)
+    assert "on_wake_fail_skip" not in source
+
+
 def test_brief_render_shows_collapsed_skip_visibly():
     """AC4: the rendered brief visibly surfaces a collapsed skip so no
     operator can assume a second opinion ran when it did not."""

@@ -238,8 +238,8 @@ def test_gw_verdict_excluded_from_recommendation():
     # Recommendation should be drive by Facets + Council only.
 
     rec = _combined_recommendation(
-        sonnet_verdict="skip",  # Sonnet is advisory-only (always "skip")
-        sonnet_issues=[],
+        reference_verdict="skip",  # Sonnet is advisory-only (always "skip")
+        reference_issues=[],
         council_status="resolved",
         council_positions=[],
         facets_escalation="proceed",
@@ -321,8 +321,8 @@ def test_gw_and_sonnet_both_advisory_only():
     """Both GW and Sonnet are reference-only; neither steers recommendation."""
     # Council resolved + Sonnet skipped → proceed-to-bind
     rec = _combined_recommendation(
-        sonnet_verdict="skip",
-        sonnet_issues=[],
+        reference_verdict="skip",
+        reference_issues=[],
         council_status="resolved",
         council_positions=[],
         facets_escalation="proceed",

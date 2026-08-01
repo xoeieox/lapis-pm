@@ -69,8 +69,8 @@ def _council_raw(status: str, positions: list[dict] | None = None) -> dict:
 ])
 def test_combined_recommendation(sonnet_verdict, council_status, positions, expected):
     result = _combined_recommendation(
-        sonnet_verdict=sonnet_verdict,
-        sonnet_issues=[],
+        reference_verdict=sonnet_verdict,
+        reference_issues=[],
         council_status=council_status,
         council_positions=positions,
     )
@@ -83,8 +83,8 @@ def test_combined_recommendation(sonnet_verdict, council_status, positions, expe
 def test_high_severity_issue_triggers_amend():
     """HIGH sonnet issue → amend-spec even if verdict=clean and council=resolved."""
     result = _combined_recommendation(
-        sonnet_verdict="clean",
-        sonnet_issues=[{"severity": "high", "note": "missing file"}],
+        reference_verdict="clean",
+        reference_issues=[{"severity": "high", "note": "missing file"}],
         council_status="resolved",
         council_positions=[],
     )
@@ -93,8 +93,8 @@ def test_high_severity_issue_triggers_amend():
 
 def test_high_severity_case_insensitive():
     result = _combined_recommendation(
-        sonnet_verdict="clean",
-        sonnet_issues=[{"severity": "HIGH", "note": "something"}],
+        reference_verdict="clean",
+        reference_issues=[{"severity": "HIGH", "note": "something"}],
         council_status="resolved",
         council_positions=[],
     )
@@ -110,7 +110,7 @@ def test_build_brief_produces_correct_recommendation(tmp_path):
     spec.write_text("# Spec\n", encoding="utf-8")
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -132,7 +132,7 @@ def test_build_brief_reservation_fields(tmp_path):
     council["confidence"] = "converged-with-reservation"
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -148,7 +148,7 @@ def test_build_brief_incomplete_on_timeout(tmp_path):
     spec.write_text("# Spec\n", encoding="utf-8")
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("timeout"),
+        reference_raw=_sonnet_raw("timeout"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="x",
@@ -156,7 +156,7 @@ def test_build_brief_incomplete_on_timeout(tmp_path):
         elapsed_s=5.0,
     )
     assert brief.combined_recommendation == "incomplete"
-    assert brief.sonnet_verdict == "timeout"
+    assert brief.reference_verdict == "timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ def test_build_brief_council_voicing_no_degrade(tmp_path):
     council["voicing_degraded"] = False
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -198,7 +198,7 @@ def test_build_brief_council_voicing_degraded(tmp_path):
     council["voicing_degraded_reason"] = "gw_not_serving"
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -221,7 +221,7 @@ def test_build_brief_council_voicing_missing_provenance(tmp_path):
     # No voicing_effective field
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -255,7 +255,7 @@ def test_build_brief_facets_operator_no_degrade(tmp_path):
     }
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -291,7 +291,7 @@ def test_build_brief_facets_operator_degraded(tmp_path):
     }
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -327,7 +327,7 @@ def test_build_brief_facets_operator_missing_provenance(tmp_path):
     }
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -353,7 +353,7 @@ def test_format_brief_degradation_summary_council_only(tmp_path):
     council["voicing_degraded_reason"] = "gw_not_serving"
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -391,7 +391,7 @@ def test_format_brief_degradation_summary_facets_only(tmp_path):
     }
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -433,7 +433,7 @@ def test_format_brief_no_degradation_summary_when_clean(tmp_path):
     }
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -476,7 +476,7 @@ def test_format_brief_voicing_lines(tmp_path):
     }
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=council,
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -506,14 +506,14 @@ def test_build_brief_claims_checked_present(tmp_path):
     raw["claims_checked"] = 34
 
     brief = _build_brief(
-        sonnet_raw=raw,
+        reference_raw=raw,
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
         repo="lapis-pm",
         elapsed_s=10.0,
     )
-    assert brief.sonnet_claims_checked == 34
+    assert brief.reference_claims_checked == 34
 
 
 def test_build_brief_claims_checked_absent_is_none_not_zero(tmp_path):
@@ -523,14 +523,14 @@ def test_build_brief_claims_checked_absent_is_none_not_zero(tmp_path):
     spec.write_text("# Spec\n", encoding="utf-8")
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
         repo="lapis-pm",
         elapsed_s=10.0,
     )
-    assert brief.sonnet_claims_checked is None
+    assert brief.reference_claims_checked is None
 
 
 def test_build_brief_claims_checked_non_numeric_is_none(tmp_path):
@@ -541,14 +541,14 @@ def test_build_brief_claims_checked_non_numeric_is_none(tmp_path):
     raw["claims_checked"] = "not-a-number"
 
     brief = _build_brief(
-        sonnet_raw=raw,
+        reference_raw=raw,
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
         repo="lapis-pm",
         elapsed_s=10.0,
     )
-    assert brief.sonnet_claims_checked is None
+    assert brief.reference_claims_checked is None
 
 
 def test_format_brief_renders_claims_checked(tmp_path):
@@ -561,7 +561,7 @@ def test_format_brief_renders_claims_checked(tmp_path):
     raw["claims_checked"] = 40
 
     brief = _build_brief(
-        sonnet_raw=raw,
+        reference_raw=raw,
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",
@@ -583,7 +583,7 @@ def test_format_brief_renders_claims_checked_not_reported_when_absent(tmp_path):
     spec.write_text("# Spec\n", encoding="utf-8")
 
     brief = _build_brief(
-        sonnet_raw=_sonnet_raw("clean"),
+        reference_raw=_sonnet_raw("clean"),
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="my-tid",

@@ -115,7 +115,7 @@ MAX_DISPATCH_RETRIES = 2
 _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 
 # Review-gate loop constants
-REVIEW_GATE_THRESHOLD = 40          # Opus reviewer calls before soft-pause
+REVIEW_GATE_THRESHOLD = 40          # local reviewer (reviewer/reviewer_fresh seat) calls before soft-pause
 REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
 REVIEW_GATE_PAUSED_KEY = "pm/review-gate/paused"
 REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
@@ -3837,7 +3837,7 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             return Decision("review_exhausted_brief", {
                 "pr": pr, "cls": cls, "history": history,
             })
-        # Check kill-switch threshold before dispatching Opus reviewer
+        # Check kill-switch threshold before dispatching the local reviewer
         if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
             _set_review_gate_paused(True)
             return Decision("review_gate_pause", {"pr": pr, "cls": cls})
@@ -4215,7 +4215,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             n_issues = len(verdict_info.get("issues") or [])
             corr = verdict_info.get("corroboration_result") or {}
             corr_v = corr.get("verdict")
-            parts = [f"Opus reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
+            parts = [f"local reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
             if corr_v:
                 parts.append(f"corroboration={corr_v}")
             reviewer_verdict_text = "; ".join(parts)
@@ -4612,14 +4612,14 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     count = _review_gate_counter()
     episodic.write_observation(
         target_id,
-        f"Review-gate loop soft-paused after {count} Opus reviewer calls in the past 7d. "
+        f"Review-gate loop soft-paused after {count} local reviewer calls in the past 7d. "
         f"Falling back to inline-Sonnet behavior for new PRs. "
         f"Resume with `lapis-pm review-gate resume --reason \"...\"` (reason is required).",
         extra_tags=["pm:review-gate-paused"],
     )
     b = brief.synthesize(
         target_id,
-        trigger=f"Review-gate loop soft-paused after {count} Opus reviewer calls",
+        trigger=f"Review-gate loop soft-paused after {count} local reviewer calls",
         query="review-gate pause — token budget exceeded",
         notify=NotifyPriority.HIGH,
     )

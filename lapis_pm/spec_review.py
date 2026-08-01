@@ -2,13 +2,14 @@
 
 Default gate: Facets (technical-integrity + trickster personas, Haiku) for the PM /
 technical domain, plus a Mirror Council deliberation for invariant-fit / meaning, plus
-a standing Sonnet deep-reviewer leg that fires by default for advisory/hold specs as a
-reference-only signal (never moves the recommendation — Facets + Council are the sole
-drivers). The Sonnet leg can be disabled per-run via --no-sonnet-reviewer or
-SPEC_REVIEW_SONNET_DISABLED=1.
+a standing local reference-leg (the Empiricist) that fires by default for advisory/hold
+specs as a reference-only signal (never moves the recommendation — Facets + Council are
+the sole drivers). The reference leg can be disabled per-run via --no-reference-reviewer
+or SPEC_REVIEW_REFERENCE_DISABLED=1 (deprecated aliases --no-sonnet-reviewer /
+SPEC_REVIEW_SONNET_DISABLED=1 still honored, sunset 90 days after merge).
 
 Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override,
-authority, dispatch_facets, sonnet_reviewer, compare_opus). Returns SpecReviewBrief.
+authority, dispatch_facets, reference_reviewer, compare_opus). Returns SpecReviewBrief.
 Synchronous; caller blocks until all dispatched passes complete or timeout.
 """
 from __future__ import annotations
@@ -33,7 +34,7 @@ from typing import Iterator, Literal
 
 # Import the canonical facets deploy clone path from pm_core (source-enforce coupling).
 # pm_core has no module-level spec_review import, so this is circular-free.
-from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE
+from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE, _SHAPER
 from agents_core.shared_deliberation.orchestrator import (
     run_deliberation,
     init_facets_semaphore,
@@ -121,16 +122,23 @@ class SpecReviewBrief:
     combined_recommendation: Literal[
         "proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
     ]
-    # Sonnet deep-reviewer fields (reference-only; never steer the recommendation)
-    sonnet_verdict: str = "error"
-    sonnet_issues: list[dict] = field(default_factory=list)
-    sonnet_confidence: float = 0.0
-    sonnet_run_id: str = ""
-    sonnet_claims_checked: int | None = None
+    # Reference-leg fields (the Empiricist; local, reference-only; never steer the
+    # recommendation). Note the field name collides in sense with spec_review's other
+    # use of "reference-only" (= advisory) — here it also means "this is the reference
+    # leg". Both senses are true of this leg; see lapis-pm-reference-leg-provider-neutral-naming-v0.
+    reference_verdict: str = "error"
+    reference_issues: list[dict] = field(default_factory=list)
+    reference_confidence: float = 0.0
+    reference_run_id: str = ""
+    reference_claims_checked: int | None = None
+    # Model identity resolved at run time from registry.yaml's spec_reviewer seat
+    # (AC3) — never hardcoded, so a repoint changes this with no code edit. None
+    # when resolution fails (missing file/key/malformed entry) — never a guess.
+    reference_model: str | None = None
     parse_error: dict | None = None
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
-    # True whenever the Sonnet leg ran (always reference-only now)
-    sonnet_advisory_only: bool = False
+    # True whenever the reference leg ran (always reference-only now)
+    reference_advisory_only: bool = False
     facets_operator: str = "gravitywell"  # operator used for Facets personas + synthesis
     # Effective voicing/operator fields (read from provenance, unknown if absent)
     council_voicing_requested: str = "gravitywell"  # what was requested
@@ -159,28 +167,34 @@ class SpecReviewBrief:
 
     @property
     def opus_verdict(self) -> str:
-        """Deprecated alias for sonnet_verdict. Remove 90 days after merge."""
-        return self.sonnet_verdict
+        """Deprecated alias for reference_verdict. Remove 90 days after merge (2026-09-05).
+
+        Erah's OQ1 ruling (gate pass 1, 2026-07-31): point the opus_* aliases at
+        reference_* rather than the sonnet_* spelling they aliased before this unit,
+        so only two name generations (reference_* canonical, opus_* deprecated) are
+        live instead of three.
+        """
+        return self.reference_verdict
 
     @property
     def opus_issues(self) -> list[dict]:
-        """Deprecated alias for sonnet_issues. Remove 90 days after merge."""
-        return self.sonnet_issues
+        """Deprecated alias for reference_issues. Remove 90 days after merge."""
+        return self.reference_issues
 
     @property
     def opus_confidence(self) -> float:
-        """Deprecated alias for sonnet_confidence. Remove 90 days after merge."""
-        return self.sonnet_confidence
+        """Deprecated alias for reference_confidence. Remove 90 days after merge."""
+        return self.reference_confidence
 
     @property
     def opus_run_id(self) -> str:
-        """Deprecated alias for sonnet_run_id. Remove 90 days after merge."""
-        return self.sonnet_run_id
+        """Deprecated alias for reference_run_id. Remove 90 days after merge."""
+        return self.reference_run_id
 
     @property
     def opus_advisory_only(self) -> bool:
-        """Deprecated alias for sonnet_advisory_only. Remove 90 days after merge."""
-        return self.sonnet_advisory_only
+        """Deprecated alias for reference_advisory_only. Remove 90 days after merge."""
+        return self.reference_advisory_only
 
 
 # ---------------------------------------------------------------------------
@@ -792,36 +806,36 @@ def _dispatch_gw_reviewer(
         return None, [], elapsed, "call_error"
 
 
-def _poll_sonnet_until_terminal(
+def _poll_reference_until_terminal(
     spec_reviewer_task_id: str | None,
     timeout_s: int,
     start_time: float,
 ) -> dict | None:
-    """Poll Sonnet leg to terminal with independent timeout.
+    """Poll the reference leg to terminal with independent timeout.
 
     Council polling is now handled by the shared orchestrator (run_deliberation),
-    which has its own internal timeout. The Sonnet leg polls independently with
+    which has its own internal timeout. The reference leg polls independently with
     its own deadline to avoid stalling when one leg is slow.
 
-    Returns sonnet_raw dict or None if task_id is None (no Sonnet leg dispatched).
+    Returns reference_raw dict or None if task_id is None (no reference leg dispatched).
     """
     if spec_reviewer_task_id is None:
         return None
 
-    sonnet_result: dict | None = None
+    reference_result: dict | None = None
 
     while True:
         elapsed = time.time() - start_time
         timed_out = elapsed >= timeout_s
 
         # Check spec_reviewer terminal state
-        if sonnet_result is None:
+        if reference_result is None:
             output_path = _find_reviewer_output(spec_reviewer_task_id)
             if output_path is not None:
                 raw = _read_verdict_from_output(output_path)
                 failed = str(_CLAUDE_QUEUE_FAILED) in str(output_path) or \
                          str(_GPU_QUEUE_FAILED) in str(output_path)
-                sonnet_result = {
+                reference_result = {
                     "status": "failed" if failed else "processed",
                     "verdict": raw.get("verdict", "error"),
                     "issues": raw.get("issues", []),
@@ -833,12 +847,12 @@ def _poll_sonnet_until_terminal(
                 elapsed_s = int(time.time() - start_time)
                 print(
                     f"[spec-review:reviewer-complete] task_id={spec_reviewer_task_id} "
-                    f"elapsed={elapsed_s}s verdict={sonnet_result['verdict']}",
+                    f"elapsed={elapsed_s}s verdict={reference_result['verdict']}",
                     file=sys.stderr,
                 )
-                return sonnet_result
+                return reference_result
             elif timed_out:
-                sonnet_result = {
+                reference_result = {
                     "status": "timeout",
                     "verdict": "timeout",
                     "issues": [],
@@ -851,14 +865,14 @@ def _poll_sonnet_until_terminal(
                     f"elapsed={elapsed_s}s",
                     file=sys.stderr,
                 )
-                return sonnet_result
+                return reference_result
 
         time.sleep(_POLL_CADENCE_S)
 
 
 def _combined_recommendation(
-    sonnet_verdict: str = "skip",
-    sonnet_issues: list[dict] = (),
+    reference_verdict: str = "skip",
+    reference_issues: list[dict] = (),
     council_status: str = "error",
     council_positions: list[dict] = (),
     facets_escalation: str | None = None,
@@ -870,10 +884,10 @@ def _combined_recommendation(
 ) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed"]:
     """Deterministic combined recommendation — Facets (PM) + Council (philosophical).
 
-    sonnet_verdict="skip" signals that the Sonnet leg was not dispatched (Facets mode).
-    The Sonnet leg is always reference-only: even when present, its verdict/issues are
-    fed the "skip" sentinel into the recommendation so they cannot move the gate.
-    Facets + Council are the sole drivers.
+    reference_verdict="skip" signals that the reference leg was not dispatched (Facets
+    mode). The reference leg is always reference-only: even when present, its
+    verdict/issues are fed the "skip" sentinel into the recommendation so they cannot
+    move the gate. Facets + Council are the sole drivers.
 
     When facets_escalation is provided and authority is advisory/hold, Facets
     signals take precedence. Falls through to Council-only logic on
@@ -882,12 +896,12 @@ def _combined_recommendation(
     """
     # Support deprecated opus_* parameter aliases
     if opus_verdict is not None:
-        sonnet_verdict = opus_verdict
+        reference_verdict = opus_verdict
     if opus_issues is not None:
-        sonnet_issues = opus_issues
+        reference_issues = opus_issues
 
     # parse_failed: parser could not extract a verdict
-    if sonnet_verdict == "parse_failed":
+    if reference_verdict == "parse_failed":
         return "parse_failed"
 
     # Facets logic — gated on authority, escalation signal, and reliability
@@ -904,31 +918,49 @@ def _combined_recommendation(
     if council_status in {"timeout", "error"}:
         return "incomplete"
 
-    # Sonnet timeout/error → incomplete (only when Sonnet was dispatched, non-advisory-only)
-    # NOTE: in the current design, sonnet_verdict is always fed as "skip" to this function
-    # (advisory-only mode), so this branch only triggers in legacy non-advisory-only calls.
-    if sonnet_verdict not in {"skip"} and sonnet_verdict in {"timeout", "error"}:
+    # Reference leg timeout/error → incomplete (only when dispatched, non-advisory-only)
+    # NOTE: in the current design, reference_verdict is always fed as "skip" to this
+    # function (advisory-only mode), so this branch only triggers in legacy
+    # non-advisory-only calls.
+    if reference_verdict not in {"skip"} and reference_verdict in {"timeout", "error"}:
         return "incomplete"
 
-    # shape-with-Erah: council laid-down, council open with blocks, or Sonnet needs-human
+    # shape-with-Erah: council laid-down, council open with blocks, or reference needs-human
     has_block = any(p.get("position") == "block" for p in council_positions)
     if council_status == "laid-down" or (council_status == "open" and has_block):
         return "shape-with-Erah"
-    if sonnet_verdict not in {"skip"} and sonnet_verdict == "needs-human":
+    if reference_verdict not in {"skip"} and reference_verdict == "needs-human":
         return "shape-with-Erah"
 
-    # amend-spec: council open, or Sonnet fixable/HIGH-issue (when non-advisory-only)
-    has_high = any(str(i.get("severity", "")).lower() == "high" for i in sonnet_issues)
+    # amend-spec: council open, or reference fixable/HIGH-issue (when non-advisory-only)
+    has_high = any(str(i.get("severity", "")).lower() == "high" for i in reference_issues)
     if council_status == "open":
         return "amend-spec"
-    if sonnet_verdict not in {"skip"} and (sonnet_verdict == "fixable" or has_high):
+    if reference_verdict not in {"skip"} and (reference_verdict == "fixable" or has_high):
         return "amend-spec"
 
-    # proceed-to-bind: council resolved + (Sonnet clean or Sonnet not dispatched)
-    if council_status == "resolved" and sonnet_verdict in {"skip", "clean"}:
+    # proceed-to-bind: council resolved + (reference clean or reference not dispatched)
+    if council_status == "resolved" and reference_verdict in {"skip", "clean"}:
         return "proceed-to-bind"
 
     return "incomplete"
+
+
+def _resolve_reference_model() -> str | None:
+    """Resolve the reference leg's model identity from registry.yaml at run time (AC3).
+
+    Reuses the Shaper instance pm_core already constructs for registry.yaml (_SHAPER)
+    rather than introducing a second loading idiom. Reads agents.spec_reviewer.model.
+
+    Never raises: a missing seat, missing file, or malformed entry returns None, which
+    the brief renders as an explicit unknown marker — never a guessed or stale model
+    name. This is the mechanism that keeps the rename from going stale a third time —
+    repointing spec_reviewer.model changes what the brief says with no code edit.
+    """
+    try:
+        return _SHAPER.get_agent("spec_reviewer").model
+    except Exception:
+        return None
 
 
 def _build_brief(
@@ -937,10 +969,11 @@ def _build_brief(
     parsed_target_id: str,
     repo: str,
     elapsed_s: float,
-    sonnet_raw: dict | None = None,
+    reference_raw: dict | None = None,
     facets_deliberation: dict | None = None,
     authority: str = "advisory",
-    sonnet_advisory_only: bool = False,
+    reference_advisory_only: bool = False,
+    reference_model: str | None = None,
     facets_operator: str = "gravitywell",
     council_voicing_requested: str = "gravitywell",
     gw_verdict: str = "skip",
@@ -956,33 +989,33 @@ def _build_brief(
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
 ) -> SpecReviewBrief:
-    """Assemble SpecReviewBrief from Facets + Council (and optionally Sonnet) results.
+    """Assemble SpecReviewBrief from Facets + Council (and optionally the reference leg).
 
-    sonnet_raw is optional — None when the Sonnet leg was not dispatched.
+    reference_raw is optional — None when the reference leg was not dispatched.
     facets_deliberation is the FacetsDeliberation envelope dict; None if disabled/timeout.
-    sonnet_advisory_only — the Sonnet leg is always reference-only: its output is
+    reference_advisory_only — the reference leg is always reference-only: its output is
     rendered for reference but excluded from the combined recommendation (Facets +
-    Council drive the gate). This flag is set True whenever the Sonnet leg ran.
+    Council drive the gate). This flag is set True whenever the reference leg ran.
     council_voicing_requested — the voicing value that was requested (default gravitywell).
     """
     # Support deprecated opus_* parameter aliases
-    if opus_raw is not None and sonnet_raw is None:
-        sonnet_raw = opus_raw
-    if opus_advisory_only is not None and sonnet_advisory_only is False:
-        sonnet_advisory_only = opus_advisory_only
+    if opus_raw is not None and reference_raw is None:
+        reference_raw = opus_raw
+    if opus_advisory_only is not None and reference_advisory_only is False:
+        reference_advisory_only = opus_advisory_only
 
-    # Sonnet fields — default to "skip" sentinel when not dispatched
-    sonnet_verdict = sonnet_raw.get("verdict", "error") if sonnet_raw is not None else "skip"
-    sonnet_issues = sonnet_raw.get("issues", []) if sonnet_raw is not None else []
-    sonnet_confidence = float(sonnet_raw.get("confidence", 0.0)) if sonnet_raw is not None else 0.0
-    sonnet_run_id = sonnet_raw.get("run_id", "") if sonnet_raw is not None else ""
-    sonnet_claims_checked = None
-    if sonnet_raw is not None:
-        _claims_checked_raw = sonnet_raw.get("claims_checked")
+    # Reference-leg fields — default to "skip" sentinel when not dispatched
+    reference_verdict = reference_raw.get("verdict", "error") if reference_raw is not None else "skip"
+    reference_issues = reference_raw.get("issues", []) if reference_raw is not None else []
+    reference_confidence = float(reference_raw.get("confidence", 0.0)) if reference_raw is not None else 0.0
+    reference_run_id = reference_raw.get("run_id", "") if reference_raw is not None else ""
+    reference_claims_checked = None
+    if reference_raw is not None:
+        _claims_checked_raw = reference_raw.get("claims_checked")
         try:
-            sonnet_claims_checked = int(_claims_checked_raw) if _claims_checked_raw is not None else None
+            reference_claims_checked = int(_claims_checked_raw) if _claims_checked_raw is not None else None
         except (TypeError, ValueError):
-            sonnet_claims_checked = None
+            reference_claims_checked = None
 
     council_status = council_raw.get("status", "error")
     council_landing = council_raw.get("landing", "")
@@ -1032,16 +1065,16 @@ def _build_brief(
             facets_operator_requested and facets_operator_requested != facets_operator_effective
         )
 
-    # The Sonnet leg is always reference-only: feed the "skip" sentinel into the
-    # recommendation so any Sonnet verdict/issues/timeout cannot move the gate.
-    # Facets + Council remain the sole drivers. The real Sonnet fields are still
+    # The reference leg is always reference-only: feed the "skip" sentinel into the
+    # recommendation so any reference verdict/issues/timeout cannot move the gate.
+    # Facets + Council remain the sole drivers. The real reference fields are still
     # stored on the brief for rendering.
-    rec_sonnet_verdict = "skip" if sonnet_advisory_only else sonnet_verdict
-    rec_sonnet_issues = () if sonnet_advisory_only else sonnet_issues
+    rec_reference_verdict = "skip" if reference_advisory_only else reference_verdict
+    rec_reference_issues = () if reference_advisory_only else reference_issues
 
     recommendation = _combined_recommendation(
-        sonnet_verdict=rec_sonnet_verdict,
-        sonnet_issues=rec_sonnet_issues,
+        reference_verdict=rec_reference_verdict,
+        reference_issues=rec_reference_issues,
         council_status=council_status,
         council_positions=council_positions,
         facets_escalation=facets_escalation,
@@ -1061,14 +1094,15 @@ def _build_brief(
         council_run_id=council_run_id,
         elapsed_s=elapsed_s,
         combined_recommendation=recommendation,
-        sonnet_verdict=sonnet_verdict,
-        sonnet_issues=sonnet_issues,
-        sonnet_confidence=sonnet_confidence,
-        sonnet_run_id=sonnet_run_id,
-        sonnet_claims_checked=sonnet_claims_checked,
-        parse_error=sonnet_raw.get("parse_error") if sonnet_raw is not None else None,
+        reference_verdict=reference_verdict,
+        reference_issues=reference_issues,
+        reference_confidence=reference_confidence,
+        reference_run_id=reference_run_id,
+        reference_claims_checked=reference_claims_checked,
+        reference_model=reference_model,
+        parse_error=reference_raw.get("parse_error") if reference_raw is not None else None,
         facets_deliberation=facets_deliberation,
-        sonnet_advisory_only=sonnet_advisory_only,
+        reference_advisory_only=reference_advisory_only,
         facets_operator=facets_operator,
         council_voicing_requested=council_voicing_requested,
         council_voicing_effective=council_voicing_effective or "unknown",
@@ -1128,9 +1162,9 @@ def format_brief(brief: SpecReviewBrief) -> str:
         "\n".join(
             f"    - [{i.get('severity','?').upper()}] "
             f"{i.get('citation', i.get('path','?'))}: {i.get('note','')}"
-            for i in brief.sonnet_issues
+            for i in brief.reference_issues
         )
-        if brief.sonnet_issues
+        if brief.reference_issues
         else "    - (none)"
     )
 
@@ -1332,29 +1366,30 @@ record instead of reaching this path — check the queue record for that distinc
 {failed_personas_line}- **Run ID:** {fd.get('deliberation_id', '')}
 """
 
-    # Sonnet section — omitted only when the leg did not run (verdict="skip").
+    # Reference-leg section — omitted only when the leg did not run (verdict="skip").
     # This section is always reference-only (purpose stated in heading).
     # IMPORTANT: always-render is load-bearing, not cosmetic — the whole point is a
     # standing deep signal in every gate run. Do not remove this section or gate it
-    # on any flag other than sonnet_verdict == "skip".
-    sonnet_section = ""
-    if brief.sonnet_verdict != "skip":
+    # on any flag other than reference_verdict == "skip".
+    reference_section = ""
+    if brief.reference_verdict != "skip":
         claims_checked_str = (
-            str(brief.sonnet_claims_checked)
-            if brief.sonnet_claims_checked is not None
+            str(brief.reference_claims_checked)
+            if brief.reference_claims_checked is not None
             else "(not reported)"
         )
-        sonnet_section = f"""
-## Empiricist — factual-claim verification, reference only (does not affect recommendation)
-- **Verdict:** {brief.sonnet_verdict} (confidence {brief.sonnet_confidence:.2f})
+        model_str = brief.reference_model or "model unknown"
+        reference_section = f"""
+## Empiricist ({model_str}) — factual-claim verification, reference only (does not affect recommendation)
+- **Verdict:** {brief.reference_verdict} (confidence {brief.reference_confidence:.2f})
 - **Claims checked:** {claims_checked_str}
-- **Run ID:** {brief.sonnet_run_id}
+- **Run ID:** {brief.reference_run_id}
 - **Issues:**
 {issues_lines}
 """
 
     # GravityWell section — rendered when the leg ran (gw_ran=True).
-    # Like Sonnet, this is always reference-only and never steers the recommendation.
+    # Like the reference leg, this is always reference-only and never steers the recommendation.
     gw_section = ""
     if brief.gw_ran:
         gw_parse_failed_block = ""
@@ -1393,7 +1428,7 @@ verdict from it. See raw output below for what the model actually said.
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-{voicing_section}{degraded_summary}{infra_banner}{facets_section}{sonnet_section}{gw_section}
+{voicing_section}{degraded_summary}{infra_banner}{facets_section}{reference_section}{gw_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -1555,37 +1590,51 @@ def run_spec_review(
     repo_override: str | None = None,
     authority: str | None = None,
     dispatch_facets: bool = True,
-    sonnet_reviewer: bool = True,
+    reference_reviewer: bool = True,
     facets_operator: str = "haiku",
-    # Deprecated parameter — kept for back-compat; no-op (sonnet_reviewer is always-on)
+    # Deprecated parameter — kept for back-compat; no-op (reference_reviewer is always-on)
     compare_opus: bool = False,
+    # Deprecated alias for reference_reviewer — remove 90 days after merge (2026-09-05).
+    sonnet_reviewer: bool | None = None,
 ) -> SpecReviewBrief:
-    """Run Facets (PM) + Council (philosophical) + Sonnet deep-reviewer review. Synchronous.
+    """Run Facets (PM) + Council (philosophical) + the reference leg's review. Synchronous.
 
-    The Sonnet spec_reviewer leg fires by default for advisory/hold specs (sonnet_reviewer=True).
-    It is reference-only and never moves combined_recommendation — Facets + Council are
-    the sole recommendation drivers. Disable with sonnet_reviewer=False or
-    SPEC_REVIEW_SONNET_DISABLED=1.
+    The reference leg (the Empiricist, local — see registry.yaml's spec_reviewer seat)
+    fires by default for advisory/hold specs (reference_reviewer=True). It is
+    reference-only and never moves combined_recommendation — Facets + Council are
+    the sole recommendation drivers. Disable with reference_reviewer=False or
+    SPEC_REVIEW_REFERENCE_DISABLED=1 (deprecated aliases sonnet_reviewer=False /
+    SPEC_REVIEW_SONNET_DISABLED=1 still honored).
 
     Facets deliberation is synchronous (blocks ~5 min); Council is async (polled up to
-    timeout). The Sonnet leg is dispatched async BEFORE the Facets block (so it runs
+    timeout). The reference leg is dispatched async BEFORE the Facets block (so it runs
     concurrently with Facets' blocking subprocess), polled alongside Council.
 
     dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
     smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
-    back to "advisory" if not found. Only advisory/hold specs dispatch Facets and Sonnet.
+    back to "advisory" if not found. Only advisory/hold specs dispatch Facets and the
+    reference leg.
 
     facets_operator controls the Facets persona + synthesis model; default haiku.
 
-    compare_opus is accepted for back-compat but is a no-op — the Sonnet leg is already
-    on by default, so passing compare_opus=True has no additional effect. A deprecation
-    note is emitted to stderr. Sunset: remove 90 days after merge (2026-09-05).
+    compare_opus is accepted for back-compat but is a no-op — the reference leg is
+    already on by default, so passing compare_opus=True has no additional effect. A
+    deprecation note is emitted to stderr. Sunset: remove 90 days after merge (2026-09-05).
     """
+    # Support deprecated sonnet_reviewer parameter alias
+    if sonnet_reviewer is not None:
+        print(
+            "[spec-review] WARNING: sonnet_reviewer= is deprecated; use reference_reviewer= "
+            "(sunset 90 days after merge, 2026-09-05).",
+            file=sys.stderr,
+        )
+        reference_reviewer = sonnet_reviewer
+
     # Emit deprecation note when the caller still passes compare_opus=True
     if compare_opus:
         print(
             "[spec-review] WARNING: --compare-opus / compare_opus is deprecated and has no effect; "
-            "the Sonnet reference leg now runs by default (sunset 90 days after merge).",
+            "the reference leg now runs by default (sunset 90 days after merge).",
             file=sys.stderr,
         )
 
@@ -1614,13 +1663,18 @@ def run_spec_review(
     # fail-CLOSED on timeout (hung holder). Superseded when the H5 elevator organ activates.
     # Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
     with _spec_review_lock(spec_path):
-        # 4b. Sonnet deep-reviewer leg: dispatch async BEFORE the Facets block so it runs
-        #     concurrently with Facets' blocking subprocess. Always-on for advisory/hold;
-        #     reference-only (never moves the recommendation). Intentional — do not remove.
+        # 4b. Reference leg (the Empiricist): dispatch async BEFORE the Facets block so it
+        #     runs concurrently with Facets' blocking subprocess. Always-on for
+        #     advisory/hold; reference-only (never moves the recommendation).
+        #     Intentional — do not remove.
         spec_reviewer_task_id: str | None = None
-        sonnet_disabled = (not sonnet_reviewer) or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
-        do_sonnet = (not sonnet_disabled) and effective_authority in {"advisory", "hold"}
-        if do_sonnet:
+        reference_disabled = (
+            (not reference_reviewer)
+            or os.getenv("SPEC_REVIEW_REFERENCE_DISABLED") == "1"
+            or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
+        )
+        do_reference = (not reference_disabled) and effective_authority in {"advisory", "hold"}
+        if do_reference:
             synth_target_id = _synth_target_id(parsed_target_id)
             try:
                 spec_reviewer_task_id = _dispatch_spec_reviewer(
@@ -1631,14 +1685,14 @@ def run_spec_review(
                     invariant_context=invariant_context,
                 ).task_id
                 print(
-                    f"[spec-review:sonnet-reviewer] dispatched reference Sonnet pass "
+                    f"[spec-review:reference-reviewer] dispatched reference pass "
                     f"task_id={spec_reviewer_task_id}",
                     file=sys.stderr,
                 )
             except Exception as e:
-                # Sonnet leg is reference-only; never let its dispatch failure abort the gate.
+                # Reference leg is reference-only; never let its dispatch failure abort the gate.
                 print(
-                    f"[spec-review:sonnet-reviewer-dispatch-error] {e} — continuing Facets-only",
+                    f"[spec-review:reference-reviewer-dispatch-error] {e} — continuing Facets-only",
                     file=sys.stderr,
                 )
                 spec_reviewer_task_id = None
@@ -1683,7 +1737,7 @@ def run_spec_review(
 
         # 5. Run shared orchestration (Facets + Council concurrently).
         #    This replaces the bespoke _dispatch_facets + _dispatch_council paths.
-        #    Council runs with its own internal timeout; Sonnet gets its own poll deadline.
+        #    Council runs with its own internal timeout; the reference leg gets its own poll deadline.
         facets_deliberation: dict | None = None
         envelope = None
         council_run_id: str | None = None
@@ -2000,9 +2054,9 @@ def run_spec_review(
                 if executor is not None:
                     executor.shutdown(wait=True)
 
-        # 8. Poll Sonnet leg to terminal (with independent timeout from Council).
+        # 8. Poll the reference leg to terminal (with independent timeout from Council).
         #    Council results come directly from the envelope (already complete).
-        sonnet_raw = _poll_sonnet_until_terminal(
+        reference_raw = _poll_reference_until_terminal(
             spec_reviewer_task_id=spec_reviewer_task_id,
             timeout_s=timeout_s,
             start_time=start_time,
@@ -2074,24 +2128,41 @@ def run_spec_review(
 
     # Write divergence record to mem via subprocess — always, even when gw_ran=False,
     # so that skip-rate visibility is preserved (gw_ran: bool field tracks success/failure)
-    sonnet_verdict_str = sonnet_raw.get("verdict", "skip") if sonnet_raw else "skip"
+    reference_verdict_str = reference_raw.get("verdict", "skip") if reference_raw else "skip"
+    reference_findings_count = len(reference_raw.get("issues", [])) if reference_raw else 0
+    resolved_reference_model = _resolve_reference_model()
     divergence_record = {
         "run_id": gw_run_id,
         "spec_path": str(spec_path),
         "repo": repo,
-        "sonnet_verdict": sonnet_verdict_str,
+        "reference_verdict": reference_verdict_str,
         "gw_verdict": gw_verdict,
         # None when no verdict was actually produced (never ran, or abandoned
         # mid-flight) - a False/True agreement value implies a real comparison.
-        "agree": (gw_verdict == sonnet_verdict_str) if (gw_ran and not gw_abandoned) else None,
+        "agree": (gw_verdict == reference_verdict_str) if (gw_ran and not gw_abandoned) else None,
         "gw_ran": gw_ran,
         "gw_abandoned": gw_abandoned,
         "gw_skip_reason": gw_skip_reason,
         "gw_transcript_ref": gw_transcript_ref,
-        "sonnet_findings_count": len(sonnet_raw.get("issues", [])) if sonnet_raw else 0,
+        "reference_findings_count": reference_findings_count,
         "gw_findings_count": gw_findings_count,
         "elapsed_gw": gw_elapsed,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # AC5 — states on its face that both legs are local, so this record cannot be
+        # misread as cross-provider decorrelation evidence (it is stance decorrelation
+        # only; see lapis-pm-reference-leg-provider-neutral-naming-v0).
+        "leg_identity": [
+            {"name": "reference", "model": resolved_reference_model or "unknown", "type": "local"},
+            {"name": "gw", "model": "gravitywell", "type": "local"},
+        ],
+        # Dual-emit back-compat (AC5): the old sonnet_* spelling is retained with values
+        # identical to the reference_* fields above so router/gw-review-divergence/*
+        # stays one readable series for consumers on either spelling. Sunset 90 days
+        # after this unit merges (~2026-10-30) — drop these two keys and this comment
+        # then, per lapis-pm-reference-leg-provider-neutral-naming-v0 AC5.
+        "sonnet_verdict": reference_verdict_str,
+        "sonnet_findings_count": reference_findings_count,
+        "sonnet_dual_emit_sunset": "2026-10-30",
     }
     try:
         from lapis_pm import node_identity as _node_identity
@@ -2120,19 +2191,20 @@ def run_spec_review(
             file=sys.stderr,
         )
 
-    # 10. Build and return brief. sonnet_raw is non-None when the Sonnet leg ran; it is
-    #     rendered for reference but excluded from the recommendation (sonnet_advisory_only).
-    #     GW leg data is also reference-only and non-steering.
+    # 10. Build and return brief. reference_raw is non-None when the reference leg ran;
+    #     it is rendered for reference but excluded from the recommendation
+    #     (reference_advisory_only). GW leg data is also reference-only and non-steering.
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
         parsed_target_id=parsed_target_id,
         repo=repo,
         elapsed_s=elapsed,
-        sonnet_raw=sonnet_raw,
+        reference_raw=reference_raw,
         facets_deliberation=facets_deliberation,
         authority=effective_authority,
-        sonnet_advisory_only=sonnet_raw is not None,
+        reference_advisory_only=reference_raw is not None,
+        reference_model=resolved_reference_model,
         facets_operator=facets_operator,
         council_voicing_requested=council_voicing,
         gw_verdict=gw_verdict,

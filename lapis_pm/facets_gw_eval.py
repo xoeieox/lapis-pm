@@ -235,7 +235,7 @@ def _run_spec_review_arm(
             "spec-review",
             str(spec_path),
             "--facets-operator", arm,
-            "--no-sonnet-reviewer",  # Keep eval cheap; no reference judgment here
+            "--no-reference-reviewer",  # Keep eval cheap; no reference judgment here
         ]
         result = subprocess.run(
             cmd,

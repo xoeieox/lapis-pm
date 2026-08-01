@@ -721,7 +721,7 @@ def _print_target_status(t, explain: bool = False):
             budget = _pm._REVIEW_CYCLE_BUDGETS.get(t.pm_authority, 2)
             mode = "fresh-reviewer" if t.pm_authority == "hold" else "same-reviewer"
             print(f"  reviewing:     PR #{review_state['pr_number']}, "
-                  f"cycle {review_state['cycle']}/{budget} (opus, {mode})")
+                  f"cycle {review_state['cycle']}/{budget} (local reviewer, {mode})")
             verdict = review_state.get("verdict", "pending")
             issues = review_state.get("issues", 0)
             if verdict != "pending":
@@ -1478,7 +1478,7 @@ def cmd_review_gate(args) -> int:
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
-        print(f"Review-gate counter reset (was {prev}). Opus reviewer active again.")
+        print(f"Review-gate counter reset (was {prev}). Local reviewer active again.")
         print(f"Reason recorded: {args.reason}")
         return 0
     print(f"ERROR: unknown review-gate subcommand: {sub}", file=sys.stderr)
@@ -1500,9 +1500,20 @@ def cmd_spec_review(args) -> int:
     if getattr(args, "compare_opus", False):
         print(
             "[spec-review] WARNING: --compare-opus is deprecated and a no-op; "
-            "the Sonnet reference leg now runs by default (sunset 90 days after merge).",
+            "the reference leg now runs by default (sunset 90 days after merge).",
             file=sys.stderr,
         )
+    # Emit deprecation note when caller passes the legacy --no-sonnet-reviewer flag
+    if getattr(args, "no_sonnet_reviewer", False):
+        print(
+            "[spec-review] WARNING: --no-sonnet-reviewer is deprecated; use "
+            "--no-reference-reviewer (sunset 90 days after merge, 2026-09-05).",
+            file=sys.stderr,
+        )
+    no_reference_reviewer = (
+        getattr(args, "no_reference_reviewer", False)
+        or getattr(args, "no_sonnet_reviewer", False)
+    )
     try:
         brief = run_spec_review(
             spec_path=spec_path,
@@ -1511,7 +1522,7 @@ def cmd_spec_review(args) -> int:
             repo_override=args.repo_override,
             authority=getattr(args, "authority", None),
             dispatch_facets=not getattr(args, "no_facets", False),
-            sonnet_reviewer=not getattr(args, "no_sonnet_reviewer", False),
+            reference_reviewer=not no_reference_reviewer,
             facets_operator=getattr(args, "facets_operator", "haiku"),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
@@ -2241,10 +2252,10 @@ def build_parser() -> argparse.ArgumentParser:
     tep.set_defaults(func=cmd_tts_episode_publish)
 
     rg = sub.add_parser("review-gate",
-                        help="Manage the Opus reviewer kill-switch.")
+                        help="Manage the local reviewer kill-switch.")
     rg_sub = rg.add_subparsers(dest="review_gate_sub", required=True)
     rg_sub.add_parser("status", help="Print current counter + threshold.")
-    rg_resume = rg_sub.add_parser("resume", help="Reset counter; re-enable Opus reviewer.")
+    rg_resume = rg_sub.add_parser("resume", help="Reset counter; re-enable the local reviewer.")
     rg_resume.add_argument(
         "--reason",
         required=True,
@@ -2628,7 +2639,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = sub.add_parser(
         "spec-review",
-        help="Pre-bind Facets + Council review of a spec document (Sonnet deep-reviewer runs by default).",
+        help="Pre-bind Facets + Council review of a spec document (the reference leg runs by default).",
     )
     sr.add_argument("spec_path", help="Path to the spec markdown file.")
     sr.add_argument(
@@ -2663,12 +2674,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override spec's stated authority for Facets dispatch gating.",
     )
     sr.add_argument(
+        "--no-reference-reviewer",
+        action="store_true",
+        dest="no_reference_reviewer",
+        help=(
+            "Skip the reference-only Empiricist claim-verification leg (on by default for "
+            "advisory/hold; opt out for faster/cheaper runs)."
+        ),
+    )
+    sr.add_argument(
         "--no-sonnet-reviewer",
         action="store_true",
         dest="no_sonnet_reviewer",
         help=(
-            "Skip the reference-only Empiricist claim-verification leg (on by default for "
-            "advisory/hold; opt out for faster/cheaper runs)."
+            "Deprecated alias for --no-reference-reviewer; still honored "
+            "(sunset 90 days after merge, 2026-09-05)."
         ),
     )
     sr.add_argument(
@@ -2676,7 +2696,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="compare_opus",
         help=(
-            "Deprecated/no-op: the Sonnet reference leg now runs by default; "
+            "Deprecated/no-op: the reference leg now runs by default; "
             "this flag is kept for back-compat (sunset 90 days after merge)."
         ),
     )

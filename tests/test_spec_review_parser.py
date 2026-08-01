@@ -7,7 +7,7 @@ Covers:
 - fenced JSON no preamble → fenced extraction path
 - embedded code-span trap → fence wins over bracket-counter false-positive
 - two competing candidates → fenced JSON wins over small bracket-counter hit
-- _combined_recommendation with sonnet_verdict="parse_failed" → "parse_failed"
+- _combined_recommendation with reference_verdict="parse_failed" → "parse_failed"
 - _build_brief with parse_failed → rendered brief contains ## Parse error section
 """
 from __future__ import annotations
@@ -170,8 +170,8 @@ def test_two_competing_candidates_fence_wins(tmp_path):
 
 def test_combined_recommendation_parse_failed():
     result = _combined_recommendation(
-        sonnet_verdict="parse_failed",
-        sonnet_issues=[],
+        reference_verdict="parse_failed",
+        reference_issues=[],
         council_status="resolved",
         council_positions=[],
     )
@@ -199,7 +199,7 @@ def test_build_brief_parse_failed_renders_parse_error_section(tmp_path):
     )
 
     brief = _build_brief(
-        sonnet_raw=sonnet,
+        reference_raw=sonnet,
         council_raw=_council_raw("resolved"),
         spec_path=spec,
         parsed_target_id="test-tid",

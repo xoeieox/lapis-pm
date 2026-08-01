@@ -430,10 +430,10 @@ class TestElevatorGroundingV1:
              mock.patch("requests.get", mock.Mock(return_value=poll_resp)), \
              mock.patch("time.sleep"), \
              mock.patch("time.time") as mock_time:
-            # time.time() calls in order: start_time(1282), poll_start(1446),
-            # first loop elapsed(1449) → 80s > 75s claim deadline fires,
-            # final elapsed(1689) → any value
-            mock_time.side_effect = [1000.0, 1000.0, 1080.0, 1001.0]
+            # time.time() calls in order: start_time, gw_submit_time (the GW leg's
+            # join-timeout anchor), poll_start, first loop elapsed → 80s > 75s claim
+            # deadline fires, final elapsed → any value
+            mock_time.side_effect = [1000.0, 1000.0, 1000.0, 1080.0, 1001.0]
             spec_review.run_spec_review(
                 spec_path=spec_fixture,
                 dispatch_facets=True,

@@ -85,9 +85,10 @@ def test_gw_principal_same_value_reaches_both_destinations(advisory_spec, monkey
         repo,
         run_id,
         gw_principal=None,
+        abandoned_event=None,
     ):
         captured["dispatch_gw_principal"] = gw_principal
-        return (None, [], 0.0)
+        return (None, [], 0.0, "")
 
     def mock_run_deliberation(request):
         captured["delib_gw_principal"] = request.gw_principal

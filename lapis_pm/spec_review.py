@@ -23,6 +23,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -143,6 +144,7 @@ class SpecReviewBrief:
     # GravityWell reference leg fields (reference-only; never steer the recommendation)
     gw_verdict: str = "skip"  # verdict from GW, or "skip" if not dispatched
     gw_ran: bool = False  # whether the GW leg actually ran
+    gw_abandoned: bool = False  # True when the join gave up on a still-running leg (never a fabricated elapsed)
     gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname")
     gw_findings_count: int = 0  # number of findings/issues from GW
     elapsed_gw: float = 0.0  # wall-clock time for GW leg
@@ -640,6 +642,7 @@ def _dispatch_gw_reviewer(
     repo: str,
     run_id: str,
     gw_principal: str | None = None,
+    abandoned_event: threading.Event | None = None,
 ) -> tuple[str | None, list[dict], float, str]:
     """Dispatch and run the GW reference reviewer synchronously against Slot-2
     Devstral (:8082), lease-free — a distinct-model second opinion that runs
@@ -754,11 +757,21 @@ def _dispatch_gw_reviewer(
         )
         elapsed = time.time() - start_time
         if text is not None:
-            print(
-                f"[spec-review:gw-reviewer] completed task_id={run_id} "
-                f"elapsed={elapsed:.1f}s",
-                file=sys.stderr,
-            )
+            if abandoned_event is not None and abandoned_event.is_set():
+                # The join already gave up and reported this leg abandoned; this
+                # result arrived too late to be used. Say so distinctly rather than
+                # printing a plain "completed" line that would misread as live.
+                print(
+                    f"[spec-review:gw-reviewer-abandoned] completed after join gave up "
+                    f"task_id={run_id} elapsed={elapsed:.1f}s reason=timeout",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[spec-review:gw-reviewer] completed task_id={run_id} "
+                    f"elapsed={elapsed:.1f}s",
+                    file=sys.stderr,
+                )
             return text, transcript, elapsed, ""
         # on_wake_fail=skip cannot fire on this call path (acquire_lease=False
         # never consults the doorman) - report the real reason_out cause
@@ -932,6 +945,7 @@ def _build_brief(
     council_voicing_requested: str = "gravitywell",
     gw_verdict: str = "skip",
     gw_ran: bool = False,
+    gw_abandoned: bool = False,
     gw_skip_reason: str = "",
     gw_findings_count: int = 0,
     elapsed_gw: float = 0.0,
@@ -1066,6 +1080,7 @@ def _build_brief(
         council_error_reason=council_error_reason,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_abandoned=gw_abandoned,
         gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=elapsed_gw,
@@ -1636,8 +1651,14 @@ def run_spec_review(
         gw_run_id = str(uuid.uuid4())[:8]
         gw_principal = f"gw-gate-{uuid.uuid4().hex[:12]}"
         do_gw = effective_authority in {"advisory", "hold"}
+        # Single source of truth for the GW leg's timeout: the join below must wait
+        # on exactly this value, not a separate hardcoded number, or a raised
+        # GW_REVIEWER_TIMEOUT_SEC (e.g. #243's 900->1800) silently fails to take effect.
+        gw_timeout = int(os.environ.get("GW_REVIEWER_TIMEOUT_SEC", "1800"))
+        gw_abandoned_event = threading.Event()
         if do_gw:
             executor = ThreadPoolExecutor(max_workers=1)
+            gw_submit_time = time.time()
             try:
                 gw_future = executor.submit(
                     _dispatch_gw_reviewer,
@@ -1647,6 +1668,7 @@ def run_spec_review(
                     repo=repo,
                     run_id=gw_run_id,
                     gw_principal=gw_principal,
+                    abandoned_event=gw_abandoned_event,
                 )
                 print(
                     f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
@@ -1939,17 +1961,25 @@ def run_spec_review(
         gw_transcript: list[dict] = []
         gw_elapsed: float = 0.0
         gw_skip_reason: str = ""
+        gw_abandoned: bool = False
         if gw_future is not None:
             try:
-                gw_text, gw_transcript, gw_elapsed, gw_skip_reason = gw_future.result(timeout=300)
+                gw_text, gw_transcript, gw_elapsed, gw_skip_reason = gw_future.result(timeout=gw_timeout)
             except FuturesTimeoutError:
+                # Real wall-clock elapsed at the moment of abandonment - never the
+                # timeout constant, and never null (AC2). gw_abandoned is the
+                # unambiguous marker a consumer branches on (AC3).
+                gw_elapsed = time.time() - gw_submit_time
+                gw_abandoned = True
+                gw_skip_reason = "timeout"
+                gw_abandoned_event.set()
                 print(
-                    f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
+                    f"[spec-review:gw-reviewer-timeout] GW leg exceeded "
+                    f"{gw_timeout}s configured timeout, abandoning at "
+                    f"elapsed={gw_elapsed:.1f}s",
                     file=sys.stderr,
                 )
                 gw_text = None
-                gw_elapsed = 300.0
-                gw_skip_reason = "timeout"
             except Exception as e:
                 print(
                     f"[spec-review:gw-reviewer-collect-error] {e}",
@@ -1958,9 +1988,17 @@ def run_spec_review(
                 gw_text = None
                 gw_skip_reason = "collection_error"
             finally:
-                # Clean up executor to prevent thread pool leak
+                # Disposal of a possibly-still-running leg (AC4). cancel() alone
+                # cannot stop an already-running LLM call, but it does prevent a
+                # not-yet-started future from starting; shutdown(wait=True) is what
+                # actually reclaims the thread once the call does return, instead of
+                # leaving it running to completion with its result unreachable
+                # (the old wait=False left the abandoned 1344s leg logging its
+                # "completed" line long after the brief had rendered).
+                if gw_future is not None:
+                    gw_future.cancel()
                 if executor is not None:
-                    executor.shutdown(wait=False)
+                    executor.shutdown(wait=True)
 
         # 8. Poll Sonnet leg to terminal (with independent timeout from Council).
         #    Council results come directly from the envelope (already complete).
@@ -2016,7 +2054,9 @@ def run_spec_review(
 
     # 9. Persist GW transcript and divergence record
     gw_verdict: str = "skip"
-    gw_ran: bool = gw_text is not None
+    # A leg abandoned mid-flight ran (gw_ran=True) but produced no text to score;
+    # gw_abandoned distinguishes it from "skipped before starting"/"collection error".
+    gw_ran: bool = (gw_text is not None) or gw_abandoned
     gw_findings_count: int = 0
     gw_transcript_ref: str = ""
     gw_parse_error: dict | None = None
@@ -2041,8 +2081,12 @@ def run_spec_review(
         "repo": repo,
         "sonnet_verdict": sonnet_verdict_str,
         "gw_verdict": gw_verdict,
-        "agree": (gw_verdict == sonnet_verdict_str) if gw_ran else None,
+        # None when no verdict was actually produced (never ran, or abandoned
+        # mid-flight) - a False/True agreement value implies a real comparison.
+        "agree": (gw_verdict == sonnet_verdict_str) if (gw_ran and not gw_abandoned) else None,
         "gw_ran": gw_ran,
+        "gw_abandoned": gw_abandoned,
+        "gw_skip_reason": gw_skip_reason,
         "gw_transcript_ref": gw_transcript_ref,
         "sonnet_findings_count": len(sonnet_raw.get("issues", [])) if sonnet_raw else 0,
         "gw_findings_count": gw_findings_count,
@@ -2093,6 +2137,7 @@ def run_spec_review(
         council_voicing_requested=council_voicing,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_abandoned=gw_abandoned,
         gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=gw_elapsed,

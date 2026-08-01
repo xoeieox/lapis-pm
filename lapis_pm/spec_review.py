@@ -125,6 +125,7 @@ class SpecReviewBrief:
     sonnet_issues: list[dict] = field(default_factory=list)
     sonnet_confidence: float = 0.0
     sonnet_run_id: str = ""
+    sonnet_claims_checked: int | None = None
     parse_error: dict | None = None
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
     # True whenever the Sonnet leg ran (always reference-only now)
@@ -814,10 +815,11 @@ def _poll_sonnet_until_terminal(
                     "confidence": raw.get("confidence", 0.0),
                     "run_id": spec_reviewer_task_id,
                     "parse_error": raw.get("parse_error"),
+                    "claims_checked": raw.get("claims_checked"),
                 }
                 elapsed_s = int(time.time() - start_time)
                 print(
-                    f"[spec-review:sonnet-complete] task_id={spec_reviewer_task_id} "
+                    f"[spec-review:reviewer-complete] task_id={spec_reviewer_task_id} "
                     f"elapsed={elapsed_s}s verdict={sonnet_result['verdict']}",
                     file=sys.stderr,
                 )
@@ -832,7 +834,7 @@ def _poll_sonnet_until_terminal(
                 }
                 elapsed_s = int(time.time() - start_time)
                 print(
-                    f"[spec-review:sonnet-timeout] task_id={spec_reviewer_task_id} "
+                    f"[spec-review:reviewer-timeout] task_id={spec_reviewer_task_id} "
                     f"elapsed={elapsed_s}s",
                     file=sys.stderr,
                 )
@@ -960,6 +962,13 @@ def _build_brief(
     sonnet_issues = sonnet_raw.get("issues", []) if sonnet_raw is not None else []
     sonnet_confidence = float(sonnet_raw.get("confidence", 0.0)) if sonnet_raw is not None else 0.0
     sonnet_run_id = sonnet_raw.get("run_id", "") if sonnet_raw is not None else ""
+    sonnet_claims_checked = None
+    if sonnet_raw is not None:
+        _claims_checked_raw = sonnet_raw.get("claims_checked")
+        try:
+            sonnet_claims_checked = int(_claims_checked_raw) if _claims_checked_raw is not None else None
+        except (TypeError, ValueError):
+            sonnet_claims_checked = None
 
     council_status = council_raw.get("status", "error")
     council_landing = council_raw.get("landing", "")
@@ -1042,6 +1051,7 @@ def _build_brief(
         sonnet_issues=sonnet_issues,
         sonnet_confidence=sonnet_confidence,
         sonnet_run_id=sonnet_run_id,
+        sonnet_claims_checked=sonnet_claims_checked,
         parse_error=sonnet_raw.get("parse_error") if sonnet_raw is not None else None,
         facets_deliberation=facets_deliberation,
         sonnet_advisory_only=sonnet_advisory_only,
@@ -1197,9 +1207,11 @@ def format_brief(brief: SpecReviewBrief) -> str:
             "Re-run spec-review, or proceed with caution after reviewing whatever completed."
         ),
         "parse_failed": (
-            "The spec_reviewer agent likely succeeded but the parser could not extract "
-            "a JSON verdict. See the Parse Error block below for diagnostics. "
-            "After the runner fix lands (`spec-review-output-truncation-runner`), re-run spec-review."
+            "The spec_reviewer agent's output file existed but no JSON verdict could be "
+            "extracted from it. See the Parse Error block below for diagnostics. "
+            "A leg that produced nothing now records status=failed with the reason in the "
+            "queue record instead of reaching this path — check the queue record for that "
+            "distinction."
         ),
     }
     # Override "incomplete" with infra-specific guidance when a council error reason is known
@@ -1236,9 +1248,9 @@ def format_brief(brief: SpecReviewBrief) -> str:
 - **File size:** {pe.get('file_size', 0)} bytes
 - **Head (first 200 chars):** {pe.get('head', '')}
 - **Tail (last 200 chars):** {pe.get('tail', '')}
-- **Note:** the spec_reviewer agent likely succeeded; the orchestration \
-could not extract a JSON verdict from the output. See chain-sibling \
-`spec-review-output-truncation-runner` for the delivery-path fix.
+- **Note:** the output file existed but no JSON verdict could be extracted from it. \
+A leg that produced nothing now records status=failed with the reason in the queue \
+record instead of reaching this path — check the queue record for that distinction.
 """
 
     # Facets section — omitted if facets_deliberation is None
@@ -1312,9 +1324,15 @@ could not extract a JSON verdict from the output. See chain-sibling \
     # on any flag other than sonnet_verdict == "skip".
     sonnet_section = ""
     if brief.sonnet_verdict != "skip":
+        claims_checked_str = (
+            str(brief.sonnet_claims_checked)
+            if brief.sonnet_claims_checked is not None
+            else "(not reported)"
+        )
         sonnet_section = f"""
-## Sonnet technical review — reference only (does not affect recommendation)
+## Empiricist — factual-claim verification, reference only (does not affect recommendation)
 - **Verdict:** {brief.sonnet_verdict} (confidence {brief.sonnet_confidence:.2f})
+- **Claims checked:** {claims_checked_str}
 - **Run ID:** {brief.sonnet_run_id}
 - **Issues:**
 {issues_lines}

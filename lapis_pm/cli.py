@@ -2667,7 +2667,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="no_sonnet_reviewer",
         help=(
-            "Skip the reference-only Sonnet deep-review leg (on by default for "
+            "Skip the reference-only Empiricist claim-verification leg (on by default for "
             "advisory/hold; opt out for faster/cheaper runs)."
         ),
     )

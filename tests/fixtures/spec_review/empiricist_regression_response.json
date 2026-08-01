@@ -1,0 +1,32 @@
+{
+  "verdict": "fixable",
+  "claims_checked": 6,
+  "issues": [
+    {
+      "severity": "high",
+      "category": "other",
+      "citation": "claim 1: lapis_pm/nonexistent_reconcile_module.py",
+      "note": "Checked repo: ls/Read of lapis_pm/nonexistent_reconcile_module.py fails, file does not exist on this checkout."
+    },
+    {
+      "severity": "high",
+      "category": "other",
+      "citation": "claim 2: lapis_pm/spec_review.py:1",
+      "note": "Checked repo: line 1 of lapis_pm/spec_review.py is the module docstring, not _read_verdict_from_output. That function is defined at line 457."
+    },
+    {
+      "severity": "high",
+      "category": "other",
+      "citation": "claim 3: lapis_pm/registry.yaml spec_reviewer.timeout_s",
+      "note": "Checked repo: the actual value of spec_reviewer.timeout_s in lapis_pm/registry.yaml is 1800, not 900 as claimed."
+    },
+    {
+      "severity": "med",
+      "category": "other",
+      "citation": "claim 4: decision/empiricist-seat-does-not-exist-fabricated-key-2026-01-01",
+      "note": "Checked mem: no such key found via mem get/mem search. Reporting as unconfirmed rather than as proven false, since a failed search on this store is evidence about the search, not a definitive absence claim beyond mem's own scope."
+    }
+  ],
+  "confidence": 0.92,
+  "run_id": "empiricist-regression-fixture-stub"
+}

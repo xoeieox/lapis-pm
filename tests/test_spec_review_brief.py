@@ -492,3 +492,104 @@ def test_format_brief_voicing_lines(tmp_path):
     assert "gravitywell (on GW)" in output
     assert "haiku (no degrade)" in output
     assert "haiku (on GW)" not in output
+
+
+# ---------------------------------------------------------------------------
+# claims_checked plumbing (Empiricist re-character)
+# ---------------------------------------------------------------------------
+
+def test_build_brief_claims_checked_present(tmp_path):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    raw = _sonnet_raw("clean")
+    raw["claims_checked"] = 34
+
+    brief = _build_brief(
+        sonnet_raw=raw,
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+    )
+    assert brief.sonnet_claims_checked == 34
+
+
+def test_build_brief_claims_checked_absent_is_none_not_zero(tmp_path):
+    """Missing claims_checked must default to None, never 0 — the two mean
+    different things: None is 'not reported', 0 is a broken lens."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+    )
+    assert brief.sonnet_claims_checked is None
+
+
+def test_build_brief_claims_checked_non_numeric_is_none(tmp_path):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    raw = _sonnet_raw("clean")
+    raw["claims_checked"] = "not-a-number"
+
+    brief = _build_brief(
+        sonnet_raw=raw,
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+    )
+    assert brief.sonnet_claims_checked is None
+
+
+def test_format_brief_renders_claims_checked(tmp_path):
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    raw = _sonnet_raw("clean")
+    raw["claims_checked"] = 40
+
+    brief = _build_brief(
+        sonnet_raw=raw,
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+    )
+    output = format_brief(brief)
+    assert "Claims checked:** 40" in output
+    assert "## Empiricist" in output
+    assert "## Sonnet technical review" not in output
+
+
+def test_format_brief_renders_claims_checked_not_reported_when_absent(tmp_path):
+    """A missing claims_checked field must render as '(not reported)', never
+    raise, and never silently print 0."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        sonnet_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+    )
+    output = format_brief(brief)
+    assert "Claims checked:** (not reported)" in output
+    assert "Claims checked:** 0" not in output

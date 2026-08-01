@@ -170,7 +170,7 @@ def test_format_brief_renders_sonnet_section_with_reference_heading():
     )
     out = format_brief(brief)
     assert "## Facets deliberation" in out
-    assert "## Sonnet technical review — reference only (does not affect recommendation)" in out
+    assert "## Empiricist — factual-claim verification, reference only (does not affect recommendation)" in out
     assert "## Mirror Council" in out
     # Old heading must not appear
     assert "Opus technical review" not in out
@@ -311,7 +311,7 @@ def test_always_render_sonnet_section_on_advisory(tmp_path):
     """AC 1: brief must contain the Sonnet section on an advisory/hold run by default."""
     brief = _run_review(tmp_path)
     out = format_brief(brief)
-    assert "## Sonnet technical review — reference only (does not affect recommendation)" in out
+    assert "## Empiricist — factual-claim verification, reference only (does not affect recommendation)" in out
 
 
 def test_automerge_spec_does_not_dispatch_sonnet(tmp_path):

@@ -1,16 +1,18 @@
 """lapis_pm.spec_review — Pre-bind Facets + Mirror Council review.
 
 Default gate: Facets (technical-integrity + trickster personas, Haiku) for the PM /
-technical domain, plus a Mirror Council deliberation for invariant-fit / meaning, plus
-a standing local reference-leg (the Empiricist) that fires by default for advisory/hold
-specs as a reference-only signal (never moves the recommendation — Facets + Council are
-the sole drivers). The reference leg can be disabled per-run via --no-reference-reviewer
-or SPEC_REVIEW_REFERENCE_DISABLED=1 (deprecated aliases --no-sonnet-reviewer /
-SPEC_REVIEW_SONNET_DISABLED=1 still honored, sunset 90 days after merge).
+technical domain, plus a Mirror Council deliberation for invariant-fit / meaning. The
+local reference-leg (the Empiricist) and the GravityWell reference leg are both OFF by
+default (lapis-pm-gate-defaults-and-dead-poll-v0, U3a/U3b) — both are reference-only
+signals that never move the recommendation, so the default fast path pays for neither.
+Opt in per-run with --with-reference-reviewer / --with-gw. The deprecated
+--no-reference-reviewer / SPEC_REVIEW_REFERENCE_DISABLED=1 (and their --no-sonnet-reviewer
+/ SPEC_REVIEW_SONNET_DISABLED=1 aliases) are still honored as harmless no-ops — they never
+invert an opt-in into "on" (sunset 90 days after merge).
 
 Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override,
-authority, dispatch_facets, reference_reviewer, compare_opus). Returns SpecReviewBrief.
-Synchronous; caller blocks until all dispatched passes complete or timeout.
+authority, dispatch_facets, reference_reviewer, compare_opus, with_gw). Returns
+SpecReviewBrief. Synchronous; caller blocks until all dispatched passes complete or timeout.
 """
 from __future__ import annotations
 
@@ -159,6 +161,15 @@ class SpecReviewBrief:
     gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
     gw_parse_error: dict | None = None  # parse_failed envelope's parse_error, if any
     gw_raw_output_ref: str = ""  # absolute path to the verbatim gw-raw-output.txt
+    # U3c/D3: whether this review was actually grounded in the code it reviews.
+    # grounding_status is exactly one of "verified" | "failed" | "silent-denial" |
+    # "not-applicable" — never a sub-key of another field, never prose. See
+    # _detect_grounding_status. grounding_reason is a short machine-parsable cause
+    # string (e.g. "gw_timeout", "no_repo_in_context", "grounding_target_unavailable",
+    # "codebase_surface_denied") — never prose, never a log pointer. Only
+    # "not-applicable" may carry an empty reason.
+    grounding_status: Literal["verified", "failed", "silent-denial", "not-applicable"] = "not-applicable"
+    grounding_reason: str = ""
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -963,6 +974,62 @@ def _resolve_reference_model() -> str | None:
         return None
 
 
+def _detect_grounding_status(facets_dict: dict | None) -> tuple[str, str]:
+    """Detect whether Facets actually grounded its review in the codebase (U3c/D3).
+
+    finding/spec-review-gate-structurally-ungrounded-2026-08-01 recorded two distinct
+    failure shapes and required a detector that covers both:
+      (a) a non-final round records a codebase-prefixed entry in sim_failures — an
+          explicit denial (e.g. "no target_repo in context"). HIGH tier.
+      (b) a non-final round records EMPTY sim_failures AND EMPTY sim_results — a
+          silent denial, not even logged as a failure. LOW tier, and per
+          decision/escalate-structural-absence-not-only-denial-2026-08-01, LOW must
+          still emit rather than being suppressed.
+
+    Returns (grounding_status, grounding_reason). facets_dict=None (Facets never ran,
+    or its dispatch failed outright) is treated as "failed" — a review that never
+    attempted grounding cannot be reported as verified or silently as not-applicable;
+    callers gate the "not-applicable" case themselves (Facets structurally skipped for
+    this authority) before calling this function.
+    """
+    if not facets_dict:
+        return ("failed", "grounding_target_unavailable")
+
+    rounds = facets_dict.get("rounds") or []
+    if not rounds:
+        return ("failed", "grounding_target_unavailable")
+
+    max_round_num = max((r.get("round_num", 0) for r in rounds), default=0)
+    codebase_denial_reason = ""
+    saw_any_data = False
+    saw_codebase_result = False
+
+    for rnd in rounds:
+        if rnd.get("round_num") == max_round_num:
+            continue
+        sim_failures = rnd.get("sim_failures") or {}
+        sim_results = rnd.get("sim_results") or {}
+        if sim_failures or sim_results:
+            saw_any_data = True
+        for key, reason in sim_failures.items():
+            if key.split(":", 1)[0] == "codebase":
+                codebase_denial_reason = str(reason) or "codebase_surface_denied"
+        for key in sim_results:
+            if key.split(":", 1)[0] == "codebase":
+                saw_codebase_result = True
+
+    if codebase_denial_reason:
+        return ("failed", "codebase_surface_denied")
+    if saw_codebase_result:
+        return ("verified", "")
+    if not saw_any_data:
+        # Case (b): structurally absent, not even logged as a failure.
+        return ("silent-denial", "no_repo_in_context")
+    # Some sim data was recorded but none of it was codebase-shaped — treat as the
+    # same silent-denial case rather than a false "verified".
+    return ("silent-denial", "no_repo_in_context")
+
+
 def _build_brief(
     council_raw: dict,
     spec_path: Path,
@@ -985,6 +1052,8 @@ def _build_brief(
     gw_transcript_ref: str = "",
     gw_parse_error: dict | None = None,
     gw_raw_output_ref: str = "",
+    grounding_status: str = "not-applicable",
+    grounding_reason: str = "",
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
@@ -1121,6 +1190,8 @@ def _build_brief(
         gw_transcript_ref=gw_transcript_ref,
         gw_parse_error=gw_parse_error,
         gw_raw_output_ref=gw_raw_output_ref,
+        grounding_status=grounding_status,
+        grounding_reason=grounding_reason,
     )
 
 
@@ -1422,12 +1493,14 @@ verdict from it. See raw output below for what the model actually said.
         voicing_lines += f"\n- Facets operator: {facets_operator_line}"
     voicing_section = f"\n**Leg voicing / operator:**\n{voicing_lines}\n" if voicing_lines else ""
 
+    grounding_reason_str = f" ({brief.grounding_reason})" if brief.grounding_reason else ""
     return f"""# Spec Review: {brief.target_id}
 
 **Spec:** {brief.spec_path}
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
+**Grounding:** {brief.grounding_status}{grounding_reason_str}
 {voicing_section}{degraded_summary}{infra_banner}{facets_section}{reference_section}{gw_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
@@ -1590,25 +1663,42 @@ def run_spec_review(
     repo_override: str | None = None,
     authority: str | None = None,
     dispatch_facets: bool = True,
-    reference_reviewer: bool = True,
+    # U3a (lapis-pm-gate-defaults-and-dead-poll-v0): OFF by default. The Empiricist
+    # is advisory-only and its verdict is hard-wired out of the combined
+    # recommendation (reference_verdict="skip" is fed to _combined_recommendation
+    # unconditionally below), so the default fast path spends no time on a leg that
+    # provably cannot change the answer. Opt in explicitly to re-enable it.
+    reference_reviewer: bool = False,
     facets_operator: str = "haiku",
-    # Deprecated parameter — kept for back-compat; no-op (reference_reviewer is always-on)
+    # Deprecated parameter — kept for back-compat; no-op (reference_reviewer is off by default)
     compare_opus: bool = False,
     # Deprecated alias for reference_reviewer — remove 90 days after merge (2026-09-05).
     sonnet_reviewer: bool | None = None,
+    # U3b: the GW reference leg is never submitted by default — no future, no
+    # executor, no orphan possible. Opt in with with_gw=True to submit it and block
+    # until it resolves (or times out, in which case the brief still renders with
+    # grounding_status="failed" — see U3c/U3b's "Open, ruled by Erah" section).
+    with_gw: bool = False,
 ) -> SpecReviewBrief:
     """Run Facets (PM) + Council (philosophical) + the reference leg's review. Synchronous.
 
     The reference leg (the Empiricist, local — see registry.yaml's spec_reviewer seat)
-    fires by default for advisory/hold specs (reference_reviewer=True). It is
-    reference-only and never moves combined_recommendation — Facets + Council are
-    the sole recommendation drivers. Disable with reference_reviewer=False or
+    is OFF by default (reference_reviewer=False) — it is reference-only and never
+    moves combined_recommendation, so paying its ~18 min cost by default bought
+    nothing. Opt in with reference_reviewer=True. Disabled regardless via
     SPEC_REVIEW_REFERENCE_DISABLED=1 (deprecated aliases sonnet_reviewer=False /
-    SPEC_REVIEW_SONNET_DISABLED=1 still honored).
+    SPEC_REVIEW_SONNET_DISABLED=1 still honored) — those never invert an opt-in.
+
+    The GW reference leg is likewise OFF by default (with_gw=False): nothing is
+    submitted to the executor, so there is no future to abandon and no orphan leg
+    possible. Opt in with with_gw=True; the gate then blocks on the GW result before
+    rendering (see run 2's "render + mark" ruling for the opt-in timeout case).
 
     Facets deliberation is synchronous (blocks ~5 min); Council is async (polled up to
-    timeout). The reference leg is dispatched async BEFORE the Facets block (so it runs
-    concurrently with Facets' blocking subprocess), polled alongside Council.
+    timeout). The reference leg, when enabled, is dispatched async BEFORE the Facets
+    block (so it runs concurrently with Facets' blocking subprocess), polled alongside
+    Council — but its poll happens AFTER the cross-session lock is released (U3d); see
+    _spec_review_lock's call site below.
 
     dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
     smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
@@ -1618,7 +1708,7 @@ def run_spec_review(
     facets_operator controls the Facets persona + synthesis model; default haiku.
 
     compare_opus is accepted for back-compat but is a no-op — the reference leg is
-    already on by default, so passing compare_opus=True has no additional effect. A
+    opt-in now, so passing compare_opus=True has no additional effect. A
     deprecation note is emitted to stderr. Sunset: remove 90 days after merge (2026-09-05).
     """
     # Support deprecated sonnet_reviewer parameter alias
@@ -1664,9 +1754,9 @@ def run_spec_review(
     # Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
     with _spec_review_lock(spec_path):
         # 4b. Reference leg (the Empiricist): dispatch async BEFORE the Facets block so it
-        #     runs concurrently with Facets' blocking subprocess. Always-on for
-        #     advisory/hold; reference-only (never moves the recommendation).
-        #     Intentional — do not remove.
+        #     runs concurrently with Facets' blocking subprocess. Opt-in only (U3a,
+        #     reference_reviewer=True) for advisory/hold; reference-only (never moves
+        #     the recommendation). Intentional — do not remove.
         spec_reviewer_task_id: str | None = None
         reference_disabled = (
             (not reference_reviewer)
@@ -1698,13 +1788,14 @@ def run_spec_review(
                 spec_reviewer_task_id = None
 
         # 4c. GW reference leg: submit to ThreadPoolExecutor BEFORE Facets block so it runs
-        #     in parallel. Always-on for advisory/hold; reference-only (never moves the
-        #     recommendation). Bounded timeout + doorman pre-flight so it NEVER stalls the gate.
+        #     in parallel. Opt-in only (U3b, with_gw=True) for advisory/hold; when off,
+        #     nothing is submitted — no future, no executor, no orphan possible. Bounded
+        #     timeout + doorman pre-flight so it NEVER stalls the gate when it does run.
         gw_future = None
         executor = None
         gw_run_id = str(uuid.uuid4())[:8]
         gw_principal = f"gw-gate-{uuid.uuid4().hex[:12]}"
-        do_gw = effective_authority in {"advisory", "hold"}
+        do_gw = with_gw and effective_authority in {"advisory", "hold"}
         # Single source of truth for the GW leg's timeout: the join below must wait
         # on exactly this value, not a separate hardcoded number, or a raised
         # GW_REVIEWER_TIMEOUT_SEC (e.g. #243's 900->1800) silently fails to take effect.
@@ -2054,55 +2145,60 @@ def run_spec_review(
                 if executor is not None:
                     executor.shutdown(wait=True)
 
-        # 8. Poll the reference leg to terminal (with independent timeout from Council).
-        #    Council results come directly from the envelope (already complete).
-        reference_raw = _poll_reference_until_terminal(
-            spec_reviewer_task_id=spec_reviewer_task_id,
-            timeout_s=timeout_s,
-            start_time=start_time,
-        )
+    # 8. Poll the reference leg to terminal (with independent timeout from Council).
+    #    Council results come directly from the envelope (already complete).
+    #    Deliberately OUTSIDE the lock (U3d): the reference leg is a ClaudeQueue task,
+    #    not a GravityWell GPU-lane job, so polling it here serves no purpose the
+    #    lock's contract names, and would otherwise hold the host's only slot for up
+    #    to timeout_s after all GPU work (Facets+Council, and the GW leg on --with-gw)
+    #    is already finished. Do not move this back inside the `with` block above.
+    reference_raw = _poll_reference_until_terminal(
+        spec_reviewer_task_id=spec_reviewer_task_id,
+        timeout_s=timeout_s,
+        start_time=start_time,
+    )
 
-        # 8b. Build council_raw from the envelope. If envelope is None (error path),
-        #     council_raw reflects the error.
-        if envelope is not None and envelope.council_ok:
-            council_raw = {
-                "status": envelope.council_status or "error",
-                "landing": envelope.council_landing or "",
-                "open_questions": envelope.council_open_questions or [],
-                "confidence": envelope.council_confidence or "",
-                "positions": envelope.council_positions or [],
-                "run_id": envelope.council_run_id or "",
-                "voicing_effective": envelope.council_voicing_effective,
-                "voicing_degraded": envelope.council_voicing_degraded,
-                "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
-            }
+    # 8b. Build council_raw from the envelope. If envelope is None (error path),
+    #     council_raw reflects the error.
+    if envelope is not None and envelope.council_ok:
+        council_raw = {
+            "status": envelope.council_status or "error",
+            "landing": envelope.council_landing or "",
+            "open_questions": envelope.council_open_questions or [],
+            "confidence": envelope.council_confidence or "",
+            "positions": envelope.council_positions or [],
+            "run_id": envelope.council_run_id or "",
+            "voicing_effective": envelope.council_voicing_effective,
+            "voicing_degraded": envelope.council_voicing_degraded,
+            "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
+        }
+    else:
+        # Council leg failed or envelope is None: return error status
+        status = "error"
+        if envelope is not None:
+            status = envelope.council_status or "error"
+            if status not in _COUNCIL_TERMINAL:
+                status = "error"
+        # D2: capture the worker's specific failure reason for legibility.
+        # Priority: preflight-skip reason > envelope error string > empty.
+        if council_not_run_reason:
+            _err_reason = council_not_run_reason
+        elif envelope is not None:
+            _err_reason = envelope.errors.get("council", "")
         else:
-            # Council leg failed or envelope is None: return error status
-            status = "error"
-            if envelope is not None:
-                status = envelope.council_status or "error"
-                if status not in _COUNCIL_TERMINAL:
-                    status = "error"
-            # D2: capture the worker's specific failure reason for legibility.
-            # Priority: preflight-skip reason > envelope error string > empty.
-            if council_not_run_reason:
-                _err_reason = council_not_run_reason
-            elif envelope is not None:
-                _err_reason = envelope.errors.get("council", "")
-            else:
-                _err_reason = ""
-            council_raw = {
-                "status": status,
-                "landing": "",
-                "open_questions": [],
-                "confidence": "",
-                "positions": [],
-                "run_id": envelope.council_run_id if envelope else "",
-                "voicing_effective": None,
-                "voicing_degraded": False,
-                "voicing_degraded_reason": "",
-                "error_reason": _err_reason,
-            }
+            _err_reason = ""
+        council_raw = {
+            "status": status,
+            "landing": "",
+            "open_questions": [],
+            "confidence": "",
+            "positions": [],
+            "run_id": envelope.council_run_id if envelope else "",
+            "voicing_effective": None,
+            "voicing_degraded": False,
+            "voicing_degraded_reason": "",
+            "error_reason": _err_reason,
+        }
 
     elapsed = time.time() - start_time
 
@@ -2194,6 +2290,20 @@ def run_spec_review(
     # 10. Build and return brief. reference_raw is non-None when the reference leg ran;
     #     it is rendered for reference but excluded from the recommendation
     #     (reference_advisory_only). GW leg data is also reference-only and non-steering.
+    # U3c/U3b: grounding_status/grounding_reason. Priority order:
+    #   1. A --with-gw timeout is a structural failure of the machinery, not a
+    #      confidence score, and must never be laundered into one (Council OQ2,
+    #      2026-08-02). It wins regardless of what Facets' own grounding looked like.
+    #   2. Facets structurally not dispatched for this run (no facets, or an
+    #      authority that skips it) — grounding never applied, not-applicable.
+    #   3. Otherwise, detect from the Facets deliberation itself.
+    if with_gw and gw_abandoned:
+        grounding_status, grounding_reason = "failed", "gw_timeout"
+    elif not (dispatch_facets and effective_authority in {"advisory", "hold"}):
+        grounding_status, grounding_reason = "not-applicable", ""
+    else:
+        grounding_status, grounding_reason = _detect_grounding_status(facets_deliberation)
+
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
@@ -2216,4 +2326,6 @@ def run_spec_review(
         gw_transcript_ref=gw_transcript_ref,
         gw_parse_error=gw_parse_error,
         gw_raw_output_ref=gw_raw_output_ref,
+        grounding_status=grounding_status,
+        grounding_reason=grounding_reason,
     )

@@ -731,9 +731,9 @@ class TestKillSwitch:
         assert "already_briefed" in result
 
     def test_review_gate_resume_resets_counter(self):
-        """review_gate_resume() resets counter to 0 and clears paused flag."""
+        """review_gate_resume() resets counter to empty window and clears paused flag."""
         mem = MagicMock()
-        # get() called for counter (returns 25) and for paused check
+        # get() called for counter (legacy bare-int format, returns 25) and for paused check
         mem.get.side_effect = [{"content": "25"}, None]
 
         with patch("lapis_pm.pm_core._mem", return_value=mem):
@@ -743,7 +743,74 @@ class TestKillSwitch:
         set_calls = [c for c in mem.set.call_args_list
                      if c[0][0] == pm_core.REVIEW_GATE_COUNTER_KEY]
         assert set_calls
-        assert set_calls[0][0][1] == "0"
+        assert set_calls[0][0][1] == "[]"
+
+
+class TestReviewGateSlidingWindow:
+    """AC3a: the counter is a trailing REVIEW_GATE_WINDOW_DAYS-day rate, not a
+    cumulative lifetime total — entries age out of the window on their own.
+    """
+
+    def _iso(self, dt):
+        return dt.isoformat()
+
+    def test_entries_inside_window_count(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        recent = [self._iso(now - timedelta(days=1)),
+                  self._iso(now - timedelta(days=6))]
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps(recent)}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            assert pm_core._review_gate_counter() == 2
+
+    def test_entries_older_than_window_do_not_count(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        mixed = [self._iso(now - timedelta(days=1)),
+                 self._iso(now - timedelta(days=8)),
+                 self._iso(now - timedelta(days=30))]
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps(mixed)}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            assert pm_core._review_gate_counter() == 1
+
+    def test_cumulative_trip_does_not_trip_under_window(self):
+        """40 dispatches spread across months (old cumulative counter would
+        trip) does not trip once only in-window entries are counted."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        old_entries = [self._iso(now - timedelta(days=30 + i)) for i in range(40)]
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps(old_entries)}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            count = pm_core._review_gate_counter()
+        assert count == 0
+        assert count < pm_core.REVIEW_GATE_THRESHOLD
+
+    def test_legacy_bare_int_counter_reads_without_raising(self):
+        """A pre-migration bare-int counter value must not crash the reader."""
+        mem = MagicMock()
+        mem.get.return_value = {"content": "23"}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            count = pm_core._review_gate_counter()
+        assert count == 23
+
+    def test_increment_appends_timestamp_and_prunes_stale(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        stale = self._iso(now - timedelta(days=10))
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps([stale])}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            new_count = pm_core._increment_review_gate_counter()
+        assert new_count == 1  # stale entry pruned, only the fresh one remains
+        set_calls = [c for c in mem.set.call_args_list
+                     if c[0][0] == pm_core.REVIEW_GATE_COUNTER_KEY]
+        assert set_calls
+        stored = json.loads(set_calls[0][0][1])
+        assert stale not in stored
+        assert len(stored) == 1
 
     def test_review_gate_status_returns_state(self):
         """review_gate_status() returns counter, threshold, paused."""

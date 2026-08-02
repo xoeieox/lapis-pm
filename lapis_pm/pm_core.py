@@ -45,7 +45,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -116,6 +116,7 @@ _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 
 # Review-gate loop constants
 REVIEW_GATE_THRESHOLD = 40          # local reviewer (reviewer/reviewer_fresh seat) calls before soft-pause
+REVIEW_GATE_WINDOW_DAYS = 7          # trailing window the threshold is measured over (a rate, not a lifetime total)
 REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
 REVIEW_GATE_PAUSED_KEY = "pm/review-gate/paused"
 REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
@@ -3179,20 +3180,59 @@ def _act_brief_already_satisfied_invalid(target_id: str) -> str:
 # Review-gate kill-switch helpers
 # ---------------------------------------------------------------------------
 
-def _review_gate_counter() -> int:
+def _review_gate_window_timestamps() -> list[str]:
+    """Read the raw dispatch-timestamp list, dropping anything outside the
+    trailing REVIEW_GATE_WINDOW_DAYS window. Handles the pre-window storage
+    format (a bare int) by treating it as that many events at an
+    unknown-but-recent time, so it counts fully rather than crashing.
+    """
     rec = _mem().get(REVIEW_GATE_COUNTER_KEY)
     if not rec:
-        return 0
+        return []
+    raw = rec["content"]
     try:
-        return int(rec["content"])
+        parsed = json.loads(raw)
     except (ValueError, TypeError):
-        return 0
+        parsed = None
+    if not isinstance(parsed, list):
+        # Legacy bare-int counter (pre sliding-window migration). Cannot
+        # recover real timestamps, so treat every unit as "now" — counts in
+        # full until it ages out of the window on its own.
+        try:
+            legacy_count = int(parsed if parsed is not None else raw)
+        except (ValueError, TypeError):
+            return []
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return [now_iso] * legacy_count
+    cutoff = datetime.now(timezone.utc) - timedelta(days=REVIEW_GATE_WINDOW_DAYS)
+    kept = []
+    for ts in parsed:
+        if not isinstance(ts, str):
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt >= cutoff:
+            kept.append(ts)
+    return kept
+
+
+def _review_gate_counter() -> int:
+    """Count of review-gate-tripping dispatches within the trailing
+    REVIEW_GATE_WINDOW_DAYS days — a rate, not a lifetime total, so the guard
+    measures runaway behavior rather than tripping on any activity level
+    given enough time.
+    """
+    return len(_review_gate_window_timestamps())
 
 
 def _increment_review_gate_counter() -> int:
-    count = _review_gate_counter() + 1
-    _mem().set(REVIEW_GATE_COUNTER_KEY, str(count), tags=["lapis-pm", "review-gate"])
-    return count
+    timestamps = _review_gate_window_timestamps()
+    timestamps.append(datetime.now(timezone.utc).isoformat())
+    _mem().set(REVIEW_GATE_COUNTER_KEY, json.dumps(timestamps),
+               tags=["lapis-pm", "review-gate"])
+    return len(timestamps)
 
 
 def _review_gate_paused() -> bool:
@@ -3206,26 +3246,30 @@ def _set_review_gate_paused(paused: bool) -> None:
 
 
 def review_gate_resume(reason: str) -> int:
-    """Reset kill-switch counter with documented reason. Returns previous count.
+    """Manually override an active rate trip. Returns the trailing-window
+    count at the moment of resume.
 
-    The reason is written to mem under `decision/review-gate-resume/<iso8601-ts>`
-    as a tagged audit entry. Empty or whitespace-only reasons raise ValueError —
-    the caller (CLI or future agent) is responsible for eliciting a substantive
-    reason before invoking.
+    This is a rate-trip override, not a budget re-arm: the counter tracks
+    dispatches within the trailing REVIEW_GATE_WINDOW_DAYS days, so clearing
+    it early means "resume before the window would have aged the count back
+    below threshold on its own," not "grant a fresh allowance." The reason is
+    written to mem under `decision/review-gate-resume/<iso8601-ts>` as a
+    tagged audit entry. Empty or whitespace-only reasons raise ValueError —
+    the caller (CLI or future agent) is responsible for eliciting a
+    substantive reason before invoking.
     """
     if not reason or not reason.strip():
         raise ValueError("review_gate_resume requires a non-empty reason")
     count = _review_gate_counter()
-    _mem().set(REVIEW_GATE_COUNTER_KEY, "0", tags=["lapis-pm", "review-gate"])
+    _mem().set(REVIEW_GATE_COUNTER_KEY, "[]", tags=["lapis-pm", "review-gate"])
     _set_review_gate_paused(False)
     _mem().delete(REVIEW_GATE_PAUSE_BRIEF_KEY)
     # Decision audit-trail
-    from datetime import timezone
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _mem().set(
         f"decision/review-gate-resume/{ts}",
-        f"Review-gate resumed at counter={count}/{REVIEW_GATE_THRESHOLD}. "
-        f"Reason: {reason.strip()}",
+        f"Review-gate rate-trip manually overridden at count={count}/{REVIEW_GATE_THRESHOLD} "
+        f"(trailing {REVIEW_GATE_WINDOW_DAYS}d). Reason: {reason.strip()}",
         tags=["lapis-pm", "review-gate", "resume-audit"],
     )
     return count
@@ -4739,7 +4783,7 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     count = _review_gate_counter()
     episodic.write_observation(
         target_id,
-        f"Review-gate loop soft-paused after {count} local reviewer calls in the past 7d. "
+        f"Review-gate loop soft-paused after {count} local reviewer calls in the past {REVIEW_GATE_WINDOW_DAYS}d. "
         f"Falling back to inline-Sonnet behavior for new PRs. "
         f"Resume with `lapis-pm review-gate resume --reason \"...\"` (reason is required).",
         extra_tags=["pm:review-gate-paused"],

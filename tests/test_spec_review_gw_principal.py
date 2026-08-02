@@ -103,6 +103,7 @@ def test_gw_principal_same_value_reaches_both_destinations(advisory_spec, monkey
         council_voicing="gravitywell",
         timeout_s=30,
         dispatch_facets=True,
+        with_gw=True,
     )
 
     assert "dispatch_gw_principal" in captured, "_dispatch_gw_reviewer was not called"
@@ -133,6 +134,7 @@ def test_gw_principal_format(advisory_spec, monkeypatch):
         council_voicing="gravitywell",
         timeout_s=30,
         dispatch_facets=True,
+        with_gw=True,
     )
 
     val = captured.get("val")

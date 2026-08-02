@@ -1500,20 +1500,33 @@ def cmd_spec_review(args) -> int:
     if getattr(args, "compare_opus", False):
         print(
             "[spec-review] WARNING: --compare-opus is deprecated and a no-op; "
-            "the reference leg now runs by default (sunset 90 days after merge).",
+            "the reference leg is opt-in now, use --with-reference-reviewer "
+            "(sunset 90 days after merge).",
             file=sys.stderr,
         )
-    # Emit deprecation note when caller passes the legacy --no-sonnet-reviewer flag
+    # --no-reference-reviewer / --no-sonnet-reviewer are harmless no-ops now that the
+    # Empiricist leg is off by default (U3a) — they must not error and must not invert
+    # to mean "turn it on". Emit a deprecation note but otherwise ignore them; only
+    # --with-reference-reviewer can enable the leg.
+    if getattr(args, "no_reference_reviewer", False):
+        print(
+            "[spec-review] WARNING: --no-reference-reviewer is deprecated and a no-op; "
+            "the Empiricist leg is off by default now (sunset 90 days after merge, "
+            "2026-09-05).",
+            file=sys.stderr,
+        )
     if getattr(args, "no_sonnet_reviewer", False):
         print(
-            "[spec-review] WARNING: --no-sonnet-reviewer is deprecated; use "
-            "--no-reference-reviewer (sunset 90 days after merge, 2026-09-05).",
+            "[spec-review] WARNING: --no-sonnet-reviewer is deprecated and a no-op; "
+            "the Empiricist leg is off by default now (sunset 90 days after merge, "
+            "2026-09-05).",
             file=sys.stderr,
         )
     no_reference_reviewer = (
         getattr(args, "no_reference_reviewer", False)
         or getattr(args, "no_sonnet_reviewer", False)
     )
+    reference_reviewer = getattr(args, "with_reference_reviewer", False) and not no_reference_reviewer
     try:
         brief = run_spec_review(
             spec_path=spec_path,
@@ -1522,8 +1535,9 @@ def cmd_spec_review(args) -> int:
             repo_override=args.repo_override,
             authority=getattr(args, "authority", None),
             dispatch_facets=not getattr(args, "no_facets", False),
-            reference_reviewer=not no_reference_reviewer,
+            reference_reviewer=reference_reviewer,
             facets_operator=getattr(args, "facets_operator", "haiku"),
+            with_gw=getattr(args, "with_gw", False),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -2639,7 +2653,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = sub.add_parser(
         "spec-review",
-        help="Pre-bind Facets + Council review of a spec document (the reference leg runs by default).",
+        help="Pre-bind Facets + Council review of a spec document (fast path by default; --with-reference-reviewer / --with-gw opt in to the reference legs).",
     )
     sr.add_argument("spec_path", help="Path to the spec markdown file.")
     sr.add_argument(
@@ -2674,12 +2688,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override spec's stated authority for Facets dispatch gating.",
     )
     sr.add_argument(
+        "--with-reference-reviewer",
+        action="store_true",
+        dest="with_reference_reviewer",
+        help=(
+            "Opt in to the reference-only Empiricist claim-verification leg (off by "
+            "default — it is advisory-only and never moves the recommendation, so the "
+            "default fast path skips its ~18min cost)."
+        ),
+    )
+    sr.add_argument(
         "--no-reference-reviewer",
         action="store_true",
         dest="no_reference_reviewer",
         help=(
-            "Skip the reference-only Empiricist claim-verification leg (on by default for "
-            "advisory/hold; opt out for faster/cheaper runs)."
+            "Deprecated no-op: the Empiricist leg is off by default now, so this flag "
+            "has nothing left to disable. Kept so existing invocations keep working "
+            "unchanged (sunset 90 days after merge, 2026-09-05)."
         ),
     )
     sr.add_argument(
@@ -2687,8 +2712,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="no_sonnet_reviewer",
         help=(
-            "Deprecated alias for --no-reference-reviewer; still honored "
+            "Deprecated no-op alias for --no-reference-reviewer; still honored "
             "(sunset 90 days after merge, 2026-09-05)."
+        ),
+    )
+    sr.add_argument(
+        "--with-gw",
+        action="store_true",
+        dest="with_gw",
+        help=(
+            "Opt in to the GravityWell reference leg (off by default — U3b). When set, "
+            "the gate submits the GW job and blocks on its result before rendering; a "
+            "timeout still renders the brief, with an explicit failed-grounding marker "
+            "rather than a bare error."
         ),
     )
     sr.add_argument(
@@ -2696,7 +2732,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="compare_opus",
         help=(
-            "Deprecated/no-op: the reference leg now runs by default; "
+            "Deprecated/no-op: the reference leg is opt-in now (--with-reference-reviewer); "
             "this flag is kept for back-compat (sunset 90 days after merge)."
         ),
     )

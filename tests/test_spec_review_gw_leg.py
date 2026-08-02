@@ -933,6 +933,7 @@ def test_gw_join_honours_configured_timeout_not_hardcoded_300(join_spec_fixture,
 
     brief = run_spec_review(
         join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True,
+        with_gw=True,
     )
 
     fake_future.result.assert_called_once_with(timeout=1800)
@@ -962,6 +963,7 @@ def test_gw_join_timeout_captures_real_elapsed_not_fabricated(join_spec_fixture,
 
     brief = run_spec_review(
         join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True,
+        with_gw=True,
     )
 
     fake_future.result.assert_called_once_with(timeout=42)
@@ -999,7 +1001,7 @@ def test_gw_join_abandoned_divergence_record_marks_and_carries_reason(join_spec_
     mock_executor.submit.return_value = fake_future
     monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
 
-    run_spec_review(join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True)
+    run_spec_review(join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True, with_gw=True)
 
     record = captured["record"]
     assert record["gw_ran"] is True
@@ -1038,6 +1040,7 @@ def test_gw_join_healthy_path_unchanged_brief_and_record(join_spec_fixture, monk
 
     brief = run_spec_review(
         join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True,
+        with_gw=True,
     )
 
     assert brief.gw_ran is True
@@ -1069,7 +1072,7 @@ def test_gw_join_abandoned_leg_cancelled_and_executor_waited(join_spec_fixture, 
     mock_executor.submit.return_value = fake_future
     monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
 
-    run_spec_review(join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True)
+    run_spec_review(join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True, with_gw=True)
 
     fake_future.cancel.assert_called_once()
     mock_executor.shutdown.assert_called_once_with(wait=True)

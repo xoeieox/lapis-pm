@@ -624,6 +624,18 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def cmd_clear_reviewer_attempts(args) -> int:
+    """Sole escape hatch for a reviewer-attempt-ceiling pause. Deliberately
+    cheap: target_id only, no confirmation prompt, no metadata (Erah's
+    ruling — ceremony here inverts the point of a cheap, obvious clear).
+    Does NOT resume the target; follow with `lapis-pm resume <target_id>`.
+    """
+    cleared = pm_core.clear_reviewer_attempts(args.target_id)
+    print(f"Cleared {cleared} reviewer-attempt counter(s) for {args.target_id}")
+    print(f"If paused, resume separately with: lapis-pm resume {args.target_id}")
+    return 0
+
+
 def cmd_tick(args) -> int:
     # Force-dispatch: bypass the normal decide path for smoke testing.
     if args.force_dispatch:
@@ -2121,6 +2133,14 @@ def build_parser() -> argparse.ArgumentParser:
     re_ = sub.add_parser("resume", help="Resume a paused target.")
     re_.add_argument("target_id")
     re_.set_defaults(func=cmd_resume)
+
+    cra = sub.add_parser(
+        "clear-reviewer-attempts",
+        help="Clear reviewer-attempt-ceiling counters for a target (sole escape hatch "
+             "after a ceiling auto-pause). Does not resume the target.",
+    )
+    cra.add_argument("target_id")
+    cra.set_defaults(func=cmd_clear_reviewer_attempts)
 
     ls = sub.add_parser("list", help="List all pm_bound targets.")
     ls.add_argument("--json", action="store_true", help="Emit machine-readable JSON")

@@ -136,6 +136,17 @@ _REVIEWER_MODES: dict[str, str] = {
     "hold": "fresh-reviewer",
 }
 
+# Reviewer attempt ceiling (lapis-pm-reviewer-attempt-ceiling-v0): bounds
+# *attempts* (dispatches), not completed cycles. A reviewer that fails before
+# ever writing a verdict never advances _reviewer_cycle_count, so without this
+# a persistently-failing reviewer is redispatched every tick forever. Counter
+# is PR+cycle-bound and survives new SHAs — only an explicit manual clear
+# (`lapis-pm clear-reviewer-attempts <target_id>`) resets it. See spec
+# "Reset scope" ruling: a SHA-triggered reset would grant amnesty to a
+# code-level defect on every push.
+REVIEWER_ATTEMPT_CEILING_DEFAULT = 2
+REVIEWER_ATTEMPT_CEILING_ENV = "LAPIS_PM_REVIEWER_ATTEMPT_CEILING"
+
 # Forgejo health gate constants
 FORGEJO_CONSECUTIVE_FAILS_KEY = "pm/forgejo_consecutive_fails"
 FORGEJO_UNREACHABLE_THRESHOLD = 3  # consecutive failed probes before Pushover
@@ -3230,6 +3241,94 @@ def review_gate_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Reviewer attempt ceiling (lapis-pm-reviewer-attempt-ceiling-v0)
+#
+# Bounds *attempts*, not successes. Keyed the same way cycle accounting is
+# (target_id, pr_number, cycle) so a failure loop that never advances the
+# cycle (no verdict ever written) is still bounded. PR-bound, survives new
+# SHAs, cleared only by an explicit manual clear — see spec "Reset scope".
+# ---------------------------------------------------------------------------
+
+def _reviewer_attempt_ceiling() -> int:
+    raw = os.environ.get(REVIEWER_ATTEMPT_CEILING_ENV)
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+        except ValueError:
+            pass
+    return REVIEWER_ATTEMPT_CEILING_DEFAULT
+
+
+def _reviewer_attempt_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/reviewer-attempts/{target_id}/pr={pr_number}/cycle={cycle}"
+
+
+def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
+    rec = _mem().get(_reviewer_attempt_key(target_id, pr_number, cycle))
+    if not rec:
+        return {"count": 0, "last_reason": None}
+    try:
+        data = json.loads(rec["content"])
+        return {
+            "count": int(data.get("count", 0)),
+            "last_reason": data.get("last_reason"),
+        }
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"count": 0, "last_reason": None}
+
+
+def _reviewer_attempt_count(target_id: str, pr_number: int, cycle: int) -> int:
+    return _reviewer_attempt_state(target_id, pr_number, cycle)["count"]
+
+
+def _increment_reviewer_attempt(target_id: str, pr_number: int, cycle: int) -> int:
+    """Record one reviewer dispatch attempt. Called at dispatch time, so it
+    counts every attempt regardless of whether it later succeeds or fails."""
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    state["count"] += 1
+    _mem().set(
+        _reviewer_attempt_key(target_id, pr_number, cycle),
+        json.dumps(state),
+        tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"],
+    )
+    return state["count"]
+
+
+def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, reason: str) -> None:
+    """Stash the most recent failure reason for this pr+cycle, as-reported and
+    unverified — see DoD 3b. Does not touch the attempt count."""
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    state["last_reason"] = reason
+    _mem().set(
+        _reviewer_attempt_key(target_id, pr_number, cycle),
+        json.dumps(state),
+        tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"],
+    )
+
+
+def clear_reviewer_attempts(target_id: str) -> int:
+    """Manual clear — the sole escape hatch once a target is ceiling-paused.
+
+    Deliberately cheap: one call, one required argument (target_id), no
+    confirmation prompt, no metadata. Wipes every attempt counter and
+    ceiling-hit marker for this target (all PRs, all cycles). Does NOT
+    resume the target — that remains a separate, explicit `lapis-pm resume`.
+    Returns the number of keys cleared.
+    """
+    cleared = 0
+    for prefix in (
+        f"pm/reviewer-attempts/{target_id}/",
+        f"pm/reviewer-attempt-ceiling/{target_id}/",
+    ):
+        for rec in _mem().list_by_prefix(prefix, limit=10_000):
+            if _mem().delete(rec["key"]):
+                cleared += 1
+    return cleared
+
+
+# ---------------------------------------------------------------------------
 # Review-gate loop helpers
 # ---------------------------------------------------------------------------
 
@@ -3767,7 +3866,26 @@ def _perceive_prs(
 class Decision:
     kind: str   # "merge" | "advisory_brief" | "hold_brief" | "retry" | "abandon_brief" | "directive_ack"
                #  | "noop_no_change" | "noop_reviewer_in_flight" | "noop_fixer_in_flight"
+               #  | "reviewer_attempt_ceiling"
     payload: dict
+
+
+def _reviewer_attempt_ceiling_check(target_id: str, pr_number: int, cycle: int) -> Decision | None:
+    """Return a `reviewer_attempt_ceiling` Decision if this pr+cycle has already
+    hit the attempt ceiling, else None. Checked immediately before every
+    dispatch_reviewer return so a reviewer that never completes a verdict
+    (and so never advances _reviewer_cycle_count) still stops on its own."""
+    ceiling = _reviewer_attempt_ceiling()
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    if state["count"] >= ceiling:
+        return Decision("reviewer_attempt_ceiling", {
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "attempts": state["count"],
+            "ceiling": ceiling,
+            "reported_reason": state["last_reason"],
+        })
+    return None
 
 
 def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
@@ -3842,6 +3960,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             _set_review_gate_paused(True)
             return Decision("review_gate_pause", {"pr": pr, "cls": cls})
         next_cycle = reviewer_count + 1
+        ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
+        if ceiling_decision is not None:
+            return ceiling_decision
         return Decision("dispatch_reviewer", {
             "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
         })
@@ -3854,6 +3975,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             _set_review_gate_paused(True)
             return Decision("review_gate_pause", {"pr": pr, "cls": cls})
         next_cycle = reviewer_count + 1
+        ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
+        if ceiling_decision is not None:
+            return ceiling_decision
         return Decision("dispatch_reviewer", {
             "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
         })
@@ -4465,6 +4589,9 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
 
     # Increment kill-switch counter before dispatch
     _increment_review_gate_counter()
+    # Increment the PR+cycle-bound attempt ceiling counter (counts this
+    # dispatch regardless of whether it later succeeds or fails).
+    _increment_reviewer_attempt(target_id, pr_number, cycle)
 
     steer.inject_overlay(target_id, vars_, agent_type)
     _ensure_dispatch_owned(vars_.get("repo", ""))
@@ -4627,6 +4754,80 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
                tags=["lapis-pm", "review-gate"])
     return f"action:review_gate_paused:cid={b.comment_id}"
+
+
+def _reviewer_attempt_ceiling_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/reviewer-attempt-ceiling/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+
+
+def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
+    """Auto-pause the target and emit exactly ONE structured record when a
+    reviewer's per-PR-cycle attempt count exceeds the ceiling without ever
+    producing a completed verdict (lapis-pm-reviewer-attempt-ceiling-v0).
+
+    Per the boundary ruling: pause is the audible state (not silent-stop),
+    the record must be machine-consumable, and this must NOT auto-unpause —
+    the only escape hatch is `lapis-pm clear-reviewer-attempts <target_id>`
+    followed by an explicit `lapis-pm resume <target_id>`.
+    """
+    pr_number = payload["pr_number"]
+    cycle = payload["cycle"]
+
+    # Idempotent: emit the record at most once per pr+cycle. The tick loop
+    # already early-returns "noop:paused" for a paused target, so this is a
+    # defensive belt-and-suspenders guard, not the primary mechanism.
+    marker_key = _reviewer_attempt_ceiling_marker_key(target_id, pr_number, cycle)
+    if _mem().get(marker_key):
+        return "action:reviewer_attempt_ceiling:already_recorded"
+
+    attempts = payload["attempts"]
+    ceiling = payload["ceiling"]
+    reported_reason = payload.get("reported_reason")
+    clear_cmd = f"lapis-pm clear-reviewer-attempts {target_id}"
+
+    record = {
+        "target_id": target_id,
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "attempts": attempts,
+        "ceiling": ceiling,
+        # As-reported by the failing reviewer leg — NOT a verified cause.
+        # This mechanism does not investigate why the reviewer failed; it
+        # only counts that it did, N times in a row. See DoD 3b.
+        "reported_reason": reported_reason,
+        "reported_reason_note": "as-reported by the failing leg; unverified by this mechanism",
+        "paused": True,
+        "clear_command": clear_cmd,
+    }
+
+    store = TargetStore()
+    target = store.get(target_id)
+    if target is not None:
+        target.set_paused(
+            True,
+            reason=(
+                f"reviewer-attempt-ceiling: PR #{pr_number} cycle {cycle} hit "
+                f"{attempts}/{ceiling} attempts with no completed verdict "
+                f"(reported_reason={reported_reason!r}, unverified). "
+                f"Clear with `{clear_cmd}`, then `lapis-pm resume {target_id}`."
+            ),
+        )
+        target.save()
+
+    episodic.write_observation(
+        target_id,
+        f"Reviewer attempt ceiling reached on PR #{pr_number} cycle {cycle} "
+        f"({attempts}/{ceiling} attempts, no completed verdict) — target auto-paused.\n"
+        f"{json.dumps(record, indent=2)}",
+        extra_tags=[
+            "pm:reviewer-attempt-ceiling",
+            f"pm:pr={pr_number}",
+            f"pm:reviewer-attempt-ceiling:pr={pr_number}:cycle={cycle}",
+        ],
+    )
+    _mem().set(marker_key, json.dumps(record),
+               tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"])
+    return f"action:reviewer_attempt_ceiling_paused:pr={pr_number}:cycle={cycle}:attempts={attempts}"
 
 
 # ---------------------------------------------------------------------------
@@ -5522,6 +5723,13 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 f"Intent: {rec.get('intent')}\n\n{snippet}",
                 extra_tags=tags + ["pm:failure"],
             )
+            if rec.get("agent_type") in ("reviewer", "reviewer_fresh") and rec.get("pr_number") is not None:
+                # Stash the as-reported reason for the attempt-ceiling record
+                # (DoD 3b: recorded as claimed, never as a verified cause).
+                reported_reason = (text.strip().splitlines() or [""])[0][:500]
+                _record_reviewer_attempt_reason(
+                    target_id, rec["pr_number"], rec.get("cycle", 1), reported_reason,
+                )
             failed_for_retry.append(rec)
         else:
             # Reviewer agents: parse JSON output and write reviewer-tagged episodic entry
@@ -6567,6 +6775,8 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                     decision_str = _act_brief_review_exhausted(target_id, decision.payload)
                 elif decision.kind == "review_gate_pause":
                     decision_str = _act_review_gate_pause(target_id, decision.payload)
+                elif decision.kind == "reviewer_attempt_ceiling":
+                    decision_str = _act_reviewer_attempt_ceiling_pause(target_id, decision.payload)
                 elif decision.kind == "noop_reviewer_in_flight":
                     p = decision.payload
                     decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"

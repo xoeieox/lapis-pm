@@ -131,6 +131,35 @@ def _clear_tick_corr_cache():
 
 
 @_pytest.fixture(autouse=True)
+def _clear_reviewer_attempt_ceiling_state():
+    """Reviewer-attempt-ceiling counters (lapis-pm-reviewer-attempt-ceiling-v0)
+    are deliberately persistent — they must survive new SHAs, so nothing in
+    production code resets them. That means the shared session-wide mem.db
+    (see MEM_DB_PATH above) accumulates them across tests. Many tests reuse
+    the same target_id/pr_number defaults (e.g. "tid"/42), so without this a
+    test earlier in a randomized run can push a later, unrelated test's PR
+    over the ceiling. Wipe both key namespaces around every test."""
+    try:
+        from lapis_pm import pm_core
+    except Exception:
+        yield
+        return
+
+    def _wipe():
+        try:
+            store = pm_core._mem()
+            for prefix in ("pm/reviewer-attempts/", "pm/reviewer-attempt-ceiling/"):
+                for rec in store.list_by_prefix(prefix, limit=10_000):
+                    store.delete(rec["key"])
+        except Exception:
+            pass
+
+    _wipe()
+    yield
+    _wipe()
+
+
+@_pytest.fixture(autouse=True)
 def _isolate_comment_store(monkeypatch, tmp_path):
     """Redirect lapis_pm.episodic._store to a per-test tmp CommentStore.
 

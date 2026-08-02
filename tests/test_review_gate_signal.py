@@ -283,8 +283,8 @@ def test_review_gate_resume_preserves_existing_behavior():
         prev = pm_core.review_gate_resume("preserve test")
 
     assert prev == 7
-    # Counter reset
-    assert set_calls.get(pm_core.REVIEW_GATE_COUNTER_KEY) == "0"
+    # Counter reset to an empty window (sliding-window storage, not legacy "0")
+    assert set_calls.get(pm_core.REVIEW_GATE_COUNTER_KEY) == "[]"
     # Paused flag flipped to False (stored as "0")
     assert set_calls.get(pm_core.REVIEW_GATE_PAUSED_KEY) == "0"
     # Pause-brief idempotency key deleted

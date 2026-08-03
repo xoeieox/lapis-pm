@@ -2941,6 +2941,33 @@ def _has_auto_land_waiting_comment(target_id: str, pr_count: int) -> bool:
     return False
 
 
+def _reconcile_surviving_head_branch(target_id: str, repo: str) -> None:
+    """Delete a merged PR's surviving head branch so auto-land can proceed.
+
+    A merge performed outside merge_and_deploy (e.g. a Forgejo web-UI merge with
+    the delete-branch box unchecked) never gets the branch-deletion backstop, which
+    leaves _is_auto_land_eligible permanently False. This reconciles that: bounded
+    to the single most-recently-merged observed PR (one branch probe per tick, per
+    target), reusing the existing idempotent, non-raising _ensure_head_branch_deleted
+    primitive rather than adding a new Forgejo surface. Best-effort — a failure here
+    is surfaced as a pm:error observation but never raises out of tick().
+    """
+    if not repo:
+        return
+    merged = _merged_pr_numbers_observed(target_id)
+    if not merged:
+        return
+    pr_num = max(merged)
+    try:
+        repo_name, owner = _repo_owner(repo)
+        _ensure_head_branch_deleted(repo_name, pr_num, owner=owner)
+    except Exception as e:
+        episodic.write_observation(
+            target_id, f"Head branch reconcile failed for PR #{pr_num}: {e}",
+            extra_tags=["pm:error", "pm:branch-reconcile-failed"],
+        )
+
+
 def _is_auto_land_eligible(target_id: str) -> bool:
     """Return True if this target meets all auto-land conditions.
 
@@ -2951,7 +2978,9 @@ def _is_auto_land_eligible(target_id: str) -> bool:
       - The most recently seen PR is the merged one (no newer open PR)
       - All declared PRs have merged (len(merged) >= target.pr_count)
       - The PR's head branch is deleted (or Forgejo unavailable, per proxy)
-    Paused check is handled in tick() before this is reached.
+    Paused check is applied by the caller: tick_all() excludes paused targets
+    from auto-land pre-selection, and tick() itself also short-circuits to
+    noop:paused before the decide phase that would call _act_auto_land.
     """
     if _mem().get(_landed_key(target_id)):
         return False
@@ -6690,6 +6719,11 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     _merged_this_tick = _encode_merged_prs(target_id, repo)
     encoded += _merged_this_tick
 
+    # Reconcile a surviving head branch on a confirmed merge (L1). Bookkeeping,
+    # not a decide-phase action — scoped to this single target_id only. See
+    # _reconcile_surviving_head_branch for why this is bounded to one probe.
+    _reconcile_surviving_head_branch(target_id, repo)
+
     # Classify lost fixer dispatches (terminal job, no PR produced).
     # Must run after encode so freshly-flipped records are visible.
     _lost_all_records = load_dispatched(target_id)
@@ -6971,8 +7005,12 @@ def tick_all() -> list[TickResult]:
     # Pre-select which target (if any) gets the auto-land slot this tick.
     # This check uses observations from previous ticks; targets that become
     # eligible for the first time this tick are deferred to the next tick.
+    # Paused targets are excluded here (not just inside tick()): a paused
+    # target that meets every other auto-land condition would otherwise sort
+    # first by oldest bind, win the single slot, and immediately noop:paused —
+    # starving every other land-eligible target for as long as it stays paused.
     eligible_ids = sorted(
-        [t.id for t in bound if _is_auto_land_eligible(t.id)],
+        [t.id for t in bound if not t.paused and _is_auto_land_eligible(t.id)],
         key=_spec_bound_ts,
     )
     auto_land_chosen = eligible_ids[0] if eligible_ids else None

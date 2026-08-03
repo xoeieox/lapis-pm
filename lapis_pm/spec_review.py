@@ -861,9 +861,19 @@ def _dispatch_gw_reviewer(
     prompt = (
         f"Review this spec for technical soundness, implementability, and "
         f"coverage of DON'T-do constraints and Definition-of-Done. "
+        f"For any issue you report at severity HIGH or MED, you MUST include the exact "
+        f"read-only command you ran to check it as STRUCTURED fields — never a single "
+        f"free-text string: \"command_program\" (bare program name, e.g. \"grep\"), "
+        f"\"command_args\" (a JSON list of its arguments, e.g. [\"-n\", \"foo\", \"bar.py\"]), "
+        f"and \"command_output\" (the exact stdout it produced). Never combine the program "
+        f"and its arguments into one string. LOW-severity issues do not need these fields. "
         f"Return a JSON verdict with structure: "
         f"{{\"verdict\": \"clean|fixable|needs-human\", "
-        f"\"issues\": [{{\"severity\": \"HIGH|MED|LOW\", \"note\": \"...\"}}], "
+        f"\"issues\": [{{\"severity\": \"HIGH|MED|LOW\", \"note\": \"...\", "
+        f"\"citation\": \"<file:line or spec section>\", "
+        f"\"command_program\": \"<required for HIGH/MED>\", "
+        f"\"command_args\": [\"<required for HIGH/MED>\"], "
+        f"\"command_output\": \"<required for HIGH/MED>\"}}], "
         f"\"confidence\": 0.0-1.0}}\n\n"
         f"=== SPEC ===\n{spec_text}"
     )
@@ -1095,6 +1105,286 @@ def _resolve_reference_model() -> str | None:
         return _SHAPER.get_agent("spec_reviewer").model
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Citation command-replay verifier (lapis-pm-citation-command-replay-verifier-v0)
+#
+# Deterministic, no-model-call check: replay the exact read-only command a
+# reference leg claims to have run against the real target_repo_path, and diff
+# its live output against the leg's claimed command_output. Informational only
+# — command_verified never feeds _combined_recommendation (see DON'T-do in the
+# spec). Only HIGH/MED issues are checked; LOW issues are left untouched.
+# ---------------------------------------------------------------------------
+
+_CITATION_COMMAND_ALLOWLIST: frozenset[str] = frozenset({"grep", "rg", "git", "cat", "find"})
+_CITATION_COMMAND_TIMEOUT_S = 5  # per-command subprocess timeout
+_CITATION_VERIFY_AGGREGATE_BUDGET_S = 30  # total wall-clock across all issues in one run
+_CITATION_VERIFY_MAX_CAPTURE_BYTES = 50 * 1024  # resource bound, not a relevance judgment
+_CITATION_LINE_RE = re.compile(r":(\d+)\s*$")
+
+
+def _citation_args_shape_valid(command_args: object) -> bool:
+    """True iff command_args is a plain list[str] — checked before any allowlist logic
+    runs, so a bare string / nested structure / non-string element is rejected at the
+    earliest possible point (schema-validation time), never re-joined or re-parsed."""
+    if not isinstance(command_args, list):
+        return False
+    return all(isinstance(a, str) for a in command_args)
+
+
+def _citation_resolve_under_repo(arg: str, target_repo_path: str) -> Path | None:
+    """Resolve arg relative to target_repo_path and reject if it escapes (symlink-safe,
+    handles absolute-path and ../ escapes). Returns the resolved Path, or None if arg
+    is not equal to or under target_repo_path."""
+    try:
+        repo_root = Path(target_repo_path).resolve()
+        resolved = (Path(target_repo_path) / arg).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved == repo_root or resolved.is_relative_to(repo_root):
+        return resolved
+    return None
+
+
+def _citation_command_allowlisted(
+    command_program: str, command_args: list[str], target_repo_path: str
+) -> bool:
+    """Hard allowlist: only grep/rg/git(grep|show)/cat/find, and only when every
+    non-flag argument resolves to a path equal to or under target_repo_path. No
+    tokenization anywhere — command_args is already a structured list."""
+    if command_program not in _CITATION_COMMAND_ALLOWLIST:
+        return False
+    if command_program == "git":
+        if not command_args or command_args[0] not in ("grep", "show"):
+            return False
+    for arg in command_args:
+        if arg.startswith("-"):
+            continue
+        if _citation_resolve_under_repo(arg, target_repo_path) is None:
+            return False
+    return True
+
+
+def _citation_execution_faulted(
+    command_program: str, command_args: list[str], returncode: int
+) -> bool:
+    """True iff returncode indicates a genuine execution fault (bad path, unknown
+    flag) rather than an expected non-error nonzero exit (grep/rg/git-grep 1 = no
+    match)."""
+    if command_program in ("grep", "rg"):
+        return returncode not in (0, 1)
+    if command_program == "git":
+        sub = command_args[0] if command_args else ""
+        if sub == "grep":
+            return returncode not in (0, 1)
+        return returncode != 0  # git show
+    return returncode != 0  # cat, find
+
+
+def _citation_extract_targets(command_program: str, command_args: list[str]) -> list[str]:
+    """Per-program lookup table returning candidate target paths for the command
+    (never a single-path heuristic — see spec's "Relevance Gap" section)."""
+    if command_program in ("grep", "rg"):
+        positionals = [a for a in command_args if not a.startswith("-")]
+        return positionals[1:] if len(positionals) > 1 else []
+    if command_program == "cat":
+        return [a for a in command_args if not a.startswith("-")]
+    if command_program == "git":
+        if not command_args:
+            return []
+        sub = command_args[0]
+        if sub == "grep":
+            return _citation_extract_targets("grep", command_args[1:])
+        if sub == "show":
+            if len(command_args) < 2:
+                return []
+            spec = command_args[1]
+            if ":" in spec:
+                return [spec.rsplit(":", 1)[1]]
+            return [spec]
+        return []
+    if command_program == "find":
+        positionals = [a for a in command_args if not a.startswith("-")]
+        return positionals[:1]
+    return []
+
+
+def _citation_path_only(citation: str) -> str:
+    """Strip a trailing :<line> suffix from a citation, leaving the bare path."""
+    if ":" in citation:
+        head, _, tail = citation.rpartition(":")
+        if tail.isdigit():
+            return head
+    return citation
+
+
+def _citation_line_number(citation: str) -> int | None:
+    m = _CITATION_LINE_RE.search(citation or "")
+    return int(m.group(1)) if m else None
+
+
+def _citation_target_matches(
+    citation_path: str, candidates: list[str], target_repo_path: str
+) -> bool:
+    """True iff citation_path (resolved under target_repo_path) equals or is contained
+    within any one of the command's extracted candidate targets."""
+    cited_resolved = _citation_resolve_under_repo(citation_path, target_repo_path)
+    if cited_resolved is None:
+        return False
+    for cand in candidates:
+        cand_resolved = _citation_resolve_under_repo(cand, target_repo_path)
+        if cand_resolved is None:
+            continue
+        if cited_resolved == cand_resolved or cited_resolved.is_relative_to(cand_resolved):
+            return True
+    return False
+
+
+def _citation_command_has_line_numbers(command_program: str, command_args: list[str]) -> bool:
+    """True iff the command is structurally capable of proving a specific line —
+    grep/rg/`git grep` invoked with -n (fixed, well-known output prefix)."""
+    if command_program in ("grep", "rg"):
+        return "-n" in command_args
+    if command_program == "git" and command_args and command_args[0] == "grep":
+        return "-n" in command_args[1:]
+    return False
+
+
+def _citation_output_covers_line(output: str, line_no: int) -> bool:
+    """Parse each output line's leading `<number>:` prefix (grep -n's fixed format —
+    a simple split on the first colon, checking the prefix is all digits) and confirm
+    at least one matches line_no. Not a general-purpose output parser."""
+    for out_line in output.splitlines():
+        prefix, sep, _ = out_line.partition(":")
+        if sep and prefix.isdigit() and int(prefix) == line_no:
+            return True
+    return False
+
+
+def _citation_normalize_output(s: str) -> str:
+    """Reasonable normalization only — trailing whitespace/newline — nothing that
+    would let a genuinely wrong claim slide through as a match."""
+    return s.rstrip()
+
+
+def _citation_diff_snippet(claimed: str, actual: str, max_len: int = 200) -> str:
+    return f"claimed={claimed[:max_len]!r} actual={actual[:max_len]!r}"
+
+
+def _verify_citation_commands(
+    issues: list[dict], target_repo_path: str | None
+) -> list[dict]:
+    """Deterministically replay each HIGH/MED issue's claimed command against
+    target_repo_path and diff its real output against the issue's claimed
+    command_output. Attaches command_verified: true | false | "not_checked" to
+    each HIGH/MED issue (LOW issues pass through untouched). Never raises, never
+    mutates any other field on an issue, never blocks past its aggregate budget.
+
+    target_repo_path unavailable (None or not a directory) is a "not_checked"
+    outcome for every HIGH/MED issue in this call, never a hard block — see the
+    spec's "target_repo_path unavailable" invariant.
+    """
+    if not issues:
+        return issues
+
+    repo_available = bool(target_repo_path) and Path(target_repo_path).is_dir()
+    budget_deadline = time.monotonic() + _CITATION_VERIFY_AGGREGATE_BUDGET_S
+
+    out: list[dict] = []
+    for issue in issues:
+        severity = str(issue.get("severity", "")).lower()
+        if severity not in ("high", "med"):
+            out.append(issue)
+            continue
+
+        new_issue = dict(issue)
+        out.append(new_issue)
+
+        if time.monotonic() >= budget_deadline:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if not repo_available:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        command_program = issue.get("command_program")
+        command_args = issue.get("command_args")
+        command_output_claim = issue.get("command_output")
+
+        if not isinstance(command_program, str) or command_output_claim is None:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if not _citation_args_shape_valid(command_args):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if not _citation_command_allowlisted(command_program, command_args, target_repo_path):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        try:
+            result = subprocess.run(
+                [command_program, *command_args],
+                cwd=target_repo_path,
+                shell=False,
+                timeout=_CITATION_COMMAND_TIMEOUT_S,
+                capture_output=True,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if _citation_execution_faulted(command_program, command_args, result.returncode):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        stdout_bytes = result.stdout or b""
+        if len(stdout_bytes) > _CITATION_VERIFY_MAX_CAPTURE_BYTES:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        actual_output = stdout_bytes.decode("utf-8", errors="replace")
+
+        # Relevance Gap close: cross-check the command's target against the
+        # issue's own citation before trusting any byte-comparison.
+        citation = str(issue.get("citation", issue.get("path", "")))
+        citation_path = _citation_path_only(citation)
+        candidates = _citation_extract_targets(command_program, command_args)
+        if citation_path and not _citation_target_matches(
+            citation_path, candidates, target_repo_path
+        ):
+            new_issue["command_verified"] = False
+            new_issue["command_verify_diff"] = (
+                f"claimed evidence for `{citation}`, command targeted "
+                f"{candidates or '(no target)'}"
+            )
+            continue
+
+        # Coincidence Trap close: a line-specific citation requires a command
+        # structurally capable of proving that line (grep/rg/git-grep -n).
+        line_no = _citation_line_number(citation)
+        if line_no is not None:
+            if not _citation_command_has_line_numbers(command_program, command_args):
+                new_issue["command_verified"] = "not_checked"
+                continue
+            if not _citation_output_covers_line(actual_output, line_no):
+                new_issue["command_verified"] = "not_checked"
+                continue
+
+        if _citation_normalize_output(actual_output) == _citation_normalize_output(
+            str(command_output_claim)
+        ):
+            new_issue["command_verified"] = True
+        else:
+            new_issue["command_verified"] = False
+            new_issue["command_verify_diff"] = _citation_diff_snippet(
+                str(command_output_claim), actual_output
+            )
+
+    return out
 
 
 def _detect_grounding_status(facets_dict: dict | None) -> tuple[str, str]:
@@ -1350,14 +1640,34 @@ def _council_infra_guidance(reason: str, run_id: str = "") -> str:
     )
 
 
+def _format_issue_line(i: dict) -> str:
+    """One reference-issue line, with command_verified (if present) rendered as one
+    of three visually distinct states: confirmed / contradicted / not checked.
+    contradicted (False) gets high-contrast emphasis plus a diff snippet — the
+    strongest signal a citation is wrong; confirmed and not-checked render neutral."""
+    base = (
+        f"    - [{i.get('severity', '?').upper()}] "
+        f"{i.get('citation', i.get('path', '?'))}: {i.get('note', '')}"
+    )
+    cv = i.get("command_verified")
+    if cv is None:
+        return base
+    if cv is True:
+        return base + "  [command-verified: ✓ confirmed]"
+    if cv is False:
+        diff = i.get("command_verify_diff", "")
+        return (
+            base
+            + "\n      ⚠️⚠️ COMMAND-VERIFIED: CONTRADICTED — the replayed command "
+            + f"disagrees with this claim ⚠️⚠️\n      {diff}"
+        )
+    return base + "  [command-verified: not checked]"
+
+
 def format_brief(brief: SpecReviewBrief) -> str:
     """Render SpecReviewBrief as markdown for stdout."""
     issues_lines = (
-        "\n".join(
-            f"    - [{i.get('severity','?').upper()}] "
-            f"{i.get('citation', i.get('path','?'))}: {i.get('note','')}"
-            for i in brief.reference_issues
-        )
+        "\n".join(_format_issue_line(i) for i in brief.reference_issues)
         if brief.reference_issues
         else "    - (none)"
     )
@@ -2281,6 +2591,23 @@ def run_spec_review(
         timeout_s=timeout_s,
         start_time=start_time,
     )
+
+    # 8a. Citation command-replay verifier (lapis-pm-citation-command-replay-verifier-v0):
+    #     deterministic replay-and-diff of any HIGH/MED issue's claimed command against
+    #     the pinned GW worktree (torn down by the time we get here in the current GW
+    #     leg lifecycle — see PR body for this known gap). Informational only; never
+    #     raises, never blocks the brief, never feeds combined_recommendation.
+    if reference_raw is not None and reference_raw.get("issues"):
+        _citation_target_repo_path = gw_provenance.worktree_path if gw_provenance is not None else None
+        try:
+            reference_raw["issues"] = _verify_citation_commands(
+                reference_raw["issues"], _citation_target_repo_path
+            )
+        except Exception as e:
+            print(
+                f"[spec-review:citation-verify-error] {e} — leaving issues unverified",
+                file=sys.stderr,
+            )
 
     # 8b. Build council_raw from the envelope. If envelope is None (error path),
     #     council_raw reflects the error.

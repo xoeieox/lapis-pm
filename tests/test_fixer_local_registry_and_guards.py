@@ -2,7 +2,7 @@
 
 Coverage (spec: local-fixer-registry-entry-v0):
 
-  AC1 — Raw YAML parse: fixer_local has engine=local-fixer, model=gravitywell-122b,
+  AC1 — Raw YAML parse: fixer_local has engine=local-fixer, model=gravitywell-slot1,
          and system_template contains none of the forbidden git/PR verbs.
 
   AC2 — force_dispatch guard scenarios:
@@ -84,7 +84,7 @@ class TestRegistryYamlFixerLocal:
         assert entry.get("engine") == "local-fixer"
 
     def test_model_field(self, entry):
-        assert entry.get("model") == "gravitywell-122b"
+        assert entry.get("model") == "gravitywell-slot1"
 
     def test_system_template_no_forbidden_verbs(self, entry):
         template = entry.get("system_template", "")

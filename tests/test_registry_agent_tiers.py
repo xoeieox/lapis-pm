@@ -68,7 +68,7 @@ def test_fixer_and_fixer_retry_currently_on_sonnet(agents):
 
 def test_fixer_local_excluded_from_parity_by_design(agents):
     """fixer_local is the intentional opt-in local tier, not part of the
-    fixer/fixer_retry pair - it must stay on local-fixer/gravitywell-122b
+    fixer/fixer_retry pair - it must stay on local-fixer/gravitywell-slot1
     and must NOT be pulled into the parity assertion above."""
     assert agents["fixer_local"]["engine"] == "local-fixer"
-    assert agents["fixer_local"]["model"] == "gravitywell-122b"
+    assert agents["fixer_local"]["model"] == "gravitywell-slot1"

@@ -542,12 +542,12 @@ agents:
       refactors. End your response with: "Pushed fixes to {existing_branch}."
     timeout_s: 2700
 
-  # DEPRECATED: standard fixer now routes to 122B directly, same target as this entry.
-  # Kept for backwards compatibility / explicit --force-dispatch fixer_local invocation.
+  # DEPRECATED: kept for backwards compatibility / explicit
+  # --force-dispatch fixer_local invocation.
   fixer_local:
     chub_bundles: []
     engine: local-fixer
-    model: gravitywell-122b
+    model: gravitywell-slot1
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -577,7 +577,7 @@ agents:
   scout:
     chub_bundles: []
     engine: local-reviewer
-    model: gravitywell-122b
+    model: gravitywell-slot1
     capture_meta: false
     notify: false
     system_template: |

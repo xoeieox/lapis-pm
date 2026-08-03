@@ -306,6 +306,17 @@ agents:
 
       ## Output
 
+      ## Command evidence — required for HIGH/MED issues only
+
+      Any issue you report at severity "high" or "med" MUST carry the exact read-only
+      command you ran to check it, as STRUCTURED fields — never a single free-text
+      string. Emit `command_program` (the bare program name, e.g. "grep") and
+      `command_args` (a JSON list of its arguments, e.g. ["-n", "foo", "bar.py"]) as two
+      separate fields, plus `command_output` (the exact stdout that command produced).
+      Do not combine program and arguments into one string anywhere. LOW-severity issues
+      never carry these fields — a LOW is exactly the case where the locator is too weak
+      to run a command against, and that hedge must not change.
+
       Return JSON ONLY:
       {{
         "verdict": "clean" | "fixable" | "needs-human",
@@ -315,7 +326,10 @@ agents:
           {{ "severity": "low|med|high",
              "category": "completeness|implementability|edge-case|dont-do|dod|other",
              "citation": "<spec section or file:line>",
-             "note": "<what you checked, how you checked it, and what you found>" }}
+             "note": "<what you checked, how you checked it, and what you found>",
+             "command_program": "<required for high/med: e.g. grep>",
+             "command_args": ["<required for high/med: e.g. -n>", "foo", "bar.py"],
+             "command_output": "<required for high/med: the exact stdout you saw>" }}
         ],
         "confidence": 0.0-1.0
       }}

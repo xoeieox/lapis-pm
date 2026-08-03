@@ -148,7 +148,7 @@ def test_gw_slot2_serving_runs_lease_free_against_slot2():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral") as mock_sm:
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -197,7 +197,7 @@ def test_gw_slot2_provenance_logged_on_successful_run(capsys):
 def test_gw_stub_returns_verdict():
     """GW_REVIEW_STUB=1 returns stubbed verdict without calling call_gw_agent."""
     with patch.dict(os.environ, {"GW_REVIEW_STUB": "1", "GW_REVIEW_STUB_VERDICT": "fixable"}):
-        text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+        text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
             spec_text="test spec",
             synth_target_id="test-tid",
             parsed_target_id="test-id",
@@ -216,7 +216,7 @@ def test_gw_stub_default_verdict_clean():
     env = {"GW_REVIEW_STUB": "1"}
     with patch.dict(os.environ, env, clear=False):
         os.environ.pop("GW_REVIEW_STUB_VERDICT", None)
-        text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+        text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
             spec_text="test",
             synth_target_id="tid",
             parsed_target_id="id",
@@ -435,7 +435,7 @@ def test_gw_slot2_not_serving_returns_none():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value=None):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -457,7 +457,7 @@ def test_gw_agents_core_import_failure_returns_none():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
             with patch.dict("sys.modules", {"agents_core": None, "agents_core.gw_agent": None}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -491,7 +491,7 @@ def test_return_shape_is_tuple_when_return_transcript_true():
         )
 
     # Unpack: this is the critical pattern
-    text, transcript, elapsed, skip_reason = result
+    text, transcript, elapsed, skip_reason, provenance = result
 
     # text can be a string or None
     assert isinstance(text, str) or text is None
@@ -522,7 +522,7 @@ def test_slot2_not_serving_returns_none_not_empty_tuple():
     with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value=None):
-            gw_text, gw_transcript, gw_elapsed, gw_skip_reason = _dispatch_gw_reviewer(
+            gw_text, gw_transcript, gw_elapsed, gw_skip_reason, gw_provenance = _dispatch_gw_reviewer(
                 spec_text="spec",
                 synth_target_id="tid",
                 parsed_target_id="id",
@@ -683,7 +683,7 @@ def test_dispatch_gw_reviewer_skips_when_slot2_collapsed_to_primary():
                                   "GW_URL": "http://203.0.113.11:8081"}, clear=False):
         with patch("lapis_pm.spec_review.swarm_model", return_value="qwen3.6-35b-a3b") as mock_sm:
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -710,7 +710,7 @@ def test_dispatch_gw_reviewer_runs_when_slot2_distinct_and_serving():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -729,7 +729,7 @@ def test_dispatch_gw_reviewer_slot2_unavailable_preserved_when_distinct():
     with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value=None):
-            text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+            text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                 spec_text="spec",
                 synth_target_id="tid",
                 parsed_target_id="id",
@@ -823,7 +823,7 @@ def test_gw_no_content_reports_real_reason_request_failed():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -851,7 +851,7 @@ def test_gw_no_content_no_reason_fallback_when_reason_out_empty():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -925,7 +925,7 @@ def test_gw_join_honours_configured_timeout_not_hardcoded_300(join_spec_fixture,
 
     fake_future = MagicMock()
     fake_future.result.return_value = (
-        '{"verdict": "clean", "issues": [], "confidence": 0.9}', [], 400.0, "",
+        '{"verdict": "clean", "issues": [], "confidence": 0.9}', [], 400.0, "", None,
     )
     mock_executor = MagicMock()
     mock_executor.submit.return_value = fake_future
@@ -1032,7 +1032,7 @@ def test_gw_join_healthy_path_unchanged_brief_and_record(join_spec_fixture, monk
 
     fake_future = MagicMock()
     fake_future.result.return_value = (
-        '{"verdict": "clean", "issues": [], "confidence": 0.9}', [], 448.4, "",
+        '{"verdict": "clean", "issues": [], "confidence": 0.9}', [], 448.4, "", None,
     )
     mock_executor = MagicMock()
     mock_executor.submit.return_value = fake_future
@@ -1095,7 +1095,7 @@ def test_dispatch_gw_reviewer_emits_abandoned_tag_when_join_gave_up(capsys):
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -1124,7 +1124,7 @@ def test_dispatch_gw_reviewer_emits_plain_completed_tag_on_healthy_path(capsys):
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",

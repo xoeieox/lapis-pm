@@ -25,7 +25,9 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -106,6 +108,17 @@ class _DispatchResult:
     spec_path: str = ""
     spec_id: str = ""
     output_path: str = ""
+
+
+@dataclass
+class GwLegProvenance:
+    """What the GW reference leg actually read: a pinned, detached origin/main
+    worktree of the local clone — never the shared -working tree. staleness_warning
+    is a static, human-readable line noting the worktree is only as fresh as the
+    local clone's last fetch (this unit never fetches)."""
+    resolved_sha: str
+    worktree_path: str
+    staleness_warning: str
 
 
 @dataclass
@@ -660,6 +673,77 @@ def _persist_gw_artifacts(
     return raw_output_ref, transcript_ref
 
 
+def _create_gw_worktree(repo: str, run_id: str) -> tuple[str | None, str | None, str]:
+    """Create a detached origin/main worktree of the local /srv/git/{repo}-working
+    clone, so the GW leg reviews a pinned tree instead of whatever an interactive
+    session or another dispatch left sitting in the shared -working checkout.
+
+    Returns (worktree_path, resolved_sha, error_reason). On success error_reason
+    is "". On any failure both worktree_path and resolved_sha are None and
+    error_reason names the cause. Never raises — this is a probe, not a command.
+    """
+    working_clone = f"/srv/git/{repo}-working"
+    try:
+        tmpdir = tempfile.mkdtemp(prefix=f"gw-leg-{run_id}-")
+    except OSError as e:
+        return None, None, f"mkdtemp_failed:{e}"
+
+    try:
+        add_result = subprocess.run(
+            ["git", "-C", working_clone, "worktree", "add", "--detach", tmpdir, "origin/main"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        return None, None, f"git_worktree_add_exception:{e}"
+
+    if add_result.returncode != 0:
+        return None, None, f"git_worktree_add_failed:{add_result.stderr.strip()[:200]}"
+
+    try:
+        sha_result = subprocess.run(
+            ["git", "-C", tmpdir, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        _try_remove_worktree_quiet(working_clone, tmpdir)
+        return None, None, f"rev_parse_exception:{e}"
+
+    if sha_result.returncode != 0:
+        _try_remove_worktree_quiet(working_clone, tmpdir)
+        return None, None, f"rev_parse_failed:{sha_result.stderr.strip()[:200]}"
+
+    return tmpdir, sha_result.stdout.strip(), ""
+
+
+def _try_remove_worktree_quiet(working_clone: str, worktree_path: str) -> None:
+    """Best-effort cleanup for a worktree that failed partway through creation
+    (e.g. `git worktree add` succeeded but `rev-parse` didn't). Never raises."""
+    try:
+        subprocess.run(
+            ["git", "-C", working_clone, "worktree", "remove", "--force", worktree_path],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        pass
+
+
+def _remove_gw_worktree(repo: str, worktree_path: str) -> None:
+    """Remove a worktree created by _create_gw_worktree. Raises RuntimeError on
+    failure so the caller's own try/except can log-and-continue without letting
+    a cleanup failure mask whatever the try body already produced."""
+    working_clone = f"/srv/git/{repo}-working"
+    result = subprocess.run(
+        ["git", "-C", working_clone, "worktree", "remove", "--force", worktree_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree remove failed: {result.stderr.strip()[:200]}")
+
+
 def _dispatch_gw_reviewer(
     spec_text: str,
     synth_target_id: str,
@@ -668,15 +752,18 @@ def _dispatch_gw_reviewer(
     run_id: str,
     gw_principal: str | None = None,
     abandoned_event: threading.Event | None = None,
-) -> tuple[str | None, list[dict], float, str]:
+) -> tuple[str | None, list[dict], float, str, GwLegProvenance | None]:
     """Dispatch and run the GW reference reviewer synchronously against Slot-2
     Devstral (:8082), lease-free — a distinct-model second opinion that runs
     concurrently with the 27B Facets/Council voicing on :8081 at zero lease
     contention.
 
-    Returns (text, transcript, elapsed_s, skip_reason) where text is the verdict
-    string (or None if GW did not run), transcript is the list of tool calls,
-    elapsed_s is the wall-clock time, and skip_reason is set when GW is skipped.
+    Returns (text, transcript, elapsed_s, skip_reason, provenance) where text is
+    the verdict string (or None if GW did not run), transcript is the list of
+    tool calls, elapsed_s is the wall-clock time, skip_reason is set when GW is
+    skipped, and provenance is a GwLegProvenance naming the pinned origin/main
+    worktree the leg actually read — populated whenever the worktree was
+    successfully created, None otherwise (never ran, or a worktree/git failure).
 
     Stub-aware: if GW_REVIEW_STUB=1, uses GW_REVIEW_STUB_VERDICT env var.
     """
@@ -686,7 +773,7 @@ def _dispatch_gw_reviewer(
     if os.getenv("GW_REVIEW_STUB") == "1":
         verdict = os.getenv("GW_REVIEW_STUB_VERDICT", "clean")
         elapsed = time.time() - start_time
-        return verdict, [], elapsed, ""
+        return verdict, [], elapsed, "", None
 
     gw_slot2_url = _gw_slot2_url()
     if gw_slot2_url is None:
@@ -697,7 +784,7 @@ def _dispatch_gw_reviewer(
             f"council voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed, "no_parseable_hostname"
+        return None, [], elapsed, "no_parseable_hostname", None
 
     primary_url = _gw_primary_url()
     if _gw_endpoints_collapsed(gw_slot2_url, primary_url):
@@ -709,7 +796,7 @@ def _dispatch_gw_reviewer(
             f"voicing only, no self-contending reference leg.",
             file=sys.stderr,
         )
-        return None, [], elapsed, "slot2_collapsed_to_primary"
+        return None, [], elapsed, "slot2_collapsed_to_primary", None
 
     # Single bounded (4s) probe: doubles as the readiness gate AND the
     # provenance source (the served model), replacing the doorman-heartbeat
@@ -726,7 +813,7 @@ def _dispatch_gw_reviewer(
             f"voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed, "slot2_unavailable"
+        return None, [], elapsed, "slot2_unavailable", None
 
     print(
         f"[spec-review:gw-reviewer-provenance] endpoint={gw_slot2_url} "
@@ -742,7 +829,34 @@ def _dispatch_gw_reviewer(
             f"[spec-review:gw-reviewer] agents_core import failed: {e} — skipping GW leg",
             file=sys.stderr,
         )
-        return None, [], elapsed, "import_error"
+        return None, [], elapsed, "import_error", None
+
+    # Ground the leg against a pinned, detached origin/main worktree of the
+    # local clone — never the shared -working tree, which is read/write from
+    # interactive PM sessions and other dispatches and carries no guarantee of
+    # being at origin/main, clean, or even on main. Mirrors the pattern
+    # agents-core's Facets orchestrator uses for the same reason (PR #201).
+    worktree_path, resolved_sha, wt_err = _create_gw_worktree(repo, run_id)
+    if worktree_path is None:
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: could not pin an "
+            f"origin/main worktree ({wt_err}) — spec-review will proceed with council "
+            f"voicing only.",
+            file=sys.stderr,
+        )
+        return None, [], elapsed, "worktree_unavailable", None
+
+    staleness_warning = (
+        f"reviewing origin/main@{resolved_sha} as pinned in the local clone's last "
+        f"fetch; may not reflect the current remote state"
+    )
+    provenance = GwLegProvenance(
+        resolved_sha=resolved_sha,
+        worktree_path=worktree_path,
+        staleness_warning=staleness_warning,
+    )
+    print(f"[spec-review:gw-reviewer-pinned] {staleness_warning}", file=sys.stderr)
 
     prompt = (
         f"Review this spec for technical soundness, implementability, and "
@@ -768,7 +882,7 @@ def _dispatch_gw_reviewer(
         text, transcript = call_gw_agent(
             prompt=prompt,
             system="",
-            cwd=f"/srv/git/{repo}-working",
+            cwd=worktree_path,
             tools=DEFAULT_READONLY_TOOLS,
             json_mode=True,
             on_wake_fail="skip",
@@ -797,7 +911,7 @@ def _dispatch_gw_reviewer(
                     f"elapsed={elapsed:.1f}s",
                     file=sys.stderr,
                 )
-            return text, transcript, elapsed, ""
+            return text, transcript, elapsed, "", provenance
         # on_wake_fail=skip cannot fire on this call path (acquire_lease=False
         # never consults the doorman) - report the real reason_out cause
         # instead of fabricating one this function cannot know.
@@ -807,14 +921,23 @@ def _dispatch_gw_reviewer(
             f"elapsed={elapsed:.1f}s timeout={gw_timeout}s",
             file=sys.stderr,
         )
-        return text, transcript, elapsed, f"gw_no_content:{reason}"
+        return text, transcript, elapsed, f"gw_no_content:{reason}", provenance
     except Exception as e:
         elapsed = time.time() - start_time
         print(
             f"[spec-review:gw-reviewer] call_gw_agent failed: {e} — skipping",
             file=sys.stderr,
         )
-        return None, [], elapsed, "call_error"
+        return None, [], elapsed, "call_error", provenance
+    finally:
+        try:
+            _remove_gw_worktree(repo, worktree_path)
+        except Exception as e:
+            print(
+                f"[spec-review:gw-reviewer-cleanup-warning] failed to remove worktree "
+                f"{worktree_path}: {e}",
+                file=sys.stderr,
+            )
 
 
 def _poll_reference_until_terminal(
@@ -2107,9 +2230,10 @@ def run_spec_review(
         gw_elapsed: float = 0.0
         gw_skip_reason: str = ""
         gw_abandoned: bool = False
+        gw_provenance: GwLegProvenance | None = None
         if gw_future is not None:
             try:
-                gw_text, gw_transcript, gw_elapsed, gw_skip_reason = gw_future.result(timeout=gw_timeout)
+                gw_text, gw_transcript, gw_elapsed, gw_skip_reason, gw_provenance = gw_future.result(timeout=gw_timeout)
             except FuturesTimeoutError:
                 # Real wall-clock elapsed at the moment of abandonment - never the
                 # timeout constant, and never null (AC2). gw_abandoned is the

@@ -88,7 +88,7 @@ def test_gw_principal_same_value_reaches_both_destinations(advisory_spec, monkey
         abandoned_event=None,
     ):
         captured["dispatch_gw_principal"] = gw_principal
-        return (None, [], 0.0, "")
+        return (None, [], 0.0, "", None)
 
     def mock_run_deliberation(request):
         captured["delib_gw_principal"] = request.gw_principal
@@ -123,7 +123,7 @@ def test_gw_principal_format(advisory_spec, monkeypatch):
 
     def mock_dispatch(**kwargs):
         captured["val"] = kwargs.get("gw_principal")
-        return (None, [], 0.0)
+        return (None, [], 0.0, "", None)
 
     monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
     monkeypatch.setattr("lapis_pm.spec_review._dispatch_gw_reviewer", mock_dispatch)

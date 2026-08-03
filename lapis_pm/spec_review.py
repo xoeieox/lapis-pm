@@ -179,10 +179,19 @@ class SpecReviewBrief:
     # "not-applicable" — never a sub-key of another field, never prose. See
     # _detect_grounding_status. grounding_reason is a short machine-parsable cause
     # string (e.g. "gw_timeout", "no_repo_in_context", "grounding_target_unavailable",
-    # "codebase_surface_denied") — never prose, never a log pointer. Only
-    # "not-applicable" may carry an empty reason.
+    # "codebase_surface_denied", "sim_data_missing", "sim_data_malformed") — never
+    # prose, never a log pointer. Only "not-applicable" may carry an empty reason.
+    # "no_repo_in_context" is reserved for the genuine repo-absent case resolved in
+    # agents_core/shared_deliberation/orchestrator.py's _resolve_grounding_target;
+    # _detect_grounding_status never emits it itself (see its docstring).
     grounding_status: Literal["verified", "failed", "silent-denial", "not-applicable"] = "not-applicable"
     grounding_reason: str = ""
+    # D2 (lapis-pm-spec-review-grounding-legibility-v0): the full commit sha this
+    # review's codebase grounding was resolved against, when grounding_status ==
+    # "verified". Empty otherwise — never fabricated. source_repo is deliberately
+    # NOT threaded (deferred at the review gate — see spec_review.py's render site).
+    grounding_resolved_sha: str = ""
+    grounding_age_days: int | None = None
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -1399,6 +1408,17 @@ def _detect_grounding_status(facets_dict: dict | None) -> tuple[str, str]:
           decision/escalate-structural-absence-not-only-denial-2026-08-01, LOW must
           still emit rather than being suppressed.
 
+    grounding_reason taxonomy (settled at the spec-review gate,
+    lapis-pm-spec-review-grounding-legibility-v0): `no_repo_in_context` is reserved
+    for the genuine case — `_resolve_grounding_target` in
+    agents_core/shared_deliberation/orchestrator.py finding context["repo"] absent
+    or malformed before this function ever runs. This function never sees that
+    signal directly (rounds/sim_results/sim_failures only), so it must never emit
+    `no_repo_in_context` itself — it emits `sim_data_missing` (no sim data recorded
+    at all in a non-final round) or `sim_data_malformed` (sim data recorded, but
+    none of it codebase-shaped) instead. Both keep the "silent-denial" status; only
+    the cause string differs.
+
     Returns (grounding_status, grounding_reason). facets_dict=None (Facets never ran,
     or its dispatch failed outright) is treated as "failed" — a review that never
     attempted grounding cannot be reported as verified or silently as not-applicable;
@@ -1437,10 +1457,49 @@ def _detect_grounding_status(facets_dict: dict | None) -> tuple[str, str]:
         return ("verified", "")
     if not saw_any_data:
         # Case (b): structurally absent, not even logged as a failure.
-        return ("silent-denial", "no_repo_in_context")
-    # Some sim data was recorded but none of it was codebase-shaped — treat as the
-    # same silent-denial case rather than a false "verified".
-    return ("silent-denial", "no_repo_in_context")
+        return ("silent-denial", "sim_data_missing")
+    # Some sim data was recorded but none of it was codebase-shaped — a distinct
+    # cause from sim_data_missing above, still "silent-denial" rather than a false
+    # "verified".
+    return ("silent-denial", "sim_data_malformed")
+
+
+def _resolve_grounding_sha_and_age(repo: str) -> tuple[str, int | None]:
+    """Best-effort local resolution of what a "verified" grounding was checked
+    against (D2, lapis-pm-spec-review-grounding-legibility-v0).
+
+    The Facets codebase-surface leg grounds against a detached `origin/main`
+    worktree of this same local clone (agents_core's `_resolve_grounding_target`,
+    mirrored by `_create_gw_worktree` above for the GW leg) — so `origin/main`'s
+    current sha in `/srv/git/{repo}-working` is the same commit that grounding
+    run against, modulo a fetch landing in the narrow window between the two.
+    Purely local, read-only, no network — same no-fetch posture as the rest of
+    this module's grounding machinery (2026-08-01 Erah ruling).
+
+    Returns (sha, age_days). On any failure returns ("", None) rather than
+    fabricating a value — a rendering degradation, never a brief failure.
+    """
+    clone_dir = f"/srv/git/{repo}-working"
+    try:
+        sha_result = subprocess.run(
+            ["git", "-C", clone_dir, "rev-parse", "origin/main"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if sha_result.returncode != 0:
+            return "", None
+        sha = sha_result.stdout.strip()
+
+        ts_result = subprocess.run(
+            ["git", "-C", clone_dir, "log", "-1", "--format=%ct", sha],
+            capture_output=True, text=True, timeout=15,
+        )
+        if ts_result.returncode != 0 or not ts_result.stdout.strip():
+            return sha, None
+        commit_ts = int(ts_result.stdout.strip())
+        age_days = max(0, int((time.time() - commit_ts) // 86400))
+        return sha, age_days
+    except Exception:
+        return "", None
 
 
 def _build_brief(
@@ -1467,6 +1526,8 @@ def _build_brief(
     gw_raw_output_ref: str = "",
     grounding_status: str = "not-applicable",
     grounding_reason: str = "",
+    grounding_resolved_sha: str = "",
+    grounding_age_days: int | None = None,
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
@@ -1605,6 +1666,8 @@ def _build_brief(
         gw_raw_output_ref=gw_raw_output_ref,
         grounding_status=grounding_status,
         grounding_reason=grounding_reason,
+        grounding_resolved_sha=grounding_resolved_sha,
+        grounding_age_days=grounding_age_days,
     )
 
 
@@ -1926,7 +1989,19 @@ verdict from it. See raw output below for what the model actually said.
         voicing_lines += f"\n- Facets operator: {facets_operator_line}"
     voicing_section = f"\n**Leg voicing / operator:**\n{voicing_lines}\n" if voicing_lines else ""
 
-    grounding_reason_str = f" ({brief.grounding_reason})" if brief.grounding_reason else ""
+    # D2 (lapis-pm-spec-review-grounding-legibility-v0): render what the grounding
+    # was actually checked against — sha only for "verified" (never fabricated for
+    # any other status); reason string only for non-verified statuses. The two are
+    # mutually exclusive by construction (grounding_resolved_sha is only populated
+    # when grounding_status == "verified"). age is a plain integer + "d" suffix,
+    # never prose — grounding_reason's machine-parsable contract extends to this.
+    if brief.grounding_resolved_sha:
+        age_part = f", age: {brief.grounding_age_days}d" if brief.grounding_age_days is not None else ""
+        grounding_reason_str = f" (sha: {brief.grounding_resolved_sha}{age_part})"
+    elif brief.grounding_reason:
+        grounding_reason_str = f" ({brief.grounding_reason})"
+    else:
+        grounding_reason_str = ""
     return f"""# Spec Review: {brief.target_id}
 
 **Spec:** {brief.spec_path}
@@ -2755,6 +2830,16 @@ def run_spec_review(
     else:
         grounding_status, grounding_reason = _detect_grounding_status(facets_deliberation)
 
+    # D2 (lapis-pm-spec-review-grounding-legibility-v0): surface what a "verified"
+    # grounding was actually checked against. resolved_sha only — source_repo
+    # threading is deferred (reaches across the agents_core repo boundary; the
+    # report's own **Repo:** line already names the repo). Best-effort and
+    # never fabricated: a git failure here degrades the render, never the brief.
+    grounding_resolved_sha = ""
+    grounding_age_days: int | None = None
+    if grounding_status == "verified":
+        grounding_resolved_sha, grounding_age_days = _resolve_grounding_sha_and_age(repo)
+
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
@@ -2779,4 +2864,6 @@ def run_spec_review(
         gw_raw_output_ref=gw_raw_output_ref,
         grounding_status=grounding_status,
         grounding_reason=grounding_reason,
+        grounding_resolved_sha=grounding_resolved_sha,
+        grounding_age_days=grounding_age_days,
     )

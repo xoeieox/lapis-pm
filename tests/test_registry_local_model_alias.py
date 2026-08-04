@@ -34,6 +34,15 @@ REGISTRY_PATH = Path(__file__).parent.parent / "lapis_pm" / "registry.yaml"
 # swaps; a concrete model id does not.
 VALID_SLOT_ALIASES = {"gravitywell-slot1", "gravitywell-slot2"}
 
+# Non-GravityWell backends (third-party swarm/contractor seats) are exempt:
+# the alias/concrete-id defect this file guards against is specific to
+# vLLM's slot-serving model on GravityWell. A contractor seat's model field
+# is a literal id its own API expects (e.g. Phala's "deepseek/deepseek-v4-
+# flash") - there is no alias to pin to, and pinning one would just be
+# wrong. lapis-pm-reviewer-peak-contractor-route-v0 adds the first such
+# entry, reviewer_fresh_contractor, routed to the BRIX phala-test-key seat.
+NON_GRAVITYWELL_CONTRACTOR_AGENTS = {"reviewer_fresh_contractor"}
+
 _REGISTRY = yaml.safe_load(REGISTRY_PATH.read_text())
 _AGENTS = _REGISTRY["agents"]
 
@@ -43,8 +52,12 @@ LOCAL_AGENT_NAMES = sorted(
     if cfg.get("engine") in ("local-reviewer", "local-fixer")
 )
 
+GRAVITYWELL_AGENT_NAMES = sorted(
+    name for name in LOCAL_AGENT_NAMES if name not in NON_GRAVITYWELL_CONTRACTOR_AGENTS
+)
 
-@pytest.mark.parametrize("name", LOCAL_AGENT_NAMES)
+
+@pytest.mark.parametrize("name", GRAVITYWELL_AGENT_NAMES)
 def test_local_agent_model_is_slot_alias_not_concrete_id(name):
     model = _AGENTS[name].get("model")
     assert model in VALID_SLOT_ALIASES, (

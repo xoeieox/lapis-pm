@@ -86,6 +86,7 @@ except ImportError as _e:
 from . import episodic, brief, authority, intent_artifact as _intent_artifact, steer
 from . import node_identity
 from . import signed_directive
+from . import tou_window
 
 try:
     from . import eval_gate as _eval_gate
@@ -113,6 +114,14 @@ MAX_DISPATCH_RETRIES = 2
 # Agent types that count as "initial fixer" for dispatch guards, lost-fixer
 # detection, and concurrency checks. A single constant so all sites stay in sync.
 _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
+
+# Every agent_type that dispatches a local-reviewer read-only judge leg.
+# reviewer_fresh_contractor (lapis-pm-reviewer-peak-contractor-route-v0) is
+# the TOU-peak seat swap of reviewer_fresh — it must be treated identically
+# by every reviewer-record classification site (attempt ceiling, review-gate
+# kill-switch, verdict decode, output-file processing) or dispatches routed
+# to it silently fall outside all of that accounting.
+_REVIEWER_AGENT_TYPES = ("reviewer", "reviewer_fresh", "reviewer_fresh_contractor")
 
 # Review-gate loop constants
 REVIEW_GATE_THRESHOLD = 40          # local reviewer (reviewer/reviewer_fresh seat) calls before soft-pause
@@ -2336,7 +2345,7 @@ def force_dispatch(
     # Also resolve pr_number here for reviewer/reviewer_fresh/fixer_retry so cycle accounting
     # (_fixer_retry_count / _reviewer_cycle_count) can attribute force-dispatched records
     # to the correct PR, same as the daemon's own _act_dispatch_fixer_retry/_act_dispatch_reviewer.
-    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry", "reviewer", "reviewer_fresh") and target.pm_repo:
+    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry",) + _REVIEWER_AGENT_TYPES and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -2362,7 +2371,7 @@ def force_dispatch(
     # this function ever reaches the record-construction code below. Build it the
     # same way the daemon's own _act_dispatch_reviewer does.
     reviewer_cycle: int | None = None
-    if agent_type in ("reviewer", "reviewer_fresh"):
+    if agent_type in _REVIEWER_AGENT_TYPES:
         reviewer_cycle = (_reviewer_cycle_count(target_id, pr_number) + 1) if pr_number is not None else 1
 
     prior_review_text = ""
@@ -2400,7 +2409,7 @@ def force_dispatch(
         if agent_type == "fixer_retry":
             record["pr_number"] = pr_number
             record["cycle"] = _reviewer_cycle_count(target_id, pr_number)
-        elif agent_type in ("reviewer", "reviewer_fresh"):
+        elif agent_type in _REVIEWER_AGENT_TYPES:
             record["pr_number"] = pr_number
             record["cycle"] = reviewer_cycle
             reviewer_tags = [f"pm:reviewer:pr={pr_number}:cycle={reviewer_cycle}:verdict=pending"]
@@ -3576,7 +3585,7 @@ def _fixer_retry_count(target_id: str, pr_number: int) -> int:
 def _has_pending_reviewer_for_pr(target_id: str, pr_number: int) -> bool:
     return any(
         r.get("status") == "pending"
-        and r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        and r.get("agent_type") in _REVIEWER_AGENT_TYPES
         and r.get("pr_number") == pr_number
         for r in load_dispatched(target_id)
     )
@@ -3666,7 +3675,7 @@ def _fixer_completion_ts(target_id: str, pr_number: int, dispatch_ts: str) -> st
 def _reviewer_dispatch_ts(target_id: str, pr_number: int, cycle: int) -> str | None:
     """Return dispatch ts of reviewer at cycle K for PR N, or None."""
     for r in load_dispatched(target_id):
-        if (r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        if (r.get("agent_type") in _REVIEWER_AGENT_TYPES
                 and r.get("pr_number") == pr_number
                 and r.get("cycle") == cycle):
             return r.get("ts")
@@ -4716,6 +4725,16 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     spec_summary = episodic.spec_summary(target_id)
 
     agent_type = "reviewer_fresh" if mode == "fresh" else "reviewer"
+    # TOU-peak contractor route (lapis-pm-reviewer-peak-contractor-route-v0,
+    # D2): dispatch-time-only routing, decided by the clock at the moment of
+    # THIS dispatch and nowhere else. No exception handler may switch seats
+    # (decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30) —
+    # this is the ONLY place agent_type is redirected to the contractor seat.
+    # Only reviewer_fresh (the local-GravityWell fresh-read leg) has a
+    # contractor counterpart; plain "reviewer" (same-reviewer mode) is
+    # unaffected.
+    if agent_type == "reviewer_fresh" and tou_window.is_peak_window():
+        agent_type = "reviewer_fresh_contractor"
 
     # Build prior_review context for same-reviewer mode
     prior_review_text = _build_prior_review_text(target_id, pr_number, cycle) if mode == "same" else ""
@@ -4779,6 +4798,16 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
 
+    # D2/D5 provenance: a verdict whose record does not say which model
+    # produced it is not auditable, and this route makes verdicts come from
+    # two different models on the same PR. Look up the registry-declared
+    # model/seat for this agent_type (never hardcode — the registry is the
+    # single source of truth for both reviewer_fresh and its contractor
+    # counterpart, which share a template but not a model).
+    try:
+        shaped_agent = _SHAPER.get_agent(agent_type)
+    except Exception:
+        shaped_agent = None
     record = {
         "gpu_id": res.task_id,
         "spec_id": res.spec_id,
@@ -4791,7 +4820,15 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "ts": _now_iso(),
         "status": "pending",
         "retry_count": 0,
+        "model": shaped_agent.model if shaped_agent else None,
     }
+    if agent_type == "reviewer_fresh_contractor":
+        # Tag the route so the locality ledger can distinguish a scheduled
+        # daytime contractor call (POLICY) from a fallback event, per
+        # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30:
+        # "instrumentation should distinguish the two or the ledger will read
+        # every daytime judge call as an independence failure."
+        record["route"] = "peak-window-policy"
     append_dispatched(target_id, record)
 
     episodic.write_dispatch(
@@ -4966,7 +5003,7 @@ def _fallback_reviewer_fail_reason(target_id: str, pr_number: int, cycle: int) -
     output file was ever written."""
     records = [
         r for r in load_dispatched(target_id)
-        if r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        if r.get("agent_type") in _REVIEWER_AGENT_TYPES
         and r.get("pr_number") == pr_number
         and r.get("cycle", 1) == cycle
         and r.get("status") == "failed"
@@ -6034,7 +6071,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 f"Intent: {rec.get('intent')}\n\n{snippet}",
                 extra_tags=tags + ["pm:failure"],
             )
-            if rec.get("agent_type") in ("reviewer", "reviewer_fresh") and rec.get("pr_number") is not None:
+            if rec.get("agent_type") in _REVIEWER_AGENT_TYPES and rec.get("pr_number") is not None:
                 # Stash the as-reported reason for the attempt-ceiling record
                 # (DoD 3b: recorded as claimed, never as a verified cause).
                 reported_reason = (text.strip().splitlines() or [""])[0][:500]
@@ -6044,7 +6081,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
             failed_for_retry.append(rec)
         else:
             # Reviewer agents: parse JSON output and write reviewer-tagged episodic entry
-            if rec.get("agent_type") in ("reviewer", "reviewer_fresh"):
+            if rec.get("agent_type") in _REVIEWER_AGENT_TYPES:
                 pr_num = rec.get("pr_number", "?")
                 cycle_num = rec.get("cycle", 1)
                 raw_output = text.strip()
@@ -6272,7 +6309,7 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         # episodic entry, and then flips to processed.
         # Failed flips for reviewers are still permitted (crashed job → no
         # output file coming; must fail fast rather than wait forever).
-        if rec.get("agent_type") in ("reviewer", "reviewer_fresh") and t["state"] == "processed":
+        if rec.get("agent_type") in _REVIEWER_AGENT_TYPES and t["state"] == "processed":
             continue  # output-file verdict-encoder owns reviewer → processed
 
         # Flip the record to the terminal state.
@@ -6296,7 +6333,7 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         # string was the verbatim "ERROR: local reviewer produced no verdict
         # (reason=gw_not_serving)"). Also classifies against the infra
         # allow-list (D1), same as the out_path-based path.
-        if (rec.get("agent_type") in ("reviewer", "reviewer_fresh")
+        if (rec.get("agent_type") in _REVIEWER_AGENT_TYPES
                 and t["state"] == "failed"
                 and rec.get("pr_number") is not None
                 and t["error"]):

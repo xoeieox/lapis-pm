@@ -149,7 +149,7 @@ agents:
     model: gravitywell-slot1
     capture_meta: false
     notify: false
-    system_template: |
+    system_template: &reviewer_fresh_system_template |
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
       {spec_summary}
@@ -206,6 +206,39 @@ agents:
         "confidence": 0.0-1.0
       }}
       No prose outside the JSON.
+    timeout_s: 600
+
+  # TOU-peak contractor seat for reviewer_fresh (lapis-pm-reviewer-peak-
+  # contractor-route-v0). GravityWell is asleep during TOU peak (16:00-21:00
+  # PT) by construction, so waking it means peak-rate electricity or a
+  # gw_not_serving non-run. This routes to the BRIX-local phala-test-key
+  # sealed seat (paid-phala-tee cost class) instead, selected at DISPATCH
+  # TIME by the clock in pm_core._act_dispatch_reviewer — never from an
+  # exception handler (decision/gw-daytime-no-flips-judge-via-deepseek-v4-
+  # flash-2026-07-30: "the routing decision belongs at dispatch time, not
+  # in an exception handler").
+  #
+  # system_template is the *same object* as reviewer_fresh's (YAML anchor
+  # alias, not a copy) — the spec requires the two prompts never fork, since
+  # a fork would make the cross-seat comparison this route exists to enable
+  # meaningless.
+  #
+  # backend_url has NO /v1 suffix: gw_agent.call_gw_agent appends
+  # /v1/chat/completions itself (agents_core/gw_agent.py:1308).
+  #
+  # acquire_lease: false + backend_url set together is the no-doorman swarm
+  # path (agents_core/shaper.py:179-185 raises if acquire_lease:false ever
+  # arrives WITHOUT a backend_url — the phantom-swarm guardrail this entry
+  # must not trip).
+  reviewer_fresh_contractor:
+    chub_bundles: []
+    engine: local-reviewer
+    model: deepseek/deepseek-v4-flash
+    backend_url: "http://127.0.0.1:8413"
+    acquire_lease: false
+    capture_meta: false
+    notify: false
+    system_template: *reviewer_fresh_system_template
     timeout_s: 600
 
   # model: gravitywell-slot1 is the slot ALIAS, not a model name - every vLLM

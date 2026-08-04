@@ -233,6 +233,10 @@ _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
     # immediate-restart path (not the claude-queue-runner in-flight-deferral path —
     # cockpit is not deferred).
     "cockpit": ("cockpit.service",),
+    # loupe.service: Type=simple long-running FastAPI read surface (Desk/Sessions/
+    # Landscape), same profile as cockpit above — a pull alone leaves it serving stale
+    # code until restarted. Spec: navigator-loupe-serve-parity-n0-v0.
+    "loupe": ("loupe.service",),
 }
 
 # Canonical deploy clone path for facets. Not pip-installed; the spec-review gate
@@ -320,6 +324,16 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # _POST_LAND_PULL_LOW_SIGNAL (spec: lapis-pm-deploy-inventory-auto-recovery-v0 Part A
     # item 3 — nothing in that spec depends on the critical/low-signal distinction here).
     "experts":        ["/srv/git/experts"],
+    # loupe: single-tree PYTHONPATH-import service (like cockpit/synapse), not a split
+    # dev/deploy pair for the read path itself — but the deploy CLONE is intentionally
+    # separate from /srv/git/loupe-working (the PM investigation tree), mirroring the
+    # lapis-pm/lapis-pm-working split above (:223), so that editing -working never
+    # changes what's live. loupe.service is Type=simple, long-running --user unit; a
+    # pull alone leaves it serving stale code until restarted (see
+    # _POST_LAND_RESTART_USER). Pull failure -> LOW signal (advisory read-only console
+    # for Erah, same tier as cockpit — see _POST_LAND_PULL_LOW_SIGNAL below).
+    # Spec: navigator-loupe-serve-parity-n0-v0.
+    "loupe":          ["/srv/git/loupe"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -352,8 +366,11 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # /data/rag git ref is attributable drift (§0 of lapis-pm-deploy-pull-rag-ops-v0), not a
 # broken runtime — docker compose doesn't even re-read the pulled files until a manual
 # recreate, so LOW keeps this failure attributable without polluting the critical channel.
+# loupe: advisory read-only console for Erah, visible the moment he opens it — same
+# tier reasoning as cockpit above. A stale pull is attributable, not a silent
+# load-bearing-substrate failure. Spec: navigator-loupe-serve-parity-n0-v0.
 _POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset(
-    {"code-reviewer", "facets", "gardener", "conductor", "cockpit", "rag-ops"}
+    {"code-reviewer", "facets", "gardener", "conductor", "cockpit", "rag-ops", "loupe"}
 )
 
 # ---------------------------------------------------------------------------

@@ -593,3 +593,113 @@ def test_format_brief_renders_claims_checked_not_reported_when_absent(tmp_path):
     output = format_brief(brief)
     assert "Claims checked:** (not reported)" in output
     assert "Claims checked:** 0" not in output
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-spec-review-grounding-legibility-v0 D2: render "Grounding: <status>
+# (sha: <hash>, age: <days>d)" for a verified grounding; source_repo is
+# deliberately NOT threaded (deferred at the review gate).
+# ---------------------------------------------------------------------------
+
+def test_format_brief_renders_grounding_sha_and_age(tmp_path):
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        grounding_status="verified",
+        grounding_reason="",
+        grounding_resolved_sha="a" * 40,
+        grounding_age_days=3,
+    )
+    output = format_brief(brief)
+    assert f"**Grounding:** verified (sha: {'a' * 40}, age: 3d)" in output
+    # age must be a plain machine-parsable integer + "d", never prose
+    assert "3 days" not in output
+
+
+def test_format_brief_grounding_sha_omitted_when_not_verified(tmp_path):
+    """A non-verified grounding must never fabricate a sha — the reason string
+    renders instead, exactly as before this unit."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        grounding_status="silent-denial",
+        grounding_reason="sim_data_missing",
+    )
+    output = format_brief(brief)
+    assert "**Grounding:** silent-denial (sim_data_missing)" in output
+    assert "sha:" not in output
+
+
+def test_format_brief_does_not_thread_source_repo(tmp_path):
+    """source_repo is DEFERRED (Council unanimous call, 2026-08-03) — the report
+    must not depend on it, and SpecReviewBrief must carry no such field."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        grounding_status="verified",
+        grounding_resolved_sha="b" * 40,
+        grounding_age_days=0,
+    )
+    assert not hasattr(brief, "grounding_source_repo")
+    output = format_brief(brief)
+    assert output  # renders fine without any source_repo field
+
+
+def test_format_brief_stale_clone_distinguishable_from_fresh(tmp_path):
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    fresh = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        grounding_status="verified",
+        grounding_resolved_sha="c" * 40,
+        grounding_age_days=0,
+    )
+    stale = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        grounding_status="verified",
+        grounding_resolved_sha="c" * 40,
+        grounding_age_days=14,
+    )
+    assert "age: 0d" in format_brief(fresh)
+    assert "age: 14d" in format_brief(stale)
+    assert format_brief(fresh) != format_brief(stale)

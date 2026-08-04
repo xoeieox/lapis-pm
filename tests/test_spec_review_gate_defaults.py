@@ -27,6 +27,7 @@ from agents_core.shared_deliberation.envelope import DeliberationEnvelope
 from lapis_pm.cli import main
 from lapis_pm.spec_review import (
     _detect_grounding_status,
+    _resolve_grounding_sha_and_age,
     run_spec_review,
 )
 
@@ -249,6 +250,98 @@ def test_detect_grounding_status_facets_never_ran():
     status, reason = _detect_grounding_status(None)
     assert status == "failed"
     assert reason != ""
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-spec-review-grounding-legibility-v0 D1: settled taxonomy split.
+# no_repo_in_context is reserved for the genuine repo-absent case resolved in
+# agents_core's _resolve_grounding_target; _detect_grounding_status must never
+# emit it, since it never observes that signal directly.
+# ---------------------------------------------------------------------------
+
+def test_detect_grounding_status_sim_data_missing():
+    """Case (b): no sim data recorded at all in a non-final round → sim_data_missing,
+    never no_repo_in_context (that name is reserved for the genuine repo-absent case)."""
+    facets_dict = {
+        "rounds": [
+            {"round_num": 0, "sim_failures": {}, "sim_results": {}},
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+        ]
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "silent-denial"
+    assert reason == "sim_data_missing"
+    assert reason != "no_repo_in_context"
+
+
+def test_detect_grounding_status_sim_data_malformed():
+    """Sim data was recorded in a non-final round, but none of it is codebase-shaped
+    → sim_data_malformed, distinct from sim_data_missing and from no_repo_in_context."""
+    facets_dict = {
+        "rounds": [
+            {
+                "round_num": 0,
+                "sim_failures": {},
+                "sim_results": {"other-surface:foo": "some result"},
+            },
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+        ]
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "silent-denial"
+    assert reason == "sim_data_malformed"
+    assert reason != "no_repo_in_context"
+    assert reason != "sim_data_missing"
+
+
+@pytest.mark.parametrize("facets_dict", [
+    {"rounds": [{"round_num": 0, "sim_failures": {}, "sim_results": {}},
+                {"round_num": 1, "sim_failures": {}, "sim_results": {}}]},
+    {"rounds": [{"round_num": 0, "sim_failures": {}, "sim_results": {"x:y": "z"}},
+                {"round_num": 1, "sim_failures": {}, "sim_results": {}}]},
+])
+def test_detect_grounding_status_never_returns_no_repo_in_context(facets_dict):
+    """_detect_grounding_status has no visibility into whether the repo was in
+    context at all — that check happens upstream in orchestrator.py's
+    _resolve_grounding_target. It must never emit no_repo_in_context itself."""
+    _status, reason = _detect_grounding_status(facets_dict)
+    assert reason != "no_repo_in_context"
+
+
+def test_detect_grounding_status_verified_unchanged_regression_fence():
+    facets_dict = {
+        "rounds": [
+            {"round_num": 0, "sim_failures": {}, "sim_results": {"codebase:foo.py": "ok"}},
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+        ]
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "verified"
+    assert reason == ""
+
+
+def test_detect_grounding_status_failed_unchanged_regression_fence():
+    facets_dict = {
+        "rounds": [
+            {
+                "round_num": 0,
+                "sim_failures": {"codebase:foo.py": "no target_repo in context"},
+                "sim_results": {},
+            },
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+        ]
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "failed"
+    assert reason == "codebase_surface_denied"
+
+
+def test_resolve_grounding_sha_and_age_never_fabricates_on_missing_clone():
+    """A nonexistent local clone must degrade to ("", None), never raise, never
+    invent a sha."""
+    sha, age = _resolve_grounding_sha_and_age("definitely-not-a-real-repo-xyz")
+    assert sha == ""
+    assert age is None
 
 
 def test_grounding_status_not_applicable_when_facets_not_dispatched(advisory_spec, monkeypatch):

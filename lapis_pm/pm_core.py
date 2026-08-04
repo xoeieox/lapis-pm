@@ -148,6 +148,31 @@ _REVIEWER_MODES: dict[str, str] = {
 REVIEWER_ATTEMPT_CEILING_DEFAULT = 2
 REVIEWER_ATTEMPT_CEILING_ENV = "LAPIS_PM_REVIEWER_ATTEMPT_CEILING"
 
+# Infrastructure non-runs (GravityWell unavailable, doorman disagreement, etc.)
+# must not consume the reviewer-attempt ceiling above — that ceiling exists to
+# bound a reviewer that keeps failing to produce a usable verdict, not a
+# reviewer that never got to run at all (lapis-pm-reviewer-attempts-not-consumed-
+# by-infra-v0). Infra-classified attempts get their own, more generous budget
+# so an endlessly-absent GravityWell still produces a bounded number of
+# dispatches rather than an unbounded loop. 6 is roughly 3x the reviewer
+# ceiling (2) — generous enough to ride out a transient doorman/wake-gravitywell
+# hiccup without burning attempts, but still a hard stop, not a retry-forever.
+REVIEWER_INFRA_RETRY_BUDGET_DEFAULT = 6
+REVIEWER_INFRA_RETRY_BUDGET_ENV = "LAPIS_PM_REVIEWER_INFRA_RETRY_BUDGET"
+
+# Hardcoded allow-list of infrastructure-unavailability reasons, owned by
+# lapis-pm and scoped to the vocabulary the reviewer's actual call path
+# (shaped_runner._run_local_reviewer -> gw_agent.call_gw_agent) can produce:
+# gw_unreachable (gw_agent.py) and gw_not_serving (gw_agent.py). Deliberately
+# NOT importing agents_core.llm.GW_PROVENANCE_PRECEDENCE — that tuple
+# (gw_deferred_swarm, slot_queued_timeout, slot_pool_down, gw_not_serving)
+# belongs to a different call path (the llm.py operator path) and most of its
+# members can never reach a reviewer dispatch record. An unrecognised reason
+# is treated as non-infrastructure and counts against the ceiling — fail
+# closed, so the ceiling's bound is never silently defeated by a new or
+# unexpected reason string.
+REVIEWER_INFRA_FAIL_REASONS = frozenset({"gw_not_serving", "gw_unreachable"})
+
 # Forgejo health gate constants
 FORGEJO_CONSECUTIVE_FAILS_KEY = "pm/forgejo_consecutive_fails"
 FORGEJO_UNREACHABLE_THRESHOLD = 3  # consecutive failed probes before Pushover
@@ -3334,22 +3359,55 @@ def _reviewer_attempt_ceiling() -> int:
     return REVIEWER_ATTEMPT_CEILING_DEFAULT
 
 
+def _reviewer_infra_retry_budget() -> int:
+    raw = os.environ.get(REVIEWER_INFRA_RETRY_BUDGET_ENV)
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+        except ValueError:
+            pass
+    return REVIEWER_INFRA_RETRY_BUDGET_DEFAULT
+
+
+def _classify_reviewer_infra_reason(reported_reason: str | None) -> str | None:
+    """Return the matched infra reason if `reported_reason` names one of
+    REVIEWER_INFRA_FAIL_REASONS, else None. Reason strings arrive embedded in
+    a larger message, e.g. "ERROR: local reviewer produced no verdict
+    (reason=gw_not_serving)" — extract via `reason=<value>` first, then fall
+    back to a bare substring match against the allow-list for any other
+    shape the reason might arrive in (e.g. straight from a queue error)."""
+    if not reported_reason:
+        return None
+    m = re.search(r"reason=([\w.-]+)", reported_reason)
+    if m and m.group(1) in REVIEWER_INFRA_FAIL_REASONS:
+        return m.group(1)
+    for candidate in REVIEWER_INFRA_FAIL_REASONS:
+        if candidate in reported_reason:
+            return candidate
+    return None
+
+
 def _reviewer_attempt_key(target_id: str, pr_number: int, cycle: int) -> str:
     return f"pm/reviewer-attempts/{target_id}/pr={pr_number}/cycle={cycle}"
 
 
 def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
+    default = {"count": 0, "last_reason": None, "infra_count": 0, "last_infra_reason": None}
     rec = _mem().get(_reviewer_attempt_key(target_id, pr_number, cycle))
     if not rec:
-        return {"count": 0, "last_reason": None}
+        return default
     try:
         data = json.loads(rec["content"])
         return {
             "count": int(data.get("count", 0)),
             "last_reason": data.get("last_reason"),
+            "infra_count": int(data.get("infra_count", 0)),
+            "last_infra_reason": data.get("last_infra_reason"),
         }
     except (ValueError, TypeError, json.JSONDecodeError):
-        return {"count": 0, "last_reason": None}
+        return default
 
 
 def _reviewer_attempt_count(target_id: str, pr_number: int, cycle: int) -> int:
@@ -3371,9 +3429,19 @@ def _increment_reviewer_attempt(target_id: str, pr_number: int, cycle: int) -> i
 
 def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, reason: str) -> None:
     """Stash the most recent failure reason for this pr+cycle, as-reported and
-    unverified — see DoD 3b. Does not touch the attempt count."""
+    unverified — see DoD 3b. Classifies the reason against
+    REVIEWER_INFRA_FAIL_REASONS (D1): an infrastructure-classified failure
+    bumps infra_count, which _reviewer_attempt_ceiling_check reads to exclude
+    that attempt from the ceiling count (and to bound infra-only failures
+    against the separate, more generous REVIEWER_INFRA_RETRY_BUDGET). Does
+    not touch the raw `count` — that stays dispatch-time-incremented history,
+    per the module docstring above."""
     state = _reviewer_attempt_state(target_id, pr_number, cycle)
     state["last_reason"] = reason
+    infra_reason = _classify_reviewer_infra_reason(reason)
+    if infra_reason is not None:
+        state["infra_count"] = state.get("infra_count", 0) + 1
+        state["last_infra_reason"] = infra_reason
     _mem().set(
         _reviewer_attempt_key(target_id, pr_number, cycle),
         json.dumps(state),
@@ -3394,6 +3462,7 @@ def clear_reviewer_attempts(target_id: str) -> int:
     for prefix in (
         f"pm/reviewer-attempts/{target_id}/",
         f"pm/reviewer-attempt-ceiling/{target_id}/",
+        f"pm/reviewer-infra-budget/{target_id}/",
     ):
         for rec in _mem().list_by_prefix(prefix, limit=10_000):
             if _mem().delete(rec["key"]):
@@ -3939,22 +4008,45 @@ def _perceive_prs(
 class Decision:
     kind: str   # "merge" | "advisory_brief" | "hold_brief" | "retry" | "abandon_brief" | "directive_ack"
                #  | "noop_no_change" | "noop_reviewer_in_flight" | "noop_fixer_in_flight"
-               #  | "reviewer_attempt_ceiling"
+               #  | "reviewer_attempt_ceiling" | "reviewer_infra_budget_exhausted"
     payload: dict
 
 
 def _reviewer_attempt_ceiling_check(target_id: str, pr_number: int, cycle: int) -> Decision | None:
-    """Return a `reviewer_attempt_ceiling` Decision if this pr+cycle has already
-    hit the attempt ceiling, else None. Checked immediately before every
-    dispatch_reviewer return so a reviewer that never completes a verdict
-    (and so never advances _reviewer_cycle_count) still stops on its own."""
-    ceiling = _reviewer_attempt_ceiling()
+    """Return a Decision if this pr+cycle has already hit either bound, else
+    None. Checked immediately before every dispatch_reviewer return so a
+    reviewer that never completes a verdict (and so never advances
+    _reviewer_cycle_count) still stops on its own.
+
+    Two separate bounds (D1):
+    - infra budget: attempts classified as infrastructure non-runs
+      (REVIEWER_INFRA_FAIL_REASONS) don't count against the reviewer-attempt
+      ceiling, but they are still bounded by their own, more generous budget
+      so an endlessly-absent GravityWell doesn't produce endless dispatches.
+      Checked first — an infra-caused wedge must surface as an infra pause,
+      never as a "clear-reviewer-attempts" ceiling pause.
+    - reviewer-attempt ceiling: count of attempts minus infra-classified
+      attempts. Unrecognised failure reasons count here (fail closed).
+    """
     state = _reviewer_attempt_state(target_id, pr_number, cycle)
-    if state["count"] >= ceiling:
+
+    infra_budget = _reviewer_infra_retry_budget()
+    if state["infra_count"] >= infra_budget:
+        return Decision("reviewer_infra_budget_exhausted", {
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "infra_attempts": state["infra_count"],
+            "infra_budget": infra_budget,
+            "reported_reason": state["last_infra_reason"] or state["last_reason"],
+        })
+
+    ceiling = _reviewer_attempt_ceiling()
+    effective_count = state["count"] - state["infra_count"]
+    if effective_count >= ceiling:
         return Decision("reviewer_attempt_ceiling", {
             "pr_number": pr_number,
             "cycle": cycle,
-            "attempts": state["count"],
+            "attempts": effective_count,
             "ceiling": ceiling,
             "reported_reason": state["last_reason"],
         })
@@ -4833,10 +4925,46 @@ def _reviewer_attempt_ceiling_marker_key(target_id: str, pr_number: int, cycle: 
     return f"pm/reviewer-attempt-ceiling/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
 
 
+def _reviewer_infra_budget_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/reviewer-infra-budget/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+
+
+# The human-judgment escape hatch that needs no automated verdict at all.
+# D2 requires every ceiling/infra-budget pause to name this — #834 and #835
+# both had briefs available the entire time they were wedged, and nothing
+# said so.
+_PM_PR_REVIEW_ESCAPE = (
+    "This does not require a reviewer verdict to resolve: walk the "
+    "outstanding brief via `pm-pr-review` for a human-judgment call on the PR."
+)
+
+
+def _fallback_reviewer_fail_reason(target_id: str, pr_number: int, cycle: int) -> str | None:
+    """D3: when no per-attempt reason was recorded — e.g. the reviewer job
+    crashed before writing an output file, so the queue-reconcile path (not
+    the out_path-based encode path) owned the terminal flip and the ordering
+    left last_reason unset for that race — fall back to the last failed
+    reviewer dispatch record's `error` field, which the queue populates from
+    the job's own stderr and reliably holds the real cause even when no
+    output file was ever written."""
+    records = [
+        r for r in load_dispatched(target_id)
+        if r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        and r.get("pr_number") == pr_number
+        and r.get("cycle", 1) == cycle
+        and r.get("status") == "failed"
+        and r.get("error")
+    ]
+    if not records:
+        return None
+    return records[-1]["error"]
+
+
 def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
     """Auto-pause the target and emit exactly ONE structured record when a
-    reviewer's per-PR-cycle attempt count exceeds the ceiling without ever
-    producing a completed verdict (lapis-pm-reviewer-attempt-ceiling-v0).
+    reviewer's per-PR-cycle attempt count (excluding infra-classified
+    non-runs, see D1) exceeds the ceiling without ever producing a completed
+    verdict (lapis-pm-reviewer-attempt-ceiling-v0).
 
     Per the boundary ruling: pause is the audible state (not silent-stop),
     the record must be machine-consumable, and this must NOT auto-unpause —
@@ -4855,8 +4983,22 @@ def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
 
     attempts = payload["attempts"]
     ceiling = payload["ceiling"]
-    reported_reason = payload.get("reported_reason")
+    # D3: a ceiling pause must never render reported_reason=None. If no
+    # per-attempt reason was recorded, fall back to the dispatch record's
+    # `error` field before giving up.
+    reported_reason = payload.get("reported_reason") or _fallback_reviewer_fail_reason(
+        target_id, pr_number, cycle,
+    )
     clear_cmd = f"lapis-pm clear-reviewer-attempts {target_id}"
+    # This is the genuine-failure ceiling (infra attempts are excluded from
+    # `attempts` by _reviewer_attempt_ceiling_check), so clear-reviewer-attempts
+    # is a legitimate remedy here — a reviewer producing bad/unparseable
+    # verdicts is exactly what clearing the counters and retrying can fix.
+    reason_clause = (
+        f"reported_reason={reported_reason!r}"
+        if reported_reason
+        else "no reason was reported by any failing attempt (unresolved)"
+    )
 
     record = {
         "target_id": target_id,
@@ -4871,6 +5013,7 @@ def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
         "reported_reason_note": "as-reported by the failing leg; unverified by this mechanism",
         "paused": True,
         "clear_command": clear_cmd,
+        "escape_hatch": _PM_PR_REVIEW_ESCAPE,
     }
 
     store = TargetStore()
@@ -4881,8 +5024,9 @@ def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
             reason=(
                 f"reviewer-attempt-ceiling: PR #{pr_number} cycle {cycle} hit "
                 f"{attempts}/{ceiling} attempts with no completed verdict "
-                f"(reported_reason={reported_reason!r}, unverified). "
-                f"Clear with `{clear_cmd}`, then `lapis-pm resume {target_id}`."
+                f"({reason_clause}, unverified). "
+                f"Clear with `{clear_cmd}`, then `lapis-pm resume {target_id}`. "
+                f"{_PM_PR_REVIEW_ESCAPE}"
             ),
         )
         target.save()
@@ -4901,6 +5045,83 @@ def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
     _mem().set(marker_key, json.dumps(record),
                tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"])
     return f"action:reviewer_attempt_ceiling_paused:pr={pr_number}:cycle={cycle}:attempts={attempts}"
+
+
+def _act_reviewer_infra_budget_pause(target_id: str, payload: dict) -> str:
+    """Auto-pause the target when the *infrastructure* retry budget (D1) is
+    exhausted — repeated reviewer non-runs (GravityWell not serving /
+    unreachable), never a reviewer that ran and produced a bad verdict.
+
+    Deliberately a distinct action from _act_reviewer_attempt_ceiling_pause:
+    per D2, an infra-caused pause must name the infrastructure cause and must
+    NOT recommend `clear-reviewer-attempts` — clearing the ceiling counters
+    cannot fix an unavailable GravityWell, and recommending it here is
+    exactly the "retry, not a repair" trap that wedged #834 on 2026-08-03.
+    """
+    pr_number = payload["pr_number"]
+    cycle = payload["cycle"]
+
+    marker_key = _reviewer_infra_budget_marker_key(target_id, pr_number, cycle)
+    if _mem().get(marker_key):
+        return "action:reviewer_infra_budget_exhausted:already_recorded"
+
+    infra_attempts = payload["infra_attempts"]
+    infra_budget = payload["infra_budget"]
+    reported_reason = payload.get("reported_reason") or _fallback_reviewer_fail_reason(
+        target_id, pr_number, cycle,
+    )
+    reason_clause = reported_reason or "infrastructure non-run (reason unresolved)"
+
+    record = {
+        "target_id": target_id,
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "infra_attempts": infra_attempts,
+        "infra_budget": infra_budget,
+        "reported_reason": reported_reason,
+        "reported_reason_note": "as-reported by the failing leg; unverified by this mechanism",
+        "cause_class": "infrastructure",
+        "paused": True,
+        "escape_hatch": _PM_PR_REVIEW_ESCAPE,
+    }
+
+    store = TargetStore()
+    target = store.get(target_id)
+    if target is not None:
+        target.set_paused(
+            True,
+            reason=(
+                f"reviewer-infra-budget: PR #{pr_number} cycle {cycle} hit "
+                f"{infra_attempts}/{infra_budget} infrastructure non-runs "
+                f"({reason_clause}) — the reviewer never ran, this is not a "
+                f"bad review. Clearing reviewer attempts will not help; this "
+                f"is an infrastructure availability problem "
+                f"(out of scope for lapis-pm — see the gw_not_serving/doorman "
+                f"divergence follow-up). {_PM_PR_REVIEW_ESCAPE} "
+                f"Resume once the infrastructure is confirmed available: "
+                f"`lapis-pm resume {target_id}`."
+            ),
+        )
+        target.save()
+
+    episodic.write_observation(
+        target_id,
+        f"Reviewer infra-retry budget exhausted on PR #{pr_number} cycle {cycle} "
+        f"({infra_attempts}/{infra_budget} infrastructure non-runs, "
+        f"cause={reason_clause}) — target auto-paused.\n"
+        f"{json.dumps(record, indent=2)}",
+        extra_tags=[
+            "pm:reviewer-infra-budget",
+            f"pm:pr={pr_number}",
+            f"pm:reviewer-infra-budget:pr={pr_number}:cycle={cycle}",
+        ],
+    )
+    _mem().set(marker_key, json.dumps(record),
+               tags=["lapis-pm", "reviewer-infra-budget", f"target={target_id}"])
+    return (
+        f"action:reviewer_infra_budget_paused:pr={pr_number}:cycle={cycle}:"
+        f"infra_attempts={infra_attempts}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6046,6 +6267,26 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         changed = True
         flipped += 1
 
+        # D3 fix (lapis-pm-reviewer-attempts-not-consumed-by-infra-v0): a
+        # reviewer/reviewer_fresh job that crashed before writing an output
+        # file (e.g. GravityWell reported not-serving) is flipped to "failed"
+        # right here — status was already != "pending" by the time
+        # _encode_gpu_results ran later this same tick, so its is_failure
+        # branch (the only other call site of _record_reviewer_attempt_reason)
+        # never sees it and last_reason stays None forever. Record the reason
+        # here too, from the queue's `error` field — the one surface that DID
+        # hold the real cause (verified live 2026-08-03: the queue's error
+        # string was the verbatim "ERROR: local reviewer produced no verdict
+        # (reason=gw_not_serving)"). Also classifies against the infra
+        # allow-list (D1), same as the out_path-based path.
+        if (rec.get("agent_type") in ("reviewer", "reviewer_fresh")
+                and t["state"] == "failed"
+                and rec.get("pr_number") is not None
+                and t["error"]):
+            _record_reviewer_attempt_reason(
+                target_id, rec["pr_number"], rec.get("cycle", 1), t["error"],
+            )
+
         # Close the project-slot + emit its deposit for slots whose terminal flip
         # is owned by THIS reconciler rather than _encode_gpu_results. The two
         # carve-outs above (fixer_retry/reviewer → processed) returned early and
@@ -6855,6 +7096,8 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                     decision_str = _act_review_gate_pause(target_id, decision.payload)
                 elif decision.kind == "reviewer_attempt_ceiling":
                     decision_str = _act_reviewer_attempt_ceiling_pause(target_id, decision.payload)
+                elif decision.kind == "reviewer_infra_budget_exhausted":
+                    decision_str = _act_reviewer_infra_budget_pause(target_id, decision.payload)
                 elif decision.kind == "noop_reviewer_in_flight":
                     p = decision.payload
                     decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"

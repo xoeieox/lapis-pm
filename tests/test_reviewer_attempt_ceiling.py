@@ -100,13 +100,15 @@ class TestCeilingDecision:
         with patch("lapis_pm.pm_core._mem", return_value=store):
             pm_core._increment_reviewer_attempt(TID, 42, 1)
             pm_core._increment_reviewer_attempt(TID, 42, 1)  # count=2 == ceiling
-            pm_core._record_reviewer_attempt_reason(TID, 42, 1, "gw_not_serving")
+            # A genuine review failure (not on the infra allow-list) —
+            # counts against the ceiling per D1/D4 regression fence.
+            pm_core._record_reviewer_attempt_reason(TID, 42, 1, "malformed verdict json")
             decision = pm_core._reviewer_attempt_ceiling_check(TID, 42, 1)
             assert decision is not None
             assert decision.kind == "reviewer_attempt_ceiling"
             assert decision.payload["attempts"] == 2
             assert decision.payload["ceiling"] == 2
-            assert decision.payload["reported_reason"] == "gw_not_serving"
+            assert decision.payload["reported_reason"] == "malformed verdict json"
 
     def test_decide_for_pr_returns_ceiling_not_dispatch_when_hit(self):
         """Reconstruct the incident shape: reviewer_count stays 0 (no verdict
@@ -138,8 +140,10 @@ class TestCeilingDecision:
         with patch("lapis_pm.pm_core._mem", return_value=store):
             pm_core._increment_reviewer_attempt(TID, 33, 1)
             pm_core._increment_reviewer_attempt(TID, 33, 1)
+            # Genuine review failure — not infra-classified, counts against
+            # the ceiling.
             pm_core._record_reviewer_attempt_reason(
-                TID, 33, 1, "local reviewer produced no verdict (reason=gw_not_serving)",
+                TID, 33, 1, "local reviewer produced no verdict (reason=budget_exhausted)",
             )
             with (
                 patch("lapis_pm.pm_core.authority.classify", return_value=cls),
@@ -292,11 +296,12 @@ class TestPersistenceAndClear:
 # ---------------------------------------------------------------------------
 
 class TestIncidentReconstruction:
-    def test_ten_consecutive_failures_stop_at_ceiling_one_record(self):
-        """Mirrors the 2026-08-01 incident: ten consecutive reviewer
-        dispatches for the same PR, each failing before a verdict, with
-        retry_count always 0. Assert dispatch stops at the ceiling (default
-        2) and exactly one ceiling record is emitted."""
+    def test_ten_consecutive_genuine_failures_stop_at_ceiling_one_record(self):
+        """Ten consecutive reviewer dispatches for the same PR, each a
+        genuine review failure (not infra), retry_count always 0. Assert
+        dispatch stops at the reviewer-attempt ceiling (default 2) and
+        exactly one ceiling record is emitted — the pre-existing bound,
+        unchanged by D1's infra carve-out."""
         from lapis_pm import authority
 
         store = _tmp_store()
@@ -349,14 +354,100 @@ class TestIncidentReconstruction:
                 decision = pm_core._decide_for_pr(TID, "facets", pr, "advisory")
                 if decision.kind == "dispatch_reviewer":
                     dispatch_calls += 1
-                    # Simulate the dispatch (attempt) and its fast failure.
+                    # Simulate the dispatch (attempt) and its fast failure —
+                    # a genuine review problem, e.g. the verdict didn't parse.
                     pm_core._increment_reviewer_attempt(TID, 33, decision.payload["cycle"])
                     pm_core._record_reviewer_attempt_reason(
                         TID, 33, decision.payload["cycle"],
-                        "local reviewer produced no verdict (reason=gw_not_serving)",
+                        "local reviewer produced no verdict (reason=budget_exhausted)",
                     )
                 elif decision.kind == "reviewer_attempt_ceiling":
                     pm_core._act_reviewer_attempt_ceiling_pause(TID, decision.payload)
 
         assert dispatch_calls == pm_core.REVIEWER_ATTEMPT_CEILING_DEFAULT  # 2, not 10
         assert pause_calls == 1  # target paused exactly once
+
+    def test_834_regression_gw_not_serving_does_not_wedge_behind_misleading_reason(self):
+        """Replays the actual #834 observed sequence (spec evidence base):
+        six consecutive `reviewer_fresh` dispatches, every one failing with
+        `error: ERROR: local reviewer produced no verdict (reason=gw_not_serving)`,
+        cycle never advancing past 1 (no verdict ever written). Before the
+        fix, two of those non-runs paused the target with
+        `reported_reason=None` and a `clear-reviewer-attempts` recommendation
+        that could never work — a retry, not a repair.
+
+        After the fix: gw_not_serving is infrastructure-classified, so it
+        does not consume the reviewer-attempt ceiling at all — the target
+        must NOT wedge behind `reviewer_attempt_ceiling` on this sequence.
+        The infra-retry budget (separate, more generous, D1) is what
+        eventually bounds it, and when it does, the pause must name the real
+        cause and must NOT recommend clear-reviewer-attempts (D2)."""
+        from lapis_pm import authority
+
+        store = _tmp_store()
+        cls = authority.PRClassification(
+            verdict="advisory",
+            screen_verdict="unknown",
+            static_outcome=authority.StaticOutcome.static_pass,
+            reasons=["static checks passed"],
+            issues=[],
+            pr_number=834,
+            repo="lapis-pm",
+            title="feat: x",
+            html_url="https://forgejo/Erah/lapis-pm/pulls/834",
+            changed_paths=["src/x.py"],
+            diff_loc=5,
+            diff="",
+        )
+        pr = {
+            "number": 834, "title": "feat: x",
+            "html_url": "https://forgejo/Erah/lapis-pm/pulls/834",
+            "head": {"ref": "lapis/t/x"}, "mergeable": True,
+        }
+
+        pause_calls = []
+        mock_target = MagicMock()
+        mock_target.set_paused.side_effect = lambda *a, **k: pause_calls.append((a, k))
+        mock_store_cls = MagicMock()
+        mock_store_cls.return_value.get.return_value = mock_target
+
+        with (
+            patch("lapis_pm.pm_core._mem", return_value=store),
+            patch("lapis_pm.pm_core.TargetStore", mock_store_cls),
+            patch("lapis_pm.pm_core.episodic.write_observation"),
+            patch("lapis_pm.pm_core.authority.classify", return_value=cls),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
+            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+        ):
+            # The observed #834 sequence was six dispatches; drive one tick
+            # further so the ceiling-check after the sixth failure gets a
+            # chance to fire the infra-budget pause (checked at the top of
+            # each iteration, before the next dispatch).
+            for _ in range(pm_core.REVIEWER_INFRA_RETRY_BUDGET_DEFAULT + 1):
+                decision = pm_core._decide_for_pr(TID, "lapis-pm", pr, "advisory")
+                # The bug this replays: gw_not_serving non-runs must never
+                # wedge the target behind the reviewer-attempt ceiling.
+                assert decision.kind != "reviewer_attempt_ceiling"
+                if decision.kind == "dispatch_reviewer":
+                    pm_core._increment_reviewer_attempt(TID, 834, decision.payload["cycle"])
+                    pm_core._record_reviewer_attempt_reason(
+                        TID, 834, decision.payload["cycle"],
+                        "error: ERROR: local reviewer produced no verdict (reason=gw_not_serving)",
+                    )
+                elif decision.kind == "reviewer_infra_budget_exhausted":
+                    pm_core._act_reviewer_infra_budget_pause(TID, decision.payload)
+                    break
+
+        # Still bounded — the separate infra-retry budget catches it after
+        # its own (more generous) count of non-runs.
+        assert len(pause_calls) == 1
+        reason_text = pause_calls[0][1].get("reason", "")
+        assert "reported_reason=None" not in reason_text
+        assert "gw_not_serving" in reason_text
+        assert "clear-reviewer-attempts" not in reason_text
+        assert "pm-pr-review" in reason_text

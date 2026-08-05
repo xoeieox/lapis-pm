@@ -683,6 +683,8 @@ def cmd_status(args) -> int:
     print("=== review-gate ===")
     print(f"  counter:       {rg['counter']} / {rg['threshold']}")
     print(f"  paused:        {rg['paused']}")
+    print(f"  window:        {rg['window_oldest']} to {rg['window_newest']} ({rg['window_days']}d)")
+    print(f"  infra-nonruns: {rg['infra_nonruns']} (separate ledger)")
     if rg["paused"]:
         print('  → Resume with: lapis-pm review-gate resume --reason "..."')
     print()
@@ -1481,6 +1483,9 @@ def cmd_review_gate(args) -> int:
         state = pm_core.review_gate_status()
         print(f"review-gate counter:   {state['counter']} / {state['threshold']}")
         print(f"review-gate paused:    {state['paused']}")
+        print(f"  window:              {state['window_oldest']} to {state['window_newest']} "
+              f"({state['window_days']}d)")
+        print(f"  infra non-runs:      {state['infra_nonruns']} (separate ledger, does not count toward counter)")
         if state["paused"]:
             print('  → Resume with: lapis-pm review-gate resume --reason "..."')
         return 0

@@ -1,9 +1,10 @@
 """Local-reviewer witness module (local-reviewer-witness-v0).
 
-Provides `run_local_reviewer_witness()` which dispatches the StarHouse local
-Qwen (MoE Qwen3.6-35B-A3B) as a parallel third-reviewer witness alongside the
-existing Claude (Opus) reviewer. Observational only — never displaces Claude's
-verdict. v0 is data-collection only; no auto-merge gate change.
+Provides `run_local_reviewer_witness()` which dispatches the local-LLM node
+(GravityWell as of 2026-08-05, formerly StarHouse) as a parallel
+third-reviewer witness alongside the existing Claude (Opus) reviewer.
+Observational only — never displaces Claude's verdict. v0 is data-collection
+only; no auto-merge gate change.
 
 Key constants (REVIEWER_PROMPT_TEMPLATE, REVIEWER_JSON_SCHEMA, _clean_model_output,
 _score_agreement) lifted verbatim from scripts/reviewer_spike.py (PR #93).
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -23,6 +25,28 @@ from lapis_pm.node_probe import node_reachable
 
 _PROBE_TIMEOUT = 3    # seconds for connect probe before POST
 _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (120s read budget preserved)
+
+
+def _default_endpoint() -> str:
+    """Resolve the qwen-operator local-LLM endpoint.
+
+    Read at call time (not import time) so tests can monkeypatch.setenv - same
+    call-time-vs-import-time discipline as agents_core.llm._llamacpp_url().
+    Defaults to GravityWell; LOCAL_LLM_URL wins when set. StarHouse (the old
+    bare-literal default) kernel-panicked 2026-08-03 and is being held off
+    deliberately - see agents-core-local-llm-gw-repoint-v0.
+    """
+    return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
+
+
+def _default_model() -> str | None:
+    """Explicit model override, or None to omit the `model` key entirely.
+
+    Deliberately does NOT fall back to a hardcoded model name - qwen3.6-35b-a3b
+    is unserved on GravityWell and 404s under vLLM. When unset, the request
+    carries no `model` field and the server serves whatever is resident.
+    """
+    return os.environ.get("LOCAL_LLM_MODEL")
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +230,8 @@ def run_local_reviewer_witness(
     spec_summary: str,
     claude_verdict: dict,           # used only for agreement classification
     *,
-    model: str = "qwen3.6-35b-a3b.gguf",
-    endpoint: str = "http://203.0.113.12:8081/v1/chat/completions",
+    model: str | None = None,
+    endpoint: str | None = None,
     timeout: int = 120,
     max_diff_chars: int = 30000,
     max_spec_chars: int = 5000,
@@ -215,10 +239,20 @@ def run_local_reviewer_witness(
 ) -> LocalReviewerWitnessResult:
     """Run the local-reviewer witness call.
 
+    `endpoint` defaults to GravityWell (call-time resolved via
+    `_default_endpoint()`) when not passed explicitly; `model` defaults to
+    None (via `_default_model()`) and is omitted from the request payload
+    when unset - see module-level docstrings for rationale.
+
     Returns a populated LocalReviewerWitnessResult on both success and failure.
     Never raises.
     """
     import httpx  # local import to avoid top-level httpx dependency at module load
+
+    if endpoint is None:
+        endpoint = _default_endpoint()
+    if model is None:
+        model = _default_model()
 
     dispatched_at = datetime.now(timezone.utc).isoformat()
 
@@ -253,11 +287,12 @@ def run_local_reviewer_witness(
     def _do_post(use_grammar: bool) -> tuple[dict | None, int, str | None, str | None]:
         """POST to endpoint. Returns (resp_json, latency_ms, raw_content, error)."""
         body: dict = {
-            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": 4096,
         }
+        if model is not None:
+            body["model"] = model
         if use_grammar:
             body["response_format"] = {
                 "type": "json_schema",

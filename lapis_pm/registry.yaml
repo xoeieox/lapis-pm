@@ -242,12 +242,24 @@ agents:
     timeout_s: 600
 
   # model: gravitywell-slot1 is the slot ALIAS, not a model name - every vLLM
-  # slot advertises both its model id and a stable alias (:8081 also answers
-  # to gravitywell-a3b-nvfp4, :8082 to gravitywell-a3b-coder/gravitywell-slot2).
+  # slot advertises both its model id and a stable alias (:8081 answers to
+  # gravitywell-27b/gravitywell-slot1/Qwen3.6-27B-NVFP4; :8082 would answer
+  # to gravitywell-slot2 if a slot-2 unit were up).
   # The alias survives model swaps; a concrete model id does not - vLLM
   # rejects an unknown id, call_gw_agent returns None, and `result or ""`
   # converts that into a silent successful empty string. Never pin a
   # concrete model id here again.
+  #
+  # This seat is deliberately pinned to slot 1 under the single-slot posture
+  # GW settled into (see lapis-pm-empiricist-repin-slot1-gw-leg-retire-v0).
+  # It was originally pinned to slot 2 (lapis-pm-empiricist-reference-seat-v0,
+  # PR #245) so it would be a genuinely separate substrate from the GW
+  # reference leg; slot 2 is now a `failed` systemd unit with no SLOT2 block
+  # in the rendered topology at all, not a periodically-absent one. The
+  # seat's differentiation was always meant to come from its character (the
+  # Empiricist template, its citation-not-existence discipline, its
+  # claims_checked accounting), not from a quantization difference - slot 1
+  # serves that character fine.
   #
   # acquire_lease: false + backend_url: this leg is dispatched concurrently
   # with Facets and Council, which hold `protected` doorman leases. A
@@ -258,12 +270,30 @@ agents:
   # the whole gate run (mirrors the GW reference leg, which already runs this
   # way). Do NOT drop the lease on reviewer/reviewer_fresh above - they have
   # no such companion. See lapis-pm-spec-review-leg-hotfix-reconcile-v0.
+  #
+  # backend_url MUST remain present and non-empty on this seat even though
+  # its value now equals the GW_URL default (:8081). This is an active
+  # behavioral constraint, not legacy residue: agents_core/gw_agent.py:1404
+  # derives `_is_swarm = (backend_url is not None) and (not acquire_lease)`
+  # from the key's mere presence. Deleting the key would flip `_is_swarm`
+  # False -> True, which silently turns on two request-body behaviors for
+  # this seat - chat_template_kwargs.enable_thinking on every tool-loop POST
+  # and grammar-constrained response_format on the conclusion POST. Those
+  # may be improvements, but they are inference-payload changes, not
+  # endpoint changes, and are out of scope for a repin; they belong to
+  # closeouts packet B1b once live Empiricist outputs exist to judge them
+  # against. See finding/gw-agent-is-swarm-flag-premise-refuted-by-live-probe-2026-08-06.
+  # tests/test_empiricist_reference_seat.py asserts backend_url stays
+  # present and non-empty specifically to catch a future deletion of this
+  # key. If agents-core ever replaces the inferred `_is_swarm` flag with an
+  # explicit parameter, this constraint is retired there first - not by
+  # deleting backend_url here.
   spec_reviewer:
     chub_bundles: ["conductor/lapis-pm", "conductor/lapis-ecosystem"]
     engine: local-reviewer
-    model: gravitywell-slot2
+    model: gravitywell-slot1
     acquire_lease: false
-    backend_url: "http://203.0.113.11:8082"
+    backend_url: "http://203.0.113.11:8081"
     capture_meta: false
     notify: false
     system_template: |

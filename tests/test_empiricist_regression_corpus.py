@@ -35,7 +35,7 @@ PLANTED_FALSE_CLAIMS = [
 # Planted true claims — must NOT appear as a flagged issue.
 PLANTED_TRUE_CLAIMS = [
     "spec_review.py:457",
-    "gravitywell-slot2",
+    "gravitywell-slot1",
 ]
 
 TOTAL_PLANTED_CLAIMS = len(PLANTED_FALSE_CLAIMS) + len(PLANTED_TRUE_CLAIMS)

@@ -168,7 +168,7 @@ class SpecReviewBrief:
     gw_verdict: str = "skip"  # verdict from GW, or "skip" if not dispatched
     gw_ran: bool = False  # whether the GW leg actually ran
     gw_abandoned: bool = False  # True when the join gave up on a still-running leg (never a fabricated elapsed)
-    gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname")
+    gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname", "gw_leg_retired")
     gw_findings_count: int = 0  # number of findings/issues from GW
     elapsed_gw: float = 0.0  # wall-clock time for GW leg
     gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
@@ -776,6 +776,19 @@ def _remove_gw_worktree(repo: str, worktree_path: str) -> None:
         raise RuntimeError(f"git worktree remove failed: {result.stderr.strip()[:200]}")
 
 
+def _gw_leg_retired() -> bool:
+    """Whether the GW reference leg is retired under the single-slot posture.
+
+    Retired by default. Set SPEC_REVIEW_GW_LEG_RETIRED=0 to un-retire it for a
+    run — e.g. once a live Slot-2 is restored. Read at call time, not import
+    time, matching the existing call-time-vs-import-time discipline used for
+    GW_REVIEWER_TIMEOUT_SEC and _gw_slot2_url() — so tests can
+    monkeypatch.setenv and a conductor.env change takes effect without a
+    daemon restart. See lapis-pm-empiricist-repin-slot1-gw-leg-retire-v0.
+    """
+    return os.environ.get("SPEC_REVIEW_GW_LEG_RETIRED") != "0"
+
+
 def _dispatch_gw_reviewer(
     spec_text: str,
     synth_target_id: str,
@@ -806,6 +819,20 @@ def _dispatch_gw_reviewer(
         verdict = os.getenv("GW_REVIEW_STUB_VERDICT", "clean")
         elapsed = time.time() - start_time
         return verdict, [], elapsed, "", None
+
+    # Retirement short-circuit: under the single-slot posture, the GW leg
+    # is declared retired (not dark) — the Empiricist is the reference leg
+    # now. No probe, no worktree, no lease, no network call. Precedes
+    # _gw_slot2_url() so nothing downstream of it ever runs.
+    if _gw_leg_retired():
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] GW reference reviewer retired under the "
+            f"single-slot posture — the Empiricist (spec_reviewer) is the reference "
+            f"leg. Set SPEC_REVIEW_GW_LEG_RETIRED=0 to un-retire for this run.",
+            file=sys.stderr,
+        )
+        return None, [], elapsed, "gw_leg_retired", None
 
     gw_slot2_url = _gw_slot2_url()
     if gw_slot2_url is None:

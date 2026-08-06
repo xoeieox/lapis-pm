@@ -48,6 +48,14 @@ def _mock_gw_module(call_gw_agent_mock):
     return mock_module
 
 
+@pytest.fixture(autouse=True)
+def _un_retire_gw_leg(monkeypatch):
+    """This file exercises the pre-retirement GW leg worktree machinery
+    exclusively — un-retire for every test here so the existing assertions
+    keep reaching the code they were written to test."""
+    monkeypatch.setenv("SPEC_REVIEW_GW_LEG_RETIRED", "0")
+
+
 @pytest.fixture
 def real_gw_repo():
     """A real /srv/git/<name>-working clone with a commit on main and a faked

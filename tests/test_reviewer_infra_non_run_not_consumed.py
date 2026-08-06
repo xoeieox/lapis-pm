@@ -303,3 +303,178 @@ class TestReasonPopulationOrdering:
             "ERROR: local reviewer produced no verdict (reason=gw_not_serving)"
         )
         assert state["infra_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-reviewer-defer-timeout-is-infra-v0: gw_defer_timeout completes the
+# allow-list. A reviewer refused GPU admission (doorman defer, client retry
+# budget exhausted) never ran — it's a capacity non-run, not a reviewer
+# failure, and should be classified identically to gw_not_serving/
+# gw_unreachable.
+# ---------------------------------------------------------------------------
+
+class TestDeferTimeoutClassification:
+    def test_verbatim_shaped_runner_string_classified_infra(self):
+        """DoD 2: the verbatim string shaped_runner.py:558 emits, not a
+        paraphrase — the regex at pm_core.py:3538(ish) is what's under test."""
+        assert pm_core._classify_reviewer_infra_reason(
+            "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)"
+        ) == "gw_defer_timeout"
+
+    def test_bare_substring_fallback_also_matches(self):
+        """DoD 3: the reason can also arrive without the `reason=` prefix —
+        straight from a queue `error` field, the shape pm_core.py:6488
+        records."""
+        assert pm_core._classify_reviewer_infra_reason(
+            "gw_defer_timeout"
+        ) == "gw_defer_timeout"
+
+
+class TestDeferTimeoutCeilingAccounting:
+    def test_consecutive_defer_timeouts_below_infra_budget_do_not_ceiling(self):
+        """DoD 4: N consecutive gw_defer_timeout attempts, N below the infra
+        budget, must not trip reviewer_attempt_ceiling."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            for _ in range(budget - 1):
+                pm_core._increment_reviewer_attempt(TID, 10, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 10, 1,
+                    "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)",
+                )
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 10, 1)
+            assert decision is None
+
+    def test_defer_timeouts_at_infra_budget_produce_infra_exhausted_decision(self):
+        """DoD 4: at exactly REVIEWER_INFRA_RETRY_BUDGET_DEFAULT (6), the
+        pause fires as reviewer_infra_budget_exhausted — never
+        reviewer_attempt_ceiling."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        assert budget == pm_core.REVIEWER_INFRA_RETRY_BUDGET_DEFAULT
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            decision = None
+            for _ in range(budget):
+                pm_core._increment_reviewer_attempt(TID, 11, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 11, 1,
+                    "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)",
+                )
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 11, 1)
+            assert decision is not None
+            assert decision.kind == "reviewer_infra_budget_exhausted"
+            assert decision.payload["infra_attempts"] == budget
+
+    def test_unrecognised_reason_still_counts_against_ceiling(self):
+        """DoD 6: fail-closed is preserved — a reason string in no allow-list
+        still consumes the reviewer-attempt ceiling."""
+        store = _tmp_store()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            pm_core._increment_reviewer_attempt(TID, 12, 1)
+            pm_core._record_reviewer_attempt_reason(
+                TID, 12, 1, "reason=some_totally_novel_failure_mode",
+            )
+            pm_core._increment_reviewer_attempt(TID, 12, 1)
+            pm_core._record_reviewer_attempt_reason(
+                TID, 12, 1, "reason=some_totally_novel_failure_mode",
+            )
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 12, 1)
+            assert decision is not None
+            assert decision.kind == "reviewer_attempt_ceiling"
+
+    def test_poison_pill_genuine_defect_wearing_defer_timeout_reason_still_bounded(self):
+        """DoD 7: a reviewer that is failing for a genuine, non-infra cause
+        but whose emitted reason happens to be gw_defer_timeout must still be
+        bounded — reclassification moves the bound from 2 to 6, not to
+        infinity. Drives repeated failures past the infra budget and asserts
+        the run halts at REVIEWER_INFRA_RETRY_BUDGET_DEFAULT with a
+        reviewer_infra_budget_exhausted Decision naming the reason — never an
+        unbounded redispatch loop."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            decision = None
+            attempts_made = 0
+            for _ in range(budget + 10):  # drive well past the budget
+                decision = pm_core._reviewer_attempt_ceiling_check(TID, 13, 1)
+                if decision is not None:
+                    break
+                pm_core._increment_reviewer_attempt(TID, 13, 1)
+                # The reason string is a genuine defect masquerading behind
+                # gw_defer_timeout's vocabulary (e.g. a misclassified crash).
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 13, 1,
+                    "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)",
+                )
+                attempts_made += 1
+            assert decision is not None
+            assert decision.kind == "reviewer_infra_budget_exhausted"
+            assert decision.payload["infra_attempts"] == budget
+            assert attempts_made == budget
+            assert "gw_defer_timeout" in decision.payload["reported_reason"]
+
+
+class TestDeferTimeoutReasonAndWaitTelemetry:
+    def test_reason_survives_verbatim_into_attempt_state_and_payload(self):
+        """DoD 8: the reason string survives verbatim into the attempt state
+        and into the reviewer_infra_budget_exhausted payload's
+        last_infra_reason, so a congestion pause is distinguishable from an
+        absence pause without reading code."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            for _ in range(budget):
+                pm_core._increment_reviewer_attempt(TID, 14, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 14, 1,
+                    "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)",
+                )
+            state = pm_core._reviewer_attempt_state(TID, 14, 1)
+            assert state["last_infra_reason"] == "gw_defer_timeout"
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 14, 1)
+            assert decision.payload["reported_reason"] == "gw_defer_timeout"
+
+    def test_wait_seconds_recorded_beside_reason(self):
+        """DoD 9: last_infra_wait_s is recorded beside last_infra_reason and
+        surfaced in the reviewer_infra_budget_exhausted payload."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            for _ in range(budget):
+                pm_core._increment_reviewer_attempt(TID, 15, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 15, 1,
+                    "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)",
+                    wait_s=44.7,
+                )
+            state = pm_core._reviewer_attempt_state(TID, 15, 1)
+            assert state["last_infra_wait_s"] == 44.7
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 15, 1)
+            assert decision.payload["last_infra_wait_s"] == 44.7
+
+    def test_unmeasurable_wait_records_none_not_zero(self):
+        """DoD 9: absent/unmeasurable duration records None, never 0 — a
+        fabricated 0 would be indistinguishable from an instant refusal."""
+        store = _tmp_store()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            pm_core._increment_reviewer_attempt(TID, 16, 1)
+            pm_core._record_reviewer_attempt_reason(
+                TID, 16, 1,
+                "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)",
+            )
+            state = pm_core._reviewer_attempt_state(TID, 16, 1)
+            assert state["last_infra_wait_s"] is None
+
+    def test_dispatch_wait_seconds_computed_from_ts_and_completed_at(self):
+        """_reviewer_dispatch_wait_seconds derives the duration from the
+        dispatch record's ts -> completed_at span."""
+        rec = {
+            "ts": "2026-08-06T10:00:00-07:00",
+            "completed_at": "2026-08-06T10:00:45-07:00",
+        }
+        assert pm_core._reviewer_dispatch_wait_seconds(rec) == 45.0
+
+    def test_dispatch_wait_seconds_none_when_timestamps_missing(self):
+        assert pm_core._reviewer_dispatch_wait_seconds({}) is None
+        assert pm_core._reviewer_dispatch_wait_seconds({"ts": "2026-08-06T10:00:00-07:00"}) is None

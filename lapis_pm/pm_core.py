@@ -179,15 +179,23 @@ REVIEWER_INFRA_RETRY_BUDGET_ENV = "LAPIS_PM_REVIEWER_INFRA_RETRY_BUDGET"
 # Hardcoded allow-list of infrastructure-unavailability reasons, owned by
 # lapis-pm and scoped to the vocabulary the reviewer's actual call path
 # (shaped_runner._run_local_reviewer -> gw_agent.call_gw_agent) can produce:
-# gw_unreachable (gw_agent.py) and gw_not_serving (gw_agent.py). Deliberately
-# NOT importing agents_core.llm.GW_PROVENANCE_PRECEDENCE — that tuple
+# gw_unreachable (gw_agent.py), gw_not_serving (gw_agent.py), and
+# gw_defer_timeout (gw_agent.py) — the doorman refused a `deferrable` lease
+# acquire and the client's jittered-backoff retry budget
+# (GW_DEFER_RETRY_BUDGET_SEC) ran out before admission. The reviewer never
+# ran; it was refused GPU admission and timed out waiting. Deliberately NOT
+# importing agents_core.llm.GW_PROVENANCE_PRECEDENCE — that tuple
 # (gw_deferred_swarm, slot_queued_timeout, slot_pool_down, gw_not_serving)
 # belongs to a different call path (the llm.py operator path) and most of its
 # members can never reach a reviewer dispatch record. An unrecognised reason
 # is treated as non-infrastructure and counts against the ceiling — fail
 # closed, so the ceiling's bound is never silently defeated by a new or
 # unexpected reason string.
-REVIEWER_INFRA_FAIL_REASONS = frozenset({"gw_not_serving", "gw_unreachable"})
+REVIEWER_INFRA_FAIL_REASONS = frozenset({
+    "gw_not_serving",
+    "gw_unreachable",
+    "gw_defer_timeout",
+})
 
 # Forgejo health gate constants
 FORGEJO_CONSECUTIVE_FAILS_KEY = "pm/forgejo_consecutive_fails"
@@ -3544,12 +3552,36 @@ def _classify_reviewer_infra_reason(reported_reason: str | None) -> str | None:
     return None
 
 
+def _reviewer_dispatch_wait_seconds(rec: dict) -> float | None:
+    """Wall-clock seconds between dispatch (`rec["ts"]`) and terminal state
+    (`rec["completed_at"]`), for the infra-wait telemetry (DoD 9). Returns
+    None — never 0 — if either timestamp is missing or unparseable; a
+    fabricated 0 would misrepresent an unmeasured duration as an instant
+    refusal, defeating the point of the telemetry (distinguishing a
+    momentary jam from systemic starvation)."""
+    started = rec.get("ts")
+    ended = rec.get("completed_at")
+    if not started or not ended:
+        return None
+    try:
+        delta = datetime.fromisoformat(ended) - datetime.fromisoformat(started)
+    except (ValueError, TypeError):
+        return None
+    return delta.total_seconds()
+
+
 def _reviewer_attempt_key(target_id: str, pr_number: int, cycle: int) -> str:
     return f"pm/reviewer-attempts/{target_id}/pr={pr_number}/cycle={cycle}"
 
 
 def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
-    default = {"count": 0, "last_reason": None, "infra_count": 0, "last_infra_reason": None}
+    default = {
+        "count": 0,
+        "last_reason": None,
+        "infra_count": 0,
+        "last_infra_reason": None,
+        "last_infra_wait_s": None,
+    }
     rec = _mem().get(_reviewer_attempt_key(target_id, pr_number, cycle))
     if not rec:
         return default
@@ -3560,6 +3592,7 @@ def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
             "last_reason": data.get("last_reason"),
             "infra_count": int(data.get("infra_count", 0)),
             "last_infra_reason": data.get("last_infra_reason"),
+            "last_infra_wait_s": data.get("last_infra_wait_s"),
         }
     except (ValueError, TypeError, json.JSONDecodeError):
         return default
@@ -3583,7 +3616,8 @@ def _increment_reviewer_attempt(target_id: str, pr_number: int, cycle: int) -> i
 
 
 def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, reason: str,
-                                    review_gate_ts: str | None = None) -> None:
+                                    review_gate_ts: str | None = None,
+                                    wait_s: float | None = None) -> None:
     """Stash the most recent failure reason for this pr+cycle, as-reported and
     unverified — see DoD 3b. Classifies the reason against
     REVIEWER_INFRA_FAIL_REASONS (D1): an infrastructure-classified failure
@@ -3592,6 +3626,16 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
     against the separate, more generous REVIEWER_INFRA_RETRY_BUDGET). Does
     not touch the raw `count` — that stays dispatch-time-incremented history,
     per the module docstring above.
+
+    `wait_s` (DoD 9, lapis-pm-reviewer-defer-timeout-is-infra-v0): the
+    wall-clock duration of the failed attempt, recorded beside
+    last_infra_reason so a congestion pause (long wait, gw_defer_timeout) is
+    distinguishable from an absence pause (short wait, gw_not_serving)
+    without reading code. Only recorded when the reason classifies as infra —
+    non-infra failures don't consume this field. Left as None (never
+    defaulted to 0) when the caller has no measured duration — a 0 would be
+    indistinguishable from an instant refusal and would defeat the
+    telemetry's purpose.
 
     lapis-pm-review-gate-counter-infra-nonruns-v0: reuses this same
     classification to drive the kill-switch record-then-retract shape — a
@@ -3607,6 +3651,7 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
     if infra_reason is not None:
         state["infra_count"] = state.get("infra_count", 0) + 1
         state["last_infra_reason"] = infra_reason
+        state["last_infra_wait_s"] = wait_s
     _mem().set(
         _reviewer_attempt_key(target_id, pr_number, cycle),
         json.dumps(state),
@@ -4206,6 +4251,7 @@ def _reviewer_attempt_ceiling_check(target_id: str, pr_number: int, cycle: int) 
             "infra_attempts": state["infra_count"],
             "infra_budget": infra_budget,
             "reported_reason": state["last_infra_reason"] or state["last_reason"],
+            "last_infra_wait_s": state["last_infra_wait_s"],
         })
 
     ceiling = _reviewer_attempt_ceiling()
@@ -6225,6 +6271,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 _record_reviewer_attempt_reason(
                     target_id, rec["pr_number"], rec.get("cycle", 1), reported_reason,
                     review_gate_ts=rec.get("review_gate_ts"),
+                    wait_s=_reviewer_dispatch_wait_seconds(rec),
                 )
             failed_for_retry.append(rec)
         else:
@@ -6488,6 +6535,7 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
             _record_reviewer_attempt_reason(
                 target_id, rec["pr_number"], rec.get("cycle", 1), t["error"],
                 review_gate_ts=rec.get("review_gate_ts"),
+                wait_s=_reviewer_dispatch_wait_seconds(rec),
             )
 
         # Close the project-slot + emit its deposit for slots whose terminal flip

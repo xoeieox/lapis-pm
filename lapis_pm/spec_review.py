@@ -79,6 +79,13 @@ _POLL_CADENCE_S = 10  # fixed per Invariant 8
 _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT = 900  # seconds; longer than a normal ~12-min review
 _ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
 
+# lapis-pm-gate-queue-progress-aware-wait-v0: progress-aware wait tuning.
+_SPEC_REVIEW_HEARTBEAT_INTERVAL_DEFAULT = 15  # seconds between beat_at refreshes
+_SPEC_REVIEW_STALL_MISSED_BEATS_DEFAULT = 20  # consecutive missed beats -> stall-abort (~300s)
+_SPEC_REVIEW_LOCK_MAX_WAIT_DEFAULT = 3600  # absolute queue-depth backstop, not a hang detector
+_GATE_QUEUE_HISTORY_PATH = Path(os.environ.get("ROOM_ROOT", "/room")) / "gate-queue" / "history.jsonl"
+_PROGRESS_FIELDS = frozenset({"pid", "phase", "phase_at", "beat_at"})
+
 
 
 # ---------------------------------------------------------------------------
@@ -2078,6 +2085,147 @@ verdict from it. See raw output below for what the model actually said.
 # Cross-session spec-review serialization lock
 # ---------------------------------------------------------------------------
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var defensively — a malformed value logs and falls back
+    to the default instead of raising (DoD9, and the pre-existing
+    SPEC_REVIEW_LOCK_TIMEOUT read this closes over)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        print(
+            f"[spec-review:env-parse-error] {name}={raw!r} is not a valid int; "
+            f"falling back to default={default}",
+            file=sys.stderr,
+        )
+        return default
+
+
+def _progress_path(lock_path: Path) -> Path:
+    """Sibling progress file, same directory as the lock (same-filesystem by
+    construction, so the atomic os.replace below can never cross devices)."""
+    return lock_path.parent / (lock_path.name + ".progress")
+
+
+def _cleanup_stale_progress_temp(progress_path: Path) -> None:
+    """Remove leftover .tmp-* siblings from a crashed holder, on lock acquisition."""
+    try:
+        for tmp in progress_path.parent.glob(progress_path.name + ".tmp-*"):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _write_progress(progress_path: Path, pid: int, phase: str, phase_at: float, beat_at: float) -> None:
+    """Write the progress record atomically: temp file in the lock's own directory,
+    then os.replace over the target. A reader can never observe a torn record."""
+    record = {"pid": pid, "phase": phase, "phase_at": phase_at, "beat_at": beat_at}
+    tmp_path = progress_path.parent / f"{progress_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        tmp_path.write_text(json.dumps(record))
+        os.replace(tmp_path, progress_path)
+    except OSError as e:
+        print(f"[spec-review:progress-write-error] {e}", file=sys.stderr)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _read_progress(progress_path: Path) -> dict | None:
+    """Return the progress record, or None if absent/unreadable/malformed.
+
+    None is the signal the waiter falls back to today's absolute-deadline
+    behaviour on (DoD5) — a mixed-fleet pre-change holder never writes this file.
+    """
+    try:
+        raw = progress_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        record = json.loads(raw.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or not _PROGRESS_FIELDS.issubset(record.keys()):
+        return None
+    return record
+
+
+def _append_gate_queue_event(event: dict) -> None:
+    """Best-effort durable JSONL append to /srv/lapis/gate-queue/history.jsonl.
+
+    Never raises — a logging failure must not abort the gate. One line per
+    queue/acquire/abort event, parseable by json.loads per line (DoD7).
+    """
+    try:
+        _GATE_QUEUE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_GATE_QUEUE_HISTORY_PATH, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError as e:
+        print(f"[spec-review:gate-queue-history-error] {e}", file=sys.stderr)
+
+
+def _send_lock_pushover(msg: str, title: str) -> None:
+    """Fire the existing NORMAL-priority Pushover alert. Isolated so both the
+    legacy timeout path and the new stall/ceiling paths share one call site."""
+    try:
+        from agents_core.notify import send_notification, Priority as _P
+        send_notification(message=msg, title=title, priority=_P.NORMAL)
+    except Exception as _notify_err:
+        print(f"[spec-review:lock-notify-error] {_notify_err}", file=sys.stderr)
+
+
+class _HeartbeatWriter:
+    """Daemon thread that periodically refreshes beat_at in the sibling progress file.
+
+    Ticks every `interval` seconds regardless of phase — a phase transition alone is
+    too coarse to distinguish a stall inside one long phase (facets+council is ~500s
+    on the median). `set_phase` updates phase + phase_at under `_lock` so a reader can
+    never observe a phase string paired with another phase's timestamp (DoD15).
+    Daemon so it can never outlive the process and leave a lying heartbeat.
+    """
+
+    def __init__(self, progress_path: Path, pid: int, interval: float, initial_phase: str):
+        self._progress_path = progress_path
+        self._pid = pid
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._phase = initial_phase
+        self._phase_at = time.time()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def set_phase(self, phase: str) -> None:
+        with self._lock:
+            self._phase = phase
+            self._phase_at = time.time()
+        self._beat()
+
+    def _beat(self) -> None:
+        with self._lock:
+            phase, phase_at = self._phase, self._phase_at
+        _write_progress(self._progress_path, self._pid, phase, phase_at, time.time())
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval):
+            self._beat()
+
+    def start(self) -> None:
+        self._beat()  # publish immediately on acquire — no window with a stale/absent file
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+
 def _spec_review_lock_path() -> Path:
     """Canonical cross-session lock path derived from os.getuid().
 
@@ -2119,14 +2267,26 @@ def _spec_review_lock(
     spec_path: Path,
     *,
     _lock_path_override: Path | None = None,
-) -> Iterator[None]:
+) -> Iterator["_HeartbeatWriter"]:
     """Cross-session exclusive advisory flock serializing spec-review GW dispatch.
 
     Lock path: /run/user/<uid>/lapis-pm-spec-review.lock (canonical, no fallback).
     Serializes within BRIX — sufficient since spec-review runs on BRIX.
-    Auto-queues waiters up to SPEC_REVIEW_LOCK_TIMEOUT seconds (default 900).
-    Fail-CLOSED on timeout: a still-held lock means a live hung holder; abort + NORMAL
-    Pushover alert. Never proceed degraded, never kill the holder (PID-reuse risk).
+
+    lapis-pm-gate-queue-progress-aware-wait-v0: the holder publishes a heartbeat to
+    a sibling `<lock_path>.progress` file (yielded to the caller as a _HeartbeatWriter
+    so it can call .set_phase(...)). A waiter judges the holder by *staleness* of that
+    heartbeat (SPEC_REVIEW_STALL_MISSED_BEATS consecutive missed beats -> stall-abort),
+    not by raw elapsed time — a healthy holder that legitimately outruns
+    SPEC_REVIEW_LOCK_TIMEOUT is never penalized. SPEC_REVIEW_LOCK_MAX_WAIT is a
+    separate, always-active backstop against an unbounded queue (not a hang
+    detector). If the progress file is absent or unreadable while the lock is held
+    (mixed-fleet rollout: a pre-change holder never writes it), the waiter falls
+    back to today's exact single-absolute-deadline behaviour on
+    SPEC_REVIEW_LOCK_TIMEOUT (default 900) — same message, same Pushover call.
+
+    Never proceed degraded, never kill the holder (PID-reuse risk). Every queue,
+    acquire, and abort appends one line to /srv/lapis/gate-queue/history.jsonl.
 
     Superseded when the H5 elevator organ activates and spec-review submits through it.
     Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
@@ -2136,16 +2296,27 @@ def _spec_review_lock(
         if _lock_path_override is not None
         else _spec_review_lock_path()
     )
-    timeout_s = int(
-        os.environ.get("SPEC_REVIEW_LOCK_TIMEOUT", str(_SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT))
+    timeout_s = _env_int("SPEC_REVIEW_LOCK_TIMEOUT", _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT)
+    stall_missed_beats = _env_int(
+        "SPEC_REVIEW_STALL_MISSED_BEATS", _SPEC_REVIEW_STALL_MISSED_BEATS_DEFAULT
     )
+    max_wait_s = _env_int("SPEC_REVIEW_LOCK_MAX_WAIT", _SPEC_REVIEW_LOCK_MAX_WAIT_DEFAULT)
+    heartbeat_interval = _env_int(
+        "SPEC_REVIEW_HEARTBEAT_INTERVAL", _SPEC_REVIEW_HEARTBEAT_INTERVAL_DEFAULT
+    )
+    progress_path = _progress_path(lock_path)
 
     print(f"[spec-review:lock] lock_path={lock_path}", file=sys.stderr)
 
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + timeout_s  # legacy fallback deadline (progress absent)
+        ceiling_deadline = time.monotonic() + max_wait_s  # absolute backstop, always active
+        wait_started_mono = time.monotonic()
         logged_waiting = False
+        missed_beats = 0
+        last_beat_at: float | None = None
+        next_stall_check_mono = wait_started_mono + heartbeat_interval
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2153,42 +2324,114 @@ def _spec_review_lock(
             except BlockingIOError:
                 pass
 
+            now_mono = time.monotonic()
+
             if not logged_waiting:
                 holder_desc = _read_lock_holder(fd)
                 print(
                     f"[spec-review:lock-queued] queued behind active review — {holder_desc}",
                     file=sys.stderr,
                 )
+                _append_gate_queue_event({
+                    "event": "queued",
+                    "ts": time.time(),
+                    "spec_path": str(spec_path),
+                    "holder": holder_desc,
+                })
                 logged_waiting = True
 
-            if time.monotonic() >= deadline:
-                # Lock still held past timeout: holder is alive and hung (a crashed holder
-                # auto-releases via kernel flock, so still-blocked => live hang). Fail CLOSED.
+            progress = _read_progress(progress_path)
+
+            if progress is not None:
+                beat_at = progress.get("beat_at")
+                if now_mono >= next_stall_check_mono:
+                    next_stall_check_mono = now_mono + heartbeat_interval
+                    if last_beat_at is not None and beat_at == last_beat_at:
+                        missed_beats += 1
+                    else:
+                        missed_beats = 0
+                    last_beat_at = beat_at
+
+                if missed_beats >= stall_missed_beats:
+                    # Consecutive missed beats, not raw elapsed time: a genuine stall,
+                    # not a slow fsync or scheduler pause on the holder (single misses
+                    # don't accumulate — see _HeartbeatWriter/DoD3a).
+                    staleness = (
+                        time.time() - beat_at if isinstance(beat_at, (int, float)) else 0.0
+                    )
+                    holder_desc = _read_lock_holder(fd)
+                    msg = (
+                        f"[spec-review:lock-stall] holder heartbeat stalled — last "
+                        f"phase={progress.get('phase')!r} missed_beats={missed_beats} "
+                        f"staleness={staleness:.1f}s (holder: {holder_desc}). Aborting "
+                        f"review of {spec_path}. Do NOT delete {lock_path} — kernel owns "
+                        f"lock state. Investigate and clear the hung process, then re-run."
+                    )
+                    print(msg, file=sys.stderr)
+                    _send_lock_pushover(msg, title="spec-review: lock stall — hung holder")
+                    _append_gate_queue_event({
+                        "event": "stall-abort",
+                        "ts": time.time(),
+                        "spec_path": str(spec_path),
+                        "holder": holder_desc,
+                        "wait_s": now_mono - wait_started_mono,
+                        "holder_phase": progress.get("phase"),
+                    })
+                    raise RuntimeError(msg)
+            else:
+                # No progress signal at all: reproduce today's behaviour exactly (DoD5).
+                if now_mono >= deadline:
+                    # Lock still held past timeout: holder is alive and hung (a crashed
+                    # holder auto-releases via kernel flock, so still-blocked => live
+                    # hang). Fail CLOSED.
+                    holder_desc = _read_lock_holder(fd)
+                    msg = (
+                        f"[spec-review:lock-timeout] lock held for >{timeout_s}s by a live "
+                        f"process (hung holder: {holder_desc}). Aborting review of {spec_path}. "
+                        f"Do NOT delete {lock_path} — kernel owns lock state. "
+                        f"Investigate and clear the hung process, then re-run."
+                    )
+                    print(msg, file=sys.stderr)
+                    _send_lock_pushover(msg, title="spec-review: lock timeout — hung holder")
+                    _append_gate_queue_event({
+                        "event": "stall-abort",
+                        "ts": time.time(),
+                        "spec_path": str(spec_path),
+                        "holder": holder_desc,
+                        "wait_s": now_mono - wait_started_mono,
+                        "holder_phase": None,
+                    })
+                    raise RuntimeError(msg)
+
+            if now_mono >= ceiling_deadline:
+                # Backstop against an unbounded queue — NOT a hang detector. Must not
+                # claim a hung holder (DoD4).
                 holder_desc = _read_lock_holder(fd)
+                holder_phase = progress.get("phase") if progress is not None else None
                 msg = (
-                    f"[spec-review:lock-timeout] lock held for >{timeout_s}s by a live "
-                    f"process (hung holder: {holder_desc}). Aborting review of {spec_path}. "
-                    f"Do NOT delete {lock_path} — kernel owns lock state. "
-                    f"Investigate and clear the hung process, then re-run."
+                    f"[spec-review:lock-ceiling] queue too deep — waited "
+                    f">{max_wait_s}s behind holder ({holder_desc}, phase="
+                    f"{holder_phase!r}). This is a queue-depth backstop, not a "
+                    f"hung-holder detection — the holder may be healthy. Aborting "
+                    f"review of {spec_path}."
                 )
                 print(msg, file=sys.stderr)
-                try:
-                    from agents_core.notify import send_notification, Priority as _P
-                    send_notification(
-                        message=msg,
-                        title="spec-review: lock timeout — hung holder",
-                        priority=_P.NORMAL,
-                    )
-                except Exception as _notify_err:
-                    print(
-                        f"[spec-review:lock-timeout-notify-error] {_notify_err}",
-                        file=sys.stderr,
-                    )
+                _send_lock_pushover(msg, title="spec-review: lock ceiling — queue too deep")
+                _append_gate_queue_event({
+                    "event": "ceiling-abort",
+                    "ts": time.time(),
+                    "spec_path": str(spec_path),
+                    "holder": holder_desc,
+                    "wait_s": now_mono - wait_started_mono,
+                    "holder_phase": holder_phase,
+                })
                 raise RuntimeError(msg)
 
             time.sleep(2)
 
-        # Acquired. Write holder identity so any waiting caller can name us in its log.
+        # Acquired. Clean up any debris a crashed prior holder left, then write
+        # holder identity so any waiting caller can name us in its log.
+        _cleanup_stale_progress_temp(progress_path)
         holder_data = json.dumps({
             "pid": os.getpid(),
             "spec_path": str(spec_path),
@@ -2200,7 +2443,25 @@ def _spec_review_lock(
         os.write(fd, holder_data)
 
         print(f"[spec-review:lock-acquired] acquired spec_path={spec_path}", file=sys.stderr)
-        yield
+        _append_gate_queue_event({
+            "event": "acquired",
+            "ts": time.time(),
+            "spec_path": str(spec_path),
+            "wait_s": time.monotonic() - wait_started_mono,
+        })
+
+        heartbeat = _HeartbeatWriter(
+            progress_path, os.getpid(), heartbeat_interval, initial_phase="acquired"
+        )
+        heartbeat.start()
+        try:
+            yield heartbeat
+        finally:
+            heartbeat.stop()
+            try:
+                progress_path.unlink()
+            except OSError:
+                pass
     finally:
         # Closing the fd releases the flock at the kernel level.
         # Process death also releases it, so stale locks never wedge.
@@ -2310,7 +2571,8 @@ def run_spec_review(
     # to prevent GW lane contention. Auto-queues up to SPEC_REVIEW_LOCK_TIMEOUT (900s);
     # fail-CLOSED on timeout (hung holder). Superseded when the H5 elevator organ activates.
     # Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
-    with _spec_review_lock(spec_path):
+    with _spec_review_lock(spec_path) as _gate_heartbeat:
+        _gate_heartbeat.set_phase("reference-dispatch")
         # 4b. Reference leg (the Empiricist): dispatch async BEFORE the Facets block so it
         #     runs concurrently with Facets' blocking subprocess. Opt-in only (U3a,
         #     reference_reviewer=True) for advisory/hold; reference-only (never moves
@@ -2349,6 +2611,7 @@ def run_spec_review(
         #     in parallel. Opt-in only (U3b, with_gw=True) for advisory/hold; when off,
         #     nothing is submitted — no future, no executor, no orphan possible. Bounded
         #     timeout + doorman pre-flight so it NEVER stalls the gate when it does run.
+        _gate_heartbeat.set_phase("gw-submit")
         gw_future = None
         executor = None
         gw_run_id = str(uuid.uuid4())[:8]
@@ -2387,6 +2650,7 @@ def run_spec_review(
         # 5. Run shared orchestration (Facets + Council concurrently).
         #    This replaces the bespoke _dispatch_facets + _dispatch_council paths.
         #    Council runs with its own internal timeout; the reference leg gets its own poll deadline.
+        _gate_heartbeat.set_phase("facets+council")
         facets_deliberation: dict | None = None
         envelope = None
         council_run_id: str | None = None
@@ -2660,6 +2924,7 @@ def run_spec_review(
                             pass
 
         # 7. Collect GW Future (with bounded timeout)
+        _gate_heartbeat.set_phase("gw-join")
         gw_text: str | None = None
         gw_transcript: list[dict] = []
         gw_elapsed: float = 0.0

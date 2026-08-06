@@ -4,8 +4,9 @@ Asserts that the reviewer and reviewer_fresh system_template blocks in
 registry.yaml contain the required strings for the full-context fallback:
   - existing_branch  (template variable placeholder)
   - base_branch      (template variable placeholder)
-  - git fetch origin (fallback command)
-  - git diff origin/ (fallback command prefix)
+  - diff origin/     (fallback recipe, expressed via the real git tool's
+                       call signature, not bare shell — see
+                       lapis-pm-reviewer-role-invariant-real-tool-names-v0)
 
 The template format is the contract; this test pins it.
 """
@@ -22,8 +23,7 @@ REGISTRY_PATH = Path(__file__).parent.parent / "lapis_pm" / "registry.yaml"
 REQUIRED_STRINGS = [
     "existing_branch",
     "base_branch",
-    "git fetch origin",
-    "git diff origin/",
+    "diff origin/",
 ]
 
 
@@ -48,15 +48,10 @@ class TestReviewerTemplateContent:
         assert "base_branch" in tpl, \
             "reviewer template missing 'base_branch' placeholder"
 
-    def test_reviewer_template_has_git_fetch_origin(self):
-        tpl = _load_templates()["reviewer"]
-        assert "git fetch origin" in tpl, \
-            "reviewer template missing 'git fetch origin' fallback recipe"
-
     def test_reviewer_template_has_git_diff_origin(self):
         tpl = _load_templates()["reviewer"]
-        assert "git diff origin/" in tpl, \
-            "reviewer template missing 'git diff origin/' fallback command"
+        assert "diff origin/" in tpl, \
+            "reviewer template missing 'diff origin/' fallback recipe"
 
     def test_reviewer_fresh_template_has_existing_branch(self):
         tpl = _load_templates()["reviewer_fresh"]
@@ -68,15 +63,10 @@ class TestReviewerTemplateContent:
         assert "base_branch" in tpl, \
             "reviewer_fresh template missing 'base_branch' placeholder"
 
-    def test_reviewer_fresh_template_has_git_fetch_origin(self):
-        tpl = _load_templates()["reviewer_fresh"]
-        assert "git fetch origin" in tpl, \
-            "reviewer_fresh template missing 'git fetch origin' fallback recipe"
-
     def test_reviewer_fresh_template_has_git_diff_origin(self):
         tpl = _load_templates()["reviewer_fresh"]
-        assert "git diff origin/" in tpl, \
-            "reviewer_fresh template missing 'git diff origin/' fallback command"
+        assert "diff origin/" in tpl, \
+            "reviewer_fresh template missing 'diff origin/' fallback recipe"
 
     def test_reviewer_template_all_required_strings(self):
         """Single sweep: all required strings present in reviewer template."""

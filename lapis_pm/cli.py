@@ -44,7 +44,10 @@ from agents_core.targets import TargetStore
 from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer_mod
 from . import node_identity
 from . import signed_directive
-from .spec_review import _parse_spec_authority_text, _parse_spec_verification_text
+from .spec_review import (
+    _parse_spec_authority_text,
+    _parse_spec_verification_text_guarded as _parse_spec_verification_text,
+)
 from .router_portfolio import emit_decision_kickoff, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .research_quest import cmd_research_quest

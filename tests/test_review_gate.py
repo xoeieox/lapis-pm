@@ -229,15 +229,49 @@ class TestCycleCountHelpers:
 
 class TestDecideForPr:
 
-    def test_held_path_returns_hold_brief_immediately(self):
-        """Held path → hold_brief without reviewer dispatch (spec invariant)."""
+    def test_held_path_dispatches_reviewer_before_hold_brief(self):
+        """Held path → reviewer dispatched once first (lapis-pm-containment-held-paths-v0
+        Leg 3), THEN hold_brief once the verdict is in — never skips the machine read."""
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_HELD_PATH),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
+            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "dispatch_reviewer"
+        assert d.payload["held_path"] is True
+        assert d.payload["cycle"] == 1
+
+    def test_held_path_pending_reviewer_is_noop(self):
+        """A held-path reviewer already in flight → noop, not a re-dispatch."""
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_HELD_PATH),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=True),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "noop_reviewer_in_flight"
+
+    def test_held_path_verdict_ready_raises_hold_brief_with_verdict(self):
+        """Reviewer already completed once → hold_brief carrying that verdict, never
+        dispatched a second time regardless of verdict content."""
+        verdict_info = {"verdict": "needs-human", "issues": ISSUES}
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_HELD_PATH),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_info),
         ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "hold_brief"
+        assert d.payload["reviewer_verdict"] == verdict_info
 
     def test_auto_authority_clean_returns_merge(self):
         """Auto authority + clean screen → merge."""

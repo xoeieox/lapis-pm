@@ -31,6 +31,16 @@ from lapis_pm.spec_review import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _un_retire_gw_leg(monkeypatch):
+    """This file exercises the pre-retirement GW leg path (probe, collapse
+    check, dispatch) exclusively — the retirement short-circuit itself is
+    covered separately in tests/test_spec_review_gw_leg_retirement.py. Un-retire
+    for every test here so the existing assertions keep reaching the code they
+    were written to test; the retirement tests override this explicitly."""
+    monkeypatch.setenv("SPEC_REVIEW_GW_LEG_RETIRED", "0")
+
+
 async def _mock_run_deliberation(request):
     return _happy_envelope()
 

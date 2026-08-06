@@ -18,6 +18,14 @@ from agents_core.shared_deliberation.envelope import DeliberationEnvelope
 from lapis_pm.spec_review import _dispatch_gw_reviewer, run_spec_review
 
 
+@pytest.fixture(autouse=True)
+def _un_retire_gw_leg(monkeypatch):
+    """This file exercises _dispatch_gw_reviewer's pre-retirement principal-
+    threading behavior exclusively — un-retire for every test here so the
+    existing assertions keep reaching the code they were written to test."""
+    monkeypatch.setenv("SPEC_REVIEW_GW_LEG_RETIRED", "0")
+
+
 @pytest.fixture
 def advisory_spec(tmp_path):
     spec_path = tmp_path / "gw_principal_test_spec.md"

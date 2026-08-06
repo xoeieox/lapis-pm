@@ -2,7 +2,7 @@
 
 Covers:
   1. spec_reviewer.system_template no longer solicits design judgment.
-  2. spec_reviewer is pinned to slot 2 (FP8, :8082), lease unchanged.
+  2. spec_reviewer is pinned to slot 1 (:8081), lease unchanged.
   3. The citation-not-existence discipline is present in the template.
 
 DoD item 3 (the planted-false-claims regression corpus against a live model
@@ -103,13 +103,22 @@ class TestClaimVerificationCharacter:
         assert "re-run spec-review" not in tpl.lower()
 
 
-class TestSlot2Pin:
+class TestSlot1Pin:
 
-    def test_model_is_slot2(self):
-        assert _load_spec_reviewer()["model"] == "gravitywell-slot2"
+    def test_model_is_slot1(self):
+        assert _load_spec_reviewer()["model"] == "gravitywell-slot1"
 
-    def test_backend_url_is_slot2_port(self):
-        assert _load_spec_reviewer()["backend_url"].endswith(":8082")
+    def test_backend_url_is_slot1_port(self):
+        assert _load_spec_reviewer()["backend_url"].endswith(":8081")
 
     def test_acquire_lease_still_false(self):
         assert _load_spec_reviewer()["acquire_lease"] is False
+
+    def test_backend_url_present_and_nonempty(self):
+        # Regression test for the _is_swarm coupling (agents_core/gw_agent.py:1404):
+        # backend_url must stay present and non-empty even though its value now
+        # equals the GW_URL default, or _is_swarm silently flips and changes this
+        # seat's inference payload. See registry.yaml's spec_reviewer comment block.
+        backend_url = _load_spec_reviewer()["backend_url"]
+        assert backend_url is not None
+        assert backend_url != ""

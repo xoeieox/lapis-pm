@@ -27,9 +27,9 @@ plus true-claim precision (see DoD item 3 of `lapis-pm-empiricist-reference-seat
    function `_read_verdict_from_output`.
 
 6. **[TRUE — host fact absent from repo, miss-#5 shape]** GravityWell's
-   `:8082` endpoint answers to the alias `gravitywell-slot2` when the box is
-   in the `dual-coder` posture. This cannot be confirmed by grepping the
+   `:8081` endpoint answers to the alias `gravitywell-slot1`, and also serves
+   the model id `gravitywell-27b`. This cannot be confirmed by grepping the
    repository — it is a live-box fact, verifiable only via
-   `curl http://203.0.113.11:8082/v1/models`, and reporting "not found in
+   `curl http://203.0.113.11:8081/v1/models`, and reporting "not found in
    repo" for it would be a false positive (the miss-#5 shape from the
    Empiricist's origin spec).

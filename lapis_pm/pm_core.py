@@ -4228,8 +4228,47 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
                              verification=verification)
     payload = {"classification": cls, "pr": pr}
 
-    # Static hold: held paths always surface immediately (no reviewer needed)
+    # Static hold: a held path always ends in a hold brief, but it still gets a
+    # machine review first — skipping it would make the PM's highest-blast-radius
+    # files (lapis-pm-containment-held-paths-v0, Leg 3) the *least* reviewed
+    # artifacts in the system. This reuses the same reviewer-cycle machinery as
+    # the advisory/hold review-gate loop below, capped at exactly one dispatch:
+    # a held PR is never fixer-retried (the fixer must not autonomously edit its
+    # own cage), so reviewer_count can only ever be 0 or 1 here. Idempotency
+    # ("dispatch once, not once per 60s tick") falls out of the same
+    # _has_pending_reviewer_for_pr guard the normal loop uses, plus the fact that
+    # only the terminal hold_brief marks a PR classified (dispatch_reviewer alone
+    # does not), so every tick between dispatch and verdict is a cheap noop.
     if cls.static_outcome == authority.StaticOutcome.auto_hold_path:
+        pr_number = pr["number"]
+        if _has_pending_reviewer_for_pr(target_id, pr_number):
+            cycle = _reviewer_cycle_count(target_id, pr_number)
+            return Decision("noop_reviewer_in_flight",
+                            {"pr_number": pr_number, "cycle": cycle})
+
+        reviewer_count = _reviewer_cycle_count(target_id, pr_number)
+        if reviewer_count == 0:
+            if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
+                _set_review_gate_paused(True)
+                # Fail safe: still raise the hold brief without a reviewer verdict
+                # rather than let the kill-switch block containment entirely.
+                return Decision("hold_brief", payload)
+            ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, 1)
+            if ceiling_decision is not None:
+                return Decision("hold_brief", payload)
+            return Decision("dispatch_reviewer", {
+                "pr": pr, "cls": cls, "mode": "fresh", "cycle": 1, "held_path": True,
+            })
+
+        # Reviewer already ran once for this PR — attach its verdict and raise
+        # the hold brief. Never dispatched again regardless of verdict content
+        # (fixable/needs-human included): held paths always need the human hand,
+        # the reviewer's job here is only to give that human a machine read.
+        verdict_info = _last_review_verdict(target_id, pr_number)
+        if verdict_info is not None:
+            cls.screen_verdict = verdict_info.get("verdict", "unknown")
+            cls.issues = verdict_info.get("issues", [])
+            payload["reviewer_verdict"] = verdict_info
         return Decision("hold_brief", payload)
 
     # Auto-merge path: inline Sonnet screen result drives action (unchanged)
@@ -4664,7 +4703,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
                     # fall through to normal brief/gem path
 
     reviewer_verdict_text: str | None = None
-    if effective_trigger == "advisory-clean":
+    if effective_trigger == "advisory-clean" or hold:
         verdict_info = _last_review_verdict(target_id, cls.pr_number)
         if verdict_info:
             v = verdict_info.get("verdict", "?")

@@ -342,6 +342,29 @@ def _parse_spec_verification_text(text: str) -> str:
     return "pm-live-test"
 
 
+_FIRST_SECTION_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
+
+
+def _parse_spec_verification_text_guarded(text: str) -> str:
+    """Sibling to _parse_spec_verification_text with a header-position guard
+    (lapis-pm-containment-held-paths-v0 Leg 4).
+
+    A '**Verification:**' match is only honored if it appears BEFORE the first
+    '## ' section heading — i.e. in the spec's own header block, where a
+    hand-authored header always lives. A match landing after that heading is
+    treated as absent (falls through to the 'pm-live-test' default) rather than
+    honored, because that position is reachable by interpolated body content
+    (e.g. LLM-authored debt-bundle notes quoting the literal header string) that
+    the spec's true author never wrote. Unlike _parse_spec_authority_text's
+    hard-abort-on-mismatch (cmd_bind :235-244), this degrades silently to the
+    fail-safe default rather than aborting the bind — there is no explicit flag
+    to conflict with here, only spec text that may or may not be trustworthy.
+    """
+    heading_m = _FIRST_SECTION_HEADING_RE.search(text)
+    window = text[: heading_m.start()] if heading_m else text
+    return _parse_spec_verification_text(window)
+
+
 def _parse_spec_verification(spec_path: Path) -> str:
     """Extract Verification from spec file (first 50 lines).
 

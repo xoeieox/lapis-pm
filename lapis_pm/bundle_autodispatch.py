@@ -229,6 +229,14 @@ def _bind(spec_id: str, repo: str, spec_path: Path) -> bool:
         spec_from=str(spec_path),
         repo=repo,
         authority="advisory",
+        # lapis-pm-containment-held-paths-v0 Leg 4: pin verification explicitly.
+        # Without this, cli.py's getattr(args, "verification", None) falls through
+        # to None and the spec's OWN prose ("**Verification:**") decides — and this
+        # bind path runs unattended nightly on interpolated debt-bundle content, so
+        # an injected "**Verification:** machine" line would self-grant the
+        # machine-merge clause of auto_resolve.py. An auto-bound spec can never
+        # carry machine verification.
+        verification="pm-live-test",
         legs_from=None,
         no_auto_fire=False,
         force=False,

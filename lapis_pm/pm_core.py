@@ -591,6 +591,26 @@ def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> No
         print(f"[post-land-pull] deploy log write failed: {e}", file=sys.stderr)
 
 
+_DEPLOY_LOG_LINE_RE = re.compile(
+    r"^- `[^`]+` \| (?P<tree>.+?) \| synced (?P<old>[0-9a-f]+)\.\.(?P<new>[0-9a-f]+) \| "
+    r".*? \| (?P<trigger>.+)$"
+)
+
+
+def _last_deploy_log_shas(tree: str, trigger: str) -> tuple[str | None, str | None]:
+    """Read back the most recent `_write_deploy_log` line for `tree`+`trigger`.
+    Best-effort — a missing/unparseable log is a clean `(None, None)`."""
+    try:
+        lines = Path(_DEPLOY_LOG).read_text().splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        m = _DEPLOY_LOG_LINE_RE.match(line)
+        if m and m.group("tree") == tree and m.group("trigger") == trigger:
+            return m.group("old"), m.group("new")
+    return None, None
+
+
 def _deploy_pull_lock_path(clone_path: str) -> Path:
     name = clone_path.strip("/").replace("/", "_") + ".json"
     return _DEPLOY_PULL_LOCK_DIR / name
@@ -1632,7 +1652,9 @@ def _reconcile_deploy_inventory() -> None:
         pass
 
 
-def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") -> None:
+def _post_land_deploy_hook(
+    repo: str | None, trigger: str = "post-land-hook", target_id: str | None = None,
+) -> None:
     """Pull working clones then restart long-running services for `repo`.
 
     Best-effort. Failures (sudo unavailable, unit missing, restart timeout)
@@ -1649,6 +1671,14 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
     drains. The deferral is bounded by RESTART_DEFER_MAX_S (default 30 min); at
     the deadline a restart is forced anyway, and a CRITICAL-severity alert fires.
     Interrupted fixers are recoverable via the existing lost-fixer-retry path.
+
+    system-spec-drift-attestation-v0: attached HERE, at the hook's
+    *definition*, not at any one of its four call sites (:567, :1463,
+    :3120, :3200) — attaching at a single call site would leave three of
+    the four land paths accruing no drift (spec §Revision 2, amendment c).
+    `target_id` is optional and only available from two of those call
+    sites; when absent, drift provenance falls back to `trigger`. Best-
+    effort and never raises, matching this function's own contract above.
     """
     if _DEPLOY_HOOK_DISABLED:
         print(
@@ -1659,6 +1689,31 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
         return
 
     head_advanced = _post_land_git_pull(repo, trigger=trigger)
+
+    # system-spec-drift-attestation-v0: derive the changed paths from the
+    # deploy-log line `_post_land_git_pull` itself just wrote — deliberately
+    # NOT an extra pair of `git rev-parse` calls bracketing that call, which
+    # would otherwise compete with its own internal pre/post HEAD checks.
+    if repo and head_advanced:
+        try:
+            _clone_paths = _POST_LAND_PULL.get(repo) or []
+            if _clone_paths:
+                primary = _clone_paths[0]
+                old_sha, new_sha = _last_deploy_log_shas(primary, trigger)
+                if old_sha and new_sha:
+                    _diff = subprocess.run(
+                        ["git", "-C", primary, "diff", "--name-only", old_sha, new_sha],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if _diff.returncode == 0:
+                        changed = [ln for ln in _diff.stdout.splitlines() if ln.strip()]
+                        from . import spec_attestation
+                        spec_attestation.run_post_land_attestation(
+                            repo, changed, target_id=target_id, trigger=trigger,
+                        )
+        except Exception as e:
+            print(f"[post-land-deploy] spec-attestation pass failed (non-fatal): {e}", file=sys.stderr)
+
     if not repo:
         return
 
@@ -3125,7 +3180,7 @@ def _act_auto_land(target_id: str) -> str:
     )
 
     _deploy_target = TargetStore().get(target_id)
-    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None)
+    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None, target_id=target_id)
 
     # 3. Audit comment in the target JSONL (spec-required format)
     episodic.write(
@@ -3205,7 +3260,7 @@ def _act_auto_land_already_satisfied(target_id: str) -> str:
     )
 
     _deploy_target = TargetStore().get(target_id)
-    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None)
+    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None, target_id=target_id)
 
     # Audit comment (spec-required tag)
     episodic.write(

@@ -478,3 +478,89 @@ class TestDeferTimeoutReasonAndWaitTelemetry:
     def test_dispatch_wait_seconds_none_when_timestamps_missing(self):
         assert pm_core._reviewer_dispatch_wait_seconds({}) is None
         assert pm_core._reviewer_dispatch_wait_seconds({"ts": "2026-08-06T10:00:00-07:00"}) is None
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-reviewer-seat-dead-token-infra-classify-v0 (Unit B): a seat that
+# cannot emit a tool call never rendered a verdict — see
+# agents-core-reviewer-seat-tool-call-probe-v0 (Unit A), the emitter of
+# `seat_no_tool_calls`. This classifies that token identically to the other
+# infra-non-run reasons: excluded from the reviewer-attempt ceiling, still
+# bounded by the separate, more generous infra-retry budget (D1/D5).
+# ---------------------------------------------------------------------------
+
+class TestSeatNoToolCallsClassification:
+    def test_verbatim_wrapped_reason_classified_infra(self):
+        """DoD 2: reason=seat_no_tool_calls extracted via the reason= regex."""
+        assert pm_core._classify_reviewer_infra_reason(
+            "ERROR: local reviewer produced no verdict (reason=seat_no_tool_calls)"
+        ) == "seat_no_tool_calls"
+
+    def test_bare_substring_fallback_also_matches(self):
+        """DoD 3: also classifies via the bare-substring fallback loop at
+        :3609-3611, for reasons arriving without the reason= wrapper."""
+        assert pm_core._classify_reviewer_infra_reason(
+            "seat_no_tool_calls"
+        ) == "seat_no_tool_calls"
+
+
+class TestPreExistingMembersUnaffected:
+    def test_gw_not_serving_still_classifies(self):
+        """DoD 4: regression fence — the three pre-existing members must
+        still classify exactly as before this token was added."""
+        assert pm_core._classify_reviewer_infra_reason(
+            "ERROR: local reviewer produced no verdict (reason=gw_not_serving)"
+        ) == "gw_not_serving"
+
+    def test_gw_unreachable_still_classifies(self):
+        assert pm_core._classify_reviewer_infra_reason(
+            "ERROR: local reviewer produced no verdict (reason=gw_unreachable)"
+        ) == "gw_unreachable"
+
+    def test_gw_defer_timeout_still_classifies(self):
+        assert pm_core._classify_reviewer_infra_reason(
+            "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)"
+        ) == "gw_defer_timeout"
+
+
+class TestSeatNoToolCallsCeilingExclusion:
+    def test_attempts_failing_with_seat_no_tool_calls_excluded_from_ceiling(self):
+        """DoD 5b: end-to-end exclusion, not just classification. Drives
+        _record_reviewer_attempt_reason with seat_no_tool_calls past what
+        would be the reviewer-attempt ceiling (default 2) and asserts the
+        resulting decision from _reviewer_attempt_ceiling_check is NOT
+        reviewer_attempt_ceiling — the attempts must be excluded via
+        state["infra_count"], the real consumer at :4318."""
+        store = _tmp_store()
+        ceiling = pm_core._reviewer_attempt_ceiling()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            for _ in range(ceiling + 1):
+                pm_core._increment_reviewer_attempt(TID, 20, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 20, 1,
+                    "ERROR: local reviewer produced no verdict (reason=seat_no_tool_calls)",
+                )
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 20, 1)
+            assert decision is None or decision.kind != "reviewer_attempt_ceiling"
+
+    def test_seat_no_tool_calls_still_bounded_by_infra_budget(self):
+        """The exclusion is not unbounded — repeated seat_no_tool_calls
+        failures still trip the separate infra-retry budget, exactly like
+        the other infra reasons (D5: no threshold tuning)."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            decision = None
+            for _ in range(budget + 2):
+                decision = pm_core._reviewer_attempt_ceiling_check(TID, 21, 1)
+                if decision is not None:
+                    break
+                pm_core._increment_reviewer_attempt(TID, 21, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 21, 1,
+                    "ERROR: local reviewer produced no verdict (reason=seat_no_tool_calls)",
+                )
+            assert decision is not None
+            assert decision.kind == "reviewer_infra_budget_exhausted"
+            assert decision.payload["infra_attempts"] == budget
+            assert decision.payload["reported_reason"] == "seat_no_tool_calls"

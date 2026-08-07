@@ -195,6 +195,11 @@ REVIEWER_INFRA_FAIL_REASONS = frozenset({
     "gw_not_serving",
     "gw_unreachable",
     "gw_defer_timeout",
+    # Emitted by agents-core-reviewer-seat-tool-call-probe-v0 (Unit A): a seat
+    # that cannot emit a tool call never rendered a verdict, so this is a
+    # non-run, not a failure — see lapis-pm-reviewer-seat-dead-token-infra-
+    # classify-v0 (Unit B).
+    "seat_no_tool_calls",
 })
 
 # Forgejo health gate constants

@@ -1512,6 +1512,13 @@ def _detect_grounding_status(facets_dict: dict | None) -> tuple[str, str]:
         return ("failed", "codebase_surface_denied")
     if saw_codebase_result:
         return ("verified", "")
+    # D4, lapis-pm-gate-brief-tells-the-truth-v0: Mode-1 auto-grounding never writes
+    # into any RoundRecord (facets/adapter.py:745-778), so a fully-grounded run falls
+    # through to here with empty sim_results in every round. context.target_repo is
+    # set only when grounding was actually supplied (adapter.py:947-949) — a reliable
+    # signal the round-level sim data misses entirely.
+    if (facets_dict.get("context") or {}).get("target_repo"):
+        return ("verified", "auto-grounded")
     if not saw_any_data:
         # Case (b): structurally absent, not even logged as a failure.
         return ("silent-denial", "sim_data_missing")
@@ -1961,7 +1968,8 @@ record instead of reaching this path — check the queue record for that distinc
 
         stances_md = "\n".join(
             f"    - **{s.get('persona', '?')}** "
-            f"({'verified' if s.get('verified') else 'inferred'}/{s.get('confidence', '?')}): "
+            f"({'verified' if s.get('verified') else 'inferred'}/{s.get('confidence', '?')}, "
+            f"citation: {s.get('citation_state', 'unknown')}): "
             f"{s.get('claim', '')}"
             for s in stances
         ) or "    - (none)"
@@ -1978,11 +1986,47 @@ record instead of reaching this path — check the queue record for that distinc
         else:
             uncertainty_line = "- **Uncertainty bounds:** not reported by synthesis"
 
+        citation_guard_line = ""
+        citation_guard = syn.get("citation_guard")
+        if isinstance(citation_guard, dict):
+            # D2, lapis-pm-gate-brief-tells-the-truth-v0: .get() on every key — the
+            # producer branches in facets/stance_citation.py emit different key sets
+            # (e.g. `unguarded` is absent on two of the three branches).
+            discounted = citation_guard.get("discounted_personas") or []
+            blocking = citation_guard.get("blocking_personas") or []
+            discounted_str = ", ".join(discounted) if discounted else "(none)"
+            if citation_guard.get("unguarded"):
+                citation_guard_line = (
+                    "- **Citation guard:** unguarded — citation validation did not run "
+                    "for this deliberation.\n"
+                )
+            elif citation_guard.get("would_have_downgraded") or citation_guard.get("downgraded"):
+                # Forensic artifact only, per the non-goals section — this reports
+                # history, never a signal to re-evaluate the block. `downgraded: True`
+                # is the legacy pre-#36 shape (13 historical envelopes); the current
+                # shape is `downgraded: False, would_have_downgraded: True`. Either
+                # way, a block was raised and did not silently vanish.
+                citation_guard_line = (
+                    "- **Citation guard:** block raised by "
+                    f"[{discounted_str}] carried no validated citation. "
+                    "The block stands — under the previous behaviour it would have "
+                    "been silently discarded.\n"
+                )
+            elif blocking or discounted:
+                citation_guard_line = (
+                    "- **Citation guard:** checkable, no downgrade — blocking personas "
+                    f"[{', '.join(blocking) if blocking else '(none)'}], discounted "
+                    f"[{discounted_str}].\n"
+                )
+            else:
+                citation_guard_line = "- **Citation guard:** checkable, no action taken.\n"
+
         facets_section = f"""
 ## Facets deliberation (PM domain) [operator: {brief.facets_operator}]{unreliable_header_line}
 {reliable_line}- **Consensus level:** {syn.get('consensus_level', '?')}
 - **Escalation:** {syn.get('escalation_recommendation', 'proceed')}
-- **Confidence:** {syn.get('confidence', '?')}
+- **Escalation reason:** {syn.get('escalation_reason', '')}
+{citation_guard_line}- **Confidence:** {syn.get('confidence', '?')}
 - **Recommendation:** {syn.get('recommendation', '')}
 - **Stances:**
 {stances_md}

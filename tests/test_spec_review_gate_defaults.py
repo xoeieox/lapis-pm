@@ -336,6 +336,70 @@ def test_detect_grounding_status_failed_unchanged_regression_fence():
     assert reason == "codebase_surface_denied"
 
 
+
+# ---------------------------------------------------------------------------
+# lapis-pm-gate-brief-tells-the-truth-v0 D4: context.target_repo false negative.
+# Mode-1 auto-grounding threads its report into working_context and
+# context.target_repo (facets/adapter.py:947-949) but never into any
+# RoundRecord, so a fully-grounded run previously fell through to
+# silent-denial/sim_data_missing despite having a real grounding target.
+# ---------------------------------------------------------------------------
+
+def test_detect_grounding_status_auto_grounded_via_target_repo():
+    """Real shape from /srv/lapis/facets/deliberations/2026-08-06-112305-8465de.json:
+    empty sim_results/sim_failures in every round, but context.target_repo set
+    to a resolved auto-grounding worktree. Must report verified, not
+    silent-denial."""
+    facets_dict = {
+        "context": {
+            "spec_path": "/srv/lapis/planning/specs/agents-core-shaper-capture-submit-taskid-v0.md",
+            "target_repo": "/tmp/grounding-agents-core-kl4x7962",
+        },
+        "rounds": [
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+            {"round_num": 2, "sim_failures": {}, "sim_results": {}},
+        ],
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "verified"
+    assert reason == "auto-grounded"
+
+
+def test_detect_grounding_status_codebase_denial_still_wins_over_target_repo():
+    """Precedence order: an explicit codebase denial in a non-final round must
+    still return failed/codebase_surface_denied even if context.target_repo
+    happens to be set."""
+    facets_dict = {
+        "context": {"target_repo": "/tmp/some-worktree"},
+        "rounds": [
+            {
+                "round_num": 0,
+                "sim_failures": {"codebase:foo.py": "no target_repo in context"},
+                "sim_results": {},
+            },
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+        ],
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "failed"
+    assert reason == "codebase_surface_denied"
+
+
+def test_detect_grounding_status_sim_data_missing_when_no_target_repo():
+    """Regression fence: with no context.target_repo and no sim data, the
+    existing sim_data_missing fallback is unchanged."""
+    facets_dict = {
+        "context": {},
+        "rounds": [
+            {"round_num": 0, "sim_failures": {}, "sim_results": {}},
+            {"round_num": 1, "sim_failures": {}, "sim_results": {}},
+        ],
+    }
+    status, reason = _detect_grounding_status(facets_dict)
+    assert status == "silent-denial"
+    assert reason == "sim_data_missing"
+
+
 def test_resolve_grounding_sha_and_age_never_fabricates_on_missing_clone():
     """A nonexistent local clone must degrade to ("", None), never raise, never
     invent a sha."""

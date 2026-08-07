@@ -703,3 +703,192 @@ def test_format_brief_stale_clone_distinguishable_from_fresh(tmp_path):
     assert "age: 0d" in format_brief(fresh)
     assert "age: 14d" in format_brief(stale)
     assert format_brief(fresh) != format_brief(stale)
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-gate-brief-tells-the-truth-v0
+# D1: escalation_reason rendered unconditionally.
+# D2: citation_guard block, including the primary DoD (would_have_downgraded).
+# D3: per-stance citation_state.
+# ---------------------------------------------------------------------------
+
+def _facets_with_synthesis(synthesis: dict, stances: list[dict] | None = None) -> dict:
+    return {
+        "deliberation_id": "fac-cg-1",
+        "synthesis": synthesis,
+        "methodology": {
+            "operator_requested": None,
+            "synthesis_operator": "haiku",
+            "persona_operators": {"technical-integrity": "haiku", "trickster": "haiku"},
+        },
+        "stances": stances or [],
+    }
+
+
+def _brief_from_facets(tmp_path, facets):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=10.0,
+        facets_deliberation=facets,
+        facets_operator="haiku",
+    )
+    from lapis_pm.spec_review import format_brief
+    return format_brief(brief)
+
+
+def test_format_brief_renders_escalation_reason(tmp_path):
+    facets = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "escalation_reason": "citations failed validation; block discarded",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+    })
+    output = _brief_from_facets(tmp_path, facets)
+    assert "citations failed validation; block discarded" in output
+
+
+def test_format_brief_escalation_reason_empty_still_renders_line(tmp_path):
+    facets = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+    })
+    output = _brief_from_facets(tmp_path, facets)
+    assert "**Escalation reason:**" in output
+
+
+def test_format_brief_citation_guard_would_have_downgraded(tmp_path):
+    """Primary DoD: the post-#36 shape. discounted_personas must be named and the
+    brief must say the block stands despite no validated citation."""
+    facets = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+        "citation_guard": {
+            "checkable": True,
+            "downgraded": False,
+            "would_have_downgraded": True,
+            "blocking_personas": ["technical-integrity", "trickster"],
+            "discounted_personas": ["technical-integrity", "trickster"],
+            "citation_states": {},
+        },
+    })
+    output = _brief_from_facets(tmp_path, facets)
+    assert "technical-integrity" in output
+    assert "trickster" in output
+    assert "block stands" in output.lower()
+
+
+def test_format_brief_citation_guard_legacy_downgraded_shape(tmp_path):
+    """DoD 1b: the pre-#36 legacy shape (downgraded: True) must also render as an
+    action taken, not as a clean proceed."""
+    facets = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+        "citation_guard": {
+            "checkable": True,
+            "downgraded": True,
+            "blocking_personas": ["technical-integrity"],
+            "discounted_personas": ["technical-integrity"],
+            "citation_states": {},
+        },
+    })
+    output = _brief_from_facets(tmp_path, facets)
+    assert "technical-integrity" in output
+    assert "no action taken" not in output.lower()
+
+
+def test_format_brief_citation_guard_unguarded(tmp_path):
+    facets = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+        "citation_guard": {
+            "checkable": False,
+            "downgraded": False,
+            "blocking_personas": [],
+            "discounted_personas": [],
+            "citation_states": {},
+            "unguarded": True,
+        },
+    })
+    output = _brief_from_facets(tmp_path, facets)
+    assert "unguarded" in output.lower()
+
+
+def test_format_brief_citation_guard_not_checkable_no_unguarded_key_no_keyerror(tmp_path):
+    """DoD 3: checkable:False, downgraded:False, with NO 'unguarded' key at all
+    (the not-checkable branch) must render without KeyError."""
+    facets = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+        "citation_guard": {
+            "checkable": False,
+            "downgraded": False,
+            "blocking_personas": [],
+            "discounted_personas": [],
+            "citation_states": {},
+        },
+    })
+    output = _brief_from_facets(tmp_path, facets)
+    assert output
+
+
+def test_format_brief_citation_guard_absent_renders_as_before(tmp_path):
+    """DoD 4: regression guard — citation_guard absent renders the same as a
+    synthesis carrying no citation_guard key at all."""
+    facets_without = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+    })
+    facets_with_none = _facets_with_synthesis({
+        "escalation_recommendation": "proceed",
+        "consensus_level": "strong",
+        "confidence": "high",
+        "recommendation": "clean",
+        "citation_guard": None,
+    })
+    out_without = _brief_from_facets(tmp_path, facets_without)
+    out_with_none = _brief_from_facets(tmp_path, facets_with_none)
+    assert "Citation guard" not in out_without
+    assert "Citation guard" not in out_with_none
+
+
+def test_format_brief_renders_per_stance_citation_state(tmp_path):
+    facets = _facets_with_synthesis(
+        {
+            "escalation_recommendation": "proceed",
+            "consensus_level": "strong",
+            "confidence": "high",
+            "recommendation": "clean",
+        },
+        stances=[
+            {
+                "persona": "technical-integrity",
+                "confidence": "high",
+                "claim": "some claim",
+                "citation_state": "unvalidated",
+            },
+        ],
+    )
+    output = _brief_from_facets(tmp_path, facets)
+    assert "unvalidated" in output
+    # The dead `verified` key branch is explicitly out of scope — must remain
+    # 'inferred' since StanceRecord carries no 'verified' key.
+    assert "inferred" in output

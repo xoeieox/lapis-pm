@@ -26,6 +26,9 @@ lapis-pm tick [--target ID | --all] [--force-brief] [--force-dispatch AGENT:INTE
 lapis-pm status [target_id] [--explain]
 lapis-pm pause <target_id> [--reason TEXT]
 lapis-pm resume <target_id>
+lapis-pm clear-reviewer-attempts <target_id>
+lapis-pm clear-dispatch <target_id>
+lapis-pm review-gate resume
 lapis-pm list
 lapis-pm land <target_id> [--dry-run]
 ```

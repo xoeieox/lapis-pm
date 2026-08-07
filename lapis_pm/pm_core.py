@@ -76,6 +76,16 @@ try:
 except Exception:
     _ClaudeQueue = None  # type: ignore
 
+try:
+    # Reuse the runner's own stale-active arithmetic (same threshold
+    # startup_sweep uses to decide a task's runner has died) rather than
+    # inventing a second number. Import is best-effort — a missing symbol
+    # falls back to the documented default (300s) rather than breaking
+    # reconciliation entirely.
+    from agents_core.claude_queue_runner import STARTUP_STALE_GRACE_S
+except Exception:
+    STARTUP_STALE_GRACE_S = 300  # type: ignore
+
 from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
 
 try:
@@ -2133,6 +2143,42 @@ def _now_iso() -> str:
     return datetime.now(PACIFIC).isoformat(timespec="microseconds")
 
 
+def _dispatch_age(ts: str | None) -> timedelta | None:
+    """Parse a dispatch record's ``ts`` (tz-aware Pacific, set at dispatch
+    from _now_iso) and return its age, or None if ``ts`` is missing/unparseable.
+    """
+    if not ts:
+        return None
+    try:
+        dispatched_at = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return datetime.now(PACIFIC) - dispatched_at
+
+
+def _format_age(age: timedelta) -> str:
+    """Render a timedelta as a short human string: '31h', '45m', '3d'."""
+    total_s = int(age.total_seconds())
+    if total_s < 0:
+        total_s = 0
+    days, rem = divmod(total_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m"
+
+
+def _dispatch_age_note(ts: str | None) -> str:
+    """' pending for 31h' (Leg 5) — or '' if age can't be established."""
+    age = _dispatch_age(ts)
+    if age is None:
+        return ""
+    return f", pending for {_format_age(age)}"
+
+
 # --- Project-slot blackboard: close the slot + emit attribution deposit ------
 # Mirrors the *_DEPOSIT_RECORDER dynamic-import convention used by the weaver/mem
 # servers: lapis-pm never statically imports zephyr — the recorder is resolved from
@@ -2397,6 +2443,32 @@ def force_dispatch(
             import sys
             print(f"[L1.D1-forgejo-warning] {target_id}: open-PR scan failed; proceeding with dispatch", file=sys.stderr)
 
+    # Leg 2 (lapis-pm-stale-pending-dispatch-reaper-v0): reconcile before the
+    # L1.D3 guard below evaluates, so the documented escape from a wedge
+    # (tick --force-dispatch) is self-healing for every case the reconciler's
+    # reap pass can prove (task gone from the queue entirely, or stuck in
+    # active/ past its own timeout). Placed in force_dispatch itself — not
+    # in the CLI — so cmd_bind_chain's call site and any future caller
+    # inherit it for free.
+    #
+    # Failure handling is visibility, not a raise: if reconciliation returns
+    # 0 because the queue read threw, warn to stderr and fall through to the
+    # guard as today. Failing closed here would manufacture a second way to
+    # wedge a target on an unreadable queue — exactly the defect class this
+    # spec exists to remove.
+    try:
+        _flipped, _reconcile_ok = _reconcile_dispatched_with_queue_ex(target_id)
+    except Exception:
+        _reconcile_ok = False
+    if not _reconcile_ok:
+        import sys
+        print(
+            f"[L1.D3-reconcile-warning] {target_id}: dispatch reconciliation "
+            "was skipped (queue read failed) before the concurrency guard; "
+            "guard below may be evaluating stale state",
+            file=sys.stderr,
+        )
+
     # L1.D3: Target-level concurrency guard for initial fixers
     if agent_type in _INITIAL_FIXER_TYPES:
         existing_dispatches = load_dispatched(target_id)
@@ -2405,9 +2477,12 @@ def force_dispatch(
                 record.get("agent_type") in _INITIAL_FIXER_TYPES + ("fixer_retry",)):
                 gpu_id = record.get("gpu_id", "unknown")
                 rec_agent = record.get("agent_type", "unknown")
+                age = _dispatch_age(record.get("ts"))
+                age_note = f" pending for {_format_age(age)}" if age is not None else " pending"
                 raise ValueError(
-                    f"target {target_id} has a pending {rec_agent} dispatch ({gpu_id}) — "
-                    "not firing a concurrent initial fixer"
+                    f"target {target_id} has a {rec_agent} dispatch ({gpu_id}),"
+                    f"{age_note} — if that fixer is dead: "
+                    f"lapis-pm clear-dispatch {target_id}"
                 )
 
     spec_sum = episodic.spec_summary(target_id)
@@ -3741,6 +3816,43 @@ def clear_reviewer_attempts(target_id: str) -> int:
             if _mem().delete(rec["key"]):
                 cleared += 1
     return cleared
+
+
+def clear_dispatch(target_id: str) -> int:
+    """Leg 3 (lapis-pm-stale-pending-dispatch-reaper-v0): the escape hatch
+    for the residue Leg 1's reap pass cannot prove — a queue entry that is
+    genuinely still running but whose PM record is wrong, or a queue whose
+    files were moved by hand. Modeled on clear_reviewer_attempts: cheap,
+    one required argument, no confirmation prompt (Erah's ruling — ceremony
+    here inverts the point of an escape hatch).
+
+    Flips every `pending` dispatch record for target_id to `failed` with
+    failure_reason "cleared:operator", stamps completed_at, saves, and
+    writes one episodic audit comment naming every cleared gpu_id. Never
+    touches non-pending records, TargetStore, paused state, or the spec.
+    Returns the number of records cleared.
+    """
+    records = load_dispatched(target_id)
+    cleared_gpu_ids: list[str] = []
+    now = _now_iso()
+    for rec in records:
+        if rec.get("status") != "pending":
+            continue
+        rec["status"] = "failed"
+        rec["failure_reason"] = "cleared:operator"
+        rec["completed_at"] = now
+        cleared_gpu_ids.append(rec.get("gpu_id", "unknown"))
+
+    if cleared_gpu_ids:
+        save_dispatched(target_id, records)
+        episodic.write_observation(
+            target_id,
+            f"Cleared {len(cleared_gpu_ids)} pending dispatch(es) via "
+            f"clear-dispatch: {', '.join(cleared_gpu_ids)}",
+            extra_tags=["pm:dispatch-cleared"],
+        )
+
+    return len(cleared_gpu_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -6544,11 +6656,84 @@ def _seen_pr_ids(target_id: str) -> set[int]:
 # Dispatch–queue reconciliation
 # ---------------------------------------------------------------------------
 
+def _reap_verdict(
+    gpu_id: str,
+    active_by_id: dict[str, dict],
+    pending_ids: set[str],
+) -> dict | None:
+    """Leg 1 reap pass: decide whether a pending record with no terminal
+    queue match (not in completed/, not in failed/) should be force-flipped
+    to failed anyway, because the queue state proves the work is gone.
+
+    Returns a verdict dict shaped like the ``terminal`` entries built in
+    ``_reconcile_dispatched_with_queue`` (state/error/completed_at), plus a
+    ``failure_reason`` key, or None if the record must stay pending.
+
+    Case A — task_absent_from_queue: gpu_id is in none of pending / active /
+    completed / failed. The task no longer exists anywhere in the queue.
+    Case B — active_past_timeout: gpu_id is in active/ and its age exceeds
+    its own declared timeout_seconds + STARTUP_STALE_GRACE_S — the same
+    arithmetic agents_core.claude_queue_runner.startup_sweep uses to decide
+    a runner died mid-task. A live, legitimately-slow fixer within its own
+    timeout is never reaped (Case B does not fire) — see spec §Leg 1.
+    """
+    task = active_by_id.get(gpu_id)
+    if task is not None:
+        started_at = task.get("started_at")
+        timeout = int(task.get("timeout_seconds", 300))
+        if not started_at:
+            # No started_at recorded at all — can't establish age, so we
+            # cannot prove staleness. Degrade open: leave it pending.
+            return None
+        try:
+            started_dt = datetime.fromisoformat(started_at)
+            age_s = (datetime.now(PACIFIC) - started_dt).total_seconds()
+        except ValueError:
+            return None
+        if age_s > (timeout + STARTUP_STALE_GRACE_S):
+            return {
+                "state": "failed",
+                "error": None,
+                "completed_at": _now_iso(),
+                "failure_reason": "reaped:active_past_timeout",
+            }
+        return None  # active and within its own timeout — never reaped
+
+    if gpu_id in pending_ids:
+        # Still queued, waiting to be claimed. Not gone, not stuck.
+        return None
+
+    # Not in pending/, not in active/, and (by construction — this is only
+    # called when `terminal.get(gpu_id) is None`) not in completed/ or
+    # failed/ either. The task no longer exists in the queue at all.
+    return {
+        "state": "failed",
+        "error": None,
+        "completed_at": _now_iso(),
+        "failure_reason": "reaped:task_absent_from_queue",
+    }
+
+
 def _reconcile_dispatched_with_queue(target_id: str) -> int:
+    """Public entry point — see _reconcile_dispatched_with_queue_ex for the
+    real implementation and full docstring. This wrapper preserves the
+    existing int-only contract for tick() and any other caller that only
+    needs the flipped count and is content with degrade-open-to-0 on a
+    queue-read failure.
+    """
+    flipped, _ok = _reconcile_dispatched_with_queue_ex(target_id)
+    return flipped
+
+
+def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
     """Flip pending dispatch records to terminal state based on ClaudeQueue.
 
-    Returns count of records flipped. Idempotent — calling twice in a row
-    with no new queue activity is a no-op (returns 0 the second time).
+    Returns (flipped_count, ok). ``ok`` is False only when the queue read
+    itself raised — Leg 2 (force_dispatch) uses it to decide whether to
+    warn that reconciliation was skipped. A normal no-op call (nothing to
+    reconcile) returns (0, True), distinguishable from a failed read's
+    (0, False). Idempotent — calling twice in a row with no new queue
+    activity is a no-op (returns 0 the second time).
 
     Reads get_recent_failed(limit=50) and get_recent_completed(limit=50)
     once per call (not once per record). Matches on gpu_id (the queue's
@@ -6569,16 +6754,28 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
       the output file, parses JSON, writes "Reviewer verdict for PR #N:").
     Failed flips for both carve-out types are still permitted — a crashed
     job produces no output file, so the record must fail rather than wait.
+
+    Reap pass (Leg 1, lapis-pm-stale-pending-dispatch-reaper-v0): a pending
+    record with no terminal match above is also checked against get_active()
+    and get_pending() — see _reap_verdict. A record whose gpu_id is provably
+    gone from every queue directory, or stuck in active/ past its own
+    timeout_seconds + STARTUP_STALE_GRACE_S, is flipped to failed with a
+    failure_reason of "reaped:task_absent_from_queue" or
+    "reaped:active_past_timeout" respectively. The carve-outs above are
+    unaffected — reap only ever produces "failed", never "processed", so it
+    never bypasses either carve-out's reasoning.
     """
     if _ClaudeQueue is None:
-        return 0
+        return 0, True
 
     try:
         cq = _ClaudeQueue()
         failed_entries = cq.get_recent_failed(limit=50)
         completed_entries = cq.get_recent_completed(limit=50)
+        active_entries = cq.get_active()
+        pending_entries = cq.get_pending()
     except Exception:
-        return 0
+        return 0, False
 
     # Build gpu_id → terminal-state index from both lists.
     # failed wins if a task somehow appears in both (shouldn't happen).
@@ -6599,6 +6796,19 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
                 "error": entry.get("error"),
                 "completed_at": entry.get("completed_at"),
             }
+
+    # Live-queue index for the reap pass below (Leg 1 of the stale-pending
+    # reaper spec). A record whose gpu_id shows up in none of these four
+    # buckets — pending / active / completed / failed — is provably gone;
+    # one whose gpu_id sits in active/ past its own declared timeout is
+    # evidence the runner that owned it died. Liveness is decided from this
+    # queue state ONLY — no ps, no worktree stat, no filesystem probing.
+    active_by_id: dict[str, dict] = {}
+    for entry in active_entries:
+        task_id = entry.get("id")
+        if task_id:
+            active_by_id[task_id] = entry
+    pending_ids: set[str] = {e.get("id") for e in pending_entries if e.get("id")}
 
     records = load_dispatched(target_id)
     flipped = 0
@@ -6621,7 +6831,9 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
             continue
         t = terminal.get(gpu_id)
         if t is None:
-            continue
+            t = _reap_verdict(gpu_id, active_by_id, pending_ids)
+            if t is None:
+                continue
 
         # fixer_retry carve-out: advance-perceiver (_fixer_completion_ts) is the
         # sole authority for fixer_retry → processed. If the queue says "completed"
@@ -6650,6 +6862,8 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
             rec["error"] = t["error"]
         if t["completed_at"] is not None:
             rec["completed_at"] = t["completed_at"]
+        if t.get("failure_reason") is not None:
+            rec["failure_reason"] = t["failure_reason"]
         changed = True
         flipped += 1
 
@@ -6689,18 +6903,30 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         # with the same gpu_id in a later tick writes nothing.
         dedup_tag = f"pm:dispatch-reconciled:gpu={gpu_id}"
         if dedup_tag not in existing_dedup_tags:
-            error_note = f" ({t['error']})" if t["error"] else ""
-            episodic.write_observation(
-                target_id,
-                f"Reconciled dispatch {gpu_id}: pending → {t['state']}{error_note}",
-                extra_tags=["pm:dispatch-reconciled", dedup_tag],
-            )
+            reaped_reason = t.get("failure_reason")
+            if reaped_reason is not None:
+                # Reap path (Leg 1): no queue error string to report — the
+                # task is either absent from every queue directory or stuck
+                # past its own timeout. Tag distinctly from a normal
+                # reconcile flip so the audit trail names cause, not just effect.
+                episodic.write_observation(
+                    target_id,
+                    f"Reaped dispatch {gpu_id}: pending → {t['state']} ({reaped_reason})",
+                    extra_tags=["pm:dispatch-reconciled", "pm:dispatch-reaped", dedup_tag],
+                )
+            else:
+                error_note = f" ({t['error']})" if t["error"] else ""
+                episodic.write_observation(
+                    target_id,
+                    f"Reconciled dispatch {gpu_id}: pending → {t['state']}{error_note}",
+                    extra_tags=["pm:dispatch-reconciled", dedup_tag],
+                )
             existing_dedup_tags.add(dedup_tag)
 
     if changed:
         save_dispatched(target_id, records)
 
-    return flipped
+    return flipped, True
 
 
 # ---------------------------------------------------------------------------

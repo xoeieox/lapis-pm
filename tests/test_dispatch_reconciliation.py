@@ -70,10 +70,17 @@ def _pending_record(gpu_id: str, agent_type: str = "fixer_retry",
 # ---------------------------------------------------------------------------
 
 def _make_queue(failed: list[dict] | None = None,
-                completed: list[dict] | None = None):
+                completed: list[dict] | None = None,
+                active: list[dict] | None = None,
+                pending: list[dict] | None = None):
     cq = MagicMock()
     cq.get_recent_failed.return_value = failed or []
     cq.get_recent_completed.return_value = completed or []
+    # get_active/get_pending back the reap pass added by
+    # lapis-pm-stale-pending-dispatch-reaper-v0 (Leg 1). Default empty —
+    # tests that care about reap-vs-stay-pending set these explicitly.
+    cq.get_active.return_value = active or []
+    cq.get_pending.return_value = pending or []
     return cq
 
 
@@ -165,12 +172,17 @@ def test_pending_flips_to_processed_on_queue_completion():
 # ---------------------------------------------------------------------------
 
 def test_pending_no_match_left_as_pending():
-    """Pending record with gpu_id=Z; queue returns nothing matching → left as pending."""
+    """Pending record with gpu_id=Z; queue reports it still queued (pending/)
+    and unmatched in completed/failed → left as pending. (Still queued is
+    the natural reading of "no match yet" — a record whose gpu_id is in
+    none of pending/active/completed/failed is the reaper's Case A, covered
+    separately in tests/test_dispatch_reaper.py.)"""
     gpu_id = "claude_20260426_130000_0002_fixer_myrepo"
     rec = _pending_record(gpu_id)
 
     queue = _make_queue(
         failed=[{"id": "some-other-id", "error": "ERROR: unrelated"}],
+        pending=[{"id": gpu_id}],
     )
 
     with patch.object(pm_core, "_ClaudeQueue", return_value=queue), \

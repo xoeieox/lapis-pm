@@ -5023,6 +5023,29 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     if agent_type == "reviewer_fresh" and tou_window.is_peak_window():
         agent_type = "reviewer_fresh_contractor"
 
+    # Dead-seat gap-spanner route (lapis-pm-reviewer-seat-phala-test-key):
+    # a second, explicitly-named routing input alongside the TOU-window check
+    # above — not an exception-driven flip (that pattern remains forbidden per
+    # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30).
+    # Only reviewer_fresh has a contractor counterpart, so this is scoped the
+    # same way the TOU branch is. Threshold is 1 prior seat_no_tool_calls on
+    # THIS exact PR/cycle: probe_seat_tool_call already tries
+    # PROBE_DEFAULT_ATTEMPTS=3 deterministic tool-order variants before
+    # reporting seat_no_tool_calls, so one occurrence already reflects 3/3
+    # failed perturbations — waiting for a second just burns another cycle
+    # against the same poisoned prefix for no new information. Runs
+    # regardless of TOU window (a dead seat is dead at any hour) and never
+    # turns OFF the TOU-peak routing above — strict addition only.
+    if agent_type == "reviewer_fresh":
+        _prior_state = _reviewer_attempt_state(target_id, pr_number, cycle)
+        if _prior_state["last_infra_reason"] == "seat_no_tool_calls":
+            agent_type = "reviewer_fresh_contractor"
+            _gap_spanner_reroute = True
+        else:
+            _gap_spanner_reroute = False
+    else:
+        _gap_spanner_reroute = False
+
     # Build prior_review context for same-reviewer mode
     prior_review_text = _build_prior_review_text(target_id, pr_number, cycle) if mode == "same" else ""
 
@@ -5113,16 +5136,31 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "review_gate_ts": review_gate_ts,
     }
     if agent_type == "reviewer_fresh_contractor":
-        # Tag the route so the locality ledger can distinguish a scheduled
-        # daytime contractor call (POLICY) from a fallback event, per
-        # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30:
-        # "instrumentation should distinguish the two or the ledger will read
-        # every daytime judge call as an independence failure."
-        record["route"] = "peak-window-policy"
+        if _gap_spanner_reroute:
+            # Tag the route so the locality ledger can distinguish a
+            # dead-seat gap-spanner reroute (this unit) from the TOU-peak
+            # scheduled contractor call above — do not conflate the two
+            # counters.
+            record["route"] = "gap-spanner-dead-seat-reroute"
+        else:
+            # Tag the route so the locality ledger can distinguish a scheduled
+            # daytime contractor call (POLICY) from a fallback event, per
+            # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30:
+            # "instrumentation should distinguish the two or the ledger will read
+            # every daytime judge call as an independence failure."
+            record["route"] = "peak-window-policy"
     append_dispatched(target_id, record)
 
+    _gap_spanner_log = (
+        f"Gap-spanner reroute: prior seat_no_tool_calls on PR #{pr_number} "
+        f"cycle {cycle} → routed to reviewer_fresh_contractor "
+        f"(decision/gw-daytime-no-flips-2026-07-30-temporary-carveout-"
+        f"reviewer-seat-health-2026-08-07).\n"
+        if _gap_spanner_reroute else ""
+    )
     episodic.write_dispatch(
         target_id,
+        f"{_gap_spanner_log}"
         f"Reviewer dispatched (cycle {cycle}, mode={mode}): {agent_type} → {res.task_id}\n"
         f"PR #{pr_number}: {pr.get('title', '')}",
         extra_tags=[

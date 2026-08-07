@@ -127,15 +127,21 @@ class TestNoExceptionHandlerSwitchesSeats:
     _act_dispatch_reviewer.
     """
 
-    def test_contractor_assignment_appears_exactly_once_outside_except(self):
+    def test_contractor_assignment_appears_at_known_dispatch_time_sites(self):
+        """Two legitimate assignment sites are expected: the TOU-peak check
+        (D2) and the dead-seat gap-spanner check
+        (lapis-pm-reviewer-seat-phala-test-key) — both dispatch-time
+        routing inputs in _act_dispatch_reviewer, neither exception-driven.
+        A third site would indicate an undocumented new routing input."""
         src = Path(pm_core.__file__).read_text()
         assignment_lines = [
             i for i, line in enumerate(src.splitlines())
             if re.search(r'agent_type\s*=\s*"reviewer_fresh_contractor"', line)
         ]
-        assert len(assignment_lines) == 1, (
-            f"expected exactly one assignment of agent_type to "
-            f"reviewer_fresh_contractor, found {len(assignment_lines)}"
+        assert len(assignment_lines) == 2, (
+            f"expected exactly two assignments of agent_type to "
+            f"reviewer_fresh_contractor (TOU-peak + gap-spanner), "
+            f"found {len(assignment_lines)}"
         )
 
     def test_no_except_block_mentions_contractor_seat(self):

@@ -639,6 +639,25 @@ def cmd_clear_reviewer_attempts(args) -> int:
     return 0
 
 
+def cmd_clear_dispatch(args) -> int:
+    """Leg 3 escape hatch for a stale-pending dispatch record. Deliberately
+    cheap: target_id only, no confirmation prompt. Flips every pending
+    dispatch record to failed; never touches the intention registry, which
+    is a separate wedge — see the reminder printed below unconditionally.
+    """
+    cleared = pm_core.clear_dispatch(args.target_id)
+    print(f"Cleared {cleared} pending dispatch record(s) for {args.target_id}")
+    # Unconditional, never suppressed — clearing a dispatch record and
+    # composting an intention are two independent pieces of state; both
+    # must be cleared or an operator can conclude the target is free when
+    # it is not (intention-registry-orphan-wedge).
+    print(
+        "Reminder: this does not touch the intention registry. If this "
+        "target also has a stuck intention, clear it separately."
+    )
+    return 0
+
+
 def cmd_tick(args) -> int:
     # Force-dispatch: bypass the normal decide path for smoke testing.
     if args.force_dispatch:
@@ -721,6 +740,11 @@ def _print_target_status(t, explain: bool = False):
     dispatched = pm_core.load_dispatched(t.id)
     pending = [d for d in dispatched if d.get("status") == "pending"]
     print(f"  dispatched:    {len(dispatched)} total, {len(pending)} pending")
+    for d in pending:
+        age = pm_core._dispatch_age(d.get("ts"))
+        age_str = pm_core._format_age(age) if age is not None else "?"
+        print(f"    pending: gpu_id={d.get('gpu_id', 'unknown')} "
+              f"agent_type={d.get('agent_type', 'unknown')} age={age_str}")
     outstanding = pm_core.get_outstanding_brief(t.id)
     print(f"  outstanding:   {outstanding or '(none)'}")
 
@@ -783,6 +807,14 @@ def cmd_deploy_status(args) -> int:
 def _target_to_json_dict(t) -> dict:
     dispatched = pm_core.load_dispatched(t.id)
     pending = [d for d in dispatched if d.get("status") == "pending"]
+    pending_detail = []
+    for d in pending:
+        age = pm_core._dispatch_age(d.get("ts"))
+        pending_detail.append({
+            "gpu_id": d.get("gpu_id"),
+            "agent_type": d.get("agent_type"),
+            "age_s": int(age.total_seconds()) if age is not None else None,
+        })
     return {
         "target_id": t.id,
         "title": t.title,
@@ -793,6 +825,7 @@ def _target_to_json_dict(t) -> dict:
         "cursor": pm_core.get_cursor(t.id),
         "dispatched_total": len(dispatched),
         "dispatched_pending": len(pending),
+        "dispatched_pending_detail": pending_detail,
         "outstanding_brief_id": pm_core.get_outstanding_brief(t.id),
         "tags": t.data.get("tags", []),
         "urgency": t.urgency,
@@ -2163,6 +2196,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cra.add_argument("target_id")
     cra.set_defaults(func=cmd_clear_reviewer_attempts)
+
+    cld = sub.add_parser(
+        "clear-dispatch",
+        help="Clear pending dispatch record(s) for a target (escape hatch for a "
+             "stale-pending fixer/reviewer dispatch the reaper couldn't prove dead). "
+             "Also prints a reminder about the intention-registry sibling wedge.",
+    )
+    cld.add_argument("target_id")
+    cld.set_defaults(func=cmd_clear_dispatch)
 
     ls = sub.add_parser("list", help="List all pm_bound targets.")
     ls.add_argument("--json", action="store_true", help="Emit machine-readable JSON")

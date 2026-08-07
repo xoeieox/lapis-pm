@@ -34,6 +34,7 @@ SCHEMA_KEYS = {
     "cursor",
     "dispatched_total",
     "dispatched_pending",
+    "dispatched_pending_detail",
     "outstanding_brief_id",
     "tags",
     "urgency",

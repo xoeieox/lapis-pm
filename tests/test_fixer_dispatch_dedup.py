@@ -148,7 +148,11 @@ class TestL1D3TargetLevelConcurrencyGuard:
     def test_initial_fixer_raises_when_pending_fixer_exists(
         self, target_store_mock, episodic_mock, mem_mock
     ):
-        """Initial fixer raises when a pending fixer record exists."""
+        """Initial fixer raises when a pending fixer record exists and the
+        queue proves it's still genuinely live (in active/, within its own
+        timeout) — lapis-pm-stale-pending-dispatch-reaper-v0's Leg 2 reconcile
+        call must not weaken this guard for a live record, only unwedge a
+        provably dead one."""
         target = MagicMock()
         target.pm_repo = None
         target.data = {}
@@ -159,17 +163,33 @@ class TestL1D3TargetLevelConcurrencyGuard:
             "gpu_id": "gpu-999",
             "status": "pending",
             "agent_type": "fixer",
+            "ts": "2026-08-07T09:00:00-07:00",
         }
+        live_queue = MagicMock()
+        live_queue.get_recent_failed.return_value = []
+        live_queue.get_recent_completed.return_value = []
+        live_queue.get_pending.return_value = []
+        live_queue.get_active.return_value = [{
+            "id": "gpu-999",
+            "started_at": pending_record["ts"],
+            "timeout_seconds": 3600,
+        }]
         with patch(
             "lapis_pm.pm_core.load_dispatched", return_value=[pending_record]
-        ):
-            with pytest.raises(ValueError, match="has a pending fixer dispatch"):
+        ), patch.object(pm_core, "_ClaudeQueue", return_value=live_queue), \
+             patch("lapis_pm.pm_core.datetime") as mock_dt:
+            import datetime as _real_datetime
+            mock_dt.now.return_value = _real_datetime.datetime(
+                2026, 8, 7, 9, 5, 0, tzinfo=pm_core.PACIFIC)
+            mock_dt.fromisoformat.side_effect = _real_datetime.datetime.fromisoformat
+            with pytest.raises(ValueError, match="has a fixer dispatch"):
                 pm_core.force_dispatch("my-target", "fixer", "Test intent")
 
     def test_initial_fixer_raises_when_pending_fixer_retry_exists(
         self, target_store_mock, episodic_mock, mem_mock
     ):
-        """Initial fixer raises when a pending fixer_retry record exists."""
+        """Initial fixer raises when a pending fixer_retry record exists and
+        the queue proves it's still genuinely live."""
         target = MagicMock()
         target.pm_repo = None
         target.data = {}
@@ -179,11 +199,26 @@ class TestL1D3TargetLevelConcurrencyGuard:
             "gpu_id": "gpu-888",
             "status": "pending",
             "agent_type": "fixer_retry",
+            "ts": "2026-08-07T09:00:00-07:00",
         }
+        live_queue = MagicMock()
+        live_queue.get_recent_failed.return_value = []
+        live_queue.get_recent_completed.return_value = []
+        live_queue.get_pending.return_value = []
+        live_queue.get_active.return_value = [{
+            "id": "gpu-888",
+            "started_at": pending_record["ts"],
+            "timeout_seconds": 3600,
+        }]
         with patch(
             "lapis_pm.pm_core.load_dispatched", return_value=[pending_record]
-        ):
-            with pytest.raises(ValueError, match="has a pending fixer_retry dispatch"):
+        ), patch.object(pm_core, "_ClaudeQueue", return_value=live_queue), \
+             patch("lapis_pm.pm_core.datetime") as mock_dt:
+            import datetime as _real_datetime
+            mock_dt.now.return_value = _real_datetime.datetime(
+                2026, 8, 7, 9, 5, 0, tzinfo=pm_core.PACIFIC)
+            mock_dt.fromisoformat.side_effect = _real_datetime.datetime.fromisoformat
+            with pytest.raises(ValueError, match="has a fixer_retry dispatch"):
                 pm_core.force_dispatch("my-target", "fixer", "Test intent")
 
     def test_initial_fixer_proceeds_when_no_pending_fixer(

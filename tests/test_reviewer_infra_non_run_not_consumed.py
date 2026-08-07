@@ -287,6 +287,18 @@ class TestReasonPopulationOrdering:
             def get_recent_completed(self, limit=50):
                 return []
 
+            # get_active/get_pending back the Leg 1 reap pass added by
+            # lapis-pm-stale-pending-dispatch-reaper-v0 — this record is
+            # already found via get_recent_failed above, so these are never
+            # consulted for it, but _reconcile_dispatched_with_queue_ex
+            # calls both unconditionally each pass and a real ClaudeQueue
+            # always has them.
+            def get_active(self):
+                return []
+
+            def get_pending(self):
+                return []
+
         with (
             patch("lapis_pm.pm_core._mem", return_value=store),
             patch("lapis_pm.pm_core._ClaudeQueue", _FakeQueue),

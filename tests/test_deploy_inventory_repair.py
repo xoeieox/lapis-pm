@@ -336,11 +336,25 @@ class TestSelectionGate:
             seen_findings.append(finding["kind"])
             return "deposited:new"
 
+        # Fixture note (D1, called out per DoD-11): under the new backlog
+        # admit path, a signature absent from the ledger is *always*
+        # admitted regardless of prior_high_keys - that is the whole point
+        # of this unit. This test's "already in prior_high_keys" finding
+        # must therefore also carry an already-ledgered (open) entry to
+        # exercise the freshness gate in isolation, or it would trivially
+        # be readmitted via is_unproposed and the test would no longer be
+        # testing what its name says. This is a fixture change only - the
+        # assertion (`stray_branch` alone is seen) is unmodified.
+        sig = dir_mod.compute_signature("/srv/git/foo", "stale_behind_origin")
+        ledger = {sig: {"gem_id": "gem-1", "status": "open", "first_seen": "2026-08-01T00:00:00+00:00",
+                         "last_seen": "2026-08-01T00:00:00+00:00", "times_seen": 1, "staled_at": None,
+                         "clone_path": "/srv/git/foo", "finding_kind": "stale_behind_origin"}}
+
         with (
             patch.object(dir_mod, "reconcile_terminal_gems"),
             patch.object(dir_mod, "propose_repair", side_effect=fake_propose),
             patch.object(dir_mod, "write_ledger"),
-            patch.object(dir_mod, "read_ledger", return_value={}),
+            patch.object(dir_mod, "read_ledger", return_value=ledger),
             patch.object(dir_mod, "escalate_stale_gems"),
         ):
             dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
@@ -526,6 +540,361 @@ class TestStaleGemEscalation:
             fired = dir_mod.escalate_stale_gems(ledger)
         assert fired == []
         assert not mock_deposit.called
+
+
+class TestWouldDeposit:
+    """DoD-10: would_deposit() must agree with propose_repair's actual
+    deposit/skip decision for all four ledger states."""
+
+    def test_absent_would_deposit(self):
+        assert dir_mod.would_deposit({}, "sig1") is True
+
+    def test_open_would_not_deposit(self):
+        ledger = {"sig1": {"status": "open"}}
+        assert dir_mod.would_deposit(ledger, "sig1") is False
+
+    def test_dismissed_fp_would_not_deposit(self):
+        ledger = {"sig1": {"status": "dismissed_fp"}}
+        assert dir_mod.would_deposit(ledger, "sig1") is False
+
+    def test_acked_would_deposit(self):
+        ledger = {"sig1": {"status": "acked"}}
+        assert dir_mod.would_deposit(ledger, "sig1") is True
+
+    @pytest.mark.parametrize("ledger_state,expect_action_prefix", [
+        (None, "deposited:"),
+        ("open", "skip:still-open"),
+        ("dismissed_fp", "skip:dismissed-fp"),
+        ("acked", "deposited:"),
+    ])
+    def test_agrees_with_propose_repair(self, ledger_state, expect_action_prefix):
+        sig = dir_mod.compute_signature("/srv/git/foo", "stale_behind_origin")
+        if ledger_state is None:
+            ledger = {}
+        else:
+            ledger = {sig: {"gem_id": "gem-1", "status": ledger_state,
+                             "first_seen": "2026-08-01T00:00:00+00:00",
+                             "last_seen": "2026-08-01T00:00:00+00:00", "times_seen": 1,
+                             "staled_at": None, "clone_path": "/srv/git/foo",
+                             "finding_kind": "stale_behind_origin"}}
+        expected_would_deposit = dir_mod.would_deposit(ledger, sig)
+
+        with (
+            patch.object(dir_mod, "diagnose_finding", return_value=(dir_mod._degrade(_finding()), "mechanical")),
+            patch.object(dir_mod, "deposit_gem", return_value="gem-new"),
+            patch.object(dir_mod, "emit_provenance"),
+        ):
+            action = dir_mod.propose_repair(
+                ledger, clone_path="/srv/git/foo", finding=_finding(),
+                mapped=True, branch="main", commits_behind=3, backing_units=[],
+            )
+        actual_would_deposit = action.startswith("deposited:")
+        assert actual_would_deposit == expected_would_deposit
+        assert action.startswith(expect_action_prefix)
+
+
+class TestBacklogBackfill:
+    """DoD-1, DoD-2, DoD-4, DoD-5, DoD-8, DoD-9: the ledger-absence admit
+    path and the cap-behind-dedup restructure."""
+
+    def test_backlog_admitted_with_empty_ledger(self):
+        """DoD-1: HIGH findings all present in prior_high_keys, empty ledger
+        -> the pass deposits gems rather than returning zero actions. This
+        is the exact defect this unit exists to fix."""
+        clones = [
+            _clone(path=f"/srv/git/repo{i}", findings=[_finding(kind="stale_behind_origin")])
+            for i in range(3)
+        ]
+        status = _status(clones)
+        prior_high_keys = {(c["path"], "stale_behind_origin") for c in clones}
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "diagnose_finding", return_value=(dir_mod._degrade(_finding()), "mechanical")),
+            patch.object(dir_mod, "deposit_gem", return_value="gem-x"),
+            patch.object(dir_mod, "emit_provenance"),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value={}),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            actions = dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
+        deposited = [a for a in actions if a.startswith("deposited:")]
+        assert len(deposited) == 3
+
+    def test_steady_state_still_quiet(self):
+        """DoD-2: same status, ledger where every signature is already
+        status='open' -> the pass deposits nothing."""
+        clones = [
+            _clone(path=f"/srv/git/repo{i}", findings=[_finding(kind="stale_behind_origin")])
+            for i in range(3)
+        ]
+        status = _status(clones)
+        prior_high_keys = {(c["path"], "stale_behind_origin") for c in clones}
+        ledger = {
+            dir_mod.compute_signature(c["path"], "stale_behind_origin"): {
+                "gem_id": "gem-existing", "status": "open",
+                "first_seen": "2026-08-01T00:00:00+00:00", "last_seen": "2026-08-01T00:00:00+00:00",
+                "times_seen": 1, "staled_at": None, "clone_path": c["path"],
+                "finding_kind": "stale_behind_origin",
+            }
+            for c in clones
+        }
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "deposit_gem") as mock_deposit,
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value=ledger),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            actions = dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
+        assert not any(a.startswith("deposited:") for a in actions)
+        assert not mock_deposit.called
+
+    def test_freshness_admit_path_intact(self):
+        """DoD-4: a genuinely-new finding (absent from prior_high_keys) with
+        no ledger entry is still admitted, and prior_high_keys=None still
+        admits everything."""
+        clones = [_clone(path="/srv/git/foo", findings=[_finding(kind="stray_branch")])]
+        status = _status(clones)
+        seen = []
+
+        def fake_propose(ledger, *, clone_path, finding, **kwargs):
+            seen.append(finding["kind"])
+            return "deposited:new"
+
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "propose_repair", side_effect=fake_propose),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value={}),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            dir_mod.run_repair_pass(status, prior_high_keys=set(), corrupt=False)
+            assert seen == ["stray_branch"]
+            seen.clear()
+            dir_mod.run_repair_pass(status, prior_high_keys=None, corrupt=False)
+            assert seen == ["stray_branch"]
+
+    def test_exemption_admitted_at_selection_but_still_ledger_suppressed(self):
+        """DoD-5: auto_recovery_restart_failed is admitted at selection
+        regardless of freshness (both halves), AND is still suppressed by an
+        open ledger entry."""
+        clones = [_clone(path="/srv/git/foo", findings=[_finding(kind="auto_recovery_restart_failed")])]
+        status = _status(clones)
+        prior_high_keys = {("/srv/git/foo", "auto_recovery_restart_failed")}
+
+        # Half 1: admitted at selection despite being non-fresh and ledgered-absent.
+        seen = []
+
+        def fake_propose(ledger, *, clone_path, finding, **kwargs):
+            seen.append(finding["kind"])
+            return "deposited:new"
+
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "propose_repair", side_effect=fake_propose),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value={}),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
+        assert seen == ["auto_recovery_restart_failed"]
+
+        # Half 2: still suppressed by an open ledger entry (no deposit call).
+        sig = dir_mod.compute_signature("/srv/git/foo", "auto_recovery_restart_failed")
+        ledger = {sig: {"gem_id": "gem-1", "status": "open",
+                         "first_seen": "2026-08-01T00:00:00+00:00", "last_seen": "2026-08-01T00:00:00+00:00",
+                         "times_seen": 1, "staled_at": None, "clone_path": "/srv/git/foo",
+                         "finding_kind": "auto_recovery_restart_failed"}}
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "deposit_gem") as mock_deposit,
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value=ledger),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            actions = dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
+        assert not any(a.startswith("deposited:") for a in actions)
+        assert not mock_deposit.called
+
+    def test_cap_starvation_cannot_happen(self):
+        """DoD-8: the single most important test in this unit. The
+        highest-ranked `cap` candidates are all status='open' (suppressed);
+        lower-ranked signatures are absent from the ledger. The pass MUST
+        still deposit the absent ones - a naive cap-before-dedup
+        implementation would starve them forever."""
+        cap = dir_mod.DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN
+        # `cap` clones with many live backing units (would sort first) but
+        # already open in the ledger - these must NOT occupy cap slots.
+        suppressed_clones = [
+            _clone(
+                path=f"/srv/git/suppressed{i}",
+                findings=[_finding(kind="stale_behind_origin")],
+                backing_units=[{"unit": f"u{i}", "field": "x", "scope": "y", "live": True, "type": "z"}],
+            )
+            for i in range(cap)
+        ]
+        # A few clones with no backing units (sort last) that are genuinely
+        # absent from the ledger - these must still get deposited.
+        absent_clones = [
+            _clone(path=f"/srv/git/absent{i}", findings=[_finding(kind="stale_behind_origin")])
+            for i in range(2)
+        ]
+        status = _status(suppressed_clones + absent_clones)
+        prior_high_keys = {(c["path"], "stale_behind_origin") for c in status["clones"]}
+
+        ledger = {
+            dir_mod.compute_signature(c["path"], "stale_behind_origin"): {
+                "gem_id": "gem-existing", "status": "open",
+                "first_seen": "2026-08-01T00:00:00+00:00", "last_seen": "2026-08-01T00:00:00+00:00",
+                "times_seen": 1, "staled_at": None, "clone_path": c["path"],
+                "finding_kind": "stale_behind_origin",
+            }
+            for c in suppressed_clones
+        }
+
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "diagnose_finding", return_value=(dir_mod._degrade(_finding()), "mechanical")),
+            patch.object(dir_mod, "deposit_gem", return_value="gem-new"),
+            patch.object(dir_mod, "emit_provenance"),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value=ledger),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            actions = dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
+
+        deposited = [a for a in actions if a.startswith("deposited:")]
+        assert len(deposited) == 2
+        for c in absent_clones:
+            assert any(c["path"] in a for a in deposited)
+        assert not any(a.startswith("dropped:") for a in actions)
+
+    def test_suppressed_candidates_still_bump_times_seen(self):
+        """DoD-9: a suppressed candidate that consumed no cap slot still has
+        last_seen/times_seen updated."""
+        sig = dir_mod.compute_signature("/srv/git/foo", "stale_behind_origin")
+        ledger = {sig: {"gem_id": "gem-1", "status": "open",
+                         "first_seen": "2026-08-01T00:00:00+00:00", "last_seen": "2026-08-01T00:00:00+00:00",
+                         "times_seen": 1, "staled_at": None, "clone_path": "/srv/git/foo",
+                         "finding_kind": "stale_behind_origin"}}
+        clones = [_clone(path="/srv/git/foo", findings=[_finding(kind="stale_behind_origin")])]
+        status = _status(clones)
+        # Fresh (absent from prior_high_keys) so it is admitted at selection
+        # despite already being ledgered - exercising the "admitted but
+        # suppressed by would_deposit" path this DoD is about, not the
+        # separate "never admitted at all" case.
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value=ledger),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            dir_mod.run_repair_pass(status, prior_high_keys=set(), corrupt=False)
+        assert ledger[sig]["times_seen"] == 2
+        assert ledger[sig]["last_seen"] != "2026-08-01T00:00:00+00:00"
+
+    def test_dropped_counts_only_would_deposit_candidates(self):
+        """DoD-7: `dropped:N` counts only would-deposit candidates cut by
+        the cap - not suppressed ones."""
+        cap = dir_mod.DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN
+        # cap + 2 absent (would-deposit) candidates, plus 3 suppressed ones
+        # that must not inflate the dropped count.
+        would_clones = [
+            _clone(path=f"/srv/git/would{i}", findings=[_finding(kind="stale_behind_origin")])
+            for i in range(cap + 2)
+        ]
+        suppressed_clones = [
+            _clone(path=f"/srv/git/suppressed{i}", findings=[_finding(kind="stale_behind_origin")])
+            for i in range(3)
+        ]
+        status = _status(would_clones + suppressed_clones)
+        prior_high_keys = {(c["path"], "stale_behind_origin") for c in status["clones"]}
+        ledger = {
+            dir_mod.compute_signature(c["path"], "stale_behind_origin"): {
+                "gem_id": "gem-existing", "status": "open",
+                "first_seen": "2026-08-01T00:00:00+00:00", "last_seen": "2026-08-01T00:00:00+00:00",
+                "times_seen": 1, "staled_at": None, "clone_path": c["path"],
+                "finding_kind": "stale_behind_origin",
+            }
+            for c in suppressed_clones
+        }
+        with (
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "diagnose_finding", return_value=(dir_mod._degrade(_finding()), "mechanical")),
+            patch.object(dir_mod, "deposit_gem", return_value="gem-new"),
+            patch.object(dir_mod, "emit_provenance"),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value=ledger),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            actions = dir_mod.run_repair_pass(status, prior_high_keys=prior_high_keys, corrupt=False)
+        deposited = [a for a in actions if a.startswith("deposited:")]
+        assert len(deposited) == cap
+        assert any(a == "dropped:2" for a in actions)
+
+
+class TestOrderingUnderCap:
+    def test_ordering_deterministic(self):
+        """DoD-6: exempt first, then most live backing units, then unmapped
+        before mapped, then clone_path ascending."""
+        cap = 3
+        clones = [
+            # Not exempt, 0 live units, mapped, path z - should be last/dropped.
+            _clone(path="/srv/git/z-low", mapped=True, backing_units=[],
+                   findings=[_finding(kind="stale_behind_origin")]),
+            # Not exempt, 5 live units, mapped - ranks by live-count.
+            _clone(path="/srv/git/b-high", mapped=True,
+                   backing_units=[{"unit": f"u{i}", "field": "x", "scope": "y", "live": True, "type": "z"}
+                                  for i in range(5)],
+                   findings=[_finding(kind="stray_branch")]),
+            # Not exempt, 2 live units, unmapped - beats mapped clones with
+            # fewer live units but loses to b-high (5 > 2).
+            _clone(path="/srv/git/c-mid-unmapped", mapped=False,
+                   backing_units=[{"unit": "u", "field": "x", "scope": "y", "live": True, "type": "z"},
+                                  {"unit": "u2", "field": "x", "scope": "y", "live": True, "type": "z"}],
+                   findings=[_finding(kind="stray_branch")]),
+            # Exempt kind - always first regardless of live-unit count.
+            _clone(path="/srv/git/a-exempt", mapped=True, backing_units=[],
+                   findings=[_finding(kind="auto_recovery_restart_failed")]),
+        ]
+        status = _status(clones)
+        seen_order = []
+
+        def fake_propose(ledger, *, clone_path, finding, **kwargs):
+            seen_order.append(clone_path)
+            return "deposited:new"
+
+        with (
+            patch.object(dir_mod, "DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN", cap),
+            patch.object(dir_mod, "reconcile_terminal_gems"),
+            patch.object(dir_mod, "propose_repair", side_effect=fake_propose),
+            patch.object(dir_mod, "write_ledger"),
+            patch.object(dir_mod, "read_ledger", return_value={}),
+            patch.object(dir_mod, "escalate_stale_gems"),
+        ):
+            dir_mod.run_repair_pass(status, prior_high_keys=None, corrupt=False)
+
+        assert seen_order == [
+            "/srv/git/a-exempt", "/srv/git/b-high", "/srv/git/c-mid-unmapped",
+        ]
+
+
+class TestProvenanceFieldRename:
+    def test_no_signature_key_has_finding_signature_instead(self):
+        """DoD-12a: emit_provenance's payload must carry no key named
+        'signature' (Zephyr's recorder reads that as a cryptographic
+        signature and rejects unsigned deposits) and must carry
+        'finding_signature' with the dedup key instead."""
+        mock_recorder = MagicMock()
+        mock_get_recorder = MagicMock(return_value=mock_recorder)
+        fake_module = MagicMock(get_recorder=mock_get_recorder)
+        with patch("importlib.import_module", return_value=fake_module):
+            dir_mod.emit_provenance(
+                gem_id="gem-1", signature="dedup-key-abc", clone_path="/srv/git/foo", model="mechanical",
+            )
+        recorded = mock_recorder.record.call_args[0][0]
+        assert "signature" not in recorded
+        assert recorded["finding_signature"] == "dedup-key-abc"
 
 
 class TestNoPushover:

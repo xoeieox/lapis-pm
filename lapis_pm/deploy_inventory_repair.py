@@ -378,7 +378,12 @@ def emit_provenance(*, gem_id: str, signature: str, clone_path: str, model: str)
             "timestamp": _now_iso(),
             "schema_version": "lapis-provenance-v0",
             "gem_id": gem_id,
-            "signature": signature,
+            # D6: NOT "signature" — Zephyr's recorder reads that field name as a
+            # cryptographic signature and rejects any deposit that carries one
+            # without a matching pubkey_id (finding/deploy-inventory-repair-
+            # provenance-signature-field-collision-2026-08-08). This is the
+            # unit's own fix-class dedup key, not a crypto signature.
+            "finding_signature": signature,
             "clone_path": clone_path,
         }
         recorder.record(prov, store_kind="gem", key=gem_id)
@@ -414,6 +419,22 @@ def reconcile_terminal_gems(ledger: dict) -> None:
                 entry["status"] = "dismissed_fp"
 
 
+def would_deposit(ledger: dict, signature: str) -> bool:
+    """D1a's single shared dedup predicate: True when a candidate with this
+    signature would actually be deposited (no ledger entry yet, or the entry
+    was acked and this is a recurrence); False when it would be suppressed
+    (an open gem, or a dismissed false-positive).
+
+    This is the ONE predicate `propose_repair`'s own early-returns and the
+    `run_repair_pass` cap partition (D1a) both consult - never reimplemented
+    at either call site (DoD-10 pins them together).
+    """
+    entry = ledger.get(signature)
+    if entry is None:
+        return True
+    return entry.get("status") == "acked"
+
+
 def propose_repair(
     ledger: dict,
     *,
@@ -436,14 +457,11 @@ def propose_repair(
     entry = ledger.get(signature)
     now = _now_iso()
 
-    if entry is not None and entry.get("status") == "open":
+    if not would_deposit(ledger, signature):
         entry["last_seen"] = now
         entry["times_seen"] = entry.get("times_seen", 1) + 1
-        return "skip:still-open"
-
-    if entry is not None and entry.get("status") == "dismissed_fp":
-        entry["last_seen"] = now
-        entry["times_seen"] = entry.get("times_seen", 1) + 1
+        if entry.get("status") == "open":
+            return "skip:still-open"
         return "skip:dismissed-fp"
 
     recurred_after_ack = entry is not None and entry.get("status") == "acked"
@@ -631,23 +649,65 @@ def run_repair_pass(
     except Exception as exc:
         logger.warning("[deploy-inventory-repair] terminal-gem reconciliation failed: %s", exc)
 
-    fresh: list[dict] = []
+    # D1: admit a finding if ANY of exempt / fresh / never-put-in-front-of-a-
+    # human is true. `is_unproposed` is the backlog admit path - the whole
+    # point of this unit - and is deliberately a *union* with freshness, not
+    # a replacement for it (see spec D1: preserves the acked-recurrence case).
+    fresh: list[tuple] = []
     for clone in status.get("clones", []):
         for finding in clone.get("findings", []):
             if finding.get("severity") != "HIGH":
                 continue
             key = (clone.get("path"), finding.get("kind"))
             is_exempt = finding.get("kind") == "auto_recovery_restart_failed"
-            if not is_exempt and prior_high_keys is not None and key in prior_high_keys:
+            is_fresh = prior_high_keys is None or key not in prior_high_keys
+            signature = compute_signature(clone.get("path"), finding.get("kind", ""))
+            is_unproposed = signature not in ledger
+            if not (is_exempt or is_fresh or is_unproposed):
                 continue
             fresh.append((clone, finding))
 
-    dropped = 0
-    if len(fresh) > DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN:
-        dropped = len(fresh) - DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN
-        fresh = fresh[:DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN]
-
+    # D1a: partition BEFORE capping. A candidate that would_deposit()==False
+    # (an open gem or a dismissed_fp) must never consume a cap slot - under
+    # D1 the same chronic, suppressed candidates would otherwise occupy every
+    # top slot on every pass, forever, and the backlog would never drain.
+    would_list: list[tuple] = []
+    suppressed_list: list[tuple] = []
     for clone, finding in fresh:
+        signature = compute_signature(clone.get("path"), finding.get("kind", ""))
+        if would_deposit(ledger, signature):
+            would_list.append((clone, finding))
+        else:
+            suppressed_list.append((clone, finding))
+
+    # D3: deterministic ordering under the cap - exempt first, then most live
+    # backing units, then unmapped before mapped, then clone_path ascending.
+    # No model call participates; purely a function of the status dict.
+    def _sort_key(item: tuple) -> tuple:
+        clone, finding = item
+        is_exempt = finding.get("kind") == "auto_recovery_restart_failed"
+        live_count = sum(1 for bu in (clone.get("backing_units") or []) if bu.get("live"))
+        return (
+            0 if is_exempt else 1,
+            -live_count,
+            bool(clone.get("mapped")),
+            clone.get("path") or "",
+        )
+
+    would_list.sort(key=_sort_key)
+
+    dropped = 0
+    if len(would_list) > DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN:
+        dropped = len(would_list) - DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN
+        would_list = would_list[:DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN]
+
+    # Suppressed candidates still flow through propose_repair - it returns
+    # skip:still-open / skip:dismissed-fp and bumps last_seen/times_seen (D11
+    # staleness accounting, the Recurrence context block), but costs no GW
+    # call and no deposit, and never touched the cap above.
+    to_process = would_list + suppressed_list
+
+    for clone, finding in to_process:
         try:
             action = propose_repair(
                 ledger,

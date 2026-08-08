@@ -47,6 +47,15 @@ DEPLOY_INVENTORY_STALE_GEM_SECS = int(
 DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS = float(
     os.environ.get("DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS", "5")
 )
+DEPLOY_INVENTORY_REDIAGNOSE_MAX_ATTEMPTS = int(
+    os.environ.get("DEPLOY_INVENTORY_REDIAGNOSE_MAX_ATTEMPTS", "2")
+)
+
+# The two states a diagnosis can land in without a real model having produced
+# the content (D3/D5a) - "mechanical" (graceful-degrade) and "unknown" (a
+# real parsed diagnosis whose serving model name was not captured). Both are
+# re-diagnosis-eligible; a missing key (legacy, pre-this-unit entry) is not.
+_DEGRADED_MODEL_VALUES = ("mechanical", "unknown")
 
 # Distinguishable action string for a lock-contended skip (D3): the pass
 # deposits nothing and this must be visible in the actions list rather than
@@ -225,6 +234,17 @@ def diagnose_finding(
         return _degrade(finding), "mechanical"
 
     if not isinstance(text, str) or not text.strip():
+        # D1 (:228): the exact observed production signature - GW reached, a
+        # model selected (served_model_out populated), but no text returned.
+        # This was previously silent; the two silent paths must be
+        # distinguishable in the journal, so this message differs in wording
+        # from the :238 parse-failure one below.
+        logger.warning(
+            "[deploy-inventory-repair] GW produced no text for %s/%s "
+            "(served_model_out=%s)",
+            clone_path, finding.get("kind"),
+            served_model_out if served_model_out else "empty (model not reached)",
+        )
         return _degrade(finding), "mechanical"
 
     try:
@@ -235,6 +255,14 @@ def diagnose_finding(
         parsed = None
 
     if not isinstance(parsed, dict):
+        # D1 (:238): GW produced text, but it did not parse to an object -
+        # a different subsystem signature from the :228 empty-return case
+        # above. Truncate the repr - this is model output and may be long.
+        logger.warning(
+            "[deploy-inventory-repair] GW text did not parse to an object for %s/%s: %s",
+            clone_path, finding.get("kind"),
+            repr(text[:200]) if isinstance(text, str) else repr(text),
+        )
         return _degrade(finding), "mechanical"
 
     diag = {
@@ -340,12 +368,24 @@ def build_gem_payload(
 ) -> dict:
     kind = finding.get("kind", "?")
     name = Path(clone_path).name
+    # D4: when the diagnostician never ran (uncertain=True, set by _degrade),
+    # say so plainly rather than silently repeating finding["detail"] a third
+    # time (it is already the first Symptom line and the gem's `ask`).
+    # Symptom, Stakes, ask and options are unchanged either way - they are
+    # mechanical and correct under degrade.
+    if diagnosis.get("uncertain"):
+        diagnosis_lines = [
+            "No model diagnosis was obtained - this restates the symptom "
+            "because the diagnostician returned nothing.",
+        ]
+    else:
+        diagnosis_lines = [diagnosis.get("root_cause", "")]
     context = [
         {"label": "Symptom", "lines": [
             finding.get("detail", ""),
             f"clone={clone_path} mapped={mapped} branch={branch} behind={commits_behind}",
         ]},
-        {"label": "Diagnosis", "lines": [diagnosis.get("root_cause", "")]},
+        {"label": "Diagnosis", "lines": diagnosis_lines},
         {"label": "Suggested direction", "lines":
             [diagnosis.get("suggested_direction", "")] + list(diagnosis.get("affected_files") or [])},
         {"label": "Stakes", "lines": [stakes_line]},
@@ -518,11 +558,23 @@ def propose_repair(
         "staled_at": None,
         "clone_path": clone_path,
         "finding_kind": finding.get("kind"),
+        # D3: the diagnosis's own model_used, so a later pass can tell a
+        # degraded/unattributed diagnosis apart from a real one, and legacy
+        # entries (written before this landed) are recognisably absent this
+        # key rather than silently defaulted to "degraded" (D3, DoD-5).
+        "diagnosis_model": model_used,
+        "rediagnose_attempts": 0,
     }
 
     emit_provenance(gem_id=gem_id, signature=signature, clone_path=clone_path, model=model_used)
 
-    return "deposited:recurred-after-ack" if recurred_after_ack else "deposited:new"
+    # D2: a pass where every diagnosis degraded must never be
+    # indistinguishable from a healthy pass. `deposited:new` remains a
+    # prefix of the degraded variant so existing greps and prior tests hold.
+    base_action = "deposited:recurred-after-ack" if recurred_after_ack else "deposited:new"
+    if diagnosis.get("uncertain"):
+        return f"{base_action}:degraded"
+    return base_action
 
 
 def propose_corrupt_status() -> str | None:
@@ -782,6 +834,11 @@ def _run_repair_pass_locked(
     # call and no deposit, and never touched the cap above.
     to_process = would_list + suppressed_list
 
+    # D2: count diagnoses attempted vs degraded this pass, for the summary
+    # line below - grepping is not the only way this must be visible.
+    diagnosed_count = 0
+    degraded_count = 0
+
     for clone, finding in to_process:
         try:
             action = propose_repair(
@@ -794,6 +851,10 @@ def _run_repair_pass_locked(
                 backing_units=clone.get("backing_units") or [],
             )
             if action:
+                if action.startswith("deposited:"):
+                    diagnosed_count += 1
+                    if action.endswith(":degraded"):
+                        degraded_count += 1
                 actions.append(f"{action}:{clone.get('path')}:{finding.get('kind')}")
         except Exception as exc:
             logger.warning(
@@ -809,6 +870,57 @@ def _run_repair_pass_locked(
         )
         actions.append(f"dropped:{dropped}")
 
+    logger.info(
+        "[deploy-inventory-repair] %d of %d diagnoses degraded this pass",
+        degraded_count, diagnosed_count,
+    )
+
+    # D5a/D5: re-diagnose bounded, budget-limited candidates. Fresh findings
+    # win the cap - re-diagnosis only spends slots `would_list` left behind.
+    leftover_slots = DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN - len(would_list)
+    if leftover_slots > 0:
+        # HIGH-finding lookup for this pass's status dict - D5a requires the
+        # candidate's (clone_path, finding_kind) still appear as a HIGH
+        # finding here; a resolved fix-class must not be re-diagnosed. This
+        # also supplies the clone/finding dicts diagnose_finding needs - never
+        # reconstructed from the ledger entry, which does not carry enough.
+        high_lookup: dict = {}
+        for clone in status.get("clones", []):
+            for finding in clone.get("findings", []):
+                if finding.get("severity") != "HIGH":
+                    continue
+                high_lookup[(clone.get("path"), finding.get("kind"))] = (clone, finding)
+
+        candidates: list[tuple] = []
+        for signature in sorted(ledger.keys()):
+            entry = ledger[signature]
+            if entry.get("status") != "open":
+                continue
+            if entry.get("diagnosis_model") not in _DEGRADED_MODEL_VALUES:
+                continue  # absent (legacy) or already a real model - not eligible
+            if entry.get("rediagnose_attempts", 0) >= DEPLOY_INVENTORY_REDIAGNOSE_MAX_ATTEMPTS:
+                continue
+            if entry.get("staled_at"):
+                continue
+            match = high_lookup.get((entry.get("clone_path"), entry.get("finding_kind")))
+            if match is None:
+                continue
+            candidates.append((signature, entry, match[0], match[1]))
+            if len(candidates) >= leftover_slots:
+                break
+
+        for signature, entry, clone, finding in candidates:
+            try:
+                action = _rediagnose_one(ledger, signature, entry, clone, finding)
+                if action:
+                    actions.append(f"{action}:{entry.get('clone_path')}:{entry.get('finding_kind')}")
+            except Exception as exc:
+                logger.warning(
+                    "[deploy-inventory-repair] re-diagnosis failed for %s/%s (non-fatal): %s",
+                    entry.get("clone_path"), entry.get("finding_kind"), exc,
+                )
+                actions.append(f"redx:error:{entry.get('clone_path')}:{entry.get('finding_kind')}")
+
     try:
         escalate_stale_gems(ledger)
     except Exception as exc:
@@ -816,3 +928,90 @@ def _run_repair_pass_locked(
 
     write_ledger(ledger)
     return actions
+
+
+def _rediagnose_one(ledger: dict, signature: str, entry: dict, clone: dict, finding: dict) -> str | None:
+    """Leg 3 (D5): re-run diagnose_finding for one D5a-selected candidate.
+
+    Deposit-then-supersede ordering (mandatory, D5): if the new deposit
+    fails, the old gem is never touched - a finding must never vanish from
+    the Desk. If supersede then returns False (409 - the old gem was
+    terminalised by someone else in the residual race D5a's trickster
+    condition names), the link is abandoned and the ledger entry is left
+    alone; the new gem is a harmless, unlinked duplicate ("deposit-then-
+    supersede fails safe" per spec) rather than a lost finding.
+    """
+    clone_path = entry.get("clone_path")
+    finding_kind = entry.get("finding_kind")
+
+    diagnosis, model_used = diagnose_finding(
+        clone_path, finding, mapped=bool(clone.get("mapped")),
+        commits_behind=clone.get("commits_behind"), branch=clone.get("branch"),
+        backing_units=clone.get("backing_units") or [],
+    )
+
+    if model_used in _DEGRADED_MODEL_VALUES or diagnosis.get("uncertain"):
+        entry["rediagnose_attempts"] = entry.get("rediagnose_attempts", 0) + 1
+        logger.warning(
+            "[deploy-inventory-repair] re-diagnosis degraded again for %s/%s (attempt %d/%d)",
+            clone_path, finding_kind, entry["rediagnose_attempts"],
+            DEPLOY_INVENTORY_REDIAGNOSE_MAX_ATTEMPTS,
+        )
+        return "redx:degraded-again"
+
+    old_gem_id = entry.get("gem_id")
+    times_seen = entry.get("times_seen", 1)
+    stakes_line = build_stakes_line(
+        backing_units=clone.get("backing_units") or [], mapped=bool(clone.get("mapped")),
+        times_seen=times_seen,
+    )
+    payload = build_gem_payload(
+        clone_path=clone_path, finding=finding, mapped=bool(clone.get("mapped")),
+        branch=clone.get("branch"), commits_behind=clone.get("commits_behind"),
+        diagnosis=diagnosis, stakes_line=stakes_line, times_seen=times_seen,
+    )
+    # D5(4): supersede carries no linkage field - this line is the only place
+    # the successor relationship can live, or the Desk history is
+    # unreconstructable.
+    payload["context"].append({
+        "label": "Supersedes",
+        "lines": [f"supersedes gem {old_gem_id} (re-diagnosis of a degraded diagnosis)"],
+    })
+
+    new_gem_id = deposit_gem(payload)
+    if new_gem_id is None:
+        logger.warning(
+            "[deploy-inventory-repair] re-diagnosis deposit failed for %s/%s; "
+            "old gem %s left in place, will retry",
+            clone_path, finding_kind, old_gem_id,
+        )
+        return "redx:deposit-failed"
+
+    from . import brief_gem as _brief_gem
+    superseded = _brief_gem._call_supersede_endpoint(
+        old_gem_id,
+        reason=(
+            "deploy-inventory-repair-degrade-visibility-and-rediagnose-v0: "
+            f"superseded by re-diagnosis, new gem {new_gem_id}"
+        ),
+        by="deploy-inventory-repair-proposer-v0",
+    )
+    if superseded is False:
+        # Trickster's condition (D5a): never retry into a 409. Abandon the
+        # link, leave the ledger entry alone - the new gem sits on the Desk
+        # unlinked but the finding is never lost.
+        logger.warning(
+            "[deploy-inventory-repair] supersede 409 for gem %s (already terminal); "
+            "abandoning re-diagnosis link, new gem %s left unlinked",
+            old_gem_id, new_gem_id,
+        )
+        return "redx:supersede-abandoned"
+
+    emit_provenance(gem_id=new_gem_id, signature=signature, clone_path=clone_path, model=model_used)
+
+    entry["gem_id"] = new_gem_id
+    entry["diagnosis_model"] = model_used
+    entry["rediagnose_attempts"] = 0
+    entry["last_seen"] = _now_iso()
+
+    return "redx:superseded"

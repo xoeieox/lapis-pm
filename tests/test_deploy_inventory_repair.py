@@ -148,7 +148,10 @@ class TestDedupAndSelection:
                 ledger, clone_path="/srv/git/foo", finding=_finding(),
                 mapped=True, branch="main", commits_behind=5, backing_units=[],
             )
-        assert action == "deposited:recurred-after-ack"
+        # D2: diagnosis here is a graceful-degrade (uncertain=True), so the
+        # action carries the ":degraded" marker - "deposited:new" (here
+        # "deposited:recurred-after-ack") remains a prefix.
+        assert action == "deposited:recurred-after-ack:degraded"
         assert mock_deposit.called
         payload = mock_deposit.call_args[0][0]
         stakes_lines = payload["context"][3]["lines"]
@@ -492,7 +495,8 @@ class TestProvenance:
                 ledger, clone_path="/srv/git/foo", finding=_finding(),
                 mapped=True, branch="main", commits_behind=3, backing_units=[],
             )
-        assert action == "deposited:new"
+        # D2: this diagnosis is a graceful-degrade (uncertain=True).
+        assert action == "deposited:new:degraded"
         sig = dir_mod.compute_signature("/srv/git/foo", "stale_behind_origin")
         assert ledger[sig]["gem_id"] == "gem-1"
 

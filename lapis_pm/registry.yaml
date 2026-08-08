@@ -239,7 +239,17 @@ agents:
   reviewer_fresh_contractor:
     chub_bundles: []
     engine: local-reviewer
-    model: deepseek/deepseek-v4-flash
+    # Pin the DATED id, never the bare alias. Measured live through :8413 on
+    # 2026-08-08: the bare "deepseek/deepseek-v4-flash" alias 429s (3/3
+    # attempts), while "deepseek/deepseek-v4-flash-0731" returns 200 with a
+    # real completion. Independent of the 429, the dated id is also the one
+    # named by both ratified decisions
+    # (decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30,
+    # decision/gw-daytime-no-flips-2026-07-30-temporary-carveout-reviewer-seat-health-2026-08-07)
+    # and the one the approved quality bakeoff measured
+    # (HANDOFF-phala-0731-bakeoff-landed-2026-08-05). Do not "tidy" this back
+    # to the bare alias - it will start 429ing again.
+    model: deepseek/deepseek-v4-flash-0731
     backend_url: "http://127.0.0.1:8413"
     acquire_lease: false
     capture_meta: false

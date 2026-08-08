@@ -29,11 +29,14 @@ logger = logging.getLogger(__name__)
 
 from agents_core.room_paths import room_path
 
+from .file_lock import FileLockTimeout, file_lock
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _LEDGER_FILE = room_path('lapis_state') / "deploy-inventory-repair-ledger.json"
+_LEDGER_LOCK_FILE = room_path('lapis_state') / "deploy-inventory-repair-ledger.lock"
 
 DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN = int(
     os.environ.get("DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN", "5")
@@ -41,6 +44,14 @@ DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN = int(
 DEPLOY_INVENTORY_STALE_GEM_SECS = int(
     os.environ.get("DEPLOY_INVENTORY_STALE_GEM_SECS", str(7 * 24 * 3600))
 )
+DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS = float(
+    os.environ.get("DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS", "5")
+)
+
+# Distinguishable action string for a lock-contended skip (D3): the pass
+# deposits nothing and this must be visible in the actions list rather than
+# looking like a clean empty pass.
+LEDGER_LOCK_CONTENDED_ACTION = "skip:ledger-lock-contended"
 
 # Fixed signature for the corrupt-status meta-finding (D8) - no per-clone
 # signature applies, so it does not go through the D3 (clone_path, kind) ledger.
@@ -115,9 +126,17 @@ def read_ledger(path: Path | None = None) -> dict:
 
 def write_ledger(ledger: dict, path: Path | None = None) -> None:
     """Atomic write: write-to-temp-then-`os.replace`. Never a torn/partial file
-    even if interrupted mid-flight (Facets gate finding, mandatory - the PM
-    tick loop can in principle overlap a slow pass with a cooldown-expired
-    next one).
+    even if interrupted mid-flight (Facets gate finding, mandatory). This
+    guards readers against a torn file; it does not by itself serialise
+    concurrent read-modify-write. The reachable overlap is not two
+    timer-fired PM ticks (systemd's `OnUnitActiveSec` cannot re-fire while
+    `lapis-pm.service` - a `Type=oneshot` unit - is still running) but an
+    operator running `lapis-pm tick --all` by hand concurrently with the
+    timer, which starts a separate process outside systemd's job model.
+    Callers take the `_LEDGER_LOCK_FILE` flock (see `run_repair_pass` /
+    `propose_corrupt_status`) around their read-modify-write region to close
+    that window; this function's atomicity and that lock are orthogonal and
+    both required.
     """
     target = path or _LEDGER_FILE
     try:
@@ -511,7 +530,29 @@ def propose_corrupt_status() -> str | None:
     underlying corruption persists unresolved (fixed signature, no per-clone
     ledger entry applies). Uses the module-level ledger for its own dedup so
     it shares the same atomic-write path as the per-clone entries.
+
+    Takes `_LEDGER_LOCK_FILE` around its own read-modify-write region: this
+    is an independent writer from `run_repair_pass`, each with its own
+    in-memory ledger copy, so the two must be mutually exclusive across
+    processes (deploy-inventory-repair-ledger-lock-v0). On contention this
+    fails closed - deposits nothing, logs WARNING, returns the
+    distinguishable `LEDGER_LOCK_CONTENDED_ACTION` - never proceeds
+    unlocked.
     """
+    try:
+        with file_lock(_LEDGER_LOCK_FILE, DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS):
+            return _propose_corrupt_status_locked()
+    except FileLockTimeout:
+        logger.warning(
+            "[deploy-inventory-repair] ledger lock contended (path=%s, timeout=%ss); "
+            "skipping corrupt-status pass, depositing nothing",
+            _LEDGER_LOCK_FILE, DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS,
+        )
+        return LEDGER_LOCK_CONTENDED_ACTION
+
+
+def _propose_corrupt_status_locked() -> str | None:
+    """Body of `propose_corrupt_status`, run under the ledger lock."""
     ledger = read_ledger()
     entry = ledger.get(_CORRUPT_STATUS_SIGNATURE)
     now = _now_iso()
@@ -641,6 +682,40 @@ def run_repair_pass(
         except Exception as exc:
             logger.warning("[deploy-inventory-repair] corrupt-status path failed: %s", exc)
         return actions
+
+    # The read-modify-write below spans the propose loop, up to
+    # `DEPLOY_INVENTORY_REPAIR_MAX_PER_RUN * 240s` of `call_gw_agent` diagnosis
+    # calls in the worst case - minutes, not milliseconds. Taking the ledger
+    # lock across that whole region is deliberate (deploy-inventory-repair-
+    # ledger-lock-v0 D2): the only reachable contender is an operator running
+    # `lapis-pm tick --all` concurrently with the timer, and the correct
+    # behaviour for that second process is to do nothing, not to interleave a
+    # lost update. On contention this fails closed - deposits nothing, logs
+    # WARNING, returns the distinguishable `LEDGER_LOCK_CONTENDED_ACTION` -
+    # never proceeds unlocked.
+    try:
+        with file_lock(_LEDGER_LOCK_FILE, DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS):
+            actions.extend(_run_repair_pass_locked(status, prior_high_keys=prior_high_keys))
+    except FileLockTimeout:
+        logger.warning(
+            "[deploy-inventory-repair] ledger lock contended (path=%s, timeout=%ss); "
+            "skipping repair pass, depositing nothing",
+            _LEDGER_LOCK_FILE, DEPLOY_INVENTORY_LEDGER_LOCK_TIMEOUT_SECS,
+        )
+        actions.append(LEDGER_LOCK_CONTENDED_ACTION)
+
+    return actions
+
+
+def _run_repair_pass_locked(
+    status: dict,
+    *,
+    prior_high_keys: set | None,
+) -> list[str]:
+    """Body of `run_repair_pass`'s non-corrupt path, run under the ledger
+    lock. Read-modify-write region: `read_ledger()` through `write_ledger()`.
+    """
+    actions: list[str] = []
 
     ledger = read_ledger()
 

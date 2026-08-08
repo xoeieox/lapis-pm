@@ -1608,21 +1608,6 @@ def _reconcile_deploy_inventory() -> None:
 
         deploy_inventory.write_status_json(status)
 
-        if corrupt:
-            try:
-                from agents_core.notify import send_notification, Priority as _P
-                send_notification(
-                    message=(
-                        "prior deploy-inventory-status.json is present but unreadable; "
-                        "per-finding notification dedup is suppressed for this pass "
-                        "(falls back to the coarse per-pass cooldown as rate limit)."
-                    ),
-                    title="deploy-inventory: status file unreadable",
-                    priority=_P.HIGH,
-                )
-            except Exception:
-                pass
-
         for clone in status.get("clones", []):
             for finding in clone.get("findings", []):
                 if finding.get("severity") != "HIGH":
@@ -1631,32 +1616,22 @@ def _reconcile_deploy_inventory() -> None:
                     f"[deploy-inventory] HIGH: {clone['path']} {finding['kind']}: {finding['detail']}",
                     file=sys.stderr, flush=True,
                 )
-                if corrupt:
-                    continue
-                key = (clone["path"], finding["kind"])
-                # auto_recovery_restart_failed is exempt from the cross-pass dedup:
-                # it exists only because this unit's own automation pulled new code
-                # and then failed to restart the service — a strictly worse,
-                # unattended state, not passive drift a human was already pinged
-                # about. Every other HIGH kind still follows the 2026-07-22
-                # no-re-alert-floor ruling exactly (lapis-pm-deploy-inventory-
-                # notify-dedup-v0) — new-since-prior-snapshot pings once, then
-                # silent while unresolved.
-                if (
-                    finding["kind"] != "auto_recovery_restart_failed"
-                    and prior_high_keys is not None
-                    and key in prior_high_keys
-                ):
-                    continue
-                try:
-                    from agents_core.notify import send_notification, Priority as _P
-                    send_notification(
-                        message=finding["detail"],
-                        title=f"deploy-inventory: {finding['kind']}",
-                        priority=_P.HIGH,
-                    )
-                except Exception:
-                    pass
+
+        # deploy-inventory-repair-proposer-v0: replaces the Pushover-to-Erah
+        # relay (both the per-finding loop and the corrupt-status one-off) with
+        # Desk-gem deposits. Fault-isolated per finding — a deposit/diagnosis
+        # failure degrades to log+skip for that finding, never suppresses the
+        # write_status_json/cooldown-timestamp writes that follow.
+        try:
+            from . import deploy_inventory_repair
+
+            deploy_inventory_repair.run_repair_pass(
+                status, prior_high_keys=prior_high_keys, corrupt=corrupt,
+            )
+        except Exception as e:
+            logger.warning(
+                "[deploy-inventory] repair-proposer pass failed (non-fatal): %s", e,
+            )
     except Exception as e:
         logger.warning("[deploy-inventory] reconcile pass failed (non-fatal): %s", e)
         return

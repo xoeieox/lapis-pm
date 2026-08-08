@@ -2082,12 +2082,14 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
     # Compact corroboration summary for quick display in claude-view.
     # Full evidence-packet lives in the episodic entry; cache stores verdict+drift only.
     last_corroboration: dict | None = None
+    panel_starvation_summary: dict | None = None
     if has_real_verdict:
         pr_number = state.get("pr_number")
         if pr_number is not None:
             # Prefer tick-local cache (populated by _encode_gpu_results this same tick)
             # to avoid re-scanning episodic for data already in hand.
             corr = _tick_corr_cache.get((target_id, pr_number))
+            verdict_info = None
             if corr is None:
                 verdict_info = _last_review_verdict(target_id, pr_number)
                 if verdict_info:
@@ -2097,6 +2099,20 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
                     "verdict": corr.get("verdict"),
                     "drift_class": corr.get("drift_class"),
                 }
+            # Leg 1 legibility (DoD #4): surface starvation in the same
+            # compact cache claude-view already reads, without opening the
+            # verdict JSON. Additive — absent on verdicts that predate this.
+            if verdict_info is None:
+                verdict_info = _last_review_verdict(target_id, pr_number)
+            if verdict_info:
+                _pstarv = verdict_info.get("panel_starvation")
+                if _pstarv:
+                    panel_starvation_summary = {
+                        "starved": _pstarv.get("starved", False),
+                        "legs_down": _pstarv.get("legs_down", []),
+                        "confidence_raw": _pstarv.get("confidence_raw"),
+                        "confidence_attenuated": verdict_info.get("confidence"),
+                    }
 
     payload = {
         "pr_number": state["pr_number"],
@@ -2108,6 +2124,7 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
         "paused": _review_gate_paused(),
         "updated_at": _now_iso(),
         "last_corroboration": last_corroboration,
+        "panel_starvation": panel_starvation_summary,
     }
     _mem().set(key, json.dumps(payload),
                tags=["lapis-pm", "review-state"])
@@ -4557,6 +4574,24 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
     issues = verdict_info.get("issues", [])
 
     # ---------------------------------------------------------------------------
+    # Panel-starvation gate (R1, ratified 2026-08-08 — closed, not open for
+    # relitigation). Any corroboration leg down (local witness, corroboration,
+    # second node) drops this verdict to advisory: it may inform, but it may
+    # never block (hold_brief / review_exhausted_brief) and may never
+    # auto-dispatch a fixer retry on its own authority. This is the exact
+    # failure class that shipped PR #220's false HIGH finding at
+    # confidence=0.9 with all three legs down — see
+    # finding/reviewer-seat-false-high-finding-absence-from-diff-third-occurrence-2026-08-08.
+    # Checked before the audit gate: a starved verdict's issues never reach
+    # the fixable/needs-human branching below.
+    # ---------------------------------------------------------------------------
+    from . import panel_starvation as _panel_starvation
+    if _panel_starvation.verdict_is_starved(verdict_info):
+        cls.screen_verdict = verdict
+        cls.issues = issues
+        return Decision("advisory_brief", payload)
+
+    # ---------------------------------------------------------------------------
     # §4 Audit gate — drop unsubstantiated still_present regurgitation
     # Runs only when there are prior issues to audit (cycle ≥ 2, same mode).
     # ---------------------------------------------------------------------------
@@ -4907,6 +4942,20 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             parts = [f"local reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
             if corr_v:
                 parts.append(f"corroboration={corr_v}")
+            # Leg 1 legibility (DoD #4): a reader must see degradation without
+            # opening the verdict JSON. panel_starvation is additive — absent
+            # on verdicts written before this landed, so guard with .get.
+            _pstarv = verdict_info.get("panel_starvation") or {}
+            if _pstarv.get("starved"):
+                _legs_down = ", ".join(_pstarv.get("legs_down") or []) or "unknown"
+                _raw_conf = _pstarv.get("confidence_raw", "?")
+                parts.append(
+                    f"DEGRADED PANEL (legs down: {_legs_down}; raw confidence "
+                    f"{_raw_conf} attenuated to {conf}) — advisory only, not gated"
+                )
+            _refuted = verdict_info.get("refuted_absence_findings") or []
+            if _refuted:
+                parts.append(f"refuted absence claims={len(_refuted)}")
             reviewer_verdict_text = "; ".join(parts)
 
     # AC8: functional critic hook — fires when pm_verification == "agent-functional"
@@ -5326,6 +5375,99 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
         ],
     )
     return f"action:fixer_dispatched:source=retry:pr={pr_number}:cycle={cycle}"
+
+
+def _noop_retry_escalation_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/noop-retry-escalation/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+
+
+def _escalate_noop_retry_if_degraded(target_id: str, rec: dict, pr_num) -> str | None:
+    """Leg 3: escalate a no-op fixer_retry when the verdict that drove it was
+    degraded (starved panel, Leg 1) or carried a refuted absence claim (Leg 2).
+
+    That combination is strong evidence the verdict was false — the PR #220
+    incident is the worked example
+    (finding/reviewer-seat-false-high-finding-absence-from-diff-third-occurrence-2026-08-08):
+    the retry correctly found nothing to change and logged exactly this noop,
+    then the target sat at "reviewing cycle N/budget" with nothing scheduled
+    to advance it — indistinguishable from a stalled worker
+    (pattern-fixer-background-wait-stall) while having the opposite remedy: a
+    real stall has unaddressed valid issues and wants redispatch; this has
+    valid-looking invalid ones and wants a human overriding the verdict.
+
+    Reuses the existing outstanding-brief mechanism (R3) rather than
+    inventing a new state or surface — same shape as the
+    reviewer_infra_budget_exhausted worked example (pm_core.py :4395-area
+    decision, :7688-area action dispatch): a distinct named condition, an
+    idempotent marker so it fires exactly once per pr+cycle, and a
+    human-reachable escalation via brief.synthesize + _set_brief_outstanding
+    (the same call pm-pr-review already walks).
+
+    Returns the action string if an escalation fired, else None (nothing to
+    escalate — verdict was healthy and unrefuted — or already recorded).
+    """
+    if pr_num is None:
+        return None
+    try:
+        pr_number = pr_num if isinstance(pr_num, int) else int(pr_num)
+    except (TypeError, ValueError):
+        return None
+    cycle = rec.get("cycle", 1)
+
+    verdict_info = _review_verdict_for_cycle(target_id, pr_number, cycle)
+    if verdict_info is None:
+        return None
+
+    from . import panel_starvation as _panel_starvation
+    starved = _panel_starvation.verdict_is_starved(verdict_info)
+    refuted = verdict_info.get("refuted_absence_findings") or []
+    if not starved and not refuted:
+        return None
+
+    marker_key = _noop_retry_escalation_marker_key(target_id, pr_number, cycle)
+    if _mem().get(marker_key):
+        return None
+
+    reasons = []
+    if starved:
+        legs = ", ".join((verdict_info.get("panel_starvation") or {}).get("legs_down") or [])
+        reasons.append(f"panel starved (legs down: {legs or 'unknown'})")
+    if refuted:
+        reasons.append(f"{len(refuted)} absence claim(s) refuted against the PR-head file")
+    reason_text = "; ".join(reasons)
+
+    episodic.write_hold(
+        target_id,
+        f"PR #{pr_number} fixer retry (cycle {cycle}) made no code or description "
+        f"change, against a verdict that was {reason_text}. This is strong evidence "
+        f"the verdict was false, not that nothing is left to fix — a real stall has "
+        f"unaddressed valid issues, this has valid-looking invalid ones. Needs a "
+        f"human overriding the verdict, not a redispatch.",
+        extra_tags=[f"pm:pr={pr_number}", "pm:noop-retry-degraded-verdict"],
+    )
+    b = brief.synthesize(
+        target_id,
+        trigger=(
+            f"No-op fixer retry against a degraded verdict on PR #{pr_number} "
+            f"cycle {cycle} ({reason_text}) — human judgment needed"
+        ),
+        query=f"PR #{pr_number} no-op retry: verdict likely false ({reason_text})",
+        pr_number=pr_number,
+        notify=NotifyPriority.HIGH,
+    )
+    _set_brief_outstanding(target_id, b)
+    _mem().set(
+        marker_key,
+        json.dumps({
+            "target_id": target_id,
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "reasons": reasons,
+            "comment_id": b.comment_id,
+        }),
+        tags=["lapis-pm", "noop-retry-escalation"],
+    )
+    return f"action:noop_retry_degraded_verdict_brief:pr={pr_number}:cycle={cycle}:cid={b.comment_id}"
 
 
 def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
@@ -6406,6 +6548,19 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                             "pm:fixer-retry-noop",
                         ],
                     )
+                    # Leg 3: a no-op retry against a degraded/refuted verdict
+                    # is strong evidence the verdict was false, not that
+                    # there's nothing to fix. Escalate rather than leave the
+                    # target wedged with nothing scheduled to advance it.
+                    try:
+                        _escalate_noop_retry_if_degraded(target_id, rec, pr_num)
+                    except Exception as _esc_exc:
+                        episodic.write_observation(
+                            target_id,
+                            f"noop-retry escalation check skipped for PR #{pr_num}: "
+                            f"{type(_esc_exc).__name__}",
+                            extra_tags=["pm:noop-retry-escalation-skipped"],
+                        )  # best-effort; never fail verdict encoding
                 continue  # fixer_retry never falls to reviewer verdict path
             # fixer_retry without pr_number: fall through to GPU output file path
             # as defensive fallback (shouldn't happen in practice).
@@ -6576,6 +6731,55 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                         f"local witness pass skipped for PR #{pr_num}: {type(_wit_exc).__name__}",
                         extra_tags=["pm:local-witness-skipped"],
                     )  # best-effort; never fail verdict encoding
+
+                # Panel starvation + confidence attenuation (Leg 1). Additive —
+                # attaches "panel_starvation" and rewrites "confidence" to the
+                # attenuated value, keeping the raw value at
+                # panel_starvation.confidence_raw for audit. Never fails verdict
+                # encoding; a starved-detection error just skips the annotation
+                # (the raw verdict still ships, unattenuated — same as before
+                # this leg existed).
+                try:
+                    from . import panel_starvation as _panel_starvation
+                    _stored_dict3 = json.loads(stored_json)
+                    _panel_starvation.apply_panel_starvation(_stored_dict3)
+                    stored_json = json.dumps(_stored_dict3)
+                except Exception as _starv_exc:
+                    episodic.write_observation(
+                        target_id,
+                        f"panel-starvation check skipped for PR #{pr_num}: {type(_starv_exc).__name__}",
+                        extra_tags=["pm:panel-starvation-skipped"],
+                    )  # best-effort; never fail verdict encoding
+
+                # Absence-claim grounding (Leg 2). Checks any "X is not
+                # defined/missing/removed" finding against the full file at
+                # the PR head rather than the diff. Refuted findings are
+                # dropped from the actionable `issues` list and moved to
+                # `refuted_absence_findings` with their location; an
+                # unrunnable check leaves the finding actionable, marked
+                # unverified (R2) — never a fail-verdict-encoding condition.
+                try:
+                    from . import absence_ground as _absence_ground
+                    _pr_head_sha = None
+                    try:
+                        from agents_core.forgejo import get_pr as _get_pr
+                        _pr_int = pr_num if isinstance(pr_num, int) else int(pr_num)
+                        _pr_head_sha = ((_get_pr(rec.get("repo", ""), _pr_int) or {})
+                                        .get("head") or {}).get("sha")
+                    except Exception:
+                        _pr_head_sha = None
+                    _stored_dict4 = json.loads(stored_json)
+                    _absence_ground.ground_verdict_issues(
+                        _stored_dict4, rec.get("repo", ""), pr_num, _pr_head_sha,
+                    )
+                    stored_json = json.dumps(_stored_dict4)
+                except Exception as _ground_exc:
+                    episodic.write_observation(
+                        target_id,
+                        f"absence-claim grounding skipped for PR #{pr_num}: {type(_ground_exc).__name__}",
+                        extra_tags=["pm:absence-grounding-skipped"],
+                    )  # best-effort; never fail verdict encoding
+
                 result_tags = tags + [
                     f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
                     f"pm:pr={pr_num}",

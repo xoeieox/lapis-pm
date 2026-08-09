@@ -229,6 +229,17 @@ class TestCycleCountHelpers:
 
 class TestDecideForPr:
 
+    @pytest.fixture(autouse=True)
+    def _healthy_panel(self):
+        # These tests exercise _decide_for_pr's fixable/needs-human/clean/budget
+        # routing, not panel-starvation (Leg 1, covered by test_panel_starvation*.py).
+        # Their verdict fixtures predate the corroboration/witness blocks, so
+        # without this they'd all read as starved (absent block == down) and
+        # route to advisory_brief regardless of verdict content. Assume a
+        # healthy (fully-corroborated) panel here.
+        with patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False):
+            yield
+
     def test_held_path_dispatches_reviewer_before_hold_brief(self):
         """Held path → reviewer dispatched once first (lapis-pm-containment-held-paths-v0
         Leg 3), THEN hold_brief once the verdict is in — never skips the machine read."""
@@ -1584,6 +1595,14 @@ def _audit_gate_patches(
 
 class TestAuditGateDeltaClassification:
     """§6 Tests — reviewer same-mode delta classification audit gate."""
+
+    @pytest.fixture(autouse=True)
+    def _healthy_panel(self):
+        # Same rationale as TestDecideForPr._healthy_panel — these fixtures
+        # predate corroboration/witness blocks and test the audit gate, not
+        # panel starvation.
+        with patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False):
+            yield
 
     # -----------------------------------------------------------------------
     # Test 1: Cycle 1 — audit gate is a no-op

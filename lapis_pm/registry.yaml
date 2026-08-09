@@ -77,6 +77,14 @@ agents:
   # completed in 49s; starvation would have returned in 0.0s like spec_reviewer
   # did. Dropping the lease here would introduce a new failure mode on a quiet
   # box. See lapis-pm-spec-review-leg-hotfix-reconcile-v0 Change 4.
+  # absence_grounding (lapis-pm-reviewer-absence-grounding-rule-v0): flag-gated
+  # obligation block appended to the rendered system_template below, off by
+  # default. Ships false on both reviewer entries — merging this unit changes
+  # zero live behaviour. Parsed via the shaper's _bool_val (agents_core/
+  # shaper.py:68), same idiom used everywhere else a registry.yaml boolean is
+  # read. See finding/deepseek-vs-27b-reviewer-seat-bakeoff-outside-harness-
+  # 2026-08-08 for why this exists; flipping it to true is a separate,
+  # deferred decision pending the A2/A4 experiment this unit unlocks.
   reviewer:
     chub_bundles: []
     engine: local-reviewer
@@ -84,6 +92,7 @@ agents:
     capture_meta: false
     notify: true
     notify_policy: infra-only
+    absence_grounding: false
     system_template: |
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
@@ -140,7 +149,7 @@ agents:
         "issues": [{{ "severity": "low|med|high", "path": "...", "note": "..." }}],
         "confidence": 0.0-1.0
       }}
-      No prose outside the JSON.
+      No prose outside the JSON.{absence_grounding_block}
     timeout_s: 600
 
   # See the "reviewer" entry above: same dead-pin fix, same reasoning for why
@@ -152,6 +161,7 @@ agents:
     model: gravitywell-slot1
     capture_meta: false
     notify: false
+    absence_grounding: false
     system_template: &reviewer_fresh_system_template |
       You are reviewing PR {pr_number} in repo {repo} for spec:
 
@@ -211,7 +221,7 @@ agents:
         "issues": [{{ "severity": "low|med|high", "path": "...", "note": "..." }}],
         "confidence": 0.0-1.0
       }}
-      No prose outside the JSON.
+      No prose outside the JSON.{absence_grounding_block}
     timeout_s: 600
 
   # TOU-peak contractor seat for reviewer_fresh (lapis-pm-reviewer-peak-

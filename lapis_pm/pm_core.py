@@ -44,6 +44,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import yaml
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -86,7 +88,7 @@ try:
 except Exception:
     STARTUP_STALE_GRACE_S = 300  # type: ignore
 
-from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
+from agents_core.shaper import Shaper, DispatchResult as _DispatchResult, _bool_val  # noqa: F401
 
 try:
     from agents_core.room_paths import room_path, room_str
@@ -132,6 +134,76 @@ _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 # kill-switch, verdict decode, output-file processing) or dispatches routed
 # to it silently fall outside all of that accounting.
 _REVIEWER_AGENT_TYPES = ("reviewer", "reviewer_fresh", "reviewer_fresh_contractor")
+
+# lapis-pm-reviewer-absence-grounding-rule-v0: flag-gated obligation block,
+# rendered into the reviewer/reviewer_fresh system_template only when the
+# registry's absence_grounding field is true (default false — see
+# registry.yaml). Reference wording is the 2026-08-08 bakeoff prompt
+# (finding/deepseek-vs-27b-reviewer-seat-bakeoff-outside-harness-2026-08-08),
+# adapted: the lapis reviewer dispatch runs inside a worktree already
+# checked out to the PR head, so the command form is the grep tool or
+# `git grep` without a ref, not the bakeoff's branch-qualified form.
+ABSENCE_GROUNDING_BLOCK = (
+    "\n\n"
+    "## HARD RULE — grounding absence claims\n\n"
+    "Any finding of the form \"X is not defined\", \"X is never called\", "
+    "\"X is not wired in\", \"I could not confirm X exists\", or \"there is "
+    "no handler for X\" is INVALID unless you first run an explicit search "
+    "over the FULL BRANCH and quote its output.\n\n"
+    "Rules that follow from this:\n"
+    "- A symbol being absent from the DIFF does not mean it is absent from "
+    "the CODEBASE.\n"
+    "- A symbol's definition and its call site are frequently hundreds of "
+    "lines apart and in different hunks. Read the whole file before "
+    "concluding anything is unwired.\n"
+    "- If your search returns any hit you did not expect, the finding is "
+    "withdrawn.\n"
+    "- For every absence-style finding you report, include the exact "
+    "command you ran and its output in the issue's `evidence` field "
+    "(optional on every other issue; required here). No evidence, no "
+    "finding.\n\n"
+    "Use your grep tool, or `git grep` (no ref needed — you are already "
+    "checked out to the branch head), to run the search. A failed or "
+    "errored search is not evidence of absence; do not report the finding "
+    "if the search itself failed.\n"
+)
+
+
+def _absence_grounding_enabled(agent_type: str) -> bool:
+    """Read the flag-gated absence_grounding field for a reviewer registry entry.
+
+    Reads registry.yaml directly rather than through _SHAPER.get_agent —
+    ShapedAgent (agents_core/shaper.py) doesn't carry ad-hoc fields, only the
+    ones it explicitly parses. Value is parsed through the existing shaper
+    boolean parser (_bool_val, agents_core/shaper.py:68) rather than a new
+    ad-hoc truthiness check, per DoD 1.
+
+    reviewer_fresh_contractor has no field of its own — it shares the
+    reviewer_fresh system_template via YAML anchor (registry.yaml), so its
+    flag state is looked up under the "reviewer_fresh" family name by the
+    caller (see _absence_grounding_block_for).
+    """
+    try:
+        raw = yaml.safe_load((Path(__file__).parent / "registry.yaml").read_text()) or {}
+        body = (raw.get("agents") or {}).get(agent_type) or {}
+        return _bool_val(body.get("absence_grounding", False))
+    except Exception:
+        return False
+
+
+def _absence_grounding_block_for(agent_type: str) -> str:
+    """Return the rendered {absence_grounding_block} var value for a reviewer dispatch.
+
+    Empty string when the flag is off (or agent_type isn't a reviewer seat at
+    all) — this is what keeps the flag-off render byte-identical to today's
+    template (DoD 2). reviewer_fresh_contractor maps to the "reviewer_fresh"
+    family flag since it shares that template and carries no field of its own.
+    """
+    if agent_type not in _REVIEWER_AGENT_TYPES:
+        return ""
+    family = "reviewer_fresh" if agent_type in ("reviewer_fresh", "reviewer_fresh_contractor") else "reviewer"
+    return ABSENCE_GROUNDING_BLOCK if _absence_grounding_enabled(family) else ""
+
 
 # Review-gate loop constants
 REVIEW_GATE_THRESHOLD = 40          # local reviewer (reviewer/reviewer_fresh seat) calls before soft-pause
@@ -2513,6 +2585,7 @@ def force_dispatch(
         "existing_branch": existing_branch,
         "base_branch": base_branch,
         "intent_block": _intent_artifact.dispatch_block(target_id),
+        "absence_grounding_block": _absence_grounding_block_for(agent_type),
     }
     if agent_type == "reviewer":
         vars_["prior_review"] = prior_review_text
@@ -5151,6 +5224,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "existing_branch": existing_branch,
         "base_branch": base_branch,
         "intent_block": _intent_artifact.dispatch_block(target_id),
+        "absence_grounding_block": _absence_grounding_block_for(agent_type),
     }
 
     # Get the diff for the reviewer prompt

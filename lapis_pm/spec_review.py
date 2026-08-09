@@ -75,6 +75,21 @@ _REPO_RE = re.compile(
     re.MULTILINE,
 )
 
+# **Consumer:** — anchored spec-header contract, alongside Target ID / Repo /
+# Authority above (lapis-pm-gate-consumer-criterion-v0, enforcing ratified
+# intent-contract entry C7: "A new autonomous producer be built without an
+# identified consumer" MUST NOT happen). Free text, not kebab-case-in-backticks
+# — see _CONSUMER_RE / _consumer_criterion_check below for the parser and the
+# admission logic (missing / empty / reject-list token / self-referential all
+# produce a blocking gate finding; anything else passes).
+#
+#   Good value:     **Consumer:** the nightly briefing pipeline reads this
+#                    report's output and surfaces it in the morning digest.
+#   Rejected value:  **Consumer:** TBD                    (reject-list token)
+#   Also rejected:   **Consumer:** `<this-spec's-own-target-id>`
+#                    (self-referential — DoD-3b: names only the thing the spec
+#                    is building, not a reader distinct from it)
+
 _POLL_CADENCE_S = 10  # fixed per Invariant 8
 _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT = 900  # seconds; longer than a normal ~12-min review
 _ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
@@ -199,6 +214,11 @@ class SpecReviewBrief:
     # NOT threaded (deferred at the review gate — see spec_review.py's render site).
     grounding_resolved_sha: str = ""
     grounding_age_days: int | None = None
+    # C7 admission criterion (lapis-pm-gate-consumer-criterion-v0): deterministic,
+    # no-model-call check on the spec's own anchored **Consumer:** header line.
+    # "ok" | "blocking". consumer_criterion_finding is empty iff status == "ok".
+    consumer_criterion_status: str = "ok"
+    consumer_criterion_finding: str = ""
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -383,6 +403,94 @@ def _parse_spec_verification(spec_path: Path) -> str:
     except OSError:
         return "pm-live-test"
     return _parse_spec_verification_text(text)
+
+
+# ---------------------------------------------------------------------------
+# C7 admission criterion (lapis-pm-gate-consumer-criterion-v0)
+#
+# C7 MUST NOT - A new autonomous producer be built without an identified
+# consumer. Deterministic, no-model-call check on the spec's own anchored
+# header block (same first-50-lines window as Target ID / Repo / Authority).
+# Fail-loud, never fail-closed: every branch below returns an explicit status;
+# there is no silent pass-through when the header is absent or malformed.
+# ---------------------------------------------------------------------------
+
+_CONSUMER_RE = re.compile(
+    r"^\*\*Consumer:\*\*[ \t]*(.*?)\s*$",
+    re.MULTILINE,
+)
+
+# Case-insensitive exact-match tokens (never substring/fuzzy — DoD-3). "self",
+# "general" and "all" added on the Mirror Council's ruling, 2026-08-09.
+_CONSUMER_REJECT_TOKENS: frozenset[str] = frozenset({
+    "n/a", "na", "none", "tbd", "unknown", "future work",
+    "self", "general", "all", "everyone", "",
+})
+
+C7_TEXT = (
+    "C7 MUST NOT - A new autonomous producer be built without an identified consumer."
+)
+
+
+def _consumer_normalize(value: str) -> str:
+    """Lowercase, strip surrounding backticks/whitespace, collapse internal
+    whitespace — used for reject-list matching (DoD-3)."""
+    v = value.strip().strip("`").strip()
+    v = re.sub(r"\s+", " ", v)
+    return v.lower()
+
+
+def _consumer_bare_alnum(value: str) -> str:
+    """Strip everything but lowercase alnum. Used to compare a Consumer value
+    against the spec's own target_id (DoD-3b) regardless of formatting
+    differences (backticks, hyphens, case) that would defeat a literal match."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _consumer_criterion_check(spec_text: str, target_id: str) -> dict:
+    """Deterministic C7 admission check against the spec's anchored header block.
+
+    Returns {"status": "ok", "raw_value": <str>} when a substantive, distinct
+    consumer is named, or {"status": "blocking", "reason": <tag>, "raw_value":
+    <str|None>} when the header is missing, empty, a reject-list token, or
+    names only the producer the spec itself creates.
+    """
+    first_50 = "\n".join(spec_text.splitlines()[:50])
+    m = _CONSUMER_RE.search(first_50)
+    if not m:
+        return {"status": "blocking", "reason": "missing", "raw_value": None}
+
+    raw_value = m.group(1)
+    normalized = _consumer_normalize(raw_value)
+    if not normalized:
+        return {"status": "blocking", "reason": "empty", "raw_value": raw_value}
+    if normalized in _CONSUMER_REJECT_TOKENS:
+        return {"status": "blocking", "reason": "trivial-non-responsive", "raw_value": raw_value}
+    if _consumer_bare_alnum(normalized) == _consumer_bare_alnum(target_id):
+        return {"status": "blocking", "reason": "self-referential", "raw_value": raw_value}
+    return {"status": "ok", "raw_value": raw_value}
+
+
+def _consumer_criterion_finding_text(spec_path: Path, result: dict) -> str:
+    """Render the blocking finding: states C7 verbatim and cites the spec's own
+    missing/rejected line (spec §3), so the author sees the rule, not a parse error."""
+    reason = result.get("reason")
+    reason_text = {
+        "missing": f"no `**Consumer:**` line found in the anchored header of {spec_path}",
+        "empty": f"`**Consumer:**` line in {spec_path} is empty",
+        "trivial-non-responsive": (
+            f"`**Consumer:**` line in {spec_path} reads {result.get('raw_value')!r} — "
+            "a trivially non-responsive value, not an identified consumer"
+        ),
+        "self-referential": (
+            f"`**Consumer:**` line in {spec_path} names only the producer this spec "
+            f"builds ({result.get('raw_value')!r}) — not a reader distinct from it"
+        ),
+    }.get(reason, f"`**Consumer:**` line in {spec_path} does not identify a consumer")
+    return (
+        f"**{C7_TEXT}**\n\n{reason_text}. Add a `**Consumer:**` line naming who or "
+        "what reads this producer's output, distinct from the producer itself."
+    )
 
 
 def _synth_target_id(parsed_target_id: str) -> str:
@@ -1592,6 +1700,7 @@ def _build_brief(
     grounding_reason: str = "",
     grounding_resolved_sha: str = "",
     grounding_age_days: int | None = None,
+    consumer_criterion: dict | None = None,
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
@@ -1689,6 +1798,18 @@ def _build_brief(
         authority=authority,
     )
 
+    # C7 admission criterion: a blocking finding forces the recommendation off
+    # "proceed-to-bind" regardless of what Facets/Council concluded — this gate
+    # surface is deterministic and never deferred to model judgment (DoD-2).
+    # A more severe existing recommendation (shape-with-Erah, incomplete, ...)
+    # is left as-is; the finding still renders below either way.
+    consumer_status = (consumer_criterion or {}).get("status", "ok")
+    consumer_finding = ""
+    if consumer_status == "blocking":
+        consumer_finding = _consumer_criterion_finding_text(spec_path, consumer_criterion)
+        if recommendation == "proceed-to-bind":
+            recommendation = "amend-spec"
+
     return SpecReviewBrief(
         spec_path=spec_path,
         target_id=parsed_target_id,
@@ -1732,6 +1853,8 @@ def _build_brief(
         grounding_reason=grounding_reason,
         grounding_resolved_sha=grounding_resolved_sha,
         grounding_age_days=grounding_age_days,
+        consumer_criterion_status=consumer_status,
+        consumer_criterion_finding=consumer_finding,
     )
 
 
@@ -1855,6 +1978,15 @@ def format_brief(brief: SpecReviewBrief) -> str:
     if degraded_legs:
         legs_str = ", ".join(degraded_legs)
         degraded_summary = f"\n⚠️ DEGRADED: 1+ leg fell off GravityWell to paid Claude ({legs_str}).\n"
+
+    # C7 admission criterion (lapis-pm-gate-consumer-criterion-v0) — blocking
+    # finding rendered unmissably; never a silent pass. See
+    # _consumer_criterion_check / _consumer_criterion_finding_text.
+    consumer_criterion_banner = ""
+    if brief.consumer_criterion_status == "blocking":
+        consumer_criterion_banner = (
+            f"\n## ⚠️ C7 — Consumer criterion (BLOCKING)\n{brief.consumer_criterion_finding}\n"
+        )
 
     # INFRA banner — rendered when council leg failed for a known infra reason
     infra_banner = ""
@@ -2110,7 +2242,7 @@ verdict from it. See raw output below for what the model actually said.
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
 **Grounding:** {brief.grounding_status}{grounding_reason_str}
-{voicing_section}{degraded_summary}{infra_banner}{facets_section}{reference_section}{gw_section}
+{voicing_section}{degraded_summary}{consumer_criterion_banner}{infra_banner}{facets_section}{reference_section}{gw_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -2607,6 +2739,11 @@ def run_spec_review(
 
     # 3. Read full spec text
     spec_text = spec_path.read_text(encoding="utf-8")
+
+    # 3b. C7 admission criterion (lapis-pm-gate-consumer-criterion-v0): deterministic,
+    #     evaluated once here and threaded into the brief regardless of what
+    #     Facets/Council conclude — see _build_brief's override of "proceed-to-bind".
+    consumer_criterion = _consumer_criterion_check(spec_text, parsed_target_id)
 
     # 4. Load invariant context
     invariant_context = _load_invariant_context(repo)
@@ -3225,4 +3362,5 @@ def run_spec_review(
         grounding_reason=grounding_reason,
         grounding_resolved_sha=grounding_resolved_sha,
         grounding_age_days=grounding_age_days,
+        consumer_criterion=consumer_criterion,
     )

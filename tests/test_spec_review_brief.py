@@ -892,3 +892,89 @@ def test_format_brief_renders_per_stance_citation_state(tmp_path):
     # The dead `verified` key branch is explicitly out of scope — must remain
     # 'inferred' since StanceRecord carries no 'verified' key.
     assert "inferred" in output
+
+
+# ---------------------------------------------------------------------------
+# C7 consumer criterion wiring (lapis-pm-gate-consumer-criterion-v0)
+# ---------------------------------------------------------------------------
+
+def test_build_brief_consumer_criterion_blocking_overrides_proceed_to_bind(tmp_path):
+    """A blocking consumer-criterion finding forces the recommendation off
+    proceed-to-bind even when Facets/Council both signal clean (DoD-2)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=1.0,
+        consumer_criterion={"status": "blocking", "reason": "missing", "raw_value": None},
+    )
+    assert brief.combined_recommendation == "amend-spec"
+    assert brief.consumer_criterion_status == "blocking"
+    assert brief.consumer_criterion_finding
+    assert "C7" in brief.consumer_criterion_finding
+
+
+def test_build_brief_consumer_criterion_ok_does_not_downgrade(tmp_path):
+    """A passing consumer criterion never introduces a finding or moves the
+    recommendation (DoD-4: the criterion cannot pass by rejecting everything)."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=1.0,
+        consumer_criterion={"status": "ok", "raw_value": "the nightly briefing pipeline"},
+    )
+    assert brief.combined_recommendation == "proceed-to-bind"
+    assert brief.consumer_criterion_status == "ok"
+    assert brief.consumer_criterion_finding == ""
+
+
+def test_build_brief_consumer_criterion_defaults_to_ok_when_absent(tmp_path):
+    """Callers that don't pass consumer_criterion (legacy call sites) get the
+    safe default — no finding, no behavior change."""
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=1.0,
+    )
+    assert brief.consumer_criterion_status == "ok"
+    assert brief.combined_recommendation == "proceed-to-bind"
+
+
+def test_format_brief_renders_blocking_consumer_criterion(tmp_path):
+    """The blocking finding surfaces in the rendered verdict text (DoD-5 requires
+    this in a live gate run; this test asserts the render mechanism itself)."""
+    from lapis_pm.spec_review import format_brief
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n", encoding="utf-8")
+
+    brief = _build_brief(
+        reference_raw=_sonnet_raw("clean"),
+        council_raw=_council_raw("resolved"),
+        spec_path=spec,
+        parsed_target_id="my-tid",
+        repo="lapis-pm",
+        elapsed_s=1.0,
+        consumer_criterion={"status": "blocking", "reason": "missing", "raw_value": None},
+    )
+    output = format_brief(brief)
+    assert "C7" in output
+    assert "BLOCKING" in output
+    assert "amend-spec" in output

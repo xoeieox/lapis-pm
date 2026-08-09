@@ -14,15 +14,11 @@ and no error. A concrete model id is silently accepted by YAML and only
 fails at request time against a live server, so nothing short of a registry
 assertion catches a drift like this before it reaches production.
 
-`fixer_local` and `scout` carry the identical dead pin and are deliberately
-left unfixed by lapis-pm-spec-review-leg-hotfix-reconcile-v0 (neither is on
-the spec-review or merge path; `fixer_local`'s DEPRECATED status needs a
-decision that isn't this target's to make). They are marked xfail(strict)
-rather than excluded, per the spec-review gate's explicit mandate to
-preserve signal integrity and prevent silent reversion by future workers.
-A follow-up target must fix the pin (or delete the entry) for `fixer_local`
-and unpin `scout`; when that lands, these xfails will start XPASSing and
-CI will force the marks to be removed.
+`fixer_local` and `scout` carried the identical dead pin and were left
+unfixed by lapis-pm-spec-review-leg-hotfix-reconcile-v0 (neither was on
+the spec-review or merge path at the time). lapis-pm-stale-122b-model-pins-v0
+repinned both to `gravitywell-slot1`, so every local-reviewer / local-fixer
+entry now passes this assertion outright - no xfail marks remain.
 """
 from __future__ import annotations
 
@@ -38,9 +34,14 @@ REGISTRY_PATH = Path(__file__).parent.parent / "lapis_pm" / "registry.yaml"
 # swaps; a concrete model id does not.
 VALID_SLOT_ALIASES = {"gravitywell-slot1", "gravitywell-slot2"}
 
-# Found while applying this fix, deliberately raised rather than fixed here -
-# see the spec's "Two more entries carry the same dead pin" section.
-KNOWN_UNFIXED_DEAD_PIN = {"fixer_local", "scout"}
+# Non-GravityWell backends (third-party swarm/contractor seats) are exempt:
+# the alias/concrete-id defect this file guards against is specific to
+# vLLM's slot-serving model on GravityWell. A contractor seat's model field
+# is a literal id its own API expects (e.g. Phala's "deepseek/deepseek-v4-
+# flash") - there is no alias to pin to, and pinning one would just be
+# wrong. lapis-pm-reviewer-peak-contractor-route-v0 adds the first such
+# entry, reviewer_fresh_contractor, routed to the BRIX phala-test-key seat.
+NON_GRAVITYWELL_CONTRACTOR_AGENTS = {"reviewer_fresh_contractor"}
 
 _REGISTRY = yaml.safe_load(REGISTRY_PATH.read_text())
 _AGENTS = _REGISTRY["agents"]
@@ -51,26 +52,12 @@ LOCAL_AGENT_NAMES = sorted(
     if cfg.get("engine") in ("local-reviewer", "local-fixer")
 )
 
-
-def _model_alias_param(name):
-    marks = []
-    if name in KNOWN_UNFIXED_DEAD_PIN:
-        marks.append(
-            pytest.mark.xfail(
-                reason=(
-                    f"{name} still carries the dead gravitywell-122b pin - "
-                    "raised, not fixed, by lapis-pm-spec-review-leg-hotfix-"
-                    "reconcile-v0 (not on the spec-review or merge path). A "
-                    "follow-up target must decide fixer_local's fate and "
-                    "unpin scout."
-                ),
-                strict=True,
-            )
-        )
-    return pytest.param(name, id=name, marks=marks)
+GRAVITYWELL_AGENT_NAMES = sorted(
+    name for name in LOCAL_AGENT_NAMES if name not in NON_GRAVITYWELL_CONTRACTOR_AGENTS
+)
 
 
-@pytest.mark.parametrize("name", [_model_alias_param(n) for n in LOCAL_AGENT_NAMES])
+@pytest.mark.parametrize("name", GRAVITYWELL_AGENT_NAMES)
 def test_local_agent_model_is_slot_alias_not_concrete_id(name):
     model = _AGENTS[name].get("model")
     assert model in VALID_SLOT_ALIASES, (

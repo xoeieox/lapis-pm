@@ -301,24 +301,76 @@ def _held_path_check_live(target_id: str, pr_number: int, repo: str) -> tuple[bo
         return True, f"diff fetch error: {exc}"
 
 
+# Once-per-day re-alert after the first HIGH notification (lapis-pm-containment-held-
+# paths-v0 Leg 5). A decided gem blocked by the hold-authority or held-path gate leaves
+# mapping status "open" and is re-fetched every ~60s PM tick indefinitely — without a
+# cooldown that's a HIGH-priority Pushover every tick, forever, for as long as the PR
+# sits open. Mirrors _DEPLOY_CURRENCY_COOLDOWN_SECS's idiom in pm_core.py rather than
+# inventing a new one.
+_MANUAL_REQUIRED_RENOTIFY_COOLDOWN_SECS = 86400
+
+
 def _notify_and_observe_manual_required(
     target_id: str,
     pr_number: int | None,
     gem_id: str,
     reason: str,
 ) -> None:
-    """Send HIGH-priority Pushover + write observation when a manual merge is required."""
+    """Send Pushover + write observation when a manual merge is required.
+
+    Rate-limited: the first notification for a given gem fires at HIGH priority.
+    Further notifications within `_MANUAL_REQUIRED_RENOTIFY_COOLDOWN_SECS` are
+    suppressed from Pushover (the condition doesn't need to page every tick), but
+    the episodic observation is written on EVERY call regardless of cooldown — a
+    containment refusal that stops being reported is worse than one that repeats.
+    Once the cooldown lapses, notification resumes at NORMAL priority (a daily
+    reminder, not a repeated page) so the still-blocked condition stays visible.
+    """
+    from . import pm_core as _pm
+
     pr_str = f" PR #{pr_number}" if pr_number else ""
     msg = f"Brief-gem decided but needs your manual merge - {reason}"
     title_str = f"lapis-pm: brief-gem manual merge - {target_id}{pr_str}"
+
+    cooldown_key = f"pm:brief-gem-manual-notify-cooldown:{gem_id}"
+    priority = _NotifyPriority.HIGH
+    should_notify = True
     try:
-        send_notification(msg, title=title_str, priority=_NotifyPriority.HIGH)
+        mem = _pm._mem()
+        last_raw = mem.get(cooldown_key)
+        if last_raw:
+            last_ts = datetime.fromisoformat(last_raw["content"])
+            now_ts = datetime.now(last_ts.tzinfo)
+            if (now_ts - last_ts).total_seconds() < _MANUAL_REQUIRED_RENOTIFY_COOLDOWN_SECS:
+                should_notify = False
+            else:
+                # Cooldown lapsed and it's still blocked — degrade to a daily
+                # reminder rather than repeating the initial HIGH page.
+                priority = _NotifyPriority.NORMAL
     except Exception as exc:
-        logger.warning("brief-gem: notify failed: %s", exc)
+        logger.warning(
+            "brief-gem: manual-required cooldown read failed for gem %s "
+            "(failing open, notifying): %s", gem_id, exc,
+        )
+
+    if should_notify:
+        try:
+            send_notification(msg, title=title_str, priority=priority)
+        except Exception as exc:
+            logger.warning("brief-gem: notify failed: %s", exc)
+        try:
+            _pm._mem().set(
+                cooldown_key, datetime.now(timezone.utc).isoformat(),
+                tags=["lapis-pm", "brief-gem-manual-notify"],
+            )
+        except Exception as exc:
+            logger.warning("brief-gem: cooldown write failed for gem %s: %s", gem_id, exc)
+
     try:
         episodic.write_observation(
             target_id,
-            f"Brief-gem {gem_id} decided but manual merge required: {reason}",
+            f"Brief-gem {gem_id} decided but manual merge required: {reason}"
+            + ("" if should_notify else " (Pushover suppressed: renotify cooldown)"),
             extra_tags=["pm:brief-gem-manual-required", f"pm:gem={gem_id}"],
         )
     except Exception as exc:

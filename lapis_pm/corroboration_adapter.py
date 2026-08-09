@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -208,13 +209,25 @@ class _IdentifierSubstrate:
 # Adapter
 # ---------------------------------------------------------------------------
 
-_LLM_URL = "http://203.0.113.12:8081/v1/chat/completions"
+def _llm_url() -> str:
+    """Resolve the qwen-operator local-LLM endpoint.
+
+    Read at call time (not module load) so tests can monkeypatch.setenv - same
+    call-time-vs-import-time discipline as agents_core.llm._llamacpp_url().
+    Defaults to GravityWell; LOCAL_LLM_URL wins when set. StarHouse (the old
+    bare-literal default) kernel-panicked 2026-08-03 and is being held off
+    deliberately - see agents-core-local-llm-gw-repoint-v0.
+    """
+    return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
+
+
 _LLM_TIMEOUT = 45  # seconds; Haiku-scale call, should be fast
 _PROBE_TIMEOUT = 3   # seconds for connect probe before POST
 _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _LLM_TIMEOUT)
 
 # Node 2 — MacBook Pro M4 Max / Gemma-3-27b (MLX, port 8080)
-# Architecturally distinct from StarHouse Qwen; used for parallel corroboration.
+# Architecturally distinct from GravityWell Qwen (formerly StarHouse Qwen, repointed
+# 2026-08-05 after StarHouse's 2026-08-03 kernel panic); used for parallel corroboration.
 _NODE2_URL = "http://100.124.203.15:8080/v1/chat/completions"
 _NODE2_MODEL = "/Users/user/Tools/mlx-models/gemma-3-27b-it-4bit"
 _NODE2_TIMEOUT = 120  # MLX on M4 Max is slower than StarHouse llama.cpp; large prompts approach 60s
@@ -327,7 +340,7 @@ class LapisPMReviewerAdapter:
 
         try:
             import httpx
-            _url = node_url or _LLM_URL
+            _url = node_url or _llm_url()
             _timeout = node_timeout or _LLM_TIMEOUT
             _body: dict = {
                 "messages": [{"role": "user", "content": prompt}],

@@ -37,7 +37,21 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 TRAJECTORY_ROOT = room_path('trajectory')
 TARGETS_DIR = room_path('targets')
 ARC_DOCS_DIR = room_path('lapis_state')
-QWEN_MODEL = "qwen3.6-35b-a3b"
+
+
+def _qwen_model_provenance() -> str:
+    """Model name to stamp into rollup provenance ('model: ...' fields).
+
+    This is provenance/metadata text written into artifacts, not a request
+    payload field - call_llm() itself resolves its own endpoint/model. Report
+    what was actually used: LOCAL_LLM_MODEL when set, else the literal
+    "server-default" - stamping a hardcoded name here would be false the
+    moment the served model changes underneath. Never "unknown" (that reads
+    as ignorance; "server-default" truthfully records that model choice was
+    delegated to the server). Gate requirement, Mirror Council run
+    2026-08-05-101841-86891c.
+    """
+    return os.environ.get("LOCAL_LLM_MODEL", "server-default")
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -429,7 +443,7 @@ def _rollup_one_target(tid: str, payload: dict, out_dir: Path) -> Path | None:
         "tid": tid,
         "arc_doc_sha256": current_sha,
         "generated_at": _now_iso(),
-        "model": "dry-run" if _dry_run() else QWEN_MODEL,
+        "model": "dry-run" if _dry_run() else _qwen_model_provenance(),
         "one_liner": one_liner,
         "what_it_enables": what_it_enables,
     }
@@ -658,7 +672,7 @@ def rollup_weekly(week: str | None = None) -> Path:
         f"range_start: {range_start}\n"
         f"range_end: {range_end}\n"
         f"generated_at: {_now_iso()}\n"
-        f"model: {'dry-run' if _dry_run() else QWEN_MODEL}\n"
+        f"model: {'dry-run' if _dry_run() else _qwen_model_provenance()}\n"
         f"landed_count: {len(landed_in_week)}\n"
         f"in_flight_count: {len(in_flight)}\n"
         f"---\n\n"
@@ -772,7 +786,7 @@ def rollup_monthly(month: str | None = None) -> Path:
         range_start, range_end = _parse_month(month)
         out_path.write_text(
             f"---\nperiod: monthly\nrange_start: {range_start}\nrange_end: {range_end}\n"
-            f"generated_at: {_now_iso()}\nmodel: {'dry-run' if _dry_run() else QWEN_MODEL}\n"
+            f"generated_at: {_now_iso()}\nmodel: {'dry-run' if _dry_run() else _qwen_model_provenance()}\n"
             f"landed_count: 0\nin_flight_count: 0\n---\n\n"
             f"# Lapis trajectory — {month}\n\n*(No weekly digests available for this month.)*\n"
         )
@@ -795,7 +809,7 @@ def rollup_monthly(month: str | None = None) -> Path:
             weekly_bullets=all_bullets,
         )
         raw = _call_qwen(synth_prompt, _MONTHLY_SYNTH_SYSTEM)
-        model_used = QWEN_MODEL
+        model_used = _qwen_model_provenance()
 
     if raw is None:
         logger.warning("LLM returned None for monthly synthesis %s; skipping", month)

@@ -44,7 +44,10 @@ from agents_core.targets import TargetStore
 from . import episodic, brief, pm_core, land, chain as chain_mod, steer as steer_mod
 from . import node_identity
 from . import signed_directive
-from .spec_review import _parse_spec_authority_text, _parse_spec_verification_text
+from .spec_review import (
+    _parse_spec_authority_text,
+    _parse_spec_verification_text_guarded as _parse_spec_verification_text,
+)
 from .router_portfolio import emit_decision_kickoff, emit_decision_land
 from .backcaster.cli import cmd_backcaster, cmd_backcaster_quest
 from .research_quest import cmd_research_quest
@@ -624,6 +627,37 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def cmd_clear_reviewer_attempts(args) -> int:
+    """Sole escape hatch for a reviewer-attempt-ceiling pause. Deliberately
+    cheap: target_id only, no confirmation prompt, no metadata (Erah's
+    ruling — ceremony here inverts the point of a cheap, obvious clear).
+    Does NOT resume the target; follow with `lapis-pm resume <target_id>`.
+    """
+    cleared = pm_core.clear_reviewer_attempts(args.target_id)
+    print(f"Cleared {cleared} reviewer-attempt counter(s) for {args.target_id}")
+    print(f"If paused, resume separately with: lapis-pm resume {args.target_id}")
+    return 0
+
+
+def cmd_clear_dispatch(args) -> int:
+    """Leg 3 escape hatch for a stale-pending dispatch record. Deliberately
+    cheap: target_id only, no confirmation prompt. Flips every pending
+    dispatch record to failed; never touches the intention registry, which
+    is a separate wedge — see the reminder printed below unconditionally.
+    """
+    cleared = pm_core.clear_dispatch(args.target_id)
+    print(f"Cleared {cleared} pending dispatch record(s) for {args.target_id}")
+    # Unconditional, never suppressed — clearing a dispatch record and
+    # composting an intention are two independent pieces of state; both
+    # must be cleared or an operator can conclude the target is free when
+    # it is not (intention-registry-orphan-wedge).
+    print(
+        "Reminder: this does not touch the intention registry. If this "
+        "target also has a stuck intention, clear it separately."
+    )
+    return 0
+
+
 def cmd_tick(args) -> int:
     # Force-dispatch: bypass the normal decide path for smoke testing.
     if args.force_dispatch:
@@ -671,6 +705,8 @@ def cmd_status(args) -> int:
     print("=== review-gate ===")
     print(f"  counter:       {rg['counter']} / {rg['threshold']}")
     print(f"  paused:        {rg['paused']}")
+    print(f"  window:        {rg['window_oldest']} to {rg['window_newest']} ({rg['window_days']}d)")
+    print(f"  infra-nonruns: {rg['infra_nonruns']} (separate ledger)")
     if rg["paused"]:
         print('  → Resume with: lapis-pm review-gate resume --reason "..."')
     print()
@@ -704,6 +740,11 @@ def _print_target_status(t, explain: bool = False):
     dispatched = pm_core.load_dispatched(t.id)
     pending = [d for d in dispatched if d.get("status") == "pending"]
     print(f"  dispatched:    {len(dispatched)} total, {len(pending)} pending")
+    for d in pending:
+        age = pm_core._dispatch_age(d.get("ts"))
+        age_str = pm_core._format_age(age) if age is not None else "?"
+        print(f"    pending: gpu_id={d.get('gpu_id', 'unknown')} "
+              f"agent_type={d.get('agent_type', 'unknown')} age={age_str}")
     outstanding = pm_core.get_outstanding_brief(t.id)
     print(f"  outstanding:   {outstanding or '(none)'}")
 
@@ -721,7 +762,7 @@ def _print_target_status(t, explain: bool = False):
             budget = _pm._REVIEW_CYCLE_BUDGETS.get(t.pm_authority, 2)
             mode = "fresh-reviewer" if t.pm_authority == "hold" else "same-reviewer"
             print(f"  reviewing:     PR #{review_state['pr_number']}, "
-                  f"cycle {review_state['cycle']}/{budget} (opus, {mode})")
+                  f"cycle {review_state['cycle']}/{budget} (local reviewer, {mode})")
             verdict = review_state.get("verdict", "pending")
             issues = review_state.get("issues", 0)
             if verdict != "pending":
@@ -766,6 +807,14 @@ def cmd_deploy_status(args) -> int:
 def _target_to_json_dict(t) -> dict:
     dispatched = pm_core.load_dispatched(t.id)
     pending = [d for d in dispatched if d.get("status") == "pending"]
+    pending_detail = []
+    for d in pending:
+        age = pm_core._dispatch_age(d.get("ts"))
+        pending_detail.append({
+            "gpu_id": d.get("gpu_id"),
+            "agent_type": d.get("agent_type"),
+            "age_s": int(age.total_seconds()) if age is not None else None,
+        })
     return {
         "target_id": t.id,
         "title": t.title,
@@ -776,6 +825,7 @@ def _target_to_json_dict(t) -> dict:
         "cursor": pm_core.get_cursor(t.id),
         "dispatched_total": len(dispatched),
         "dispatched_pending": len(pending),
+        "dispatched_pending_detail": pending_detail,
         "outstanding_brief_id": pm_core.get_outstanding_brief(t.id),
         "tags": t.data.get("tags", []),
         "urgency": t.urgency,
@@ -1469,6 +1519,9 @@ def cmd_review_gate(args) -> int:
         state = pm_core.review_gate_status()
         print(f"review-gate counter:   {state['counter']} / {state['threshold']}")
         print(f"review-gate paused:    {state['paused']}")
+        print(f"  window:              {state['window_oldest']} to {state['window_newest']} "
+              f"({state['window_days']}d)")
+        print(f"  infra non-runs:      {state['infra_nonruns']} (separate ledger, does not count toward counter)")
         if state["paused"]:
             print('  → Resume with: lapis-pm review-gate resume --reason "..."')
         return 0
@@ -1478,7 +1531,7 @@ def cmd_review_gate(args) -> int:
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
-        print(f"Review-gate counter reset (was {prev}). Opus reviewer active again.")
+        print(f"Review-gate counter reset (was {prev}). Local reviewer active again.")
         print(f"Reason recorded: {args.reason}")
         return 0
     print(f"ERROR: unknown review-gate subcommand: {sub}", file=sys.stderr)
@@ -1500,9 +1553,33 @@ def cmd_spec_review(args) -> int:
     if getattr(args, "compare_opus", False):
         print(
             "[spec-review] WARNING: --compare-opus is deprecated and a no-op; "
-            "the Sonnet reference leg now runs by default (sunset 90 days after merge).",
+            "the reference leg is opt-in now, use --with-reference-reviewer "
+            "(sunset 90 days after merge).",
             file=sys.stderr,
         )
+    # --no-reference-reviewer / --no-sonnet-reviewer are harmless no-ops now that the
+    # Empiricist leg is off by default (U3a) — they must not error and must not invert
+    # to mean "turn it on". Emit a deprecation note but otherwise ignore them; only
+    # --with-reference-reviewer can enable the leg.
+    if getattr(args, "no_reference_reviewer", False):
+        print(
+            "[spec-review] WARNING: --no-reference-reviewer is deprecated and a no-op; "
+            "the Empiricist leg is off by default now (sunset 90 days after merge, "
+            "2026-09-05).",
+            file=sys.stderr,
+        )
+    if getattr(args, "no_sonnet_reviewer", False):
+        print(
+            "[spec-review] WARNING: --no-sonnet-reviewer is deprecated and a no-op; "
+            "the Empiricist leg is off by default now (sunset 90 days after merge, "
+            "2026-09-05).",
+            file=sys.stderr,
+        )
+    no_reference_reviewer = (
+        getattr(args, "no_reference_reviewer", False)
+        or getattr(args, "no_sonnet_reviewer", False)
+    )
+    reference_reviewer = getattr(args, "with_reference_reviewer", False) and not no_reference_reviewer
     try:
         brief = run_spec_review(
             spec_path=spec_path,
@@ -1511,8 +1588,9 @@ def cmd_spec_review(args) -> int:
             repo_override=args.repo_override,
             authority=getattr(args, "authority", None),
             dispatch_facets=not getattr(args, "no_facets", False),
-            sonnet_reviewer=not getattr(args, "no_sonnet_reviewer", False),
+            reference_reviewer=reference_reviewer,
             facets_operator=getattr(args, "facets_operator", "haiku"),
+            with_gw=getattr(args, "with_gw", False),
         )
     except (SpecFrontmatterError, InvariantContextError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -2111,6 +2189,23 @@ def build_parser() -> argparse.ArgumentParser:
     re_.add_argument("target_id")
     re_.set_defaults(func=cmd_resume)
 
+    cra = sub.add_parser(
+        "clear-reviewer-attempts",
+        help="Clear reviewer-attempt-ceiling counters for a target (sole escape hatch "
+             "after a ceiling auto-pause). Does not resume the target.",
+    )
+    cra.add_argument("target_id")
+    cra.set_defaults(func=cmd_clear_reviewer_attempts)
+
+    cld = sub.add_parser(
+        "clear-dispatch",
+        help="Clear pending dispatch record(s) for a target (escape hatch for a "
+             "stale-pending fixer/reviewer dispatch the reaper couldn't prove dead). "
+             "Also prints a reminder about the intention-registry sibling wedge.",
+    )
+    cld.add_argument("target_id")
+    cld.set_defaults(func=cmd_clear_dispatch)
+
     ls = sub.add_parser("list", help="List all pm_bound targets.")
     ls.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     ls.set_defaults(func=cmd_list)
@@ -2241,10 +2336,10 @@ def build_parser() -> argparse.ArgumentParser:
     tep.set_defaults(func=cmd_tts_episode_publish)
 
     rg = sub.add_parser("review-gate",
-                        help="Manage the Opus reviewer kill-switch.")
+                        help="Manage the local reviewer kill-switch.")
     rg_sub = rg.add_subparsers(dest="review_gate_sub", required=True)
     rg_sub.add_parser("status", help="Print current counter + threshold.")
-    rg_resume = rg_sub.add_parser("resume", help="Reset counter; re-enable Opus reviewer.")
+    rg_resume = rg_sub.add_parser("resume", help="Reset counter; re-enable the local reviewer.")
     rg_resume.add_argument(
         "--reason",
         required=True,
@@ -2628,7 +2723,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = sub.add_parser(
         "spec-review",
-        help="Pre-bind Facets + Council review of a spec document (Sonnet deep-reviewer runs by default).",
+        help="Pre-bind Facets + Council review of a spec document (fast path by default; --with-reference-reviewer / --with-gw opt in to the reference legs).",
     )
     sr.add_argument("spec_path", help="Path to the spec markdown file.")
     sr.add_argument(
@@ -2663,12 +2758,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override spec's stated authority for Facets dispatch gating.",
     )
     sr.add_argument(
+        "--with-reference-reviewer",
+        action="store_true",
+        dest="with_reference_reviewer",
+        help=(
+            "Opt in to the reference-only Empiricist claim-verification leg (off by "
+            "default — it is advisory-only and never moves the recommendation, so the "
+            "default fast path skips its ~18min cost)."
+        ),
+    )
+    sr.add_argument(
+        "--no-reference-reviewer",
+        action="store_true",
+        dest="no_reference_reviewer",
+        help=(
+            "Deprecated no-op: the Empiricist leg is off by default now, so this flag "
+            "has nothing left to disable. Kept so existing invocations keep working "
+            "unchanged (sunset 90 days after merge, 2026-09-05)."
+        ),
+    )
+    sr.add_argument(
         "--no-sonnet-reviewer",
         action="store_true",
         dest="no_sonnet_reviewer",
         help=(
-            "Skip the reference-only Sonnet deep-review leg (on by default for "
-            "advisory/hold; opt out for faster/cheaper runs)."
+            "Deprecated no-op alias for --no-reference-reviewer; still honored "
+            "(sunset 90 days after merge, 2026-09-05)."
+        ),
+    )
+    sr.add_argument(
+        "--with-gw",
+        action="store_true",
+        dest="with_gw",
+        help=(
+            "Opt in to the GravityWell reference leg (off by default — U3b). When set, "
+            "the gate submits the GW job and blocks on its result before rendering; a "
+            "timeout still renders the brief, with an explicit failed-grounding marker "
+            "rather than a bare error."
         ),
     )
     sr.add_argument(
@@ -2676,7 +2802,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="compare_opus",
         help=(
-            "Deprecated/no-op: the Sonnet reference leg now runs by default; "
+            "Deprecated/no-op: the reference leg is opt-in now (--with-reference-reviewer); "
             "this flag is kept for back-compat (sunset 90 days after merge)."
         ),
     )

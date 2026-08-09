@@ -2,7 +2,7 @@
 
 Coverage (spec: local-fixer-registry-entry-v0):
 
-  AC1 — Raw YAML parse: fixer_local has engine=local-fixer, model=gravitywell-122b,
+  AC1 — Raw YAML parse: fixer_local has engine=local-fixer, model=gravitywell-slot1,
          and system_template contains none of the forbidden git/PR verbs.
 
   AC2 — force_dispatch guard scenarios:
@@ -48,7 +48,27 @@ def _make_target(adopted_pr_number=None, adopted_head_branch=None, pm_repo=None)
 
 
 def _dispatch_record(gpu_id, agent_type, status="pending"):
-    return {"gpu_id": gpu_id, "agent_type": agent_type, "status": status}
+    return {
+        "gpu_id": gpu_id, "agent_type": agent_type, "status": status,
+        "ts": "2026-08-07T09:00:00-07:00",
+    }
+
+
+def _live_queue(gpu_id):
+    """A ClaudeQueue double whose gpu_id is genuinely still active and
+    within its own timeout — used so the L1.D3 guard tests exercise a
+    record the reap pass (lapis-pm-stale-pending-dispatch-reaper-v0, Leg 1)
+    correctly leaves pending, rather than one it unwedges."""
+    cq = MagicMock()
+    cq.get_recent_failed.return_value = []
+    cq.get_recent_completed.return_value = []
+    cq.get_pending.return_value = []
+    cq.get_active.return_value = [{
+        "id": gpu_id,
+        "started_at": "2026-08-07T09:00:00-07:00",
+        "timeout_seconds": 3600,
+    }]
+    return cq
 
 
 def _fixer_local_rec(gpu_id="gpu-001", status="failed", parent_gpu_id=None):
@@ -84,7 +104,7 @@ class TestRegistryYamlFixerLocal:
         assert entry.get("engine") == "local-fixer"
 
     def test_model_field(self, entry):
-        assert entry.get("model") == "gravitywell-122b"
+        assert entry.get("model") == "gravitywell-slot1"
 
     def test_system_template_no_forbidden_verbs(self, entry):
         template = entry.get("system_template", "")
@@ -133,43 +153,65 @@ def shaper_stub():
         yield m
 
 
+@pytest.fixture
+def frozen_reap_clock():
+    """Freeze pm_core.datetime.now() 5 minutes past the fixture records' ts
+    (2026-08-07T09:00:00-07:00) — well within the 1-hour timeout _live_queue
+    declares, so the Leg 1 reap pass never mistakes these fixtures for dead
+    (real wall-clock time would drift the age past the threshold)."""
+    import datetime as _real_datetime
+    with patch("lapis_pm.pm_core.datetime") as mock_dt:
+        mock_dt.now.return_value = _real_datetime.datetime(
+            2026, 8, 7, 9, 5, 0, tzinfo=pm_core.PACIFIC)
+        mock_dt.fromisoformat.side_effect = _real_datetime.datetime.fromisoformat
+        yield mock_dt
+
+
 class TestL1D3FixerLocalCrossBlock:
     """L1.D3 inner check now uses _INITIAL_FIXER_TYPES + (fixer_retry,)."""
 
-    def test_fixer_local_blocked_by_pending_fixer_local(self, episodic_stub):
+    def test_fixer_local_blocked_by_pending_fixer_local(
+        self, episodic_stub, frozen_reap_clock
+    ):
         """fixer_local must not fire when another fixer_local is pending (self-block)."""
         with patch("lapis_pm.pm_core.TargetStore") as ts_mock:
             ts_mock.return_value.get.return_value = _make_target()
             pending = _dispatch_record("gpu-A", "fixer_local", "pending")
-            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]):
-                with pytest.raises(ValueError, match="pending fixer_local"):
+            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]), \
+                 patch.object(pm_core, "_ClaudeQueue", return_value=_live_queue("gpu-A")):
+                with pytest.raises(ValueError, match="has a fixer_local dispatch"):
                     pm_core.force_dispatch("tgt", "fixer_local", "intent")
 
-    def test_fixer_local_blocked_by_pending_fixer(self, episodic_stub):
+    def test_fixer_local_blocked_by_pending_fixer(self, episodic_stub, frozen_reap_clock):
         """fixer_local must not fire when a fixer is pending (cross-block)."""
         with patch("lapis_pm.pm_core.TargetStore") as ts_mock:
             ts_mock.return_value.get.return_value = _make_target()
             pending = _dispatch_record("gpu-B", "fixer", "pending")
-            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]):
-                with pytest.raises(ValueError, match="pending fixer"):
+            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]), \
+                 patch.object(pm_core, "_ClaudeQueue", return_value=_live_queue("gpu-B")):
+                with pytest.raises(ValueError, match="has a fixer dispatch"):
                     pm_core.force_dispatch("tgt", "fixer_local", "intent")
 
-    def test_fixer_blocked_by_pending_fixer_local(self, episodic_stub):
+    def test_fixer_blocked_by_pending_fixer_local(self, episodic_stub, frozen_reap_clock):
         """fixer must not fire when a fixer_local is pending (cross-block reverse)."""
         with patch("lapis_pm.pm_core.TargetStore") as ts_mock:
             ts_mock.return_value.get.return_value = _make_target()
             pending = _dispatch_record("gpu-C", "fixer_local", "pending")
-            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]):
-                with pytest.raises(ValueError, match="pending fixer_local"):
+            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]), \
+                 patch.object(pm_core, "_ClaudeQueue", return_value=_live_queue("gpu-C")):
+                with pytest.raises(ValueError, match="has a fixer_local dispatch"):
                     pm_core.force_dispatch("tgt", "fixer", "intent")
 
-    def test_fixer_local_blocked_by_pending_fixer_retry(self, episodic_stub):
+    def test_fixer_local_blocked_by_pending_fixer_retry(
+        self, episodic_stub, frozen_reap_clock
+    ):
         """fixer_local must not fire when a fixer_retry is pending."""
         with patch("lapis_pm.pm_core.TargetStore") as ts_mock:
             ts_mock.return_value.get.return_value = _make_target()
             pending = _dispatch_record("gpu-D", "fixer_retry", "pending")
-            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]):
-                with pytest.raises(ValueError, match="pending fixer_retry"):
+            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]), \
+                 patch.object(pm_core, "_ClaudeQueue", return_value=_live_queue("gpu-D")):
+                with pytest.raises(ValueError, match="has a fixer_retry dispatch"):
                     pm_core.force_dispatch("tgt", "fixer_local", "intent")
 
     def test_fixer_local_proceeds_when_only_completed_records(
@@ -319,20 +361,30 @@ class TestRegressionFixerBehaviorUnchanged:
         assert retry == [], "fixer_retry must not appear in needs_retry"
         assert brief == [], "fixer_retry must not appear in needs_brief"
 
-    def test_fixer_blocked_by_pending_fixer_guard_unchanged(self, episodic_stub):
-        """fixer still raises when a pending fixer record exists (unchanged behavior)."""
+    def test_fixer_blocked_by_pending_fixer_guard_unchanged(
+        self, episodic_stub, frozen_reap_clock
+    ):
+        """fixer still raises when a pending, genuinely-live fixer record
+        exists (unchanged behavior; queue liveness added by
+        lapis-pm-stale-pending-dispatch-reaper-v0 so the guard's own reap
+        pass doesn't unwedge this fixture out from under the assertion)."""
         with patch("lapis_pm.pm_core.TargetStore") as ts_mock:
             ts_mock.return_value.get.return_value = _make_target()
             pending = _dispatch_record("gpu-H", "fixer", "pending")
-            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]):
-                with pytest.raises(ValueError, match="pending fixer"):
+            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]), \
+                 patch.object(pm_core, "_ClaudeQueue", return_value=_live_queue("gpu-H")):
+                with pytest.raises(ValueError, match="has a fixer dispatch"):
                     pm_core.force_dispatch("tgt", "fixer", "intent")
 
-    def test_fixer_blocked_by_pending_fixer_retry_guard_unchanged(self, episodic_stub):
-        """fixer still raises when a pending fixer_retry exists (unchanged behavior)."""
+    def test_fixer_blocked_by_pending_fixer_retry_guard_unchanged(
+        self, episodic_stub, frozen_reap_clock
+    ):
+        """fixer still raises when a pending, genuinely-live fixer_retry
+        exists (unchanged behavior)."""
         with patch("lapis_pm.pm_core.TargetStore") as ts_mock:
             ts_mock.return_value.get.return_value = _make_target()
             pending = _dispatch_record("gpu-I", "fixer_retry", "pending")
-            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]):
-                with pytest.raises(ValueError, match="pending fixer_retry"):
+            with patch("lapis_pm.pm_core.load_dispatched", return_value=[pending]), \
+                 patch.object(pm_core, "_ClaudeQueue", return_value=_live_queue("gpu-I")):
+                with pytest.raises(ValueError, match="has a fixer_retry dispatch"):
                     pm_core.force_dispatch("tgt", "fixer", "intent")

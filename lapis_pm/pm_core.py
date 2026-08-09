@@ -44,8 +44,10 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import yaml
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -76,7 +78,17 @@ try:
 except Exception:
     _ClaudeQueue = None  # type: ignore
 
-from agents_core.shaper import Shaper, DispatchResult as _DispatchResult  # noqa: F401
+try:
+    # Reuse the runner's own stale-active arithmetic (same threshold
+    # startup_sweep uses to decide a task's runner has died) rather than
+    # inventing a second number. Import is best-effort — a missing symbol
+    # falls back to the documented default (300s) rather than breaking
+    # reconciliation entirely.
+    from agents_core.claude_queue_runner import STARTUP_STALE_GRACE_S
+except Exception:
+    STARTUP_STALE_GRACE_S = 300  # type: ignore
+
+from agents_core.shaper import Shaper, DispatchResult as _DispatchResult, _bool_val  # noqa: F401
 
 try:
     from agents_core.room_paths import room_path, room_str
@@ -86,6 +98,7 @@ except ImportError as _e:
 from . import episodic, brief, authority, intent_artifact as _intent_artifact, steer
 from . import node_identity
 from . import signed_directive
+from . import tou_window
 
 try:
     from . import eval_gate as _eval_gate
@@ -114,11 +127,97 @@ MAX_DISPATCH_RETRIES = 2
 # detection, and concurrency checks. A single constant so all sites stay in sync.
 _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 
+# Every agent_type that dispatches a local-reviewer read-only judge leg.
+# reviewer_fresh_contractor (lapis-pm-reviewer-peak-contractor-route-v0) is
+# the TOU-peak seat swap of reviewer_fresh — it must be treated identically
+# by every reviewer-record classification site (attempt ceiling, review-gate
+# kill-switch, verdict decode, output-file processing) or dispatches routed
+# to it silently fall outside all of that accounting.
+_REVIEWER_AGENT_TYPES = ("reviewer", "reviewer_fresh", "reviewer_fresh_contractor")
+
+# lapis-pm-reviewer-absence-grounding-rule-v0: flag-gated obligation block,
+# rendered into the reviewer/reviewer_fresh system_template only when the
+# registry's absence_grounding field is true (default false — see
+# registry.yaml). Reference wording is the 2026-08-08 bakeoff prompt
+# (finding/deepseek-vs-27b-reviewer-seat-bakeoff-outside-harness-2026-08-08),
+# adapted: the lapis reviewer dispatch runs inside a worktree already
+# checked out to the PR head, so the command form is the grep tool or
+# `git grep` without a ref, not the bakeoff's branch-qualified form.
+ABSENCE_GROUNDING_BLOCK = (
+    "\n\n"
+    "## HARD RULE — grounding absence claims\n\n"
+    "Any finding of the form \"X is not defined\", \"X is never called\", "
+    "\"X is not wired in\", \"I could not confirm X exists\", or \"there is "
+    "no handler for X\" is INVALID unless you first run an explicit search "
+    "over the FULL BRANCH and quote its output.\n\n"
+    "Rules that follow from this:\n"
+    "- A symbol being absent from the DIFF does not mean it is absent from "
+    "the CODEBASE.\n"
+    "- A symbol's definition and its call site are frequently hundreds of "
+    "lines apart and in different hunks. Read the whole file before "
+    "concluding anything is unwired.\n"
+    "- If your search returns any hit you did not expect, the finding is "
+    "withdrawn.\n"
+    "- For every absence-style finding you report, include the exact "
+    "command you ran and its output in the issue's `evidence` field "
+    "(optional on every other issue; required here). No evidence, no "
+    "finding.\n\n"
+    "Use your grep tool, or `git grep` (no ref needed — you are already "
+    "checked out to the branch head), to run the search. A failed or "
+    "errored search is not evidence of absence; do not report the finding "
+    "if the search itself failed.\n"
+)
+
+
+def _absence_grounding_enabled(agent_type: str) -> bool:
+    """Read the flag-gated absence_grounding field for a reviewer registry entry.
+
+    Reads registry.yaml directly rather than through _SHAPER.get_agent —
+    ShapedAgent (agents_core/shaper.py) doesn't carry ad-hoc fields, only the
+    ones it explicitly parses. Value is parsed through the existing shaper
+    boolean parser (_bool_val, agents_core/shaper.py:68) rather than a new
+    ad-hoc truthiness check, per DoD 1.
+
+    reviewer_fresh_contractor has no field of its own — it shares the
+    reviewer_fresh system_template via YAML anchor (registry.yaml), so its
+    flag state is looked up under the "reviewer_fresh" family name by the
+    caller (see _absence_grounding_block_for).
+    """
+    try:
+        raw = yaml.safe_load((Path(__file__).parent / "registry.yaml").read_text()) or {}
+        body = (raw.get("agents") or {}).get(agent_type) or {}
+        return _bool_val(body.get("absence_grounding", False))
+    except Exception:
+        return False
+
+
+def _absence_grounding_block_for(agent_type: str) -> str:
+    """Return the rendered {absence_grounding_block} var value for a reviewer dispatch.
+
+    Empty string when the flag is off (or agent_type isn't a reviewer seat at
+    all) — this is what keeps the flag-off render byte-identical to today's
+    template (DoD 2). reviewer_fresh_contractor maps to the "reviewer_fresh"
+    family flag since it shares that template and carries no field of its own.
+    """
+    if agent_type not in _REVIEWER_AGENT_TYPES:
+        return ""
+    family = "reviewer_fresh" if agent_type in ("reviewer_fresh", "reviewer_fresh_contractor") else "reviewer"
+    return ABSENCE_GROUNDING_BLOCK if _absence_grounding_enabled(family) else ""
+
+
 # Review-gate loop constants
-REVIEW_GATE_THRESHOLD = 40          # Opus reviewer calls before soft-pause
+REVIEW_GATE_THRESHOLD = 40          # local reviewer (reviewer/reviewer_fresh seat) calls before soft-pause
+REVIEW_GATE_WINDOW_DAYS = 7          # trailing window the threshold is measured over (a rate, not a lifetime total)
 REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
 REVIEW_GATE_PAUSED_KEY = "pm/review-gate/paused"
 REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
+# Separate diagnostic ledger (lapis-pm-review-gate-counter-infra-nonruns-v0):
+# infra non-runs are retracted from REVIEW_GATE_COUNTER_KEY (so they stop
+# consuming kill-switch slots) but still recorded here so the pause signal —
+# and a future operator — can distinguish "38 reviews, 22 infra non-runs"
+# from a bare "40 / 40". Same trailing-window, prune-on-read semantics as the
+# counter, so it never grows past the window's own bound.
+REVIEW_GATE_INFRA_LEDGER_KEY = "pm/review-gate/infra-nonruns-this-window"
 
 # Synth-fail counter constants
 _SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
@@ -135,6 +234,55 @@ _REVIEWER_MODES: dict[str, str] = {
     "advisory": "same-reviewer",
     "hold": "fresh-reviewer",
 }
+
+# Reviewer attempt ceiling (lapis-pm-reviewer-attempt-ceiling-v0): bounds
+# *attempts* (dispatches), not completed cycles. A reviewer that fails before
+# ever writing a verdict never advances _reviewer_cycle_count, so without this
+# a persistently-failing reviewer is redispatched every tick forever. Counter
+# is PR+cycle-bound and survives new SHAs — only an explicit manual clear
+# (`lapis-pm clear-reviewer-attempts <target_id>`) resets it. See spec
+# "Reset scope" ruling: a SHA-triggered reset would grant amnesty to a
+# code-level defect on every push.
+REVIEWER_ATTEMPT_CEILING_DEFAULT = 2
+REVIEWER_ATTEMPT_CEILING_ENV = "LAPIS_PM_REVIEWER_ATTEMPT_CEILING"
+
+# Infrastructure non-runs (GravityWell unavailable, doorman disagreement, etc.)
+# must not consume the reviewer-attempt ceiling above — that ceiling exists to
+# bound a reviewer that keeps failing to produce a usable verdict, not a
+# reviewer that never got to run at all (lapis-pm-reviewer-attempts-not-consumed-
+# by-infra-v0). Infra-classified attempts get their own, more generous budget
+# so an endlessly-absent GravityWell still produces a bounded number of
+# dispatches rather than an unbounded loop. 6 is roughly 3x the reviewer
+# ceiling (2) — generous enough to ride out a transient doorman/wake-gravitywell
+# hiccup without burning attempts, but still a hard stop, not a retry-forever.
+REVIEWER_INFRA_RETRY_BUDGET_DEFAULT = 6
+REVIEWER_INFRA_RETRY_BUDGET_ENV = "LAPIS_PM_REVIEWER_INFRA_RETRY_BUDGET"
+
+# Hardcoded allow-list of infrastructure-unavailability reasons, owned by
+# lapis-pm and scoped to the vocabulary the reviewer's actual call path
+# (shaped_runner._run_local_reviewer -> gw_agent.call_gw_agent) can produce:
+# gw_unreachable (gw_agent.py), gw_not_serving (gw_agent.py), and
+# gw_defer_timeout (gw_agent.py) — the doorman refused a `deferrable` lease
+# acquire and the client's jittered-backoff retry budget
+# (GW_DEFER_RETRY_BUDGET_SEC) ran out before admission. The reviewer never
+# ran; it was refused GPU admission and timed out waiting. Deliberately NOT
+# importing agents_core.llm.GW_PROVENANCE_PRECEDENCE — that tuple
+# (gw_deferred_swarm, slot_queued_timeout, slot_pool_down, gw_not_serving)
+# belongs to a different call path (the llm.py operator path) and most of its
+# members can never reach a reviewer dispatch record. An unrecognised reason
+# is treated as non-infrastructure and counts against the ceiling — fail
+# closed, so the ceiling's bound is never silently defeated by a new or
+# unexpected reason string.
+REVIEWER_INFRA_FAIL_REASONS = frozenset({
+    "gw_not_serving",
+    "gw_unreachable",
+    "gw_defer_timeout",
+    # Emitted by agents-core-reviewer-seat-tool-call-probe-v0 (Unit A): a seat
+    # that cannot emit a tool call never rendered a verdict, so this is a
+    # non-run, not a failure — see lapis-pm-reviewer-seat-dead-token-infra-
+    # classify-v0 (Unit B).
+    "seat_no_tool_calls",
+})
 
 # Forgejo health gate constants
 FORGEJO_CONSECUTIVE_FAILS_KEY = "pm/forgejo_consecutive_fails"
@@ -196,6 +344,10 @@ _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
     # immediate-restart path (not the claude-queue-runner in-flight-deferral path —
     # cockpit is not deferred).
     "cockpit": ("cockpit.service",),
+    # loupe.service: Type=simple long-running FastAPI read surface (Desk/Sessions/
+    # Landscape), same profile as cockpit above — a pull alone leaves it serving stale
+    # code until restarted. Spec: navigator-loupe-serve-parity-n0-v0.
+    "loupe": ("loupe.service",),
 }
 
 # Canonical deploy clone path for facets. Not pip-installed; the spec-review gate
@@ -283,6 +435,16 @@ _POST_LAND_PULL: dict[str, list[str]] = {
     # _POST_LAND_PULL_LOW_SIGNAL (spec: lapis-pm-deploy-inventory-auto-recovery-v0 Part A
     # item 3 — nothing in that spec depends on the critical/low-signal distinction here).
     "experts":        ["/srv/git/experts"],
+    # loupe: single-tree PYTHONPATH-import service (like cockpit/synapse), not a split
+    # dev/deploy pair for the read path itself — but the deploy CLONE is intentionally
+    # separate from /srv/git/loupe-working (the PM investigation tree), mirroring the
+    # lapis-pm/lapis-pm-working split above (:223), so that editing -working never
+    # changes what's live. loupe.service is Type=simple, long-running --user unit; a
+    # pull alone leaves it serving stale code until restarted (see
+    # _POST_LAND_RESTART_USER). Pull failure -> LOW signal (advisory read-only console
+    # for Erah, same tier as cockpit — see _POST_LAND_PULL_LOW_SIGNAL below).
+    # Spec: navigator-loupe-serve-parity-n0-v0.
+    "loupe":          ["/srv/git/loupe"],
 }
 
 # lapis-pm: failed pull → next tick runs stale code.
@@ -315,8 +477,11 @@ _POST_LAND_PULL_CRITICAL: frozenset[str] = frozenset({"lapis-pm", "agents-core",
 # /data/rag git ref is attributable drift (§0 of lapis-pm-deploy-pull-rag-ops-v0), not a
 # broken runtime — docker compose doesn't even re-read the pulled files until a manual
 # recreate, so LOW keeps this failure attributable without polluting the critical channel.
+# loupe: advisory read-only console for Erah, visible the moment he opens it — same
+# tier reasoning as cockpit above. A stale pull is attributable, not a silent
+# load-bearing-substrate failure. Spec: navigator-loupe-serve-parity-n0-v0.
 _POST_LAND_PULL_LOW_SIGNAL: frozenset[str] = frozenset(
-    {"code-reviewer", "facets", "gardener", "conductor", "cockpit", "rag-ops"}
+    {"code-reviewer", "facets", "gardener", "conductor", "cockpit", "rag-ops", "loupe"}
 )
 
 # ---------------------------------------------------------------------------
@@ -511,6 +676,26 @@ def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> No
             f.write(line)
     except OSError as e:
         print(f"[post-land-pull] deploy log write failed: {e}", file=sys.stderr)
+
+
+_DEPLOY_LOG_LINE_RE = re.compile(
+    r"^- `[^`]+` \| (?P<tree>.+?) \| synced (?P<old>[0-9a-f]+)\.\.(?P<new>[0-9a-f]+) \| "
+    r".*? \| (?P<trigger>.+)$"
+)
+
+
+def _last_deploy_log_shas(tree: str, trigger: str) -> tuple[str | None, str | None]:
+    """Read back the most recent `_write_deploy_log` line for `tree`+`trigger`.
+    Best-effort — a missing/unparseable log is a clean `(None, None)`."""
+    try:
+        lines = Path(_DEPLOY_LOG).read_text().splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        m = _DEPLOY_LOG_LINE_RE.match(line)
+        if m and m.group("tree") == tree and m.group("trigger") == trigger:
+            return m.group("old"), m.group("new")
+    return None, None
 
 
 def _deploy_pull_lock_path(clone_path: str) -> Path:
@@ -1495,21 +1680,6 @@ def _reconcile_deploy_inventory() -> None:
 
         deploy_inventory.write_status_json(status)
 
-        if corrupt:
-            try:
-                from agents_core.notify import send_notification, Priority as _P
-                send_notification(
-                    message=(
-                        "prior deploy-inventory-status.json is present but unreadable; "
-                        "per-finding notification dedup is suppressed for this pass "
-                        "(falls back to the coarse per-pass cooldown as rate limit)."
-                    ),
-                    title="deploy-inventory: status file unreadable",
-                    priority=_P.HIGH,
-                )
-            except Exception:
-                pass
-
         for clone in status.get("clones", []):
             for finding in clone.get("findings", []):
                 if finding.get("severity") != "HIGH":
@@ -1518,32 +1688,22 @@ def _reconcile_deploy_inventory() -> None:
                     f"[deploy-inventory] HIGH: {clone['path']} {finding['kind']}: {finding['detail']}",
                     file=sys.stderr, flush=True,
                 )
-                if corrupt:
-                    continue
-                key = (clone["path"], finding["kind"])
-                # auto_recovery_restart_failed is exempt from the cross-pass dedup:
-                # it exists only because this unit's own automation pulled new code
-                # and then failed to restart the service — a strictly worse,
-                # unattended state, not passive drift a human was already pinged
-                # about. Every other HIGH kind still follows the 2026-07-22
-                # no-re-alert-floor ruling exactly (lapis-pm-deploy-inventory-
-                # notify-dedup-v0) — new-since-prior-snapshot pings once, then
-                # silent while unresolved.
-                if (
-                    finding["kind"] != "auto_recovery_restart_failed"
-                    and prior_high_keys is not None
-                    and key in prior_high_keys
-                ):
-                    continue
-                try:
-                    from agents_core.notify import send_notification, Priority as _P
-                    send_notification(
-                        message=finding["detail"],
-                        title=f"deploy-inventory: {finding['kind']}",
-                        priority=_P.HIGH,
-                    )
-                except Exception:
-                    pass
+
+        # deploy-inventory-repair-proposer-v0: replaces the Pushover-to-Erah
+        # relay (both the per-finding loop and the corrupt-status one-off) with
+        # Desk-gem deposits. Fault-isolated per finding — a deposit/diagnosis
+        # failure degrades to log+skip for that finding, never suppresses the
+        # write_status_json/cooldown-timestamp writes that follow.
+        try:
+            from . import deploy_inventory_repair
+
+            deploy_inventory_repair.run_repair_pass(
+                status, prior_high_keys=prior_high_keys, corrupt=corrupt,
+            )
+        except Exception as e:
+            logger.warning(
+                "[deploy-inventory] repair-proposer pass failed (non-fatal): %s", e,
+            )
     except Exception as e:
         logger.warning("[deploy-inventory] reconcile pass failed (non-fatal): %s", e)
         return
@@ -1554,7 +1714,9 @@ def _reconcile_deploy_inventory() -> None:
         pass
 
 
-def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") -> None:
+def _post_land_deploy_hook(
+    repo: str | None, trigger: str = "post-land-hook", target_id: str | None = None,
+) -> None:
     """Pull working clones then restart long-running services for `repo`.
 
     Best-effort. Failures (sudo unavailable, unit missing, restart timeout)
@@ -1571,6 +1733,14 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
     drains. The deferral is bounded by RESTART_DEFER_MAX_S (default 30 min); at
     the deadline a restart is forced anyway, and a CRITICAL-severity alert fires.
     Interrupted fixers are recoverable via the existing lost-fixer-retry path.
+
+    system-spec-drift-attestation-v0: attached HERE, at the hook's
+    *definition*, not at any one of its four call sites (:567, :1463,
+    :3120, :3200) — attaching at a single call site would leave three of
+    the four land paths accruing no drift (spec §Revision 2, amendment c).
+    `target_id` is optional and only available from two of those call
+    sites; when absent, drift provenance falls back to `trigger`. Best-
+    effort and never raises, matching this function's own contract above.
     """
     if _DEPLOY_HOOK_DISABLED:
         print(
@@ -1581,6 +1751,31 @@ def _post_land_deploy_hook(repo: str | None, trigger: str = "post-land-hook") ->
         return
 
     head_advanced = _post_land_git_pull(repo, trigger=trigger)
+
+    # system-spec-drift-attestation-v0: derive the changed paths from the
+    # deploy-log line `_post_land_git_pull` itself just wrote — deliberately
+    # NOT an extra pair of `git rev-parse` calls bracketing that call, which
+    # would otherwise compete with its own internal pre/post HEAD checks.
+    if repo and head_advanced:
+        try:
+            _clone_paths = _POST_LAND_PULL.get(repo) or []
+            if _clone_paths:
+                primary = _clone_paths[0]
+                old_sha, new_sha = _last_deploy_log_shas(primary, trigger)
+                if old_sha and new_sha:
+                    _diff = subprocess.run(
+                        ["git", "-C", primary, "diff", "--name-only", old_sha, new_sha],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if _diff.returncode == 0:
+                        changed = [ln for ln in _diff.stdout.splitlines() if ln.strip()]
+                        from . import spec_attestation
+                        spec_attestation.run_post_land_attestation(
+                            repo, changed, target_id=target_id, trigger=trigger,
+                        )
+        except Exception as e:
+            print(f"[post-land-deploy] spec-attestation pass failed (non-fatal): {e}", file=sys.stderr)
+
     if not repo:
         return
 
@@ -1959,12 +2154,14 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
     # Compact corroboration summary for quick display in claude-view.
     # Full evidence-packet lives in the episodic entry; cache stores verdict+drift only.
     last_corroboration: dict | None = None
+    panel_starvation_summary: dict | None = None
     if has_real_verdict:
         pr_number = state.get("pr_number")
         if pr_number is not None:
             # Prefer tick-local cache (populated by _encode_gpu_results this same tick)
             # to avoid re-scanning episodic for data already in hand.
             corr = _tick_corr_cache.get((target_id, pr_number))
+            verdict_info = None
             if corr is None:
                 verdict_info = _last_review_verdict(target_id, pr_number)
                 if verdict_info:
@@ -1974,6 +2171,20 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
                     "verdict": corr.get("verdict"),
                     "drift_class": corr.get("drift_class"),
                 }
+            # Leg 1 legibility (DoD #4): surface starvation in the same
+            # compact cache claude-view already reads, without opening the
+            # verdict JSON. Additive — absent on verdicts that predate this.
+            if verdict_info is None:
+                verdict_info = _last_review_verdict(target_id, pr_number)
+            if verdict_info:
+                _pstarv = verdict_info.get("panel_starvation")
+                if _pstarv:
+                    panel_starvation_summary = {
+                        "starved": _pstarv.get("starved", False),
+                        "legs_down": _pstarv.get("legs_down", []),
+                        "confidence_raw": _pstarv.get("confidence_raw"),
+                        "confidence_attenuated": verdict_info.get("confidence"),
+                    }
 
     payload = {
         "pr_number": state["pr_number"],
@@ -1985,6 +2196,7 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
         "paused": _review_gate_paused(),
         "updated_at": _now_iso(),
         "last_corroboration": last_corroboration,
+        "panel_starvation": panel_starvation_summary,
     }
     _mem().set(key, json.dumps(payload),
                tags=["lapis-pm", "review-state"])
@@ -1993,6 +2205,42 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
 def _now_iso() -> str:
     """Microsecond-precision so it interleaves cleanly with comment timestamps."""
     return datetime.now(PACIFIC).isoformat(timespec="microseconds")
+
+
+def _dispatch_age(ts: str | None) -> timedelta | None:
+    """Parse a dispatch record's ``ts`` (tz-aware Pacific, set at dispatch
+    from _now_iso) and return its age, or None if ``ts`` is missing/unparseable.
+    """
+    if not ts:
+        return None
+    try:
+        dispatched_at = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return datetime.now(PACIFIC) - dispatched_at
+
+
+def _format_age(age: timedelta) -> str:
+    """Render a timedelta as a short human string: '31h', '45m', '3d'."""
+    total_s = int(age.total_seconds())
+    if total_s < 0:
+        total_s = 0
+    days, rem = divmod(total_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m"
+
+
+def _dispatch_age_note(ts: str | None) -> str:
+    """' pending for 31h' (Leg 5) — or '' if age can't be established."""
+    age = _dispatch_age(ts)
+    if age is None:
+        return ""
+    return f", pending for {_format_age(age)}"
 
 
 # --- Project-slot blackboard: close the slot + emit attribution deposit ------
@@ -2259,6 +2507,32 @@ def force_dispatch(
             import sys
             print(f"[L1.D1-forgejo-warning] {target_id}: open-PR scan failed; proceeding with dispatch", file=sys.stderr)
 
+    # Leg 2 (lapis-pm-stale-pending-dispatch-reaper-v0): reconcile before the
+    # L1.D3 guard below evaluates, so the documented escape from a wedge
+    # (tick --force-dispatch) is self-healing for every case the reconciler's
+    # reap pass can prove (task gone from the queue entirely, or stuck in
+    # active/ past its own timeout). Placed in force_dispatch itself — not
+    # in the CLI — so cmd_bind_chain's call site and any future caller
+    # inherit it for free.
+    #
+    # Failure handling is visibility, not a raise: if reconciliation returns
+    # 0 because the queue read threw, warn to stderr and fall through to the
+    # guard as today. Failing closed here would manufacture a second way to
+    # wedge a target on an unreadable queue — exactly the defect class this
+    # spec exists to remove.
+    try:
+        _flipped, _reconcile_ok = _reconcile_dispatched_with_queue_ex(target_id)
+    except Exception:
+        _reconcile_ok = False
+    if not _reconcile_ok:
+        import sys
+        print(
+            f"[L1.D3-reconcile-warning] {target_id}: dispatch reconciliation "
+            "was skipped (queue read failed) before the concurrency guard; "
+            "guard below may be evaluating stale state",
+            file=sys.stderr,
+        )
+
     # L1.D3: Target-level concurrency guard for initial fixers
     if agent_type in _INITIAL_FIXER_TYPES:
         existing_dispatches = load_dispatched(target_id)
@@ -2267,9 +2541,12 @@ def force_dispatch(
                 record.get("agent_type") in _INITIAL_FIXER_TYPES + ("fixer_retry",)):
                 gpu_id = record.get("gpu_id", "unknown")
                 rec_agent = record.get("agent_type", "unknown")
+                age = _dispatch_age(record.get("ts"))
+                age_note = f" pending for {_format_age(age)}" if age is not None else " pending"
                 raise ValueError(
-                    f"target {target_id} has a pending {rec_agent} dispatch ({gpu_id}) — "
-                    "not firing a concurrent initial fixer"
+                    f"target {target_id} has a {rec_agent} dispatch ({gpu_id}),"
+                    f"{age_note} — if that fixer is dead: "
+                    f"lapis-pm clear-dispatch {target_id}"
                 )
 
     spec_sum = episodic.spec_summary(target_id)
@@ -2282,7 +2559,7 @@ def force_dispatch(
     # Also resolve pr_number here for reviewer/reviewer_fresh/fixer_retry so cycle accounting
     # (_fixer_retry_count / _reviewer_cycle_count) can attribute force-dispatched records
     # to the correct PR, same as the daemon's own _act_dispatch_fixer_retry/_act_dispatch_reviewer.
-    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry", "reviewer", "reviewer_fresh") and target.pm_repo:
+    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry",) + _REVIEWER_AGENT_TYPES and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)
@@ -2308,7 +2585,7 @@ def force_dispatch(
     # this function ever reaches the record-construction code below. Build it the
     # same way the daemon's own _act_dispatch_reviewer does.
     reviewer_cycle: int | None = None
-    if agent_type in ("reviewer", "reviewer_fresh"):
+    if agent_type in _REVIEWER_AGENT_TYPES:
         reviewer_cycle = (_reviewer_cycle_count(target_id, pr_number) + 1) if pr_number is not None else 1
 
     prior_review_text = ""
@@ -2325,6 +2602,7 @@ def force_dispatch(
         "existing_branch": existing_branch,
         "base_branch": base_branch,
         "intent_block": _intent_artifact.dispatch_block(target_id),
+        "absence_grounding_block": _absence_grounding_block_for(agent_type),
     }
     if agent_type == "reviewer":
         vars_["prior_review"] = prior_review_text
@@ -2346,7 +2624,7 @@ def force_dispatch(
         if agent_type == "fixer_retry":
             record["pr_number"] = pr_number
             record["cycle"] = _reviewer_cycle_count(target_id, pr_number)
-        elif agent_type in ("reviewer", "reviewer_fresh"):
+        elif agent_type in _REVIEWER_AGENT_TYPES:
             record["pr_number"] = pr_number
             record["cycle"] = reviewer_cycle
             reviewer_tags = [f"pm:reviewer:pr={pr_number}:cycle={reviewer_cycle}:verdict=pending"]
@@ -2929,6 +3207,33 @@ def _has_auto_land_waiting_comment(target_id: str, pr_count: int) -> bool:
     return False
 
 
+def _reconcile_surviving_head_branch(target_id: str, repo: str) -> None:
+    """Delete a merged PR's surviving head branch so auto-land can proceed.
+
+    A merge performed outside merge_and_deploy (e.g. a Forgejo web-UI merge with
+    the delete-branch box unchecked) never gets the branch-deletion backstop, which
+    leaves _is_auto_land_eligible permanently False. This reconciles that: bounded
+    to the single most-recently-merged observed PR (one branch probe per tick, per
+    target), reusing the existing idempotent, non-raising _ensure_head_branch_deleted
+    primitive rather than adding a new Forgejo surface. Best-effort — a failure here
+    is surfaced as a pm:error observation but never raises out of tick().
+    """
+    if not repo:
+        return
+    merged = _merged_pr_numbers_observed(target_id)
+    if not merged:
+        return
+    pr_num = max(merged)
+    try:
+        repo_name, owner = _repo_owner(repo)
+        _ensure_head_branch_deleted(repo_name, pr_num, owner=owner)
+    except Exception as e:
+        episodic.write_observation(
+            target_id, f"Head branch reconcile failed for PR #{pr_num}: {e}",
+            extra_tags=["pm:error", "pm:branch-reconcile-failed"],
+        )
+
+
 def _is_auto_land_eligible(target_id: str) -> bool:
     """Return True if this target meets all auto-land conditions.
 
@@ -2939,7 +3244,9 @@ def _is_auto_land_eligible(target_id: str) -> bool:
       - The most recently seen PR is the merged one (no newer open PR)
       - All declared PRs have merged (len(merged) >= target.pr_count)
       - The PR's head branch is deleted (or Forgejo unavailable, per proxy)
-    Paused check is handled in tick() before this is reached.
+    Paused check is applied by the caller: tick_all() excludes paused targets
+    from auto-land pre-selection, and tick() itself also short-circuits to
+    noop:paused before the decide phase that would call _act_auto_land.
     """
     if _mem().get(_landed_key(target_id)):
         return False
@@ -3018,7 +3325,7 @@ def _act_auto_land(target_id: str) -> str:
     )
 
     _deploy_target = TargetStore().get(target_id)
-    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None)
+    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None, target_id=target_id)
 
     # 3. Audit comment in the target JSONL (spec-required format)
     episodic.write(
@@ -3098,7 +3405,7 @@ def _act_auto_land_already_satisfied(target_id: str) -> str:
     )
 
     _deploy_target = TargetStore().get(target_id)
-    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None)
+    _post_land_deploy_hook(_deploy_target.pm_repo if _deploy_target else None, target_id=target_id)
 
     # Audit comment (spec-required tag)
     episodic.write(
@@ -3168,20 +3475,176 @@ def _act_brief_already_satisfied_invalid(target_id: str) -> str:
 # Review-gate kill-switch helpers
 # ---------------------------------------------------------------------------
 
-def _review_gate_counter() -> int:
+def _review_gate_window_timestamps() -> list[str]:
+    """Read the raw dispatch-timestamp list, dropping anything outside the
+    trailing REVIEW_GATE_WINDOW_DAYS window. Handles the pre-window storage
+    format (a bare int) by treating it as that many events at an
+    unknown-but-recent time, so it counts fully rather than crashing.
+    """
     rec = _mem().get(REVIEW_GATE_COUNTER_KEY)
     if not rec:
-        return 0
+        return []
+    raw = rec["content"]
     try:
-        return int(rec["content"])
+        parsed = json.loads(raw)
     except (ValueError, TypeError):
-        return 0
+        parsed = None
+    if not isinstance(parsed, list):
+        # Legacy bare-int counter (pre sliding-window migration). Cannot
+        # recover real timestamps, so treat every unit as "now" — counts in
+        # full until it ages out of the window on its own.
+        try:
+            legacy_count = int(parsed if parsed is not None else raw)
+        except (ValueError, TypeError):
+            return []
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return [now_iso] * legacy_count
+    cutoff = datetime.now(timezone.utc) - timedelta(days=REVIEW_GATE_WINDOW_DAYS)
+    kept = []
+    for ts in parsed:
+        if not isinstance(ts, str):
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt >= cutoff:
+            kept.append(ts)
+    return kept
 
 
-def _increment_review_gate_counter() -> int:
-    count = _review_gate_counter() + 1
-    _mem().set(REVIEW_GATE_COUNTER_KEY, str(count), tags=["lapis-pm", "review-gate"])
-    return count
+def _review_gate_counter() -> int:
+    """Count of review-gate-tripping dispatches within the trailing
+    REVIEW_GATE_WINDOW_DAYS days — a rate, not a lifetime total, so the guard
+    measures runaway behavior rather than tripping on any activity level
+    given enough time.
+    """
+    return len(_review_gate_window_timestamps())
+
+
+def _increment_review_gate_counter() -> str:
+    """Record one reviewer dispatch attempt against the kill-switch, BEFORE
+    the dispatch fires (record-then-retract shape, mandated by the
+    2026-08-04 spec-review gate). This preserves the runaway-guard signal for
+    a dispatch that hangs or crashes without ever classifying — the entry
+    stays counted unless a later, classified infra failure retracts it via
+    _retract_review_gate_counter_entry.
+
+    Returns the appended ISO-8601 timestamp (not the count) — the caller
+    stashes it on the dispatch record so a later infra-classified failure can
+    retract this exact entry rather than any entry.
+    """
+    timestamps = _review_gate_window_timestamps()
+    ts = datetime.now(timezone.utc).isoformat()
+    timestamps.append(ts)
+    _mem().set(REVIEW_GATE_COUNTER_KEY, json.dumps(timestamps),
+               tags=["lapis-pm", "review-gate"])
+    return ts
+
+
+def _retract_review_gate_counter_entry(ts: str | None) -> bool:
+    """Retract one previously-recorded kill-switch entry, keyed by the exact
+    timestamp _increment_review_gate_counter returned at dispatch time.
+
+    Called only for a dispatch that failed for a classified
+    REVIEWER_INFRA_FAIL_REASONS cause — the record-then-retract shape means
+    every other outcome (success, hang, crash, unclassified failure) leaves
+    the pre-dispatch increment standing.
+
+    Must tolerate a missing entry (Council open question 1: double-retract, a
+    race with window-expiry pruning, or ts=None from an older dispatch record
+    that predates this field) — swallow and return False, never raise, never
+    write a corrupted ledger. Under-counting (a retraction that silently
+    no-ops because the entry already aged out) is the safe direction; the
+    counter measures pressure, not per-dispatch identity, so no UUID is
+    introduced here.
+    """
+    if not ts:
+        return False
+    try:
+        timestamps = _review_gate_window_timestamps()
+        if ts not in timestamps:
+            return False
+        timestamps.remove(ts)
+        _mem().set(REVIEW_GATE_COUNTER_KEY, json.dumps(timestamps),
+                   tags=["lapis-pm", "review-gate"])
+        return True
+    except Exception:
+        return False
+
+
+def _infra_nonrun_window_timestamps() -> list[str]:
+    """Same trailing-window, prune-on-read semantics as
+    _review_gate_window_timestamps, applied to the separate diagnostic
+    infra-non-run ledger. No legacy bare-int format exists for this key (it
+    is new), so no migration handling is needed."""
+    rec = _mem().get(REVIEW_GATE_INFRA_LEDGER_KEY)
+    if not rec:
+        return []
+    try:
+        parsed = json.loads(rec["content"])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=REVIEW_GATE_WINDOW_DAYS)
+    kept = []
+    for ts in parsed:
+        if not isinstance(ts, str):
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt >= cutoff:
+            kept.append(ts)
+    return kept
+
+
+def _record_infra_nonrun() -> int:
+    """Append one entry to the diagnostic infra-non-run ledger. Independent
+    of, and unaffected by, kill-switch retraction — retracting an entry from
+    REVIEW_GATE_COUNTER_KEY must not erase the fact that an infra non-run
+    happened. Returns the new trailing-window count."""
+    timestamps = _infra_nonrun_window_timestamps()
+    timestamps.append(datetime.now(timezone.utc).isoformat())
+    _mem().set(REVIEW_GATE_INFRA_LEDGER_KEY, json.dumps(timestamps),
+               tags=["lapis-pm", "review-gate", "infra-ledger"])
+    return len(timestamps)
+
+
+def _infra_nonrun_counter() -> int:
+    return len(_infra_nonrun_window_timestamps())
+
+
+def _review_gate_span_desc() -> str:
+    """Human-readable window-span + infra-nonrun clause for pause signals
+    (DoD Part 2) — turns a bare "40 / 40" into something an operator can
+    judge without a manual mem dig, e.g. "40 entries spanning 2026-08-04T17:22Z
+    to 2026-08-04T22:15Z (7d window); 22 of the past dispatches were infra
+    non-runs (see the separate infra ledger)."."""
+    span = _review_gate_window_span()
+    if span["count"] == 0:
+        return "0 entries in the current window"
+    return (
+        f"{span['count']} entries spanning {span['oldest']} to {span['newest']} "
+        f"({REVIEW_GATE_WINDOW_DAYS}d window); {span['infra_nonruns']} infra "
+        f"non-runs recorded separately in this window"
+    )
+
+
+def _review_gate_window_span() -> dict:
+    """Diagnostic detail for the pause signal (DoD Part 2): entry count plus
+    the oldest/newest timestamp in the trailing window, and the infra
+    non-run count from the separate ledger — so an operator sees "38 reviews,
+    22 infra non-runs" instead of a bare "40 / 40"."""
+    timestamps = _review_gate_window_timestamps()
+    return {
+        "count": len(timestamps),
+        "oldest": min(timestamps) if timestamps else None,
+        "newest": max(timestamps) if timestamps else None,
+        "infra_nonruns": _infra_nonrun_counter(),
+    }
 
 
 def _review_gate_paused() -> bool:
@@ -3195,26 +3658,30 @@ def _set_review_gate_paused(paused: bool) -> None:
 
 
 def review_gate_resume(reason: str) -> int:
-    """Reset kill-switch counter with documented reason. Returns previous count.
+    """Manually override an active rate trip. Returns the trailing-window
+    count at the moment of resume.
 
-    The reason is written to mem under `decision/review-gate-resume/<iso8601-ts>`
-    as a tagged audit entry. Empty or whitespace-only reasons raise ValueError —
-    the caller (CLI or future agent) is responsible for eliciting a substantive
-    reason before invoking.
+    This is a rate-trip override, not a budget re-arm: the counter tracks
+    dispatches within the trailing REVIEW_GATE_WINDOW_DAYS days, so clearing
+    it early means "resume before the window would have aged the count back
+    below threshold on its own," not "grant a fresh allowance." The reason is
+    written to mem under `decision/review-gate-resume/<iso8601-ts>` as a
+    tagged audit entry. Empty or whitespace-only reasons raise ValueError —
+    the caller (CLI or future agent) is responsible for eliciting a
+    substantive reason before invoking.
     """
     if not reason or not reason.strip():
         raise ValueError("review_gate_resume requires a non-empty reason")
     count = _review_gate_counter()
-    _mem().set(REVIEW_GATE_COUNTER_KEY, "0", tags=["lapis-pm", "review-gate"])
+    _mem().set(REVIEW_GATE_COUNTER_KEY, "[]", tags=["lapis-pm", "review-gate"])
     _set_review_gate_paused(False)
     _mem().delete(REVIEW_GATE_PAUSE_BRIEF_KEY)
     # Decision audit-trail
-    from datetime import timezone
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _mem().set(
         f"decision/review-gate-resume/{ts}",
-        f"Review-gate resumed at counter={count}/{REVIEW_GATE_THRESHOLD}. "
-        f"Reason: {reason.strip()}",
+        f"Review-gate rate-trip manually overridden at count={count}/{REVIEW_GATE_THRESHOLD} "
+        f"(trailing {REVIEW_GATE_WINDOW_DAYS}d). Reason: {reason.strip()}",
         tags=["lapis-pm", "review-gate", "resume-audit"],
     )
     return count
@@ -3222,11 +3689,235 @@ def review_gate_resume(reason: str) -> int:
 
 def review_gate_status() -> dict:
     """Return kill-switch state for `lapis-pm review-gate status`."""
+    span = _review_gate_window_span()
     return {
         "counter": _review_gate_counter(),
         "threshold": REVIEW_GATE_THRESHOLD,
         "paused": _review_gate_paused(),
+        "window_days": REVIEW_GATE_WINDOW_DAYS,
+        "window_oldest": span["oldest"],
+        "window_newest": span["newest"],
+        "infra_nonruns": span["infra_nonruns"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Reviewer attempt ceiling (lapis-pm-reviewer-attempt-ceiling-v0)
+#
+# Bounds *attempts*, not successes. Keyed the same way cycle accounting is
+# (target_id, pr_number, cycle) so a failure loop that never advances the
+# cycle (no verdict ever written) is still bounded. PR-bound, survives new
+# SHAs, cleared only by an explicit manual clear — see spec "Reset scope".
+# ---------------------------------------------------------------------------
+
+def _reviewer_attempt_ceiling() -> int:
+    raw = os.environ.get(REVIEWER_ATTEMPT_CEILING_ENV)
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+        except ValueError:
+            pass
+    return REVIEWER_ATTEMPT_CEILING_DEFAULT
+
+
+def _reviewer_infra_retry_budget() -> int:
+    raw = os.environ.get(REVIEWER_INFRA_RETRY_BUDGET_ENV)
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+        except ValueError:
+            pass
+    return REVIEWER_INFRA_RETRY_BUDGET_DEFAULT
+
+
+def _classify_reviewer_infra_reason(reported_reason: str | None) -> str | None:
+    """Return the matched infra reason if `reported_reason` names one of
+    REVIEWER_INFRA_FAIL_REASONS, else None. Reason strings arrive embedded in
+    a larger message, e.g. "ERROR: local reviewer produced no verdict
+    (reason=gw_not_serving)" — extract via `reason=<value>` first, then fall
+    back to a bare substring match against the allow-list for any other
+    shape the reason might arrive in (e.g. straight from a queue error)."""
+    if not reported_reason:
+        return None
+    m = re.search(r"reason=([\w.-]+)", reported_reason)
+    if m and m.group(1) in REVIEWER_INFRA_FAIL_REASONS:
+        return m.group(1)
+    for candidate in REVIEWER_INFRA_FAIL_REASONS:
+        if candidate in reported_reason:
+            return candidate
+    return None
+
+
+def _reviewer_dispatch_wait_seconds(rec: dict) -> float | None:
+    """Wall-clock seconds between dispatch (`rec["ts"]`) and terminal state
+    (`rec["completed_at"]`), for the infra-wait telemetry (DoD 9). Returns
+    None — never 0 — if either timestamp is missing or unparseable; a
+    fabricated 0 would misrepresent an unmeasured duration as an instant
+    refusal, defeating the point of the telemetry (distinguishing a
+    momentary jam from systemic starvation)."""
+    started = rec.get("ts")
+    ended = rec.get("completed_at")
+    if not started or not ended:
+        return None
+    try:
+        delta = datetime.fromisoformat(ended) - datetime.fromisoformat(started)
+    except (ValueError, TypeError):
+        return None
+    return delta.total_seconds()
+
+
+def _reviewer_attempt_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/reviewer-attempts/{target_id}/pr={pr_number}/cycle={cycle}"
+
+
+def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
+    default = {
+        "count": 0,
+        "last_reason": None,
+        "infra_count": 0,
+        "last_infra_reason": None,
+        "last_infra_wait_s": None,
+    }
+    rec = _mem().get(_reviewer_attempt_key(target_id, pr_number, cycle))
+    if not rec:
+        return default
+    try:
+        data = json.loads(rec["content"])
+        return {
+            "count": int(data.get("count", 0)),
+            "last_reason": data.get("last_reason"),
+            "infra_count": int(data.get("infra_count", 0)),
+            "last_infra_reason": data.get("last_infra_reason"),
+            "last_infra_wait_s": data.get("last_infra_wait_s"),
+        }
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return default
+
+
+def _reviewer_attempt_count(target_id: str, pr_number: int, cycle: int) -> int:
+    return _reviewer_attempt_state(target_id, pr_number, cycle)["count"]
+
+
+def _increment_reviewer_attempt(target_id: str, pr_number: int, cycle: int) -> int:
+    """Record one reviewer dispatch attempt. Called at dispatch time, so it
+    counts every attempt regardless of whether it later succeeds or fails."""
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    state["count"] += 1
+    _mem().set(
+        _reviewer_attempt_key(target_id, pr_number, cycle),
+        json.dumps(state),
+        tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"],
+    )
+    return state["count"]
+
+
+def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, reason: str,
+                                    review_gate_ts: str | None = None,
+                                    wait_s: float | None = None) -> None:
+    """Stash the most recent failure reason for this pr+cycle, as-reported and
+    unverified — see DoD 3b. Classifies the reason against
+    REVIEWER_INFRA_FAIL_REASONS (D1): an infrastructure-classified failure
+    bumps infra_count, which _reviewer_attempt_ceiling_check reads to exclude
+    that attempt from the ceiling count (and to bound infra-only failures
+    against the separate, more generous REVIEWER_INFRA_RETRY_BUDGET). Does
+    not touch the raw `count` — that stays dispatch-time-incremented history,
+    per the module docstring above.
+
+    `wait_s` (DoD 9, lapis-pm-reviewer-defer-timeout-is-infra-v0): the
+    wall-clock duration of the failed attempt, recorded beside
+    last_infra_reason so a congestion pause (long wait, gw_defer_timeout) is
+    distinguishable from an absence pause (short wait, gw_not_serving)
+    without reading code. Only recorded when the reason classifies as infra —
+    non-infra failures don't consume this field. Left as None (never
+    defaulted to 0) when the caller has no measured duration — a 0 would be
+    indistinguishable from an instant refusal and would defeat the
+    telemetry's purpose.
+
+    lapis-pm-review-gate-counter-infra-nonruns-v0: reuses this same
+    classification to drive the kill-switch record-then-retract shape — a
+    classified infra failure retracts the pre-dispatch REVIEW_GATE_COUNTER_KEY
+    entry (keyed by review_gate_ts, the dispatch record's stashed timestamp)
+    and records the non-run in the separate diagnostic infra ledger. Any
+    other outcome (unclassified failure, review_gate_ts absent because the
+    dispatch record predates this field) leaves the kill-switch entry
+    standing — the runaway guard must not be weakened."""
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    state["last_reason"] = reason
+    infra_reason = _classify_reviewer_infra_reason(reason)
+    if infra_reason is not None:
+        state["infra_count"] = state.get("infra_count", 0) + 1
+        state["last_infra_reason"] = infra_reason
+        state["last_infra_wait_s"] = wait_s
+    _mem().set(
+        _reviewer_attempt_key(target_id, pr_number, cycle),
+        json.dumps(state),
+        tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"],
+    )
+    if infra_reason is not None:
+        _retract_review_gate_counter_entry(review_gate_ts)
+        _record_infra_nonrun()
+
+
+def clear_reviewer_attempts(target_id: str) -> int:
+    """Manual clear — the sole escape hatch once a target is ceiling-paused.
+
+    Deliberately cheap: one call, one required argument (target_id), no
+    confirmation prompt, no metadata. Wipes every attempt counter and
+    ceiling-hit marker for this target (all PRs, all cycles). Does NOT
+    resume the target — that remains a separate, explicit `lapis-pm resume`.
+    Returns the number of keys cleared.
+    """
+    cleared = 0
+    for prefix in (
+        f"pm/reviewer-attempts/{target_id}/",
+        f"pm/reviewer-attempt-ceiling/{target_id}/",
+        f"pm/reviewer-infra-budget/{target_id}/",
+    ):
+        for rec in _mem().list_by_prefix(prefix, limit=10_000):
+            if _mem().delete(rec["key"]):
+                cleared += 1
+    return cleared
+
+
+def clear_dispatch(target_id: str) -> int:
+    """Leg 3 (lapis-pm-stale-pending-dispatch-reaper-v0): the escape hatch
+    for the residue Leg 1's reap pass cannot prove — a queue entry that is
+    genuinely still running but whose PM record is wrong, or a queue whose
+    files were moved by hand. Modeled on clear_reviewer_attempts: cheap,
+    one required argument, no confirmation prompt (Erah's ruling — ceremony
+    here inverts the point of an escape hatch).
+
+    Flips every `pending` dispatch record for target_id to `failed` with
+    failure_reason "cleared:operator", stamps completed_at, saves, and
+    writes one episodic audit comment naming every cleared gpu_id. Never
+    touches non-pending records, TargetStore, paused state, or the spec.
+    Returns the number of records cleared.
+    """
+    records = load_dispatched(target_id)
+    cleared_gpu_ids: list[str] = []
+    now = _now_iso()
+    for rec in records:
+        if rec.get("status") != "pending":
+            continue
+        rec["status"] = "failed"
+        rec["failure_reason"] = "cleared:operator"
+        rec["completed_at"] = now
+        cleared_gpu_ids.append(rec.get("gpu_id", "unknown"))
+
+    if cleared_gpu_ids:
+        save_dispatched(target_id, records)
+        episodic.write_observation(
+            target_id,
+            f"Cleared {len(cleared_gpu_ids)} pending dispatch(es) via "
+            f"clear-dispatch: {', '.join(cleared_gpu_ids)}",
+            extra_tags=["pm:dispatch-cleared"],
+        )
+
+    return len(cleared_gpu_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -3318,7 +4009,7 @@ def _fixer_retry_count(target_id: str, pr_number: int) -> int:
 def _has_pending_reviewer_for_pr(target_id: str, pr_number: int) -> bool:
     return any(
         r.get("status") == "pending"
-        and r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        and r.get("agent_type") in _REVIEWER_AGENT_TYPES
         and r.get("pr_number") == pr_number
         for r in load_dispatched(target_id)
     )
@@ -3408,7 +4099,7 @@ def _fixer_completion_ts(target_id: str, pr_number: int, dispatch_ts: str) -> st
 def _reviewer_dispatch_ts(target_id: str, pr_number: int, cycle: int) -> str | None:
     """Return dispatch ts of reviewer at cycle K for PR N, or None."""
     for r in load_dispatched(target_id):
-        if (r.get("agent_type") in ("reviewer", "reviewer_fresh")
+        if (r.get("agent_type") in _REVIEWER_AGENT_TYPES
                 and r.get("pr_number") == pr_number
                 and r.get("cycle") == cycle):
             return r.get("ts")
@@ -3767,7 +4458,50 @@ def _perceive_prs(
 class Decision:
     kind: str   # "merge" | "advisory_brief" | "hold_brief" | "retry" | "abandon_brief" | "directive_ack"
                #  | "noop_no_change" | "noop_reviewer_in_flight" | "noop_fixer_in_flight"
+               #  | "reviewer_attempt_ceiling" | "reviewer_infra_budget_exhausted"
     payload: dict
+
+
+def _reviewer_attempt_ceiling_check(target_id: str, pr_number: int, cycle: int) -> Decision | None:
+    """Return a Decision if this pr+cycle has already hit either bound, else
+    None. Checked immediately before every dispatch_reviewer return so a
+    reviewer that never completes a verdict (and so never advances
+    _reviewer_cycle_count) still stops on its own.
+
+    Two separate bounds (D1):
+    - infra budget: attempts classified as infrastructure non-runs
+      (REVIEWER_INFRA_FAIL_REASONS) don't count against the reviewer-attempt
+      ceiling, but they are still bounded by their own, more generous budget
+      so an endlessly-absent GravityWell doesn't produce endless dispatches.
+      Checked first — an infra-caused wedge must surface as an infra pause,
+      never as a "clear-reviewer-attempts" ceiling pause.
+    - reviewer-attempt ceiling: count of attempts minus infra-classified
+      attempts. Unrecognised failure reasons count here (fail closed).
+    """
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+
+    infra_budget = _reviewer_infra_retry_budget()
+    if state["infra_count"] >= infra_budget:
+        return Decision("reviewer_infra_budget_exhausted", {
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "infra_attempts": state["infra_count"],
+            "infra_budget": infra_budget,
+            "reported_reason": state["last_infra_reason"] or state["last_reason"],
+            "last_infra_wait_s": state["last_infra_wait_s"],
+        })
+
+    ceiling = _reviewer_attempt_ceiling()
+    effective_count = state["count"] - state["infra_count"]
+    if effective_count >= ceiling:
+        return Decision("reviewer_attempt_ceiling", {
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "attempts": effective_count,
+            "ceiling": ceiling,
+            "reported_reason": state["last_reason"],
+        })
+    return None
 
 
 def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
@@ -3777,8 +4511,47 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
                              verification=verification)
     payload = {"classification": cls, "pr": pr}
 
-    # Static hold: held paths always surface immediately (no reviewer needed)
+    # Static hold: a held path always ends in a hold brief, but it still gets a
+    # machine review first — skipping it would make the PM's highest-blast-radius
+    # files (lapis-pm-containment-held-paths-v0, Leg 3) the *least* reviewed
+    # artifacts in the system. This reuses the same reviewer-cycle machinery as
+    # the advisory/hold review-gate loop below, capped at exactly one dispatch:
+    # a held PR is never fixer-retried (the fixer must not autonomously edit its
+    # own cage), so reviewer_count can only ever be 0 or 1 here. Idempotency
+    # ("dispatch once, not once per 60s tick") falls out of the same
+    # _has_pending_reviewer_for_pr guard the normal loop uses, plus the fact that
+    # only the terminal hold_brief marks a PR classified (dispatch_reviewer alone
+    # does not), so every tick between dispatch and verdict is a cheap noop.
     if cls.static_outcome == authority.StaticOutcome.auto_hold_path:
+        pr_number = pr["number"]
+        if _has_pending_reviewer_for_pr(target_id, pr_number):
+            cycle = _reviewer_cycle_count(target_id, pr_number)
+            return Decision("noop_reviewer_in_flight",
+                            {"pr_number": pr_number, "cycle": cycle})
+
+        reviewer_count = _reviewer_cycle_count(target_id, pr_number)
+        if reviewer_count == 0:
+            if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
+                _set_review_gate_paused(True)
+                # Fail safe: still raise the hold brief without a reviewer verdict
+                # rather than let the kill-switch block containment entirely.
+                return Decision("hold_brief", payload)
+            ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, 1)
+            if ceiling_decision is not None:
+                return Decision("hold_brief", payload)
+            return Decision("dispatch_reviewer", {
+                "pr": pr, "cls": cls, "mode": "fresh", "cycle": 1, "held_path": True,
+            })
+
+        # Reviewer already ran once for this PR — attach its verdict and raise
+        # the hold brief. Never dispatched again regardless of verdict content
+        # (fixable/needs-human included): held paths always need the human hand,
+        # the reviewer's job here is only to give that human a machine read.
+        verdict_info = _last_review_verdict(target_id, pr_number)
+        if verdict_info is not None:
+            cls.screen_verdict = verdict_info.get("verdict", "unknown")
+            cls.issues = verdict_info.get("issues", [])
+            payload["reviewer_verdict"] = verdict_info
         return Decision("hold_brief", payload)
 
     # Auto-merge path: inline Sonnet screen result drives action (unchanged)
@@ -3837,11 +4610,14 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             return Decision("review_exhausted_brief", {
                 "pr": pr, "cls": cls, "history": history,
             })
-        # Check kill-switch threshold before dispatching Opus reviewer
+        # Check kill-switch threshold before dispatching the local reviewer
         if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
             _set_review_gate_paused(True)
             return Decision("review_gate_pause", {"pr": pr, "cls": cls})
         next_cycle = reviewer_count + 1
+        ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
+        if ceiling_decision is not None:
+            return ceiling_decision
         return Decision("dispatch_reviewer", {
             "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
         })
@@ -3854,6 +4630,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             _set_review_gate_paused(True)
             return Decision("review_gate_pause", {"pr": pr, "cls": cls})
         next_cycle = reviewer_count + 1
+        ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
+        if ceiling_decision is not None:
+            return ceiling_decision
         return Decision("dispatch_reviewer", {
             "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
         })
@@ -3866,6 +4645,24 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
 
     verdict = verdict_info.get("verdict", "needs-human")
     issues = verdict_info.get("issues", [])
+
+    # ---------------------------------------------------------------------------
+    # Panel-starvation gate (R1, ratified 2026-08-08 — closed, not open for
+    # relitigation). Any corroboration leg down (local witness, corroboration,
+    # second node) drops this verdict to advisory: it may inform, but it may
+    # never block (hold_brief / review_exhausted_brief) and may never
+    # auto-dispatch a fixer retry on its own authority. This is the exact
+    # failure class that shipped PR #220's false HIGH finding at
+    # confidence=0.9 with all three legs down — see
+    # finding/reviewer-seat-false-high-finding-absence-from-diff-third-occurrence-2026-08-08.
+    # Checked before the audit gate: a starved verdict's issues never reach
+    # the fixable/needs-human branching below.
+    # ---------------------------------------------------------------------------
+    from . import panel_starvation as _panel_starvation
+    if _panel_starvation.verdict_is_starved(verdict_info):
+        cls.screen_verdict = verdict
+        cls.issues = issues
+        return Decision("advisory_brief", payload)
 
     # ---------------------------------------------------------------------------
     # §4 Audit gate — drop unsubstantiated still_present regurgitation
@@ -4207,7 +5004,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
                     # fall through to normal brief/gem path
 
     reviewer_verdict_text: str | None = None
-    if effective_trigger == "advisory-clean":
+    if effective_trigger == "advisory-clean" or hold:
         verdict_info = _last_review_verdict(target_id, cls.pr_number)
         if verdict_info:
             v = verdict_info.get("verdict", "?")
@@ -4215,9 +5012,23 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             n_issues = len(verdict_info.get("issues") or [])
             corr = verdict_info.get("corroboration_result") or {}
             corr_v = corr.get("verdict")
-            parts = [f"Opus reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
+            parts = [f"local reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
             if corr_v:
                 parts.append(f"corroboration={corr_v}")
+            # Leg 1 legibility (DoD #4): a reader must see degradation without
+            # opening the verdict JSON. panel_starvation is additive — absent
+            # on verdicts written before this landed, so guard with .get.
+            _pstarv = verdict_info.get("panel_starvation") or {}
+            if _pstarv.get("starved"):
+                _legs_down = ", ".join(_pstarv.get("legs_down") or []) or "unknown"
+                _raw_conf = _pstarv.get("confidence_raw", "?")
+                parts.append(
+                    f"DEGRADED PANEL (legs down: {_legs_down}; raw confidence "
+                    f"{_raw_conf} attenuated to {conf}) — advisory only, not gated"
+                )
+            _refuted = verdict_info.get("refuted_absence_findings") or []
+            if _refuted:
+                parts.append(f"refuted absence claims={len(_refuted)}")
             reviewer_verdict_text = "; ".join(parts)
 
     # AC8: functional critic hook — fires when pm_verification == "agent-functional"
@@ -4410,6 +5221,39 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     spec_summary = episodic.spec_summary(target_id)
 
     agent_type = "reviewer_fresh" if mode == "fresh" else "reviewer"
+    # TOU-peak contractor route (lapis-pm-reviewer-peak-contractor-route-v0,
+    # D2): dispatch-time-only routing, decided by the clock at the moment of
+    # THIS dispatch and nowhere else. No exception handler may switch seats
+    # (decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30) —
+    # this is the ONLY place agent_type is redirected to the contractor seat.
+    # Only reviewer_fresh (the local-GravityWell fresh-read leg) has a
+    # contractor counterpart; plain "reviewer" (same-reviewer mode) is
+    # unaffected.
+    if agent_type == "reviewer_fresh" and tou_window.is_peak_window():
+        agent_type = "reviewer_fresh_contractor"
+
+    # Dead-seat gap-spanner route (lapis-pm-reviewer-seat-phala-test-key):
+    # a second, explicitly-named routing input alongside the TOU-window check
+    # above — not an exception-driven flip (that pattern remains forbidden per
+    # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30).
+    # Only reviewer_fresh has a contractor counterpart, so this is scoped the
+    # same way the TOU branch is. Threshold is 1 prior seat_no_tool_calls on
+    # THIS exact PR/cycle: probe_seat_tool_call already tries
+    # PROBE_DEFAULT_ATTEMPTS=3 deterministic tool-order variants before
+    # reporting seat_no_tool_calls, so one occurrence already reflects 3/3
+    # failed perturbations — waiting for a second just burns another cycle
+    # against the same poisoned prefix for no new information. Runs
+    # regardless of TOU window (a dead seat is dead at any hour) and never
+    # turns OFF the TOU-peak routing above — strict addition only.
+    if agent_type == "reviewer_fresh":
+        _prior_state = _reviewer_attempt_state(target_id, pr_number, cycle)
+        if _prior_state["last_infra_reason"] == "seat_no_tool_calls":
+            agent_type = "reviewer_fresh_contractor"
+            _gap_spanner_reroute = True
+        else:
+            _gap_spanner_reroute = False
+    else:
+        _gap_spanner_reroute = False
 
     # Build prior_review context for same-reviewer mode
     prior_review_text = _build_prior_review_text(target_id, pr_number, cycle) if mode == "same" else ""
@@ -4429,6 +5273,7 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "existing_branch": existing_branch,
         "base_branch": base_branch,
         "intent_block": _intent_artifact.dispatch_block(target_id),
+        "absence_grounding_block": _absence_grounding_block_for(agent_type),
     }
 
     # Get the diff for the reviewer prompt
@@ -4463,13 +5308,28 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         f'}}]{schema_extra}, "confidence": 0.0-1.0}}'
     )
 
-    # Increment kill-switch counter before dispatch
-    _increment_review_gate_counter()
+    # Increment kill-switch counter before dispatch (record-then-retract —
+    # stash the exact entry so a later classified infra failure can retract
+    # this one specifically; see _retract_review_gate_counter_entry).
+    review_gate_ts = _increment_review_gate_counter()
+    # Increment the PR+cycle-bound attempt ceiling counter (counts this
+    # dispatch regardless of whether it later succeeds or fails).
+    _increment_reviewer_attempt(target_id, pr_number, cycle)
 
     steer.inject_overlay(target_id, vars_, agent_type)
     _ensure_dispatch_owned(vars_.get("repo", ""))
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
 
+    # D2/D5 provenance: a verdict whose record does not say which model
+    # produced it is not auditable, and this route makes verdicts come from
+    # two different models on the same PR. Look up the registry-declared
+    # model/seat for this agent_type (never hardcode — the registry is the
+    # single source of truth for both reviewer_fresh and its contractor
+    # counterpart, which share a template but not a model).
+    try:
+        shaped_agent = _SHAPER.get_agent(agent_type)
+    except Exception:
+        shaped_agent = None
     record = {
         "gpu_id": res.task_id,
         "spec_id": res.spec_id,
@@ -4482,11 +5342,35 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "ts": _now_iso(),
         "status": "pending",
         "retry_count": 0,
+        "model": shaped_agent.model if shaped_agent else None,
+        "review_gate_ts": review_gate_ts,
     }
+    if agent_type == "reviewer_fresh_contractor":
+        if _gap_spanner_reroute:
+            # Tag the route so the locality ledger can distinguish a
+            # dead-seat gap-spanner reroute (this unit) from the TOU-peak
+            # scheduled contractor call above — do not conflate the two
+            # counters.
+            record["route"] = "gap-spanner-dead-seat-reroute"
+        else:
+            # Tag the route so the locality ledger can distinguish a scheduled
+            # daytime contractor call (POLICY) from a fallback event, per
+            # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30:
+            # "instrumentation should distinguish the two or the ledger will read
+            # every daytime judge call as an independence failure."
+            record["route"] = "peak-window-policy"
     append_dispatched(target_id, record)
 
+    _gap_spanner_log = (
+        f"Gap-spanner reroute: prior seat_no_tool_calls on PR #{pr_number} "
+        f"cycle {cycle} → routed to reviewer_fresh_contractor "
+        f"(decision/gw-daytime-no-flips-2026-07-30-temporary-carveout-"
+        f"reviewer-seat-health-2026-08-07).\n"
+        if _gap_spanner_reroute else ""
+    )
     episodic.write_dispatch(
         target_id,
+        f"{_gap_spanner_log}"
         f"Reviewer dispatched (cycle {cycle}, mode={mode}): {agent_type} → {res.task_id}\n"
         f"PR #{pr_number}: {pr.get('title', '')}",
         extra_tags=[
@@ -4567,6 +5451,99 @@ def _act_dispatch_fixer_retry(target_id: str, payload: dict) -> str:
     return f"action:fixer_dispatched:source=retry:pr={pr_number}:cycle={cycle}"
 
 
+def _noop_retry_escalation_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/noop-retry-escalation/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+
+
+def _escalate_noop_retry_if_degraded(target_id: str, rec: dict, pr_num) -> str | None:
+    """Leg 3: escalate a no-op fixer_retry when the verdict that drove it was
+    degraded (starved panel, Leg 1) or carried a refuted absence claim (Leg 2).
+
+    That combination is strong evidence the verdict was false — the PR #220
+    incident is the worked example
+    (finding/reviewer-seat-false-high-finding-absence-from-diff-third-occurrence-2026-08-08):
+    the retry correctly found nothing to change and logged exactly this noop,
+    then the target sat at "reviewing cycle N/budget" with nothing scheduled
+    to advance it — indistinguishable from a stalled worker
+    (pattern-fixer-background-wait-stall) while having the opposite remedy: a
+    real stall has unaddressed valid issues and wants redispatch; this has
+    valid-looking invalid ones and wants a human overriding the verdict.
+
+    Reuses the existing outstanding-brief mechanism (R3) rather than
+    inventing a new state or surface — same shape as the
+    reviewer_infra_budget_exhausted worked example (pm_core.py :4395-area
+    decision, :7688-area action dispatch): a distinct named condition, an
+    idempotent marker so it fires exactly once per pr+cycle, and a
+    human-reachable escalation via brief.synthesize + _set_brief_outstanding
+    (the same call pm-pr-review already walks).
+
+    Returns the action string if an escalation fired, else None (nothing to
+    escalate — verdict was healthy and unrefuted — or already recorded).
+    """
+    if pr_num is None:
+        return None
+    try:
+        pr_number = pr_num if isinstance(pr_num, int) else int(pr_num)
+    except (TypeError, ValueError):
+        return None
+    cycle = rec.get("cycle", 1)
+
+    verdict_info = _review_verdict_for_cycle(target_id, pr_number, cycle)
+    if verdict_info is None:
+        return None
+
+    from . import panel_starvation as _panel_starvation
+    starved = _panel_starvation.verdict_is_starved(verdict_info)
+    refuted = verdict_info.get("refuted_absence_findings") or []
+    if not starved and not refuted:
+        return None
+
+    marker_key = _noop_retry_escalation_marker_key(target_id, pr_number, cycle)
+    if _mem().get(marker_key):
+        return None
+
+    reasons = []
+    if starved:
+        legs = ", ".join((verdict_info.get("panel_starvation") or {}).get("legs_down") or [])
+        reasons.append(f"panel starved (legs down: {legs or 'unknown'})")
+    if refuted:
+        reasons.append(f"{len(refuted)} absence claim(s) refuted against the PR-head file")
+    reason_text = "; ".join(reasons)
+
+    episodic.write_hold(
+        target_id,
+        f"PR #{pr_number} fixer retry (cycle {cycle}) made no code or description "
+        f"change, against a verdict that was {reason_text}. This is strong evidence "
+        f"the verdict was false, not that nothing is left to fix — a real stall has "
+        f"unaddressed valid issues, this has valid-looking invalid ones. Needs a "
+        f"human overriding the verdict, not a redispatch.",
+        extra_tags=[f"pm:pr={pr_number}", "pm:noop-retry-degraded-verdict"],
+    )
+    b = brief.synthesize(
+        target_id,
+        trigger=(
+            f"No-op fixer retry against a degraded verdict on PR #{pr_number} "
+            f"cycle {cycle} ({reason_text}) — human judgment needed"
+        ),
+        query=f"PR #{pr_number} no-op retry: verdict likely false ({reason_text})",
+        pr_number=pr_number,
+        notify=NotifyPriority.HIGH,
+    )
+    _set_brief_outstanding(target_id, b)
+    _mem().set(
+        marker_key,
+        json.dumps({
+            "target_id": target_id,
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "reasons": reasons,
+            "comment_id": b.comment_id,
+        }),
+        tags=["lapis-pm", "noop-retry-escalation"],
+    )
+    return f"action:noop_retry_degraded_verdict_brief:pr={pr_number}:cycle={cycle}:cid={b.comment_id}"
+
+
 def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
     """Human brief when review cycle budget is exhausted."""
     pr = payload["pr"]
@@ -4610,16 +5587,18 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
         return "action:review_gate_paused:already_briefed"
 
     count = _review_gate_counter()
+    span_desc = _review_gate_span_desc()
     episodic.write_observation(
         target_id,
-        f"Review-gate loop soft-paused after {count} Opus reviewer calls in the past 7d. "
+        f"Review-gate loop soft-paused after {count} local reviewer calls in the past {REVIEW_GATE_WINDOW_DAYS}d "
+        f"({span_desc}). "
         f"Falling back to inline-Sonnet behavior for new PRs. "
         f"Resume with `lapis-pm review-gate resume --reason \"...\"` (reason is required).",
         extra_tags=["pm:review-gate-paused"],
     )
     b = brief.synthesize(
         target_id,
-        trigger=f"Review-gate loop soft-paused after {count} Opus reviewer calls",
+        trigger=f"Review-gate loop soft-paused after {count} local reviewer calls ({span_desc})",
         query="review-gate pause — token budget exceeded",
         notify=NotifyPriority.HIGH,
     )
@@ -4627,6 +5606,209 @@ def _act_review_gate_pause(target_id: str, payload: dict) -> str:
     _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
                tags=["lapis-pm", "review-gate"])
     return f"action:review_gate_paused:cid={b.comment_id}"
+
+
+def _reviewer_attempt_ceiling_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/reviewer-attempt-ceiling/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+
+
+def _reviewer_infra_budget_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
+    return f"pm/reviewer-infra-budget/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+
+
+# The human-judgment escape hatch that needs no automated verdict at all.
+# D2 requires every ceiling/infra-budget pause to name this — #834 and #835
+# both had briefs available the entire time they were wedged, and nothing
+# said so.
+_PM_PR_REVIEW_ESCAPE = (
+    "This does not require a reviewer verdict to resolve: walk the "
+    "outstanding brief via `pm-pr-review` for a human-judgment call on the PR."
+)
+
+
+def _fallback_reviewer_fail_reason(target_id: str, pr_number: int, cycle: int) -> str | None:
+    """D3: when no per-attempt reason was recorded — e.g. the reviewer job
+    crashed before writing an output file, so the queue-reconcile path (not
+    the out_path-based encode path) owned the terminal flip and the ordering
+    left last_reason unset for that race — fall back to the last failed
+    reviewer dispatch record's `error` field, which the queue populates from
+    the job's own stderr and reliably holds the real cause even when no
+    output file was ever written."""
+    records = [
+        r for r in load_dispatched(target_id)
+        if r.get("agent_type") in _REVIEWER_AGENT_TYPES
+        and r.get("pr_number") == pr_number
+        and r.get("cycle", 1) == cycle
+        and r.get("status") == "failed"
+        and r.get("error")
+    ]
+    if not records:
+        return None
+    return records[-1]["error"]
+
+
+def _act_reviewer_attempt_ceiling_pause(target_id: str, payload: dict) -> str:
+    """Auto-pause the target and emit exactly ONE structured record when a
+    reviewer's per-PR-cycle attempt count (excluding infra-classified
+    non-runs, see D1) exceeds the ceiling without ever producing a completed
+    verdict (lapis-pm-reviewer-attempt-ceiling-v0).
+
+    Per the boundary ruling: pause is the audible state (not silent-stop),
+    the record must be machine-consumable, and this must NOT auto-unpause —
+    the only escape hatch is `lapis-pm clear-reviewer-attempts <target_id>`
+    followed by an explicit `lapis-pm resume <target_id>`.
+    """
+    pr_number = payload["pr_number"]
+    cycle = payload["cycle"]
+
+    # Idempotent: emit the record at most once per pr+cycle. The tick loop
+    # already early-returns "noop:paused" for a paused target, so this is a
+    # defensive belt-and-suspenders guard, not the primary mechanism.
+    marker_key = _reviewer_attempt_ceiling_marker_key(target_id, pr_number, cycle)
+    if _mem().get(marker_key):
+        return "action:reviewer_attempt_ceiling:already_recorded"
+
+    attempts = payload["attempts"]
+    ceiling = payload["ceiling"]
+    # D3: a ceiling pause must never render reported_reason=None. If no
+    # per-attempt reason was recorded, fall back to the dispatch record's
+    # `error` field before giving up.
+    reported_reason = payload.get("reported_reason") or _fallback_reviewer_fail_reason(
+        target_id, pr_number, cycle,
+    )
+    clear_cmd = f"lapis-pm clear-reviewer-attempts {target_id}"
+    # This is the genuine-failure ceiling (infra attempts are excluded from
+    # `attempts` by _reviewer_attempt_ceiling_check), so clear-reviewer-attempts
+    # is a legitimate remedy here — a reviewer producing bad/unparseable
+    # verdicts is exactly what clearing the counters and retrying can fix.
+    reason_clause = (
+        f"reported_reason={reported_reason!r}"
+        if reported_reason
+        else "no reason was reported by any failing attempt (unresolved)"
+    )
+
+    record = {
+        "target_id": target_id,
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "attempts": attempts,
+        "ceiling": ceiling,
+        # As-reported by the failing reviewer leg — NOT a verified cause.
+        # This mechanism does not investigate why the reviewer failed; it
+        # only counts that it did, N times in a row. See DoD 3b.
+        "reported_reason": reported_reason,
+        "reported_reason_note": "as-reported by the failing leg; unverified by this mechanism",
+        "paused": True,
+        "clear_command": clear_cmd,
+        "escape_hatch": _PM_PR_REVIEW_ESCAPE,
+    }
+
+    store = TargetStore()
+    target = store.get(target_id)
+    if target is not None:
+        target.set_paused(
+            True,
+            reason=(
+                f"reviewer-attempt-ceiling: PR #{pr_number} cycle {cycle} hit "
+                f"{attempts}/{ceiling} attempts with no completed verdict "
+                f"({reason_clause}, unverified). "
+                f"Clear with `{clear_cmd}`, then `lapis-pm resume {target_id}`. "
+                f"{_PM_PR_REVIEW_ESCAPE}"
+            ),
+        )
+        target.save()
+
+    episodic.write_observation(
+        target_id,
+        f"Reviewer attempt ceiling reached on PR #{pr_number} cycle {cycle} "
+        f"({attempts}/{ceiling} attempts, no completed verdict) — target auto-paused.\n"
+        f"{json.dumps(record, indent=2)}",
+        extra_tags=[
+            "pm:reviewer-attempt-ceiling",
+            f"pm:pr={pr_number}",
+            f"pm:reviewer-attempt-ceiling:pr={pr_number}:cycle={cycle}",
+        ],
+    )
+    _mem().set(marker_key, json.dumps(record),
+               tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"])
+    return f"action:reviewer_attempt_ceiling_paused:pr={pr_number}:cycle={cycle}:attempts={attempts}"
+
+
+def _act_reviewer_infra_budget_pause(target_id: str, payload: dict) -> str:
+    """Auto-pause the target when the *infrastructure* retry budget (D1) is
+    exhausted — repeated reviewer non-runs (GravityWell not serving /
+    unreachable), never a reviewer that ran and produced a bad verdict.
+
+    Deliberately a distinct action from _act_reviewer_attempt_ceiling_pause:
+    per D2, an infra-caused pause must name the infrastructure cause and must
+    NOT recommend `clear-reviewer-attempts` — clearing the ceiling counters
+    cannot fix an unavailable GravityWell, and recommending it here is
+    exactly the "retry, not a repair" trap that wedged #834 on 2026-08-03.
+    """
+    pr_number = payload["pr_number"]
+    cycle = payload["cycle"]
+
+    marker_key = _reviewer_infra_budget_marker_key(target_id, pr_number, cycle)
+    if _mem().get(marker_key):
+        return "action:reviewer_infra_budget_exhausted:already_recorded"
+
+    infra_attempts = payload["infra_attempts"]
+    infra_budget = payload["infra_budget"]
+    reported_reason = payload.get("reported_reason") or _fallback_reviewer_fail_reason(
+        target_id, pr_number, cycle,
+    )
+    reason_clause = reported_reason or "infrastructure non-run (reason unresolved)"
+
+    record = {
+        "target_id": target_id,
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "infra_attempts": infra_attempts,
+        "infra_budget": infra_budget,
+        "reported_reason": reported_reason,
+        "reported_reason_note": "as-reported by the failing leg; unverified by this mechanism",
+        "cause_class": "infrastructure",
+        "paused": True,
+        "escape_hatch": _PM_PR_REVIEW_ESCAPE,
+    }
+
+    store = TargetStore()
+    target = store.get(target_id)
+    if target is not None:
+        target.set_paused(
+            True,
+            reason=(
+                f"reviewer-infra-budget: PR #{pr_number} cycle {cycle} hit "
+                f"{infra_attempts}/{infra_budget} infrastructure non-runs "
+                f"({reason_clause}) — the reviewer never ran, this is not a "
+                f"bad review. Clearing reviewer attempts will not help; this "
+                f"is an infrastructure availability problem "
+                f"(out of scope for lapis-pm — see the gw_not_serving/doorman "
+                f"divergence follow-up). {_PM_PR_REVIEW_ESCAPE} "
+                f"Resume once the infrastructure is confirmed available: "
+                f"`lapis-pm resume {target_id}`."
+            ),
+        )
+        target.save()
+
+    episodic.write_observation(
+        target_id,
+        f"Reviewer infra-retry budget exhausted on PR #{pr_number} cycle {cycle} "
+        f"({infra_attempts}/{infra_budget} infrastructure non-runs, "
+        f"cause={reason_clause}) — target auto-paused.\n"
+        f"{json.dumps(record, indent=2)}",
+        extra_tags=[
+            "pm:reviewer-infra-budget",
+            f"pm:pr={pr_number}",
+            f"pm:reviewer-infra-budget:pr={pr_number}:cycle={cycle}",
+        ],
+    )
+    _mem().set(marker_key, json.dumps(record),
+               tags=["lapis-pm", "reviewer-infra-budget", f"target={target_id}"])
+    return (
+        f"action:reviewer_infra_budget_paused:pr={pr_number}:cycle={cycle}:"
+        f"infra_attempts={infra_attempts}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5440,6 +6622,19 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                             "pm:fixer-retry-noop",
                         ],
                     )
+                    # Leg 3: a no-op retry against a degraded/refuted verdict
+                    # is strong evidence the verdict was false, not that
+                    # there's nothing to fix. Escalate rather than leave the
+                    # target wedged with nothing scheduled to advance it.
+                    try:
+                        _escalate_noop_retry_if_degraded(target_id, rec, pr_num)
+                    except Exception as _esc_exc:
+                        episodic.write_observation(
+                            target_id,
+                            f"noop-retry escalation check skipped for PR #{pr_num}: "
+                            f"{type(_esc_exc).__name__}",
+                            extra_tags=["pm:noop-retry-escalation-skipped"],
+                        )  # best-effort; never fail verdict encoding
                 continue  # fixer_retry never falls to reviewer verdict path
             # fixer_retry without pr_number: fall through to GPU output file path
             # as defensive fallback (shouldn't happen in practice).
@@ -5522,10 +6717,19 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 f"Intent: {rec.get('intent')}\n\n{snippet}",
                 extra_tags=tags + ["pm:failure"],
             )
+            if rec.get("agent_type") in _REVIEWER_AGENT_TYPES and rec.get("pr_number") is not None:
+                # Stash the as-reported reason for the attempt-ceiling record
+                # (DoD 3b: recorded as claimed, never as a verified cause).
+                reported_reason = (text.strip().splitlines() or [""])[0][:500]
+                _record_reviewer_attempt_reason(
+                    target_id, rec["pr_number"], rec.get("cycle", 1), reported_reason,
+                    review_gate_ts=rec.get("review_gate_ts"),
+                    wait_s=_reviewer_dispatch_wait_seconds(rec),
+                )
             failed_for_retry.append(rec)
         else:
             # Reviewer agents: parse JSON output and write reviewer-tagged episodic entry
-            if rec.get("agent_type") in ("reviewer", "reviewer_fresh"):
+            if rec.get("agent_type") in _REVIEWER_AGENT_TYPES:
                 pr_num = rec.get("pr_number", "?")
                 cycle_num = rec.get("cycle", 1)
                 raw_output = text.strip()
@@ -5601,6 +6805,55 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                         f"local witness pass skipped for PR #{pr_num}: {type(_wit_exc).__name__}",
                         extra_tags=["pm:local-witness-skipped"],
                     )  # best-effort; never fail verdict encoding
+
+                # Panel starvation + confidence attenuation (Leg 1). Additive —
+                # attaches "panel_starvation" and rewrites "confidence" to the
+                # attenuated value, keeping the raw value at
+                # panel_starvation.confidence_raw for audit. Never fails verdict
+                # encoding; a starved-detection error just skips the annotation
+                # (the raw verdict still ships, unattenuated — same as before
+                # this leg existed).
+                try:
+                    from . import panel_starvation as _panel_starvation
+                    _stored_dict3 = json.loads(stored_json)
+                    _panel_starvation.apply_panel_starvation(_stored_dict3)
+                    stored_json = json.dumps(_stored_dict3)
+                except Exception as _starv_exc:
+                    episodic.write_observation(
+                        target_id,
+                        f"panel-starvation check skipped for PR #{pr_num}: {type(_starv_exc).__name__}",
+                        extra_tags=["pm:panel-starvation-skipped"],
+                    )  # best-effort; never fail verdict encoding
+
+                # Absence-claim grounding (Leg 2). Checks any "X is not
+                # defined/missing/removed" finding against the full file at
+                # the PR head rather than the diff. Refuted findings are
+                # dropped from the actionable `issues` list and moved to
+                # `refuted_absence_findings` with their location; an
+                # unrunnable check leaves the finding actionable, marked
+                # unverified (R2) — never a fail-verdict-encoding condition.
+                try:
+                    from . import absence_ground as _absence_ground
+                    _pr_head_sha = None
+                    try:
+                        from agents_core.forgejo import get_pr as _get_pr
+                        _pr_int = pr_num if isinstance(pr_num, int) else int(pr_num)
+                        _pr_head_sha = ((_get_pr(rec.get("repo", ""), _pr_int) or {})
+                                        .get("head") or {}).get("sha")
+                    except Exception:
+                        _pr_head_sha = None
+                    _stored_dict4 = json.loads(stored_json)
+                    _absence_ground.ground_verdict_issues(
+                        _stored_dict4, rec.get("repo", ""), pr_num, _pr_head_sha,
+                    )
+                    stored_json = json.dumps(_stored_dict4)
+                except Exception as _ground_exc:
+                    episodic.write_observation(
+                        target_id,
+                        f"absence-claim grounding skipped for PR #{pr_num}: {type(_ground_exc).__name__}",
+                        extra_tags=["pm:absence-grounding-skipped"],
+                    )  # best-effort; never fail verdict encoding
+
                 result_tags = tags + [
                     f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
                     f"pm:pr={pr_num}",
@@ -5656,11 +6909,84 @@ def _seen_pr_ids(target_id: str) -> set[int]:
 # Dispatch–queue reconciliation
 # ---------------------------------------------------------------------------
 
+def _reap_verdict(
+    gpu_id: str,
+    active_by_id: dict[str, dict],
+    pending_ids: set[str],
+) -> dict | None:
+    """Leg 1 reap pass: decide whether a pending record with no terminal
+    queue match (not in completed/, not in failed/) should be force-flipped
+    to failed anyway, because the queue state proves the work is gone.
+
+    Returns a verdict dict shaped like the ``terminal`` entries built in
+    ``_reconcile_dispatched_with_queue`` (state/error/completed_at), plus a
+    ``failure_reason`` key, or None if the record must stay pending.
+
+    Case A — task_absent_from_queue: gpu_id is in none of pending / active /
+    completed / failed. The task no longer exists anywhere in the queue.
+    Case B — active_past_timeout: gpu_id is in active/ and its age exceeds
+    its own declared timeout_seconds + STARTUP_STALE_GRACE_S — the same
+    arithmetic agents_core.claude_queue_runner.startup_sweep uses to decide
+    a runner died mid-task. A live, legitimately-slow fixer within its own
+    timeout is never reaped (Case B does not fire) — see spec §Leg 1.
+    """
+    task = active_by_id.get(gpu_id)
+    if task is not None:
+        started_at = task.get("started_at")
+        timeout = int(task.get("timeout_seconds", 300))
+        if not started_at:
+            # No started_at recorded at all — can't establish age, so we
+            # cannot prove staleness. Degrade open: leave it pending.
+            return None
+        try:
+            started_dt = datetime.fromisoformat(started_at)
+            age_s = (datetime.now(PACIFIC) - started_dt).total_seconds()
+        except ValueError:
+            return None
+        if age_s > (timeout + STARTUP_STALE_GRACE_S):
+            return {
+                "state": "failed",
+                "error": None,
+                "completed_at": _now_iso(),
+                "failure_reason": "reaped:active_past_timeout",
+            }
+        return None  # active and within its own timeout — never reaped
+
+    if gpu_id in pending_ids:
+        # Still queued, waiting to be claimed. Not gone, not stuck.
+        return None
+
+    # Not in pending/, not in active/, and (by construction — this is only
+    # called when `terminal.get(gpu_id) is None`) not in completed/ or
+    # failed/ either. The task no longer exists in the queue at all.
+    return {
+        "state": "failed",
+        "error": None,
+        "completed_at": _now_iso(),
+        "failure_reason": "reaped:task_absent_from_queue",
+    }
+
+
 def _reconcile_dispatched_with_queue(target_id: str) -> int:
+    """Public entry point — see _reconcile_dispatched_with_queue_ex for the
+    real implementation and full docstring. This wrapper preserves the
+    existing int-only contract for tick() and any other caller that only
+    needs the flipped count and is content with degrade-open-to-0 on a
+    queue-read failure.
+    """
+    flipped, _ok = _reconcile_dispatched_with_queue_ex(target_id)
+    return flipped
+
+
+def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
     """Flip pending dispatch records to terminal state based on ClaudeQueue.
 
-    Returns count of records flipped. Idempotent — calling twice in a row
-    with no new queue activity is a no-op (returns 0 the second time).
+    Returns (flipped_count, ok). ``ok`` is False only when the queue read
+    itself raised — Leg 2 (force_dispatch) uses it to decide whether to
+    warn that reconciliation was skipped. A normal no-op call (nothing to
+    reconcile) returns (0, True), distinguishable from a failed read's
+    (0, False). Idempotent — calling twice in a row with no new queue
+    activity is a no-op (returns 0 the second time).
 
     Reads get_recent_failed(limit=50) and get_recent_completed(limit=50)
     once per call (not once per record). Matches on gpu_id (the queue's
@@ -5681,16 +7007,28 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
       the output file, parses JSON, writes "Reviewer verdict for PR #N:").
     Failed flips for both carve-out types are still permitted — a crashed
     job produces no output file, so the record must fail rather than wait.
+
+    Reap pass (Leg 1, lapis-pm-stale-pending-dispatch-reaper-v0): a pending
+    record with no terminal match above is also checked against get_active()
+    and get_pending() — see _reap_verdict. A record whose gpu_id is provably
+    gone from every queue directory, or stuck in active/ past its own
+    timeout_seconds + STARTUP_STALE_GRACE_S, is flipped to failed with a
+    failure_reason of "reaped:task_absent_from_queue" or
+    "reaped:active_past_timeout" respectively. The carve-outs above are
+    unaffected — reap only ever produces "failed", never "processed", so it
+    never bypasses either carve-out's reasoning.
     """
     if _ClaudeQueue is None:
-        return 0
+        return 0, True
 
     try:
         cq = _ClaudeQueue()
         failed_entries = cq.get_recent_failed(limit=50)
         completed_entries = cq.get_recent_completed(limit=50)
+        active_entries = cq.get_active()
+        pending_entries = cq.get_pending()
     except Exception:
-        return 0
+        return 0, False
 
     # Build gpu_id → terminal-state index from both lists.
     # failed wins if a task somehow appears in both (shouldn't happen).
@@ -5711,6 +7049,19 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
                 "error": entry.get("error"),
                 "completed_at": entry.get("completed_at"),
             }
+
+    # Live-queue index for the reap pass below (Leg 1 of the stale-pending
+    # reaper spec). A record whose gpu_id shows up in none of these four
+    # buckets — pending / active / completed / failed — is provably gone;
+    # one whose gpu_id sits in active/ past its own declared timeout is
+    # evidence the runner that owned it died. Liveness is decided from this
+    # queue state ONLY — no ps, no worktree stat, no filesystem probing.
+    active_by_id: dict[str, dict] = {}
+    for entry in active_entries:
+        task_id = entry.get("id")
+        if task_id:
+            active_by_id[task_id] = entry
+    pending_ids: set[str] = {e.get("id") for e in pending_entries if e.get("id")}
 
     records = load_dispatched(target_id)
     flipped = 0
@@ -5733,7 +7084,9 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
             continue
         t = terminal.get(gpu_id)
         if t is None:
-            continue
+            t = _reap_verdict(gpu_id, active_by_id, pending_ids)
+            if t is None:
+                continue
 
         # fixer_retry carve-out: advance-perceiver (_fixer_completion_ts) is the
         # sole authority for fixer_retry → processed. If the queue says "completed"
@@ -5753,7 +7106,7 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         # episodic entry, and then flips to processed.
         # Failed flips for reviewers are still permitted (crashed job → no
         # output file coming; must fail fast rather than wait forever).
-        if rec.get("agent_type") in ("reviewer", "reviewer_fresh") and t["state"] == "processed":
+        if rec.get("agent_type") in _REVIEWER_AGENT_TYPES and t["state"] == "processed":
             continue  # output-file verdict-encoder owns reviewer → processed
 
         # Flip the record to the terminal state.
@@ -5762,8 +7115,32 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
             rec["error"] = t["error"]
         if t["completed_at"] is not None:
             rec["completed_at"] = t["completed_at"]
+        if t.get("failure_reason") is not None:
+            rec["failure_reason"] = t["failure_reason"]
         changed = True
         flipped += 1
+
+        # D3 fix (lapis-pm-reviewer-attempts-not-consumed-by-infra-v0): a
+        # reviewer/reviewer_fresh job that crashed before writing an output
+        # file (e.g. GravityWell reported not-serving) is flipped to "failed"
+        # right here — status was already != "pending" by the time
+        # _encode_gpu_results ran later this same tick, so its is_failure
+        # branch (the only other call site of _record_reviewer_attempt_reason)
+        # never sees it and last_reason stays None forever. Record the reason
+        # here too, from the queue's `error` field — the one surface that DID
+        # hold the real cause (verified live 2026-08-03: the queue's error
+        # string was the verbatim "ERROR: local reviewer produced no verdict
+        # (reason=gw_not_serving)"). Also classifies against the infra
+        # allow-list (D1), same as the out_path-based path.
+        if (rec.get("agent_type") in _REVIEWER_AGENT_TYPES
+                and t["state"] == "failed"
+                and rec.get("pr_number") is not None
+                and t["error"]):
+            _record_reviewer_attempt_reason(
+                target_id, rec["pr_number"], rec.get("cycle", 1), t["error"],
+                review_gate_ts=rec.get("review_gate_ts"),
+                wait_s=_reviewer_dispatch_wait_seconds(rec),
+            )
 
         # Close the project-slot + emit its deposit for slots whose terminal flip
         # is owned by THIS reconciler rather than _encode_gpu_results. The two
@@ -5779,18 +7156,30 @@ def _reconcile_dispatched_with_queue(target_id: str) -> int:
         # with the same gpu_id in a later tick writes nothing.
         dedup_tag = f"pm:dispatch-reconciled:gpu={gpu_id}"
         if dedup_tag not in existing_dedup_tags:
-            error_note = f" ({t['error']})" if t["error"] else ""
-            episodic.write_observation(
-                target_id,
-                f"Reconciled dispatch {gpu_id}: pending → {t['state']}{error_note}",
-                extra_tags=["pm:dispatch-reconciled", dedup_tag],
-            )
+            reaped_reason = t.get("failure_reason")
+            if reaped_reason is not None:
+                # Reap path (Leg 1): no queue error string to report — the
+                # task is either absent from every queue directory or stuck
+                # past its own timeout. Tag distinctly from a normal
+                # reconcile flip so the audit trail names cause, not just effect.
+                episodic.write_observation(
+                    target_id,
+                    f"Reaped dispatch {gpu_id}: pending → {t['state']} ({reaped_reason})",
+                    extra_tags=["pm:dispatch-reconciled", "pm:dispatch-reaped", dedup_tag],
+                )
+            else:
+                error_note = f" ({t['error']})" if t["error"] else ""
+                episodic.write_observation(
+                    target_id,
+                    f"Reconciled dispatch {gpu_id}: pending → {t['state']}{error_note}",
+                    extra_tags=["pm:dispatch-reconciled", dedup_tag],
+                )
             existing_dedup_tags.add(dedup_tag)
 
     if changed:
         save_dispatched(target_id, records)
 
-    return flipped
+    return flipped, True
 
 
 # ---------------------------------------------------------------------------
@@ -6438,6 +7827,11 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     _merged_this_tick = _encode_merged_prs(target_id, repo)
     encoded += _merged_this_tick
 
+    # Reconcile a surviving head branch on a confirmed merge (L1). Bookkeeping,
+    # not a decide-phase action — scoped to this single target_id only. See
+    # _reconcile_surviving_head_branch for why this is bounded to one probe.
+    _reconcile_surviving_head_branch(target_id, repo)
+
     # Classify lost fixer dispatches (terminal job, no PR produced).
     # Must run after encode so freshly-flipped records are visible.
     _lost_all_records = load_dispatched(target_id)
@@ -6567,6 +7961,10 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                     decision_str = _act_brief_review_exhausted(target_id, decision.payload)
                 elif decision.kind == "review_gate_pause":
                     decision_str = _act_review_gate_pause(target_id, decision.payload)
+                elif decision.kind == "reviewer_attempt_ceiling":
+                    decision_str = _act_reviewer_attempt_ceiling_pause(target_id, decision.payload)
+                elif decision.kind == "reviewer_infra_budget_exhausted":
+                    decision_str = _act_reviewer_infra_budget_pause(target_id, decision.payload)
                 elif decision.kind == "noop_reviewer_in_flight":
                     p = decision.payload
                     decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"
@@ -6695,10 +8093,11 @@ def tick_all() -> list[TickResult]:
     if _review_gate_paused():
         count = _review_gate_counter()
         logger.info(
-            "[review-gate-paused] counter=%d/%d: dispatching inline-Sonnet fallback for "
+            "[review-gate-paused] counter=%d/%d (%s): dispatching inline-Sonnet fallback for "
             "advisory PRs. Resume with `lapis-pm review-gate resume --reason \"...\"`.",
             count,
             REVIEW_GATE_THRESHOLD,
+            _review_gate_span_desc(),
         )
 
     # Decided-gem reconciler: process brief-gems Erah has decided on the Desk.
@@ -6717,8 +8116,12 @@ def tick_all() -> list[TickResult]:
     # Pre-select which target (if any) gets the auto-land slot this tick.
     # This check uses observations from previous ticks; targets that become
     # eligible for the first time this tick are deferred to the next tick.
+    # Paused targets are excluded here (not just inside tick()): a paused
+    # target that meets every other auto-land condition would otherwise sort
+    # first by oldest bind, win the single slot, and immediately noop:paused —
+    # starving every other land-eligible target for as long as it stays paused.
     eligible_ids = sorted(
-        [t.id for t in bound if _is_auto_land_eligible(t.id)],
+        [t.id for t in bound if not t.paused and _is_auto_land_eligible(t.id)],
         key=_spec_bound_ts,
     )
     auto_land_chosen = eligible_ids[0] if eligible_ids else None

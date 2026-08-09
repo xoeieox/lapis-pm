@@ -407,7 +407,14 @@ class TestElevatorGroundingV1:
         monkeypatch.setenv("ELEVATOR_ACTIVE", "true")
         monkeypatch.setenv("ELEVATOR_STORE_URL", "http://test-store:8405")
         monkeypatch.setenv("ELEVATOR_GROUNDING_POLL_TIMEOUT_SEC", "180")
-        monkeypatch.setenv("ELEVATOR_GROUNDING_CLAIM_DEADLINE_SEC", "75")
+        # 0, not 75: the gate-queue-progress-aware-wait-v0 heartbeat now calls
+        # time.time() at several points before this poll loop runs (progress-file
+        # beats on lock-acquire and each phase transition), which made a hand-crafted
+        # exact time.time() call-count mock (previously used here) brittle to any
+        # change in call count. A claim deadline of 0s makes the very first poll
+        # iteration trip the AC5b stall path on real wall-clock time instead —
+        # exercising the same code path without depending on call ordering.
+        monkeypatch.setenv("ELEVATOR_GROUNDING_CLAIM_DEADLINE_SEC", "0")
 
         captured = []
 
@@ -428,12 +435,7 @@ class TestElevatorGroundingV1:
 
         with mock.patch("requests.post", mock.Mock(return_value=enqueue_resp)), \
              mock.patch("requests.get", mock.Mock(return_value=poll_resp)), \
-             mock.patch("time.sleep"), \
-             mock.patch("time.time") as mock_time:
-            # time.time() calls in order: start_time(1282), poll_start(1446),
-            # first loop elapsed(1449) → 80s > 75s claim deadline fires,
-            # final elapsed(1689) → any value
-            mock_time.side_effect = [1000.0, 1000.0, 1080.0, 1001.0]
+             mock.patch("time.sleep"):
             spec_review.run_spec_review(
                 spec_path=spec_fixture,
                 dispatch_facets=True,

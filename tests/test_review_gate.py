@@ -229,15 +229,60 @@ class TestCycleCountHelpers:
 
 class TestDecideForPr:
 
-    def test_held_path_returns_hold_brief_immediately(self):
-        """Held path → hold_brief without reviewer dispatch (spec invariant)."""
+    @pytest.fixture(autouse=True)
+    def _healthy_panel(self):
+        # These tests exercise _decide_for_pr's fixable/needs-human/clean/budget
+        # routing, not panel-starvation (Leg 1, covered by test_panel_starvation*.py).
+        # Their verdict fixtures predate the corroboration/witness blocks, so
+        # without this they'd all read as starved (absent block == down) and
+        # route to advisory_brief regardless of verdict content. Assume a
+        # healthy (fully-corroborated) panel here.
+        with patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False):
+            yield
+
+    def test_held_path_dispatches_reviewer_before_hold_brief(self):
+        """Held path → reviewer dispatched once first (lapis-pm-containment-held-paths-v0
+        Leg 3), THEN hold_brief once the verdict is in — never skips the machine read."""
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_HELD_PATH),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
+            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "dispatch_reviewer"
+        assert d.payload["held_path"] is True
+        assert d.payload["cycle"] == 1
+
+    def test_held_path_pending_reviewer_is_noop(self):
+        """A held-path reviewer already in flight → noop, not a re-dispatch."""
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_HELD_PATH),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=True),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+        ):
+            d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
+        assert d.kind == "noop_reviewer_in_flight"
+
+    def test_held_path_verdict_ready_raises_hold_brief_with_verdict(self):
+        """Reviewer already completed once → hold_brief carrying that verdict, never
+        dispatched a second time regardless of verdict content."""
+        verdict_info = {"verdict": "needs-human", "issues": ISSUES}
+        with (
+            patch("lapis_pm.pm_core.authority.classify", return_value=CLS_HELD_PATH),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_info),
         ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "hold_brief"
+        assert d.payload["reviewer_verdict"] == verdict_info
 
     def test_auto_authority_clean_returns_merge(self):
         """Auto authority + clean screen → merge."""
@@ -731,9 +776,9 @@ class TestKillSwitch:
         assert "already_briefed" in result
 
     def test_review_gate_resume_resets_counter(self):
-        """review_gate_resume() resets counter to 0 and clears paused flag."""
+        """review_gate_resume() resets counter to empty window and clears paused flag."""
         mem = MagicMock()
-        # get() called for counter (returns 25) and for paused check
+        # get() called for counter (legacy bare-int format, returns 25) and for paused check
         mem.get.side_effect = [{"content": "25"}, None]
 
         with patch("lapis_pm.pm_core._mem", return_value=mem):
@@ -743,18 +788,232 @@ class TestKillSwitch:
         set_calls = [c for c in mem.set.call_args_list
                      if c[0][0] == pm_core.REVIEW_GATE_COUNTER_KEY]
         assert set_calls
-        assert set_calls[0][0][1] == "0"
+        assert set_calls[0][0][1] == "[]"
+
+
+class TestReviewGateSlidingWindow:
+    """AC3a: the counter is a trailing REVIEW_GATE_WINDOW_DAYS-day rate, not a
+    cumulative lifetime total — entries age out of the window on their own.
+    """
+
+    def _iso(self, dt):
+        return dt.isoformat()
+
+    def test_entries_inside_window_count(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        recent = [self._iso(now - timedelta(days=1)),
+                  self._iso(now - timedelta(days=6))]
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps(recent)}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            assert pm_core._review_gate_counter() == 2
+
+    def test_entries_older_than_window_do_not_count(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        mixed = [self._iso(now - timedelta(days=1)),
+                 self._iso(now - timedelta(days=8)),
+                 self._iso(now - timedelta(days=30))]
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps(mixed)}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            assert pm_core._review_gate_counter() == 1
+
+    def test_cumulative_trip_does_not_trip_under_window(self):
+        """40 dispatches spread across months (old cumulative counter would
+        trip) does not trip once only in-window entries are counted."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        old_entries = [self._iso(now - timedelta(days=30 + i)) for i in range(40)]
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps(old_entries)}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            count = pm_core._review_gate_counter()
+        assert count == 0
+        assert count < pm_core.REVIEW_GATE_THRESHOLD
+
+    def test_legacy_bare_int_counter_reads_without_raising(self):
+        """A pre-migration bare-int counter value must not crash the reader."""
+        mem = MagicMock()
+        mem.get.return_value = {"content": "23"}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            count = pm_core._review_gate_counter()
+        assert count == 23
+
+    def test_increment_appends_timestamp_and_prunes_stale(self):
+        """_increment_review_gate_counter returns the appended timestamp (not
+        the count) — record-then-retract (Part 1) needs the exact entry back
+        so a later classified infra failure can retract this one specifically."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        stale = self._iso(now - timedelta(days=10))
+        mem = MagicMock()
+        mem.get.return_value = {"content": json.dumps([stale])}
+        with patch("lapis_pm.pm_core._mem", return_value=mem):
+            appended_ts = pm_core._increment_review_gate_counter()
+        set_calls = [c for c in mem.set.call_args_list
+                     if c[0][0] == pm_core.REVIEW_GATE_COUNTER_KEY]
+        assert set_calls
+        stored = json.loads(set_calls[0][0][1])
+        assert stale not in stored  # stale entry pruned
+        assert stored == [appended_ts]  # only the fresh, returned entry remains
 
     def test_review_gate_status_returns_state(self):
-        """review_gate_status() returns counter, threshold, paused."""
+        """review_gate_status() returns counter, threshold, paused, and the
+        window-span + infra-nonrun diagnostic fields (Part 2)."""
         with (
             patch("lapis_pm.pm_core._review_gate_counter", return_value=15),
             patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
+            patch("lapis_pm.pm_core._review_gate_window_timestamps",
+                  return_value=["2026-08-01T00:00:00+00:00", "2026-08-04T00:00:00+00:00"]),
+            patch("lapis_pm.pm_core._infra_nonrun_counter", return_value=3),
         ):
             state = pm_core.review_gate_status()
         assert state["counter"] == 15
         assert state["threshold"] == pm_core.REVIEW_GATE_THRESHOLD
         assert state["paused"] is False
+        assert state["window_days"] == pm_core.REVIEW_GATE_WINDOW_DAYS
+        assert state["window_oldest"] == "2026-08-01T00:00:00+00:00"
+        assert state["window_newest"] == "2026-08-04T00:00:00+00:00"
+        assert state["infra_nonruns"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch record-then-retract (lapis-pm-review-gate-counter-infra-nonruns-v0)
+# ---------------------------------------------------------------------------
+
+class _FakeMemStore:
+    """Minimal in-memory stand-in for the real MemoryStore, backed by a plain
+    dict, so record-then-retract sequences (get → mutate → set → get again)
+    behave like the real thing across multiple calls within one test."""
+
+    def __init__(self):
+        self._data: dict[str, str] = {}
+
+    def get(self, key):
+        if key not in self._data:
+            return None
+        return {"content": self._data[key]}
+
+    def set(self, key, content, tags=None):
+        self._data[key] = content
+
+    def delete(self, key):
+        return self._data.pop(key, None) is not None
+
+
+class TestReviewGateInfraNonRuns:
+    """Part 1 (record-then-retract) + Part 2 (separate infra ledger).
+
+    Shape is mandated: the kill-switch counter increments pre-dispatch
+    (_increment_review_gate_counter) and is retracted ONLY when
+    _record_reviewer_attempt_reason classifies the failure as infra
+    (REVIEWER_INFRA_FAIL_REASONS). Every other outcome leaves the entry
+    standing — that's what proves the runaway guard isn't weakened.
+    """
+
+    def test_infra_classified_failure_retracts_kill_switch_entry(self):
+        """AC1: a gw_not_serving failure leaves the window count unchanged
+        from before the dispatch (increment then retract nets to zero)."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            before = pm_core._review_gate_counter()
+            ts = pm_core._increment_review_gate_counter()
+            assert pm_core._review_gate_counter() == before + 1
+            pm_core._record_reviewer_attempt_reason(
+                "tid", 42, 1, "ERROR: local reviewer produced no verdict (reason=gw_not_serving)",
+                review_gate_ts=ts,
+            )
+            assert pm_core._review_gate_counter() == before
+
+    def test_successful_review_increments_exactly_once(self):
+        """AC2: a completed review (any verdict) leaves the pre-dispatch
+        increment standing — no retraction happens absent a failure."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            before = pm_core._review_gate_counter()
+            pm_core._increment_review_gate_counter()
+            # No call to _record_reviewer_attempt_reason — success path never
+            # calls it (only the is_failure branch does).
+            assert pm_core._review_gate_counter() == before + 1
+
+    def test_unclassified_failure_still_counts(self):
+        """AC3: a hang/crash/unknown-reason failure does NOT retract — the
+        runaway guard must not be weakened by an unrecognised reason."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            before = pm_core._review_gate_counter()
+            ts = pm_core._increment_review_gate_counter()
+            pm_core._record_reviewer_attempt_reason(
+                "tid", 42, 1, "ERROR: unexpected exception, traceback follows",
+                review_gate_ts=ts,
+            )
+            assert pm_core._review_gate_counter() == before + 1
+
+    def test_six_infra_nonruns_consume_zero_kill_switch_slots(self):
+        """AC4: the exact 2026-08-04 scenario — REVIEWER_INFRA_RETRY_BUDGET_DEFAULT
+        (6) consecutive infra non-runs against one PR consume zero slots."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            before = pm_core._review_gate_counter()
+            for cycle in range(1, 7):
+                ts = pm_core._increment_review_gate_counter()
+                pm_core._record_reviewer_attempt_reason(
+                    "tid", 42, cycle, "reason=gw_not_serving", review_gate_ts=ts,
+                )
+            assert pm_core._review_gate_counter() == before
+
+    def test_retract_missing_entry_does_not_raise(self):
+        """AC8 / Council open question 1: retracting an absent entry (double
+        retract, race, already-expired) swallows cleanly — no raise, counter
+        unaffected."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            before = pm_core._review_gate_counter()
+            result = pm_core._retract_review_gate_counter_entry("2020-01-01T00:00:00+00:00")
+            assert result is False
+            assert pm_core._review_gate_counter() == before
+
+    def test_retract_none_ts_does_not_raise(self):
+        """AC8: retracting with ts=None (dispatch record predates this field)
+        swallows cleanly."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            assert pm_core._retract_review_gate_counter_entry(None) is False
+
+    def test_double_retract_second_call_is_a_noop(self):
+        """AC8: retracting the same ts twice — the second call finds nothing
+        and swallows, it does not under-run the counter or corrupt the ledger."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            ts = pm_core._increment_review_gate_counter()
+            assert pm_core._retract_review_gate_counter_entry(ts) is True
+            assert pm_core._retract_review_gate_counter_entry(ts) is False
+            assert pm_core._review_gate_counter() == 0
+
+    def test_infra_ledger_survives_kill_switch_retraction(self):
+        """AC9: the diagnostic infra-non-run ledger still shows the event
+        after it's been retracted from the kill-switch counter — fixing the
+        throttle must not erase the evidence."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            ts = pm_core._increment_review_gate_counter()
+            pm_core._record_reviewer_attempt_reason(
+                "tid", 42, 1, "reason=gw_unreachable", review_gate_ts=ts,
+            )
+            assert pm_core._review_gate_counter() == 0
+            assert pm_core._infra_nonrun_counter() == 1
+
+    def test_infra_ledger_unaffected_by_non_infra_failures(self):
+        """A non-infra failure must not pollute the infra diagnostic ledger."""
+        fake = _FakeMemStore()
+        with patch("lapis_pm.pm_core._mem", return_value=fake):
+            ts = pm_core._increment_review_gate_counter()
+            pm_core._record_reviewer_attempt_reason(
+                "tid", 42, 1, "ERROR: some other crash", review_gate_ts=ts,
+            )
+            assert pm_core._infra_nonrun_counter() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -816,17 +1075,24 @@ class TestEncodeGpuResultsReviewer:
 class TestReviewGateCli:
 
     def test_review_gate_status_command(self, capsys):
-        """lapis-pm review-gate status prints counter + threshold."""
+        """lapis-pm review-gate status prints counter + threshold + window span
+        + infra-nonrun diagnostics (Part 2)."""
         from lapis_pm.cli import main
         with (
             patch("lapis_pm.cli.pm_core.review_gate_status",
-                  return_value={"counter": 10, "threshold": 40, "paused": False}),
+                  return_value={
+                      "counter": 10, "threshold": 40, "paused": False,
+                      "window_days": 7, "window_oldest": "2026-08-01T00:00:00+00:00",
+                      "window_newest": "2026-08-04T00:00:00+00:00", "infra_nonruns": 2,
+                  }),
         ):
             ret = main(["review-gate", "status"])
         assert ret == 0
         out = capsys.readouterr().out
         assert "10" in out
         assert "40" in out
+        assert "infra non-runs" in out
+        assert "2" in out
 
     def test_review_gate_resume_command(self):
         """lapis-pm review-gate resume resets counter."""
@@ -1329,6 +1595,14 @@ def _audit_gate_patches(
 
 class TestAuditGateDeltaClassification:
     """§6 Tests — reviewer same-mode delta classification audit gate."""
+
+    @pytest.fixture(autouse=True)
+    def _healthy_panel(self):
+        # Same rationale as TestDecideForPr._healthy_panel — these fixtures
+        # predate corroboration/witness blocks and test the audit gate, not
+        # panel starvation.
+        with patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False):
+            yield
 
     # -----------------------------------------------------------------------
     # Test 1: Cycle 1 — audit gate is a no-op

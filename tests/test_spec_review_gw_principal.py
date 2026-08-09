@@ -18,6 +18,14 @@ from agents_core.shared_deliberation.envelope import DeliberationEnvelope
 from lapis_pm.spec_review import _dispatch_gw_reviewer, run_spec_review
 
 
+@pytest.fixture(autouse=True)
+def _un_retire_gw_leg(monkeypatch):
+    """This file exercises _dispatch_gw_reviewer's pre-retirement principal-
+    threading behavior exclusively — un-retire for every test here so the
+    existing assertions keep reaching the code they were written to test."""
+    monkeypatch.setenv("SPEC_REVIEW_GW_LEG_RETIRED", "0")
+
+
 @pytest.fixture
 def advisory_spec(tmp_path):
     spec_path = tmp_path / "gw_principal_test_spec.md"
@@ -85,9 +93,10 @@ def test_gw_principal_same_value_reaches_both_destinations(advisory_spec, monkey
         repo,
         run_id,
         gw_principal=None,
+        abandoned_event=None,
     ):
         captured["dispatch_gw_principal"] = gw_principal
-        return (None, [], 0.0)
+        return (None, [], 0.0, "", None)
 
     def mock_run_deliberation(request):
         captured["delib_gw_principal"] = request.gw_principal
@@ -102,6 +111,7 @@ def test_gw_principal_same_value_reaches_both_destinations(advisory_spec, monkey
         council_voicing="gravitywell",
         timeout_s=30,
         dispatch_facets=True,
+        with_gw=True,
     )
 
     assert "dispatch_gw_principal" in captured, "_dispatch_gw_reviewer was not called"
@@ -121,7 +131,7 @@ def test_gw_principal_format(advisory_spec, monkeypatch):
 
     def mock_dispatch(**kwargs):
         captured["val"] = kwargs.get("gw_principal")
-        return (None, [], 0.0)
+        return (None, [], 0.0, "", None)
 
     monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
     monkeypatch.setattr("lapis_pm.spec_review._dispatch_gw_reviewer", mock_dispatch)
@@ -132,6 +142,7 @@ def test_gw_principal_format(advisory_spec, monkeypatch):
         council_voicing="gravitywell",
         timeout_s=30,
         dispatch_facets=True,
+        with_gw=True,
     )
 
     val = captured.get("val")

@@ -9,22 +9,95 @@ Tests the additive, non-steering GW reference leg alongside Sonnet:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agents_core.shared_deliberation.envelope import DeliberationEnvelope
 from lapis_pm.spec_review import (
     _combined_recommendation,
     _dispatch_gw_reviewer,
     _gw_endpoints_collapsed,
     _gw_slot2_url,
+    run_spec_review,
     SpecReviewBrief,
 )
+
+
+@pytest.fixture(autouse=True)
+def _un_retire_gw_leg(monkeypatch):
+    """This file exercises the pre-retirement GW leg path (probe, collapse
+    check, dispatch) exclusively — the retirement short-circuit itself is
+    covered separately in tests/test_spec_review_gw_leg_retirement.py. Un-retire
+    for every test here so the existing assertions keep reaching the code they
+    were written to test; the retirement tests override this explicitly."""
+    monkeypatch.setenv("SPEC_REVIEW_GW_LEG_RETIRED", "0")
+
+
+async def _mock_run_deliberation(request):
+    return _happy_envelope()
+
+
+def _happy_envelope():
+    """A minimal resolved/proceed envelope — reused by the join-timeout tests below,
+    which only care about the GW leg's own behavior, not Facets/Council content."""
+    return DeliberationEnvelope(
+        deliberation_request_id="test-req-join",
+        triage="full",
+        facets_ok=True,
+        facets={
+            "deliberation_id": "facets-join",
+            "synthesis": {
+                "escalation_recommendation": "proceed",
+                "consensus_level": "strong",
+                "confidence": "high",
+                "recommendation": "All clear",
+            },
+            "stances": [],
+            "methodology": {"synthesis_operator": "haiku"},
+        },
+        facets_deliberation_id="facets-join",
+        operator_requested="haiku",
+        operator_effective="haiku",
+        council_ok=True,
+        council_run_id="council-join",
+        council_status="resolved",
+        council_landing="Land this spec.",
+        council_confidence="converged",
+        council_open_questions=[],
+        council_positions=[],
+        council_voicing_requested="gravitywell",
+        council_voicing_effective="gravitywell",
+        council_voicing_degraded=False,
+        council_voicing_degraded_reason="",
+    )
+
+
+@pytest.fixture
+def join_spec_fixture(tmp_path):
+    """Advisory-authority spec — matches do_gw's {"advisory", "hold"} gate."""
+    spec_path = tmp_path / "join_test_spec.md"
+    spec_path.write_text(
+        """
+# Test Spec
+
+**Target ID:** `join-test-target`
+**Repo:** `lapis-pm`
+**Authority:** advisory
+
+## Goal
+Test the GW leg join timeout.
+""",
+        encoding="utf-8",
+    )
+    return spec_path
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +158,7 @@ def test_gw_slot2_serving_runs_lease_free_against_slot2():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral") as mock_sm:
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -134,7 +207,7 @@ def test_gw_slot2_provenance_logged_on_successful_run(capsys):
 def test_gw_stub_returns_verdict():
     """GW_REVIEW_STUB=1 returns stubbed verdict without calling call_gw_agent."""
     with patch.dict(os.environ, {"GW_REVIEW_STUB": "1", "GW_REVIEW_STUB_VERDICT": "fixable"}):
-        text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+        text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
             spec_text="test spec",
             synth_target_id="test-tid",
             parsed_target_id="test-id",
@@ -153,7 +226,7 @@ def test_gw_stub_default_verdict_clean():
     env = {"GW_REVIEW_STUB": "1"}
     with patch.dict(os.environ, env, clear=False):
         os.environ.pop("GW_REVIEW_STUB_VERDICT", None)
-        text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+        text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
             spec_text="test",
             synth_target_id="tid",
             parsed_target_id="id",
@@ -175,8 +248,8 @@ def test_gw_verdict_excluded_from_recommendation():
     # Recommendation should be drive by Facets + Council only.
 
     rec = _combined_recommendation(
-        sonnet_verdict="skip",  # Sonnet is advisory-only (always "skip")
-        sonnet_issues=[],
+        reference_verdict="skip",  # Sonnet is advisory-only (always "skip")
+        reference_issues=[],
         council_status="resolved",
         council_positions=[],
         facets_escalation="proceed",
@@ -258,8 +331,8 @@ def test_gw_and_sonnet_both_advisory_only():
     """Both GW and Sonnet are reference-only; neither steers recommendation."""
     # Council resolved + Sonnet skipped → proceed-to-bind
     rec = _combined_recommendation(
-        sonnet_verdict="skip",
-        sonnet_issues=[],
+        reference_verdict="skip",
+        reference_issues=[],
         council_status="resolved",
         council_positions=[],
         facets_escalation="proceed",
@@ -372,7 +445,7 @@ def test_gw_slot2_not_serving_returns_none():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value=None):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -394,7 +467,7 @@ def test_gw_agents_core_import_failure_returns_none():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
             with patch.dict("sys.modules", {"agents_core": None, "agents_core.gw_agent": None}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -428,7 +501,7 @@ def test_return_shape_is_tuple_when_return_transcript_true():
         )
 
     # Unpack: this is the critical pattern
-    text, transcript, elapsed, skip_reason = result
+    text, transcript, elapsed, skip_reason, provenance = result
 
     # text can be a string or None
     assert isinstance(text, str) or text is None
@@ -459,7 +532,7 @@ def test_slot2_not_serving_returns_none_not_empty_tuple():
     with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value=None):
-            gw_text, gw_transcript, gw_elapsed, gw_skip_reason = _dispatch_gw_reviewer(
+            gw_text, gw_transcript, gw_elapsed, gw_skip_reason, gw_provenance = _dispatch_gw_reviewer(
                 spec_text="spec",
                 synth_target_id="tid",
                 parsed_target_id="id",
@@ -620,7 +693,7 @@ def test_dispatch_gw_reviewer_skips_when_slot2_collapsed_to_primary():
                                   "GW_URL": "http://203.0.113.11:8081"}, clear=False):
         with patch("lapis_pm.spec_review.swarm_model", return_value="qwen3.6-35b-a3b") as mock_sm:
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -647,7 +720,7 @@ def test_dispatch_gw_reviewer_runs_when_slot2_distinct_and_serving():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -666,7 +739,7 @@ def test_dispatch_gw_reviewer_slot2_unavailable_preserved_when_distinct():
     with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value=None):
-            text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+            text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                 spec_text="spec",
                 synth_target_id="tid",
                 parsed_target_id="id",
@@ -760,7 +833,7 @@ def test_gw_no_content_reports_real_reason_request_failed():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -788,7 +861,7 @@ def test_gw_no_content_no_reason_fallback_when_reason_out_empty():
         os.environ.pop("GW_SLOT2_URL", None)
         with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-a3b-coder"):
             with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
-                text, transcript, elapsed, skip_reason = _dispatch_gw_reviewer(
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
                     spec_text="spec",
                     synth_target_id="tid",
                     parsed_target_id="id",
@@ -840,3 +913,236 @@ def test_brief_render_shows_collapsed_skip_visibly():
     rendered = format_brief(brief)
     assert "skipped" in rendered.lower()
     assert "slot2_collapsed_to_primary" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Join-timeout fix: AC1-AC6 (lapis-pm-gw-leg-join-honours-configured-timeout-v0)
+# ---------------------------------------------------------------------------
+
+def test_gw_join_honours_configured_timeout_not_hardcoded_300(join_spec_fixture, monkeypatch):
+    """AC1 + verification 1: the future join uses gw_timeout (GW_REVIEWER_TIMEOUT_SEC),
+    not a hardcoded 300. A stubbed future resolving well past 300s (but inside the
+    configured 1800s) must be collected, not abandoned — the regression run 2e1ba58e
+    reproduces here."""
+    monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
+    monkeypatch.setenv("GW_REVIEWER_TIMEOUT_SEC", "1800")
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", _mock_run_deliberation)
+    monkeypatch.setattr(
+        "lapis_pm.node_identity.resolve_node_identity",
+        lambda force=False: MagicMock(node_role="master"),
+    )
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: MagicMock(returncode=0))
+
+    fake_future = MagicMock()
+    fake_future.result.return_value = (
+        '{"verdict": "clean", "issues": [], "confidence": 0.9}', [], 400.0, "", None,
+    )
+    mock_executor = MagicMock()
+    mock_executor.submit.return_value = fake_future
+    monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
+
+    brief = run_spec_review(
+        join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True,
+        with_gw=True,
+    )
+
+    fake_future.result.assert_called_once_with(timeout=1800)
+    assert brief.gw_ran is True
+    assert brief.gw_abandoned is False
+    assert brief.elapsed_gw == 400.0
+    assert brief.gw_verdict == "clean"
+
+
+def test_gw_join_timeout_captures_real_elapsed_not_fabricated(join_spec_fixture, monkeypatch):
+    """AC2 + verification 2: on genuine timeout, elapsed_gw is the real wall-clock
+    elapsed at abandonment — never the timeout constant."""
+    monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
+    monkeypatch.setenv("GW_REVIEWER_TIMEOUT_SEC", "42")
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", _mock_run_deliberation)
+    monkeypatch.setattr(
+        "lapis_pm.node_identity.resolve_node_identity",
+        lambda force=False: MagicMock(node_role="master"),
+    )
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: MagicMock(returncode=0))
+
+    fake_future = MagicMock()
+    fake_future.result.side_effect = concurrent.futures.TimeoutError()
+    mock_executor = MagicMock()
+    mock_executor.submit.return_value = fake_future
+    monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
+
+    brief = run_spec_review(
+        join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True,
+        with_gw=True,
+    )
+
+    fake_future.result.assert_called_once_with(timeout=42)
+    assert brief.gw_abandoned is True
+    assert brief.gw_skip_reason == "timeout"
+    assert brief.elapsed_gw != 42.0
+    assert brief.elapsed_gw != 300.0
+    assert brief.elapsed_gw >= 0.0
+
+
+def test_gw_join_abandoned_divergence_record_marks_and_carries_reason(join_spec_fixture, monkeypatch):
+    """AC3 + verification 3: the divergence record for an abandoned leg carries
+    gw_abandoned=True and the gw_skip_reason, and is distinguishable from a
+    never-ran record (agree stays None, not a fabricated comparison)."""
+    monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
+    monkeypatch.setenv("GW_REVIEWER_TIMEOUT_SEC", "42")
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", _mock_run_deliberation)
+    monkeypatch.setattr(
+        "lapis_pm.node_identity.resolve_node_identity",
+        lambda force=False: MagicMock(node_role="master"),
+    )
+
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        if len(cmd) >= 2 and cmd[0] == "mem" and cmd[1] == "set":
+            captured["record"] = json.loads(cmd[3])
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+
+    fake_future = MagicMock()
+    fake_future.result.side_effect = concurrent.futures.TimeoutError()
+    mock_executor = MagicMock()
+    mock_executor.submit.return_value = fake_future
+    monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
+
+    run_spec_review(join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True, with_gw=True)
+
+    record = captured["record"]
+    assert record["gw_ran"] is True
+    assert record["gw_abandoned"] is True
+    assert record["gw_skip_reason"] == "timeout"
+    assert record["agree"] is None
+
+
+def test_gw_join_healthy_path_unchanged_brief_and_record(join_spec_fixture, monkeypatch):
+    """AC6: a leg that completes inside the budget produces the same brief/record
+    shape as before this fix — gw_abandoned False, gw_ran True, real elapsed carried."""
+    monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
+    monkeypatch.setenv("GW_REVIEWER_TIMEOUT_SEC", "1800")
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", _mock_run_deliberation)
+    monkeypatch.setattr(
+        "lapis_pm.node_identity.resolve_node_identity",
+        lambda force=False: MagicMock(node_role="master"),
+    )
+
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        if len(cmd) >= 2 and cmd[0] == "mem" and cmd[1] == "set":
+            captured["record"] = json.loads(cmd[3])
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+
+    fake_future = MagicMock()
+    fake_future.result.return_value = (
+        '{"verdict": "clean", "issues": [], "confidence": 0.9}', [], 448.4, "", None,
+    )
+    mock_executor = MagicMock()
+    mock_executor.submit.return_value = fake_future
+    monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
+
+    brief = run_spec_review(
+        join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True,
+        with_gw=True,
+    )
+
+    assert brief.gw_ran is True
+    assert brief.gw_abandoned is False
+    assert brief.elapsed_gw == 448.4
+    assert brief.gw_verdict == "clean"
+    record = captured["record"]
+    assert record["gw_abandoned"] is False
+    assert record["agree"] is False  # gw_verdict "clean" != sonnet_verdict_str "skip" (Sonnet disabled)
+    fake_future.cancel.assert_called_once()
+    mock_executor.shutdown.assert_called_once_with(wait=True)
+
+
+def test_gw_join_abandoned_leg_cancelled_and_executor_waited(join_spec_fixture, monkeypatch):
+    """AC4 + verification 6: an abandoned leg's future is cancelled and the
+    executor is shut down with wait=True — never wait=False."""
+    monkeypatch.setenv("SPEC_REVIEW_SONNET_DISABLED", "1")
+    monkeypatch.setenv("GW_REVIEWER_TIMEOUT_SEC", "1")
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", _mock_run_deliberation)
+    monkeypatch.setattr(
+        "lapis_pm.node_identity.resolve_node_identity",
+        lambda force=False: MagicMock(node_role="master"),
+    )
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: MagicMock(returncode=0))
+
+    fake_future = MagicMock()
+    fake_future.result.side_effect = concurrent.futures.TimeoutError()
+    mock_executor = MagicMock()
+    mock_executor.submit.return_value = fake_future
+    monkeypatch.setattr("lapis_pm.spec_review.ThreadPoolExecutor", lambda *a, **k: mock_executor)
+
+    run_spec_review(join_spec_fixture, council_voicing="gravitywell", timeout_s=30, dispatch_facets=True, with_gw=True)
+
+    fake_future.cancel.assert_called_once()
+    mock_executor.shutdown.assert_called_once_with(wait=True)
+    assert mock_executor.shutdown.call_args.kwargs.get("wait") is not False
+
+
+def test_dispatch_gw_reviewer_emits_abandoned_tag_when_join_gave_up(capsys):
+    """AC5 + verification 7: when the join already gave up (abandoned_event set),
+    a leg that later completes emits the distinct -abandoned tag with elapsed and
+    reason, not the plain 'completed' line that would misread as a live result."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    event = threading.Event()
+    event.set()
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                    abandoned_event=event,
+                )
+
+    captured = capsys.readouterr()
+    assert "[spec-review:gw-reviewer-abandoned]" in captured.err
+    assert "[spec-review:gw-reviewer] completed" not in captured.err
+    assert text == "clean"
+
+
+def test_dispatch_gw_reviewer_emits_plain_completed_tag_on_healthy_path(capsys):
+    """AC6: the healthy path (abandonment event never set) still emits the plain
+    'completed' line, unchanged from before this fix."""
+    mock_call_gw = MagicMock(return_value=("clean", []))
+    mock_gw_module = MagicMock()
+    mock_gw_module.call_gw_agent = mock_call_gw
+    mock_gw_module.DEFAULT_READONLY_TOOLS = []
+
+    event = threading.Event()  # never set
+
+    with patch.dict(os.environ, {"GW_URL": "http://203.0.113.11:8081"}, clear=False):
+        os.environ.pop("GW_SLOT2_URL", None)
+        with patch("lapis_pm.spec_review.swarm_model", return_value="gravitywell-devstral"):
+            with patch.dict("sys.modules", {"agents_core.gw_agent": mock_gw_module}):
+                text, transcript, elapsed, skip_reason, provenance = _dispatch_gw_reviewer(
+                    spec_text="spec",
+                    synth_target_id="tid",
+                    parsed_target_id="id",
+                    repo="repo",
+                    run_id="run",
+                    abandoned_event=event,
+                )
+
+    captured = capsys.readouterr()
+    assert "[spec-review:gw-reviewer] completed" in captured.err
+    assert "gw-reviewer-abandoned" not in captured.err

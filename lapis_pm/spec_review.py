@@ -1,15 +1,18 @@
 """lapis_pm.spec_review — Pre-bind Facets + Mirror Council review.
 
 Default gate: Facets (technical-integrity + trickster personas, Haiku) for the PM /
-technical domain, plus a Mirror Council deliberation for invariant-fit / meaning, plus
-a standing Sonnet deep-reviewer leg that fires by default for advisory/hold specs as a
-reference-only signal (never moves the recommendation — Facets + Council are the sole
-drivers). The Sonnet leg can be disabled per-run via --no-sonnet-reviewer or
-SPEC_REVIEW_SONNET_DISABLED=1.
+technical domain, plus a Mirror Council deliberation for invariant-fit / meaning. The
+local reference-leg (the Empiricist) and the GravityWell reference leg are both OFF by
+default (lapis-pm-gate-defaults-and-dead-poll-v0, U3a/U3b) — both are reference-only
+signals that never move the recommendation, so the default fast path pays for neither.
+Opt in per-run with --with-reference-reviewer / --with-gw. The deprecated
+--no-reference-reviewer / SPEC_REVIEW_REFERENCE_DISABLED=1 (and their --no-sonnet-reviewer
+/ SPEC_REVIEW_SONNET_DISABLED=1 aliases) are still honored as harmless no-ops — they never
+invert an opt-in into "on" (sunset 90 days after merge).
 
 Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override,
-authority, dispatch_facets, sonnet_reviewer, compare_opus). Returns SpecReviewBrief.
-Synchronous; caller blocks until all dispatched passes complete or timeout.
+authority, dispatch_facets, reference_reviewer, compare_opus, with_gw). Returns
+SpecReviewBrief. Synchronous; caller blocks until all dispatched passes complete or timeout.
 """
 from __future__ import annotations
 
@@ -22,7 +25,10 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -32,7 +38,7 @@ from typing import Iterator, Literal
 
 # Import the canonical facets deploy clone path from pm_core (source-enforce coupling).
 # pm_core has no module-level spec_review import, so this is circular-free.
-from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE
+from lapis_pm.pm_core import _FACETS_DEPLOY_CLONE, _SHAPER
 from agents_core.shared_deliberation.orchestrator import (
     run_deliberation,
     init_facets_semaphore,
@@ -69,9 +75,31 @@ _REPO_RE = re.compile(
     re.MULTILINE,
 )
 
+# **Consumer:** — anchored spec-header contract, alongside Target ID / Repo /
+# Authority above (lapis-pm-gate-consumer-criterion-v0, enforcing ratified
+# intent-contract entry C7: "A new autonomous producer be built without an
+# identified consumer" MUST NOT happen). Free text, not kebab-case-in-backticks
+# — see _CONSUMER_RE / _consumer_criterion_check below for the parser and the
+# admission logic (missing / empty / reject-list token / self-referential all
+# produce a blocking gate finding; anything else passes).
+#
+#   Good value:     **Consumer:** the nightly briefing pipeline reads this
+#                    report's output and surfaces it in the morning digest.
+#   Rejected value:  **Consumer:** TBD                    (reject-list token)
+#   Also rejected:   **Consumer:** `<this-spec's-own-target-id>`
+#                    (self-referential — DoD-3b: names only the thing the spec
+#                    is building, not a reader distinct from it)
+
 _POLL_CADENCE_S = 10  # fixed per Invariant 8
 _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT = 900  # seconds; longer than a normal ~12-min review
 _ELEVATOR_GROUNDING_POLL_CADENCE_S = 5  # inter-poll sleep for grounding polls
+
+# lapis-pm-gate-queue-progress-aware-wait-v0: progress-aware wait tuning.
+_SPEC_REVIEW_HEARTBEAT_INTERVAL_DEFAULT = 15  # seconds between beat_at refreshes
+_SPEC_REVIEW_STALL_MISSED_BEATS_DEFAULT = 20  # consecutive missed beats -> stall-abort (~300s)
+_SPEC_REVIEW_LOCK_MAX_WAIT_DEFAULT = 3600  # absolute queue-depth backstop, not a hang detector
+_GATE_QUEUE_HISTORY_PATH = Path(os.environ.get("ROOM_ROOT", "/room")) / "gate-queue" / "history.jsonl"
+_PROGRESS_FIELDS = frozenset({"pid", "phase", "phase_at", "beat_at"})
 
 
 
@@ -105,6 +133,17 @@ class _DispatchResult:
 
 
 @dataclass
+class GwLegProvenance:
+    """What the GW reference leg actually read: a pinned, detached origin/main
+    worktree of the local clone — never the shared -working tree. staleness_warning
+    is a static, human-readable line noting the worktree is only as fresh as the
+    local clone's last fetch (this unit never fetches)."""
+    resolved_sha: str
+    worktree_path: str
+    staleness_warning: str
+
+
+@dataclass
 class SpecReviewBrief:
     # Required fields
     spec_path: Path
@@ -120,15 +159,23 @@ class SpecReviewBrief:
     combined_recommendation: Literal[
         "proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
     ]
-    # Sonnet deep-reviewer fields (reference-only; never steer the recommendation)
-    sonnet_verdict: str = "error"
-    sonnet_issues: list[dict] = field(default_factory=list)
-    sonnet_confidence: float = 0.0
-    sonnet_run_id: str = ""
+    # Reference-leg fields (the Empiricist; local, reference-only; never steer the
+    # recommendation). Note the field name collides in sense with spec_review's other
+    # use of "reference-only" (= advisory) — here it also means "this is the reference
+    # leg". Both senses are true of this leg; see lapis-pm-reference-leg-provider-neutral-naming-v0.
+    reference_verdict: str = "error"
+    reference_issues: list[dict] = field(default_factory=list)
+    reference_confidence: float = 0.0
+    reference_run_id: str = ""
+    reference_claims_checked: int | None = None
+    # Model identity resolved at run time from registry.yaml's spec_reviewer seat
+    # (AC3) — never hardcoded, so a repoint changes this with no code edit. None
+    # when resolution fails (missing file/key/malformed entry) — never a guess.
+    reference_model: str | None = None
     parse_error: dict | None = None
     facets_deliberation: dict | None = None  # FacetsDeliberation envelope; None if disabled/timeout
-    # True whenever the Sonnet leg ran (always reference-only now)
-    sonnet_advisory_only: bool = False
+    # True whenever the reference leg ran (always reference-only now)
+    reference_advisory_only: bool = False
     facets_operator: str = "gravitywell"  # operator used for Facets personas + synthesis
     # Effective voicing/operator fields (read from provenance, unknown if absent)
     council_voicing_requested: str = "gravitywell"  # what was requested
@@ -142,10 +189,36 @@ class SpecReviewBrief:
     # GravityWell reference leg fields (reference-only; never steer the recommendation)
     gw_verdict: str = "skip"  # verdict from GW, or "skip" if not dispatched
     gw_ran: bool = False  # whether the GW leg actually ran
-    gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname")
+    gw_abandoned: bool = False  # True when the join gave up on a still-running leg (never a fabricated elapsed)
+    gw_skip_reason: str = ""  # reason for skip (e.g., "slot2_unavailable", "no_parseable_hostname", "gw_leg_retired")
     gw_findings_count: int = 0  # number of findings/issues from GW
     elapsed_gw: float = 0.0  # wall-clock time for GW leg
     gw_transcript_ref: str = ""  # absolute path to GW transcript JSON file
+    gw_parse_error: dict | None = None  # parse_failed envelope's parse_error, if any
+    gw_raw_output_ref: str = ""  # absolute path to the verbatim gw-raw-output.txt
+    # U3c/D3: whether this review was actually grounded in the code it reviews.
+    # grounding_status is exactly one of "verified" | "failed" | "silent-denial" |
+    # "not-applicable" — never a sub-key of another field, never prose. See
+    # _detect_grounding_status. grounding_reason is a short machine-parsable cause
+    # string (e.g. "gw_timeout", "no_repo_in_context", "grounding_target_unavailable",
+    # "codebase_surface_denied", "sim_data_missing", "sim_data_malformed") — never
+    # prose, never a log pointer. Only "not-applicable" may carry an empty reason.
+    # "no_repo_in_context" is reserved for the genuine repo-absent case resolved in
+    # agents_core/shared_deliberation/orchestrator.py's _resolve_grounding_target;
+    # _detect_grounding_status never emits it itself (see its docstring).
+    grounding_status: Literal["verified", "failed", "silent-denial", "not-applicable"] = "not-applicable"
+    grounding_reason: str = ""
+    # D2 (lapis-pm-spec-review-grounding-legibility-v0): the full commit sha this
+    # review's codebase grounding was resolved against, when grounding_status ==
+    # "verified". Empty otherwise — never fabricated. source_repo is deliberately
+    # NOT threaded (deferred at the review gate — see spec_review.py's render site).
+    grounding_resolved_sha: str = ""
+    grounding_age_days: int | None = None
+    # C7 admission criterion (lapis-pm-gate-consumer-criterion-v0): deterministic,
+    # no-model-call check on the spec's own anchored **Consumer:** header line.
+    # "ok" | "blocking". consumer_criterion_finding is empty iff status == "ok".
+    consumer_criterion_status: str = "ok"
+    consumer_criterion_finding: str = ""
 
     # ------------------------------------------------------------------
     # Deprecated read-aliases — remove 90 days after merge (2026-09-05).
@@ -154,28 +227,34 @@ class SpecReviewBrief:
 
     @property
     def opus_verdict(self) -> str:
-        """Deprecated alias for sonnet_verdict. Remove 90 days after merge."""
-        return self.sonnet_verdict
+        """Deprecated alias for reference_verdict. Remove 90 days after merge (2026-09-05).
+
+        Erah's OQ1 ruling (gate pass 1, 2026-07-31): point the opus_* aliases at
+        reference_* rather than the sonnet_* spelling they aliased before this unit,
+        so only two name generations (reference_* canonical, opus_* deprecated) are
+        live instead of three.
+        """
+        return self.reference_verdict
 
     @property
     def opus_issues(self) -> list[dict]:
-        """Deprecated alias for sonnet_issues. Remove 90 days after merge."""
-        return self.sonnet_issues
+        """Deprecated alias for reference_issues. Remove 90 days after merge."""
+        return self.reference_issues
 
     @property
     def opus_confidence(self) -> float:
-        """Deprecated alias for sonnet_confidence. Remove 90 days after merge."""
-        return self.sonnet_confidence
+        """Deprecated alias for reference_confidence. Remove 90 days after merge."""
+        return self.reference_confidence
 
     @property
     def opus_run_id(self) -> str:
-        """Deprecated alias for sonnet_run_id. Remove 90 days after merge."""
-        return self.sonnet_run_id
+        """Deprecated alias for reference_run_id. Remove 90 days after merge."""
+        return self.reference_run_id
 
     @property
     def opus_advisory_only(self) -> bool:
-        """Deprecated alias for sonnet_advisory_only. Remove 90 days after merge."""
-        return self.sonnet_advisory_only
+        """Deprecated alias for reference_advisory_only. Remove 90 days after merge."""
+        return self.reference_advisory_only
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +369,29 @@ def _parse_spec_verification_text(text: str) -> str:
     return "pm-live-test"
 
 
+_FIRST_SECTION_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
+
+
+def _parse_spec_verification_text_guarded(text: str) -> str:
+    """Sibling to _parse_spec_verification_text with a header-position guard
+    (lapis-pm-containment-held-paths-v0 Leg 4).
+
+    A '**Verification:**' match is only honored if it appears BEFORE the first
+    '## ' section heading — i.e. in the spec's own header block, where a
+    hand-authored header always lives. A match landing after that heading is
+    treated as absent (falls through to the 'pm-live-test' default) rather than
+    honored, because that position is reachable by interpolated body content
+    (e.g. LLM-authored debt-bundle notes quoting the literal header string) that
+    the spec's true author never wrote. Unlike _parse_spec_authority_text's
+    hard-abort-on-mismatch (cmd_bind :235-244), this degrades silently to the
+    fail-safe default rather than aborting the bind — there is no explicit flag
+    to conflict with here, only spec text that may or may not be trustworthy.
+    """
+    heading_m = _FIRST_SECTION_HEADING_RE.search(text)
+    window = text[: heading_m.start()] if heading_m else text
+    return _parse_spec_verification_text(window)
+
+
 def _parse_spec_verification(spec_path: Path) -> str:
     """Extract Verification from spec file (first 50 lines).
 
@@ -301,6 +403,94 @@ def _parse_spec_verification(spec_path: Path) -> str:
     except OSError:
         return "pm-live-test"
     return _parse_spec_verification_text(text)
+
+
+# ---------------------------------------------------------------------------
+# C7 admission criterion (lapis-pm-gate-consumer-criterion-v0)
+#
+# C7 MUST NOT - A new autonomous producer be built without an identified
+# consumer. Deterministic, no-model-call check on the spec's own anchored
+# header block (same first-50-lines window as Target ID / Repo / Authority).
+# Fail-loud, never fail-closed: every branch below returns an explicit status;
+# there is no silent pass-through when the header is absent or malformed.
+# ---------------------------------------------------------------------------
+
+_CONSUMER_RE = re.compile(
+    r"^\*\*Consumer:\*\*[ \t]*(.*?)\s*$",
+    re.MULTILINE,
+)
+
+# Case-insensitive exact-match tokens (never substring/fuzzy — DoD-3). "self",
+# "general" and "all" added on the Mirror Council's ruling, 2026-08-09.
+_CONSUMER_REJECT_TOKENS: frozenset[str] = frozenset({
+    "n/a", "na", "none", "tbd", "unknown", "future work",
+    "self", "general", "all", "everyone", "",
+})
+
+C7_TEXT = (
+    "C7 MUST NOT - A new autonomous producer be built without an identified consumer."
+)
+
+
+def _consumer_normalize(value: str) -> str:
+    """Lowercase, strip surrounding backticks/whitespace, collapse internal
+    whitespace — used for reject-list matching (DoD-3)."""
+    v = value.strip().strip("`").strip()
+    v = re.sub(r"\s+", " ", v)
+    return v.lower()
+
+
+def _consumer_bare_alnum(value: str) -> str:
+    """Strip everything but lowercase alnum. Used to compare a Consumer value
+    against the spec's own target_id (DoD-3b) regardless of formatting
+    differences (backticks, hyphens, case) that would defeat a literal match."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _consumer_criterion_check(spec_text: str, target_id: str) -> dict:
+    """Deterministic C7 admission check against the spec's anchored header block.
+
+    Returns {"status": "ok", "raw_value": <str>} when a substantive, distinct
+    consumer is named, or {"status": "blocking", "reason": <tag>, "raw_value":
+    <str|None>} when the header is missing, empty, a reject-list token, or
+    names only the producer the spec itself creates.
+    """
+    first_50 = "\n".join(spec_text.splitlines()[:50])
+    m = _CONSUMER_RE.search(first_50)
+    if not m:
+        return {"status": "blocking", "reason": "missing", "raw_value": None}
+
+    raw_value = m.group(1)
+    normalized = _consumer_normalize(raw_value)
+    if not normalized:
+        return {"status": "blocking", "reason": "empty", "raw_value": raw_value}
+    if normalized in _CONSUMER_REJECT_TOKENS:
+        return {"status": "blocking", "reason": "trivial-non-responsive", "raw_value": raw_value}
+    if _consumer_bare_alnum(normalized) == _consumer_bare_alnum(target_id):
+        return {"status": "blocking", "reason": "self-referential", "raw_value": raw_value}
+    return {"status": "ok", "raw_value": raw_value}
+
+
+def _consumer_criterion_finding_text(spec_path: Path, result: dict) -> str:
+    """Render the blocking finding: states C7 verbatim and cites the spec's own
+    missing/rejected line (spec §3), so the author sees the rule, not a parse error."""
+    reason = result.get("reason")
+    reason_text = {
+        "missing": f"no `**Consumer:**` line found in the anchored header of {spec_path}",
+        "empty": f"`**Consumer:**` line in {spec_path} is empty",
+        "trivial-non-responsive": (
+            f"`**Consumer:**` line in {spec_path} reads {result.get('raw_value')!r} — "
+            "a trivially non-responsive value, not an identified consumer"
+        ),
+        "self-referential": (
+            f"`**Consumer:**` line in {spec_path} names only the producer this spec "
+            f"builds ({result.get('raw_value')!r}) — not a reader distinct from it"
+        ),
+    }.get(reason, f"`**Consumer:**` line in {spec_path} does not identify a consumer")
+    return (
+        f"**{C7_TEXT}**\n\n{reason_text}. Add a `**Consumer:**` line naming who or "
+        "what reads this producer's output, distinct from the producer itself."
+    )
 
 
 def _synth_target_id(parsed_target_id: str) -> str:
@@ -404,8 +594,8 @@ def _iter_balanced_json_candidates(text: str) -> list[str]:
     return candidates
 
 
-def _read_verdict_from_output(output_path: Path) -> dict:
-    """Parse the verdict JSON from the spec_reviewer output file.
+def _extract_verdict_from_text(content: str) -> dict:
+    """Parse the verdict JSON out of raw model output text.
 
     Multi-strategy pipeline — handles model narrate-then-emit patterns:
     1. Extract from ```(json)? fenced blocks (handles "narration + fence" pattern).
@@ -414,7 +604,6 @@ def _read_verdict_from_output(output_path: Path) -> dict:
        (handles fence-less JSON embedded in prose).
     4. Return parse_failed envelope (richer diagnostics than bare "error").
     """
-    content = output_path.read_text(encoding="utf-8")
     stripped = content.strip()
 
     # Strategy 1: fenced extraction
@@ -450,6 +639,12 @@ def _read_verdict_from_output(output_path: Path) -> dict:
             "tail": content[-200:],
         },
     }
+
+
+def _read_verdict_from_output(output_path: Path) -> dict:
+    """Parse the verdict JSON from the spec_reviewer output file."""
+    content = output_path.read_text(encoding="utf-8", errors="replace")
+    return _extract_verdict_from_text(content)
 
 
 def _dispatch_spec_reviewer(
@@ -580,6 +775,135 @@ def _gw_endpoints_collapsed(slot2_url: str, primary_url: str) -> bool:
     return a[1] == b[1] and bool(ips_a & ips_b)
 
 
+def _process_gw_verdict(gw_text: str) -> tuple[str, int, dict | None]:
+    """Parse the GW leg's raw output tolerantly, via the same strategy pipeline
+    the local leg uses. Returns (verdict, findings_count, parse_error).
+
+    parse_error is None unless the pipeline could not extract a verdict at all,
+    in which case verdict is "parse_failed" — distinct from "error", which means
+    the model itself ran and reported a failure or an unusable verdict value.
+    """
+    verdict_obj = _extract_verdict_from_text(gw_text)
+    if verdict_obj.get("verdict") == "parse_failed":
+        return "parse_failed", 0, verdict_obj.get("parse_error")
+    return verdict_obj.get("verdict", "error"), len(verdict_obj.get("issues", [])), None
+
+
+def _persist_gw_artifacts(
+    artifacts_dir: Path, gw_text: str, gw_transcript: list[dict]
+) -> tuple[str, str]:
+    """Best-effort persistence of the GW leg's raw output and tool transcript.
+
+    Writes gw-raw-output.txt verbatim (on every run, not only on parse failure)
+    and gw-transcript.json beside it. Returns (raw_output_ref, transcript_ref);
+    either is empty string if its write failed. A write failure here must never
+    raise or alter the verdict.
+    """
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_output_ref = ""
+    raw_output_path = artifacts_dir / "gw-raw-output.txt"
+    try:
+        raw_output_path.write_text(gw_text, encoding="utf-8")
+        raw_output_ref = str(raw_output_path.resolve())
+    except Exception as e:
+        print(f"[spec-review:gw-raw-output-write-error] {e}", file=sys.stderr)
+
+    transcript_ref = ""
+    transcript_path = artifacts_dir / "gw-transcript.json"
+    try:
+        transcript_path.write_text(json.dumps(gw_transcript, indent=2), encoding="utf-8")
+        transcript_ref = str(transcript_path.resolve())
+    except Exception as e:
+        print(f"[spec-review:gw-transcript-write-error] {e}", file=sys.stderr)
+
+    return raw_output_ref, transcript_ref
+
+
+def _create_gw_worktree(repo: str, run_id: str) -> tuple[str | None, str | None, str]:
+    """Create a detached origin/main worktree of the local /srv/git/{repo}-working
+    clone, so the GW leg reviews a pinned tree instead of whatever an interactive
+    session or another dispatch left sitting in the shared -working checkout.
+
+    Returns (worktree_path, resolved_sha, error_reason). On success error_reason
+    is "". On any failure both worktree_path and resolved_sha are None and
+    error_reason names the cause. Never raises — this is a probe, not a command.
+    """
+    working_clone = f"/srv/git/{repo}-working"
+    try:
+        tmpdir = tempfile.mkdtemp(prefix=f"gw-leg-{run_id}-")
+    except OSError as e:
+        return None, None, f"mkdtemp_failed:{e}"
+
+    try:
+        add_result = subprocess.run(
+            ["git", "-C", working_clone, "worktree", "add", "--detach", tmpdir, "origin/main"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        return None, None, f"git_worktree_add_exception:{e}"
+
+    if add_result.returncode != 0:
+        return None, None, f"git_worktree_add_failed:{add_result.stderr.strip()[:200]}"
+
+    try:
+        sha_result = subprocess.run(
+            ["git", "-C", tmpdir, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        _try_remove_worktree_quiet(working_clone, tmpdir)
+        return None, None, f"rev_parse_exception:{e}"
+
+    if sha_result.returncode != 0:
+        _try_remove_worktree_quiet(working_clone, tmpdir)
+        return None, None, f"rev_parse_failed:{sha_result.stderr.strip()[:200]}"
+
+    return tmpdir, sha_result.stdout.strip(), ""
+
+
+def _try_remove_worktree_quiet(working_clone: str, worktree_path: str) -> None:
+    """Best-effort cleanup for a worktree that failed partway through creation
+    (e.g. `git worktree add` succeeded but `rev-parse` didn't). Never raises."""
+    try:
+        subprocess.run(
+            ["git", "-C", working_clone, "worktree", "remove", "--force", worktree_path],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        pass
+
+
+def _remove_gw_worktree(repo: str, worktree_path: str) -> None:
+    """Remove a worktree created by _create_gw_worktree. Raises RuntimeError on
+    failure so the caller's own try/except can log-and-continue without letting
+    a cleanup failure mask whatever the try body already produced."""
+    working_clone = f"/srv/git/{repo}-working"
+    result = subprocess.run(
+        ["git", "-C", working_clone, "worktree", "remove", "--force", worktree_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree remove failed: {result.stderr.strip()[:200]}")
+
+
+def _gw_leg_retired() -> bool:
+    """Whether the GW reference leg is retired under the single-slot posture.
+
+    Retired by default. Set SPEC_REVIEW_GW_LEG_RETIRED=0 to un-retire it for a
+    run — e.g. once a live Slot-2 is restored. Read at call time, not import
+    time, matching the existing call-time-vs-import-time discipline used for
+    GW_REVIEWER_TIMEOUT_SEC and _gw_slot2_url() — so tests can
+    monkeypatch.setenv and a conductor.env change takes effect without a
+    daemon restart. See lapis-pm-empiricist-repin-slot1-gw-leg-retire-v0.
+    """
+    return os.environ.get("SPEC_REVIEW_GW_LEG_RETIRED") != "0"
+
+
 def _dispatch_gw_reviewer(
     spec_text: str,
     synth_target_id: str,
@@ -587,15 +911,19 @@ def _dispatch_gw_reviewer(
     repo: str,
     run_id: str,
     gw_principal: str | None = None,
-) -> tuple[str | None, list[dict], float, str]:
+    abandoned_event: threading.Event | None = None,
+) -> tuple[str | None, list[dict], float, str, GwLegProvenance | None]:
     """Dispatch and run the GW reference reviewer synchronously against Slot-2
     Devstral (:8082), lease-free — a distinct-model second opinion that runs
     concurrently with the 27B Facets/Council voicing on :8081 at zero lease
     contention.
 
-    Returns (text, transcript, elapsed_s, skip_reason) where text is the verdict
-    string (or None if GW did not run), transcript is the list of tool calls,
-    elapsed_s is the wall-clock time, and skip_reason is set when GW is skipped.
+    Returns (text, transcript, elapsed_s, skip_reason, provenance) where text is
+    the verdict string (or None if GW did not run), transcript is the list of
+    tool calls, elapsed_s is the wall-clock time, skip_reason is set when GW is
+    skipped, and provenance is a GwLegProvenance naming the pinned origin/main
+    worktree the leg actually read — populated whenever the worktree was
+    successfully created, None otherwise (never ran, or a worktree/git failure).
 
     Stub-aware: if GW_REVIEW_STUB=1, uses GW_REVIEW_STUB_VERDICT env var.
     """
@@ -605,7 +933,21 @@ def _dispatch_gw_reviewer(
     if os.getenv("GW_REVIEW_STUB") == "1":
         verdict = os.getenv("GW_REVIEW_STUB_VERDICT", "clean")
         elapsed = time.time() - start_time
-        return verdict, [], elapsed, ""
+        return verdict, [], elapsed, "", None
+
+    # Retirement short-circuit: under the single-slot posture, the GW leg
+    # is declared retired (not dark) — the Empiricist is the reference leg
+    # now. No probe, no worktree, no lease, no network call. Precedes
+    # _gw_slot2_url() so nothing downstream of it ever runs.
+    if _gw_leg_retired():
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] GW reference reviewer retired under the "
+            f"single-slot posture — the Empiricist (spec_reviewer) is the reference "
+            f"leg. Set SPEC_REVIEW_GW_LEG_RETIRED=0 to un-retire for this run.",
+            file=sys.stderr,
+        )
+        return None, [], elapsed, "gw_leg_retired", None
 
     gw_slot2_url = _gw_slot2_url()
     if gw_slot2_url is None:
@@ -616,7 +958,7 @@ def _dispatch_gw_reviewer(
             f"council voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed, "no_parseable_hostname"
+        return None, [], elapsed, "no_parseable_hostname", None
 
     primary_url = _gw_primary_url()
     if _gw_endpoints_collapsed(gw_slot2_url, primary_url):
@@ -628,7 +970,7 @@ def _dispatch_gw_reviewer(
             f"voicing only, no self-contending reference leg.",
             file=sys.stderr,
         )
-        return None, [], elapsed, "slot2_collapsed_to_primary"
+        return None, [], elapsed, "slot2_collapsed_to_primary", None
 
     # Single bounded (4s) probe: doubles as the readiness gate AND the
     # provenance source (the served model), replacing the doorman-heartbeat
@@ -645,7 +987,7 @@ def _dispatch_gw_reviewer(
             f"voicing only.",
             file=sys.stderr,
         )
-        return None, [], elapsed, "slot2_unavailable"
+        return None, [], elapsed, "slot2_unavailable", None
 
     print(
         f"[spec-review:gw-reviewer-provenance] endpoint={gw_slot2_url} "
@@ -661,14 +1003,51 @@ def _dispatch_gw_reviewer(
             f"[spec-review:gw-reviewer] agents_core import failed: {e} — skipping GW leg",
             file=sys.stderr,
         )
-        return None, [], elapsed, "import_error"
+        return None, [], elapsed, "import_error", None
+
+    # Ground the leg against a pinned, detached origin/main worktree of the
+    # local clone — never the shared -working tree, which is read/write from
+    # interactive PM sessions and other dispatches and carries no guarantee of
+    # being at origin/main, clean, or even on main. Mirrors the pattern
+    # agents-core's Facets orchestrator uses for the same reason (PR #201).
+    worktree_path, resolved_sha, wt_err = _create_gw_worktree(repo, run_id)
+    if worktree_path is None:
+        elapsed = time.time() - start_time
+        print(
+            f"[spec-review:gw-reviewer] GW reference reviewer skipped: could not pin an "
+            f"origin/main worktree ({wt_err}) — spec-review will proceed with council "
+            f"voicing only.",
+            file=sys.stderr,
+        )
+        return None, [], elapsed, "worktree_unavailable", None
+
+    staleness_warning = (
+        f"reviewing origin/main@{resolved_sha} as pinned in the local clone's last "
+        f"fetch; may not reflect the current remote state"
+    )
+    provenance = GwLegProvenance(
+        resolved_sha=resolved_sha,
+        worktree_path=worktree_path,
+        staleness_warning=staleness_warning,
+    )
+    print(f"[spec-review:gw-reviewer-pinned] {staleness_warning}", file=sys.stderr)
 
     prompt = (
         f"Review this spec for technical soundness, implementability, and "
         f"coverage of DON'T-do constraints and Definition-of-Done. "
+        f"For any issue you report at severity HIGH or MED, you MUST include the exact "
+        f"read-only command you ran to check it as STRUCTURED fields — never a single "
+        f"free-text string: \"command_program\" (bare program name, e.g. \"grep\"), "
+        f"\"command_args\" (a JSON list of its arguments, e.g. [\"-n\", \"foo\", \"bar.py\"]), "
+        f"and \"command_output\" (the exact stdout it produced). Never combine the program "
+        f"and its arguments into one string. LOW-severity issues do not need these fields. "
         f"Return a JSON verdict with structure: "
         f"{{\"verdict\": \"clean|fixable|needs-human\", "
-        f"\"issues\": [{{\"severity\": \"HIGH|MED|LOW\", \"note\": \"...\"}}], "
+        f"\"issues\": [{{\"severity\": \"HIGH|MED|LOW\", \"note\": \"...\", "
+        f"\"citation\": \"<file:line or spec section>\", "
+        f"\"command_program\": \"<required for HIGH/MED>\", "
+        f"\"command_args\": [\"<required for HIGH/MED>\"], "
+        f"\"command_output\": \"<required for HIGH/MED>\"}}], "
         f"\"confidence\": 0.0-1.0}}\n\n"
         f"=== SPEC ===\n{spec_text}"
     )
@@ -687,7 +1066,7 @@ def _dispatch_gw_reviewer(
         text, transcript = call_gw_agent(
             prompt=prompt,
             system="",
-            cwd=f"/srv/git/{repo}-working",
+            cwd=worktree_path,
             tools=DEFAULT_READONLY_TOOLS,
             json_mode=True,
             on_wake_fail="skip",
@@ -701,12 +1080,22 @@ def _dispatch_gw_reviewer(
         )
         elapsed = time.time() - start_time
         if text is not None:
-            print(
-                f"[spec-review:gw-reviewer] completed task_id={run_id} "
-                f"elapsed={elapsed:.1f}s",
-                file=sys.stderr,
-            )
-            return text, transcript, elapsed, ""
+            if abandoned_event is not None and abandoned_event.is_set():
+                # The join already gave up and reported this leg abandoned; this
+                # result arrived too late to be used. Say so distinctly rather than
+                # printing a plain "completed" line that would misread as live.
+                print(
+                    f"[spec-review:gw-reviewer-abandoned] completed after join gave up "
+                    f"task_id={run_id} elapsed={elapsed:.1f}s reason=timeout",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[spec-review:gw-reviewer] completed task_id={run_id} "
+                    f"elapsed={elapsed:.1f}s",
+                    file=sys.stderr,
+                )
+            return text, transcript, elapsed, "", provenance
         # on_wake_fail=skip cannot fire on this call path (acquire_lease=False
         # never consults the doorman) - report the real reason_out cause
         # instead of fabricating one this function cannot know.
@@ -716,62 +1105,72 @@ def _dispatch_gw_reviewer(
             f"elapsed={elapsed:.1f}s timeout={gw_timeout}s",
             file=sys.stderr,
         )
-        return text, transcript, elapsed, f"gw_no_content:{reason}"
+        return text, transcript, elapsed, f"gw_no_content:{reason}", provenance
     except Exception as e:
         elapsed = time.time() - start_time
         print(
             f"[spec-review:gw-reviewer] call_gw_agent failed: {e} — skipping",
             file=sys.stderr,
         )
-        return None, [], elapsed, "call_error"
+        return None, [], elapsed, "call_error", provenance
+    finally:
+        try:
+            _remove_gw_worktree(repo, worktree_path)
+        except Exception as e:
+            print(
+                f"[spec-review:gw-reviewer-cleanup-warning] failed to remove worktree "
+                f"{worktree_path}: {e}",
+                file=sys.stderr,
+            )
 
 
-def _poll_sonnet_until_terminal(
+def _poll_reference_until_terminal(
     spec_reviewer_task_id: str | None,
     timeout_s: int,
     start_time: float,
 ) -> dict | None:
-    """Poll Sonnet leg to terminal with independent timeout.
+    """Poll the reference leg to terminal with independent timeout.
 
     Council polling is now handled by the shared orchestrator (run_deliberation),
-    which has its own internal timeout. The Sonnet leg polls independently with
+    which has its own internal timeout. The reference leg polls independently with
     its own deadline to avoid stalling when one leg is slow.
 
-    Returns sonnet_raw dict or None if task_id is None (no Sonnet leg dispatched).
+    Returns reference_raw dict or None if task_id is None (no reference leg dispatched).
     """
     if spec_reviewer_task_id is None:
         return None
 
-    sonnet_result: dict | None = None
+    reference_result: dict | None = None
 
     while True:
         elapsed = time.time() - start_time
         timed_out = elapsed >= timeout_s
 
         # Check spec_reviewer terminal state
-        if sonnet_result is None:
+        if reference_result is None:
             output_path = _find_reviewer_output(spec_reviewer_task_id)
             if output_path is not None:
                 raw = _read_verdict_from_output(output_path)
                 failed = str(_CLAUDE_QUEUE_FAILED) in str(output_path) or \
                          str(_GPU_QUEUE_FAILED) in str(output_path)
-                sonnet_result = {
+                reference_result = {
                     "status": "failed" if failed else "processed",
                     "verdict": raw.get("verdict", "error"),
                     "issues": raw.get("issues", []),
                     "confidence": raw.get("confidence", 0.0),
                     "run_id": spec_reviewer_task_id,
                     "parse_error": raw.get("parse_error"),
+                    "claims_checked": raw.get("claims_checked"),
                 }
                 elapsed_s = int(time.time() - start_time)
                 print(
-                    f"[spec-review:sonnet-complete] task_id={spec_reviewer_task_id} "
-                    f"elapsed={elapsed_s}s verdict={sonnet_result['verdict']}",
+                    f"[spec-review:reviewer-complete] task_id={spec_reviewer_task_id} "
+                    f"elapsed={elapsed_s}s verdict={reference_result['verdict']}",
                     file=sys.stderr,
                 )
-                return sonnet_result
+                return reference_result
             elif timed_out:
-                sonnet_result = {
+                reference_result = {
                     "status": "timeout",
                     "verdict": "timeout",
                     "issues": [],
@@ -780,18 +1179,18 @@ def _poll_sonnet_until_terminal(
                 }
                 elapsed_s = int(time.time() - start_time)
                 print(
-                    f"[spec-review:sonnet-timeout] task_id={spec_reviewer_task_id} "
+                    f"[spec-review:reviewer-timeout] task_id={spec_reviewer_task_id} "
                     f"elapsed={elapsed_s}s",
                     file=sys.stderr,
                 )
-                return sonnet_result
+                return reference_result
 
         time.sleep(_POLL_CADENCE_S)
 
 
 def _combined_recommendation(
-    sonnet_verdict: str = "skip",
-    sonnet_issues: list[dict] = (),
+    reference_verdict: str = "skip",
+    reference_issues: list[dict] = (),
     council_status: str = "error",
     council_positions: list[dict] = (),
     facets_escalation: str | None = None,
@@ -803,10 +1202,10 @@ def _combined_recommendation(
 ) -> Literal["proceed-to-bind", "amend-spec", "shape-with-Erah", "incomplete", "parse_failed"]:
     """Deterministic combined recommendation — Facets (PM) + Council (philosophical).
 
-    sonnet_verdict="skip" signals that the Sonnet leg was not dispatched (Facets mode).
-    The Sonnet leg is always reference-only: even when present, its verdict/issues are
-    fed the "skip" sentinel into the recommendation so they cannot move the gate.
-    Facets + Council are the sole drivers.
+    reference_verdict="skip" signals that the reference leg was not dispatched (Facets
+    mode). The reference leg is always reference-only: even when present, its
+    verdict/issues are fed the "skip" sentinel into the recommendation so they cannot
+    move the gate. Facets + Council are the sole drivers.
 
     When facets_escalation is provided and authority is advisory/hold, Facets
     signals take precedence. Falls through to Council-only logic on
@@ -815,12 +1214,12 @@ def _combined_recommendation(
     """
     # Support deprecated opus_* parameter aliases
     if opus_verdict is not None:
-        sonnet_verdict = opus_verdict
+        reference_verdict = opus_verdict
     if opus_issues is not None:
-        sonnet_issues = opus_issues
+        reference_issues = opus_issues
 
     # parse_failed: parser could not extract a verdict
-    if sonnet_verdict == "parse_failed":
+    if reference_verdict == "parse_failed":
         return "parse_failed"
 
     # Facets logic — gated on authority, escalation signal, and reliability
@@ -837,31 +1236,442 @@ def _combined_recommendation(
     if council_status in {"timeout", "error"}:
         return "incomplete"
 
-    # Sonnet timeout/error → incomplete (only when Sonnet was dispatched, non-advisory-only)
-    # NOTE: in the current design, sonnet_verdict is always fed as "skip" to this function
-    # (advisory-only mode), so this branch only triggers in legacy non-advisory-only calls.
-    if sonnet_verdict not in {"skip"} and sonnet_verdict in {"timeout", "error"}:
+    # Reference leg timeout/error → incomplete (only when dispatched, non-advisory-only)
+    # NOTE: in the current design, reference_verdict is always fed as "skip" to this
+    # function (advisory-only mode), so this branch only triggers in legacy
+    # non-advisory-only calls.
+    if reference_verdict not in {"skip"} and reference_verdict in {"timeout", "error"}:
         return "incomplete"
 
-    # shape-with-Erah: council laid-down, council open with blocks, or Sonnet needs-human
+    # shape-with-Erah: council laid-down, council open with blocks, or reference needs-human
     has_block = any(p.get("position") == "block" for p in council_positions)
     if council_status == "laid-down" or (council_status == "open" and has_block):
         return "shape-with-Erah"
-    if sonnet_verdict not in {"skip"} and sonnet_verdict == "needs-human":
+    if reference_verdict not in {"skip"} and reference_verdict == "needs-human":
         return "shape-with-Erah"
 
-    # amend-spec: council open, or Sonnet fixable/HIGH-issue (when non-advisory-only)
-    has_high = any(str(i.get("severity", "")).lower() == "high" for i in sonnet_issues)
+    # amend-spec: council open, or reference fixable/HIGH-issue (when non-advisory-only)
+    has_high = any(str(i.get("severity", "")).lower() == "high" for i in reference_issues)
     if council_status == "open":
         return "amend-spec"
-    if sonnet_verdict not in {"skip"} and (sonnet_verdict == "fixable" or has_high):
+    if reference_verdict not in {"skip"} and (reference_verdict == "fixable" or has_high):
         return "amend-spec"
 
-    # proceed-to-bind: council resolved + (Sonnet clean or Sonnet not dispatched)
-    if council_status == "resolved" and sonnet_verdict in {"skip", "clean"}:
+    # proceed-to-bind: council resolved + (reference clean or reference not dispatched)
+    if council_status == "resolved" and reference_verdict in {"skip", "clean"}:
         return "proceed-to-bind"
 
     return "incomplete"
+
+
+def _resolve_reference_model() -> str | None:
+    """Resolve the reference leg's model identity from registry.yaml at run time (AC3).
+
+    Reuses the Shaper instance pm_core already constructs for registry.yaml (_SHAPER)
+    rather than introducing a second loading idiom. Reads agents.spec_reviewer.model.
+
+    Never raises: a missing seat, missing file, or malformed entry returns None, which
+    the brief renders as an explicit unknown marker — never a guessed or stale model
+    name. This is the mechanism that keeps the rename from going stale a third time —
+    repointing spec_reviewer.model changes what the brief says with no code edit.
+    """
+    try:
+        return _SHAPER.get_agent("spec_reviewer").model
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Citation command-replay verifier (lapis-pm-citation-command-replay-verifier-v0)
+#
+# Deterministic, no-model-call check: replay the exact read-only command a
+# reference leg claims to have run against the real target_repo_path, and diff
+# its live output against the leg's claimed command_output. Informational only
+# — command_verified never feeds _combined_recommendation (see DON'T-do in the
+# spec). Only HIGH/MED issues are checked; LOW issues are left untouched.
+# ---------------------------------------------------------------------------
+
+_CITATION_COMMAND_ALLOWLIST: frozenset[str] = frozenset({"grep", "rg", "git", "cat", "find"})
+_CITATION_COMMAND_TIMEOUT_S = 5  # per-command subprocess timeout
+_CITATION_VERIFY_AGGREGATE_BUDGET_S = 30  # total wall-clock across all issues in one run
+_CITATION_VERIFY_MAX_CAPTURE_BYTES = 50 * 1024  # resource bound, not a relevance judgment
+_CITATION_LINE_RE = re.compile(r":(\d+)\s*$")
+
+
+def _citation_args_shape_valid(command_args: object) -> bool:
+    """True iff command_args is a plain list[str] — checked before any allowlist logic
+    runs, so a bare string / nested structure / non-string element is rejected at the
+    earliest possible point (schema-validation time), never re-joined or re-parsed."""
+    if not isinstance(command_args, list):
+        return False
+    return all(isinstance(a, str) for a in command_args)
+
+
+def _citation_resolve_under_repo(arg: str, target_repo_path: str) -> Path | None:
+    """Resolve arg relative to target_repo_path and reject if it escapes (symlink-safe,
+    handles absolute-path and ../ escapes). Returns the resolved Path, or None if arg
+    is not equal to or under target_repo_path."""
+    try:
+        repo_root = Path(target_repo_path).resolve()
+        resolved = (Path(target_repo_path) / arg).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved == repo_root or resolved.is_relative_to(repo_root):
+        return resolved
+    return None
+
+
+def _citation_command_allowlisted(
+    command_program: str, command_args: list[str], target_repo_path: str
+) -> bool:
+    """Hard allowlist: only grep/rg/git(grep|show)/cat/find, and only when every
+    non-flag argument resolves to a path equal to or under target_repo_path. No
+    tokenization anywhere — command_args is already a structured list."""
+    if command_program not in _CITATION_COMMAND_ALLOWLIST:
+        return False
+    if command_program == "git":
+        if not command_args or command_args[0] not in ("grep", "show"):
+            return False
+    for arg in command_args:
+        if arg.startswith("-"):
+            continue
+        if _citation_resolve_under_repo(arg, target_repo_path) is None:
+            return False
+    return True
+
+
+def _citation_execution_faulted(
+    command_program: str, command_args: list[str], returncode: int
+) -> bool:
+    """True iff returncode indicates a genuine execution fault (bad path, unknown
+    flag) rather than an expected non-error nonzero exit (grep/rg/git-grep 1 = no
+    match)."""
+    if command_program in ("grep", "rg"):
+        return returncode not in (0, 1)
+    if command_program == "git":
+        sub = command_args[0] if command_args else ""
+        if sub == "grep":
+            return returncode not in (0, 1)
+        return returncode != 0  # git show
+    return returncode != 0  # cat, find
+
+
+def _citation_extract_targets(command_program: str, command_args: list[str]) -> list[str]:
+    """Per-program lookup table returning candidate target paths for the command
+    (never a single-path heuristic — see spec's "Relevance Gap" section)."""
+    if command_program in ("grep", "rg"):
+        positionals = [a for a in command_args if not a.startswith("-")]
+        return positionals[1:] if len(positionals) > 1 else []
+    if command_program == "cat":
+        return [a for a in command_args if not a.startswith("-")]
+    if command_program == "git":
+        if not command_args:
+            return []
+        sub = command_args[0]
+        if sub == "grep":
+            return _citation_extract_targets("grep", command_args[1:])
+        if sub == "show":
+            if len(command_args) < 2:
+                return []
+            spec = command_args[1]
+            if ":" in spec:
+                return [spec.rsplit(":", 1)[1]]
+            return [spec]
+        return []
+    if command_program == "find":
+        positionals = [a for a in command_args if not a.startswith("-")]
+        return positionals[:1]
+    return []
+
+
+def _citation_path_only(citation: str) -> str:
+    """Strip a trailing :<line> suffix from a citation, leaving the bare path."""
+    if ":" in citation:
+        head, _, tail = citation.rpartition(":")
+        if tail.isdigit():
+            return head
+    return citation
+
+
+def _citation_line_number(citation: str) -> int | None:
+    m = _CITATION_LINE_RE.search(citation or "")
+    return int(m.group(1)) if m else None
+
+
+def _citation_target_matches(
+    citation_path: str, candidates: list[str], target_repo_path: str
+) -> bool:
+    """True iff citation_path (resolved under target_repo_path) equals or is contained
+    within any one of the command's extracted candidate targets."""
+    cited_resolved = _citation_resolve_under_repo(citation_path, target_repo_path)
+    if cited_resolved is None:
+        return False
+    for cand in candidates:
+        cand_resolved = _citation_resolve_under_repo(cand, target_repo_path)
+        if cand_resolved is None:
+            continue
+        if cited_resolved == cand_resolved or cited_resolved.is_relative_to(cand_resolved):
+            return True
+    return False
+
+
+def _citation_command_has_line_numbers(command_program: str, command_args: list[str]) -> bool:
+    """True iff the command is structurally capable of proving a specific line —
+    grep/rg/`git grep` invoked with -n (fixed, well-known output prefix)."""
+    if command_program in ("grep", "rg"):
+        return "-n" in command_args
+    if command_program == "git" and command_args and command_args[0] == "grep":
+        return "-n" in command_args[1:]
+    return False
+
+
+def _citation_output_covers_line(output: str, line_no: int) -> bool:
+    """Parse each output line's leading `<number>:` prefix (grep -n's fixed format —
+    a simple split on the first colon, checking the prefix is all digits) and confirm
+    at least one matches line_no. Not a general-purpose output parser."""
+    for out_line in output.splitlines():
+        prefix, sep, _ = out_line.partition(":")
+        if sep and prefix.isdigit() and int(prefix) == line_no:
+            return True
+    return False
+
+
+def _citation_normalize_output(s: str) -> str:
+    """Reasonable normalization only — trailing whitespace/newline — nothing that
+    would let a genuinely wrong claim slide through as a match."""
+    return s.rstrip()
+
+
+def _citation_diff_snippet(claimed: str, actual: str, max_len: int = 200) -> str:
+    return f"claimed={claimed[:max_len]!r} actual={actual[:max_len]!r}"
+
+
+def _verify_citation_commands(
+    issues: list[dict], target_repo_path: str | None
+) -> list[dict]:
+    """Deterministically replay each HIGH/MED issue's claimed command against
+    target_repo_path and diff its real output against the issue's claimed
+    command_output. Attaches command_verified: true | false | "not_checked" to
+    each HIGH/MED issue (LOW issues pass through untouched). Never raises, never
+    mutates any other field on an issue, never blocks past its aggregate budget.
+
+    target_repo_path unavailable (None or not a directory) is a "not_checked"
+    outcome for every HIGH/MED issue in this call, never a hard block — see the
+    spec's "target_repo_path unavailable" invariant.
+    """
+    if not issues:
+        return issues
+
+    repo_available = bool(target_repo_path) and Path(target_repo_path).is_dir()
+    budget_deadline = time.monotonic() + _CITATION_VERIFY_AGGREGATE_BUDGET_S
+
+    out: list[dict] = []
+    for issue in issues:
+        severity = str(issue.get("severity", "")).lower()
+        if severity not in ("high", "med"):
+            out.append(issue)
+            continue
+
+        new_issue = dict(issue)
+        out.append(new_issue)
+
+        if time.monotonic() >= budget_deadline:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if not repo_available:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        command_program = issue.get("command_program")
+        command_args = issue.get("command_args")
+        command_output_claim = issue.get("command_output")
+
+        if not isinstance(command_program, str) or command_output_claim is None:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if not _citation_args_shape_valid(command_args):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if not _citation_command_allowlisted(command_program, command_args, target_repo_path):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        try:
+            result = subprocess.run(
+                [command_program, *command_args],
+                cwd=target_repo_path,
+                shell=False,
+                timeout=_CITATION_COMMAND_TIMEOUT_S,
+                capture_output=True,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        if _citation_execution_faulted(command_program, command_args, result.returncode):
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        stdout_bytes = result.stdout or b""
+        if len(stdout_bytes) > _CITATION_VERIFY_MAX_CAPTURE_BYTES:
+            new_issue["command_verified"] = "not_checked"
+            continue
+
+        actual_output = stdout_bytes.decode("utf-8", errors="replace")
+
+        # Relevance Gap close: cross-check the command's target against the
+        # issue's own citation before trusting any byte-comparison.
+        citation = str(issue.get("citation", issue.get("path", "")))
+        citation_path = _citation_path_only(citation)
+        candidates = _citation_extract_targets(command_program, command_args)
+        if citation_path and not _citation_target_matches(
+            citation_path, candidates, target_repo_path
+        ):
+            new_issue["command_verified"] = False
+            new_issue["command_verify_diff"] = (
+                f"claimed evidence for `{citation}`, command targeted "
+                f"{candidates or '(no target)'}"
+            )
+            continue
+
+        # Coincidence Trap close: a line-specific citation requires a command
+        # structurally capable of proving that line (grep/rg/git-grep -n).
+        line_no = _citation_line_number(citation)
+        if line_no is not None:
+            if not _citation_command_has_line_numbers(command_program, command_args):
+                new_issue["command_verified"] = "not_checked"
+                continue
+            if not _citation_output_covers_line(actual_output, line_no):
+                new_issue["command_verified"] = "not_checked"
+                continue
+
+        if _citation_normalize_output(actual_output) == _citation_normalize_output(
+            str(command_output_claim)
+        ):
+            new_issue["command_verified"] = True
+        else:
+            new_issue["command_verified"] = False
+            new_issue["command_verify_diff"] = _citation_diff_snippet(
+                str(command_output_claim), actual_output
+            )
+
+    return out
+
+
+def _detect_grounding_status(facets_dict: dict | None) -> tuple[str, str]:
+    """Detect whether Facets actually grounded its review in the codebase (U3c/D3).
+
+    finding/spec-review-gate-structurally-ungrounded-2026-08-01 recorded two distinct
+    failure shapes and required a detector that covers both:
+      (a) a non-final round records a codebase-prefixed entry in sim_failures — an
+          explicit denial (e.g. "no target_repo in context"). HIGH tier.
+      (b) a non-final round records EMPTY sim_failures AND EMPTY sim_results — a
+          silent denial, not even logged as a failure. LOW tier, and per
+          decision/escalate-structural-absence-not-only-denial-2026-08-01, LOW must
+          still emit rather than being suppressed.
+
+    grounding_reason taxonomy (settled at the spec-review gate,
+    lapis-pm-spec-review-grounding-legibility-v0): `no_repo_in_context` is reserved
+    for the genuine case — `_resolve_grounding_target` in
+    agents_core/shared_deliberation/orchestrator.py finding context["repo"] absent
+    or malformed before this function ever runs. This function never sees that
+    signal directly (rounds/sim_results/sim_failures only), so it must never emit
+    `no_repo_in_context` itself — it emits `sim_data_missing` (no sim data recorded
+    at all in a non-final round) or `sim_data_malformed` (sim data recorded, but
+    none of it codebase-shaped) instead. Both keep the "silent-denial" status; only
+    the cause string differs.
+
+    Returns (grounding_status, grounding_reason). facets_dict=None (Facets never ran,
+    or its dispatch failed outright) is treated as "failed" — a review that never
+    attempted grounding cannot be reported as verified or silently as not-applicable;
+    callers gate the "not-applicable" case themselves (Facets structurally skipped for
+    this authority) before calling this function.
+    """
+    if not facets_dict:
+        return ("failed", "grounding_target_unavailable")
+
+    rounds = facets_dict.get("rounds") or []
+    if not rounds:
+        return ("failed", "grounding_target_unavailable")
+
+    max_round_num = max((r.get("round_num", 0) for r in rounds), default=0)
+    codebase_denial_reason = ""
+    saw_any_data = False
+    saw_codebase_result = False
+
+    for rnd in rounds:
+        if rnd.get("round_num") == max_round_num:
+            continue
+        sim_failures = rnd.get("sim_failures") or {}
+        sim_results = rnd.get("sim_results") or {}
+        if sim_failures or sim_results:
+            saw_any_data = True
+        for key, reason in sim_failures.items():
+            if key.split(":", 1)[0] == "codebase":
+                codebase_denial_reason = str(reason) or "codebase_surface_denied"
+        for key in sim_results:
+            if key.split(":", 1)[0] == "codebase":
+                saw_codebase_result = True
+
+    if codebase_denial_reason:
+        return ("failed", "codebase_surface_denied")
+    if saw_codebase_result:
+        return ("verified", "")
+    # D4, lapis-pm-gate-brief-tells-the-truth-v0: Mode-1 auto-grounding never writes
+    # into any RoundRecord (facets/adapter.py:745-778), so a fully-grounded run falls
+    # through to here with empty sim_results in every round. context.target_repo is
+    # set only when grounding was actually supplied (adapter.py:947-949) — a reliable
+    # signal the round-level sim data misses entirely.
+    if (facets_dict.get("context") or {}).get("target_repo"):
+        return ("verified", "auto-grounded")
+    if not saw_any_data:
+        # Case (b): structurally absent, not even logged as a failure.
+        return ("silent-denial", "sim_data_missing")
+    # Some sim data was recorded but none of it was codebase-shaped — a distinct
+    # cause from sim_data_missing above, still "silent-denial" rather than a false
+    # "verified".
+    return ("silent-denial", "sim_data_malformed")
+
+
+def _resolve_grounding_sha_and_age(repo: str) -> tuple[str, int | None]:
+    """Best-effort local resolution of what a "verified" grounding was checked
+    against (D2, lapis-pm-spec-review-grounding-legibility-v0).
+
+    The Facets codebase-surface leg grounds against a detached `origin/main`
+    worktree of this same local clone (agents_core's `_resolve_grounding_target`,
+    mirrored by `_create_gw_worktree` above for the GW leg) — so `origin/main`'s
+    current sha in `/srv/git/{repo}-working` is the same commit that grounding
+    run against, modulo a fetch landing in the narrow window between the two.
+    Purely local, read-only, no network — same no-fetch posture as the rest of
+    this module's grounding machinery (2026-08-01 Erah ruling).
+
+    Returns (sha, age_days). On any failure returns ("", None) rather than
+    fabricating a value — a rendering degradation, never a brief failure.
+    """
+    clone_dir = f"/srv/git/{repo}-working"
+    try:
+        sha_result = subprocess.run(
+            ["git", "-C", clone_dir, "rev-parse", "origin/main"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if sha_result.returncode != 0:
+            return "", None
+        sha = sha_result.stdout.strip()
+
+        ts_result = subprocess.run(
+            ["git", "-C", clone_dir, "log", "-1", "--format=%ct", sha],
+            capture_output=True, text=True, timeout=15,
+        )
+        if ts_result.returncode != 0 or not ts_result.stdout.strip():
+            return sha, None
+        commit_ts = int(ts_result.stdout.strip())
+        age_days = max(0, int((time.time() - commit_ts) // 86400))
+        return sha, age_days
+    except Exception:
+        return "", None
 
 
 def _build_brief(
@@ -870,42 +1680,58 @@ def _build_brief(
     parsed_target_id: str,
     repo: str,
     elapsed_s: float,
-    sonnet_raw: dict | None = None,
+    reference_raw: dict | None = None,
     facets_deliberation: dict | None = None,
     authority: str = "advisory",
-    sonnet_advisory_only: bool = False,
+    reference_advisory_only: bool = False,
+    reference_model: str | None = None,
     facets_operator: str = "gravitywell",
     council_voicing_requested: str = "gravitywell",
     gw_verdict: str = "skip",
     gw_ran: bool = False,
+    gw_abandoned: bool = False,
     gw_skip_reason: str = "",
     gw_findings_count: int = 0,
     elapsed_gw: float = 0.0,
     gw_transcript_ref: str = "",
+    gw_parse_error: dict | None = None,
+    gw_raw_output_ref: str = "",
+    grounding_status: str = "not-applicable",
+    grounding_reason: str = "",
+    grounding_resolved_sha: str = "",
+    grounding_age_days: int | None = None,
+    consumer_criterion: dict | None = None,
     # Deprecated parameter aliases — kept for callers that haven't migrated yet
     opus_raw: dict | None = None,
     opus_advisory_only: bool | None = None,
 ) -> SpecReviewBrief:
-    """Assemble SpecReviewBrief from Facets + Council (and optionally Sonnet) results.
+    """Assemble SpecReviewBrief from Facets + Council (and optionally the reference leg).
 
-    sonnet_raw is optional — None when the Sonnet leg was not dispatched.
+    reference_raw is optional — None when the reference leg was not dispatched.
     facets_deliberation is the FacetsDeliberation envelope dict; None if disabled/timeout.
-    sonnet_advisory_only — the Sonnet leg is always reference-only: its output is
+    reference_advisory_only — the reference leg is always reference-only: its output is
     rendered for reference but excluded from the combined recommendation (Facets +
-    Council drive the gate). This flag is set True whenever the Sonnet leg ran.
+    Council drive the gate). This flag is set True whenever the reference leg ran.
     council_voicing_requested — the voicing value that was requested (default gravitywell).
     """
     # Support deprecated opus_* parameter aliases
-    if opus_raw is not None and sonnet_raw is None:
-        sonnet_raw = opus_raw
-    if opus_advisory_only is not None and sonnet_advisory_only is False:
-        sonnet_advisory_only = opus_advisory_only
+    if opus_raw is not None and reference_raw is None:
+        reference_raw = opus_raw
+    if opus_advisory_only is not None and reference_advisory_only is False:
+        reference_advisory_only = opus_advisory_only
 
-    # Sonnet fields — default to "skip" sentinel when not dispatched
-    sonnet_verdict = sonnet_raw.get("verdict", "error") if sonnet_raw is not None else "skip"
-    sonnet_issues = sonnet_raw.get("issues", []) if sonnet_raw is not None else []
-    sonnet_confidence = float(sonnet_raw.get("confidence", 0.0)) if sonnet_raw is not None else 0.0
-    sonnet_run_id = sonnet_raw.get("run_id", "") if sonnet_raw is not None else ""
+    # Reference-leg fields — default to "skip" sentinel when not dispatched
+    reference_verdict = reference_raw.get("verdict", "error") if reference_raw is not None else "skip"
+    reference_issues = reference_raw.get("issues", []) if reference_raw is not None else []
+    reference_confidence = float(reference_raw.get("confidence", 0.0)) if reference_raw is not None else 0.0
+    reference_run_id = reference_raw.get("run_id", "") if reference_raw is not None else ""
+    reference_claims_checked = None
+    if reference_raw is not None:
+        _claims_checked_raw = reference_raw.get("claims_checked")
+        try:
+            reference_claims_checked = int(_claims_checked_raw) if _claims_checked_raw is not None else None
+        except (TypeError, ValueError):
+            reference_claims_checked = None
 
     council_status = council_raw.get("status", "error")
     council_landing = council_raw.get("landing", "")
@@ -955,22 +1781,34 @@ def _build_brief(
             facets_operator_requested and facets_operator_requested != facets_operator_effective
         )
 
-    # The Sonnet leg is always reference-only: feed the "skip" sentinel into the
-    # recommendation so any Sonnet verdict/issues/timeout cannot move the gate.
-    # Facets + Council remain the sole drivers. The real Sonnet fields are still
+    # The reference leg is always reference-only: feed the "skip" sentinel into the
+    # recommendation so any reference verdict/issues/timeout cannot move the gate.
+    # Facets + Council remain the sole drivers. The real reference fields are still
     # stored on the brief for rendering.
-    rec_sonnet_verdict = "skip" if sonnet_advisory_only else sonnet_verdict
-    rec_sonnet_issues = () if sonnet_advisory_only else sonnet_issues
+    rec_reference_verdict = "skip" if reference_advisory_only else reference_verdict
+    rec_reference_issues = () if reference_advisory_only else reference_issues
 
     recommendation = _combined_recommendation(
-        sonnet_verdict=rec_sonnet_verdict,
-        sonnet_issues=rec_sonnet_issues,
+        reference_verdict=rec_reference_verdict,
+        reference_issues=rec_reference_issues,
         council_status=council_status,
         council_positions=council_positions,
         facets_escalation=facets_escalation,
         facets_unreliable=facets_unreliable,
         authority=authority,
     )
+
+    # C7 admission criterion: a blocking finding forces the recommendation off
+    # "proceed-to-bind" regardless of what Facets/Council concluded — this gate
+    # surface is deterministic and never deferred to model judgment (DoD-2).
+    # A more severe existing recommendation (shape-with-Erah, incomplete, ...)
+    # is left as-is; the finding still renders below either way.
+    consumer_status = (consumer_criterion or {}).get("status", "ok")
+    consumer_finding = ""
+    if consumer_status == "blocking":
+        consumer_finding = _consumer_criterion_finding_text(spec_path, consumer_criterion)
+        if recommendation == "proceed-to-bind":
+            recommendation = "amend-spec"
 
     return SpecReviewBrief(
         spec_path=spec_path,
@@ -984,13 +1822,15 @@ def _build_brief(
         council_run_id=council_run_id,
         elapsed_s=elapsed_s,
         combined_recommendation=recommendation,
-        sonnet_verdict=sonnet_verdict,
-        sonnet_issues=sonnet_issues,
-        sonnet_confidence=sonnet_confidence,
-        sonnet_run_id=sonnet_run_id,
-        parse_error=sonnet_raw.get("parse_error") if sonnet_raw is not None else None,
+        reference_verdict=reference_verdict,
+        reference_issues=reference_issues,
+        reference_confidence=reference_confidence,
+        reference_run_id=reference_run_id,
+        reference_claims_checked=reference_claims_checked,
+        reference_model=reference_model,
+        parse_error=reference_raw.get("parse_error") if reference_raw is not None else None,
         facets_deliberation=facets_deliberation,
-        sonnet_advisory_only=sonnet_advisory_only,
+        reference_advisory_only=reference_advisory_only,
         facets_operator=facets_operator,
         council_voicing_requested=council_voicing_requested,
         council_voicing_effective=council_voicing_effective or "unknown",
@@ -1002,10 +1842,19 @@ def _build_brief(
         council_error_reason=council_error_reason,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_abandoned=gw_abandoned,
         gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=elapsed_gw,
         gw_transcript_ref=gw_transcript_ref,
+        gw_parse_error=gw_parse_error,
+        gw_raw_output_ref=gw_raw_output_ref,
+        grounding_status=grounding_status,
+        grounding_reason=grounding_reason,
+        grounding_resolved_sha=grounding_resolved_sha,
+        grounding_age_days=grounding_age_days,
+        consumer_criterion_status=consumer_status,
+        consumer_criterion_finding=consumer_finding,
     )
 
 
@@ -1041,15 +1890,35 @@ def _council_infra_guidance(reason: str, run_id: str = "") -> str:
     )
 
 
+def _format_issue_line(i: dict) -> str:
+    """One reference-issue line, with command_verified (if present) rendered as one
+    of three visually distinct states: confirmed / contradicted / not checked.
+    contradicted (False) gets high-contrast emphasis plus a diff snippet — the
+    strongest signal a citation is wrong; confirmed and not-checked render neutral."""
+    base = (
+        f"    - [{i.get('severity', '?').upper()}] "
+        f"{i.get('citation', i.get('path', '?'))}: {i.get('note', '')}"
+    )
+    cv = i.get("command_verified")
+    if cv is None:
+        return base
+    if cv is True:
+        return base + "  [command-verified: ✓ confirmed]"
+    if cv is False:
+        diff = i.get("command_verify_diff", "")
+        return (
+            base
+            + "\n      ⚠️⚠️ COMMAND-VERIFIED: CONTRADICTED — the replayed command "
+            + f"disagrees with this claim ⚠️⚠️\n      {diff}"
+        )
+    return base + "  [command-verified: not checked]"
+
+
 def format_brief(brief: SpecReviewBrief) -> str:
     """Render SpecReviewBrief as markdown for stdout."""
     issues_lines = (
-        "\n".join(
-            f"    - [{i.get('severity','?').upper()}] "
-            f"{i.get('citation', i.get('path','?'))}: {i.get('note','')}"
-            for i in brief.sonnet_issues
-        )
-        if brief.sonnet_issues
+        "\n".join(_format_issue_line(i) for i in brief.reference_issues)
+        if brief.reference_issues
         else "    - (none)"
     )
 
@@ -1110,6 +1979,15 @@ def format_brief(brief: SpecReviewBrief) -> str:
         legs_str = ", ".join(degraded_legs)
         degraded_summary = f"\n⚠️ DEGRADED: 1+ leg fell off GravityWell to paid Claude ({legs_str}).\n"
 
+    # C7 admission criterion (lapis-pm-gate-consumer-criterion-v0) — blocking
+    # finding rendered unmissably; never a silent pass. See
+    # _consumer_criterion_check / _consumer_criterion_finding_text.
+    consumer_criterion_banner = ""
+    if brief.consumer_criterion_status == "blocking":
+        consumer_criterion_banner = (
+            f"\n## ⚠️ C7 — Consumer criterion (BLOCKING)\n{brief.consumer_criterion_finding}\n"
+        )
+
     # INFRA banner — rendered when council leg failed for a known infra reason
     infra_banner = ""
     if brief.council_error_reason:
@@ -1141,9 +2019,11 @@ def format_brief(brief: SpecReviewBrief) -> str:
             "Re-run spec-review, or proceed with caution after reviewing whatever completed."
         ),
         "parse_failed": (
-            "The spec_reviewer agent likely succeeded but the parser could not extract "
-            "a JSON verdict. See the Parse Error block below for diagnostics. "
-            "After the runner fix lands (`spec-review-output-truncation-runner`), re-run spec-review."
+            "The spec_reviewer agent's output file existed but no JSON verdict could be "
+            "extracted from it. See the Parse Error block below for diagnostics. "
+            "A leg that produced nothing now records status=failed with the reason in the "
+            "queue record instead of reaching this path — check the queue record for that "
+            "distinction."
         ),
     }
     # Override "incomplete" with infra-specific guidance when a council error reason is known
@@ -1180,9 +2060,9 @@ def format_brief(brief: SpecReviewBrief) -> str:
 - **File size:** {pe.get('file_size', 0)} bytes
 - **Head (first 200 chars):** {pe.get('head', '')}
 - **Tail (last 200 chars):** {pe.get('tail', '')}
-- **Note:** the spec_reviewer agent likely succeeded; the orchestration \
-could not extract a JSON verdict from the output. See chain-sibling \
-`spec-review-output-truncation-runner` for the delivery-path fix.
+- **Note:** the output file existed but no JSON verdict could be extracted from it. \
+A leg that produced nothing now records status=failed with the reason in the queue \
+record instead of reaching this path — check the queue record for that distinction.
 """
 
     # Facets section — omitted if facets_deliberation is None
@@ -1220,7 +2100,8 @@ could not extract a JSON verdict from the output. See chain-sibling \
 
         stances_md = "\n".join(
             f"    - **{s.get('persona', '?')}** "
-            f"({'verified' if s.get('verified') else 'inferred'}/{s.get('confidence', '?')}): "
+            f"({'verified' if s.get('verified') else 'inferred'}/{s.get('confidence', '?')}, "
+            f"citation: {s.get('citation_state', 'unknown')}): "
             f"{s.get('claim', '')}"
             for s in stances
         ) or "    - (none)"
@@ -1237,11 +2118,47 @@ could not extract a JSON verdict from the output. See chain-sibling \
         else:
             uncertainty_line = "- **Uncertainty bounds:** not reported by synthesis"
 
+        citation_guard_line = ""
+        citation_guard = syn.get("citation_guard")
+        if isinstance(citation_guard, dict):
+            # D2, lapis-pm-gate-brief-tells-the-truth-v0: .get() on every key — the
+            # producer branches in facets/stance_citation.py emit different key sets
+            # (e.g. `unguarded` is absent on two of the three branches).
+            discounted = citation_guard.get("discounted_personas") or []
+            blocking = citation_guard.get("blocking_personas") or []
+            discounted_str = ", ".join(discounted) if discounted else "(none)"
+            if citation_guard.get("unguarded"):
+                citation_guard_line = (
+                    "- **Citation guard:** unguarded — citation validation did not run "
+                    "for this deliberation.\n"
+                )
+            elif citation_guard.get("would_have_downgraded") or citation_guard.get("downgraded"):
+                # Forensic artifact only, per the non-goals section — this reports
+                # history, never a signal to re-evaluate the block. `downgraded: True`
+                # is the legacy pre-#36 shape (13 historical envelopes); the current
+                # shape is `downgraded: False, would_have_downgraded: True`. Either
+                # way, a block was raised and did not silently vanish.
+                citation_guard_line = (
+                    "- **Citation guard:** block raised by "
+                    f"[{discounted_str}] carried no validated citation. "
+                    "The block stands — under the previous behaviour it would have "
+                    "been silently discarded.\n"
+                )
+            elif blocking or discounted:
+                citation_guard_line = (
+                    "- **Citation guard:** checkable, no downgrade — blocking personas "
+                    f"[{', '.join(blocking) if blocking else '(none)'}], discounted "
+                    f"[{discounted_str}].\n"
+                )
+            else:
+                citation_guard_line = "- **Citation guard:** checkable, no action taken.\n"
+
         facets_section = f"""
 ## Facets deliberation (PM domain) [operator: {brief.facets_operator}]{unreliable_header_line}
 {reliable_line}- **Consensus level:** {syn.get('consensus_level', '?')}
 - **Escalation:** {syn.get('escalation_recommendation', 'proceed')}
-- **Confidence:** {syn.get('confidence', '?')}
+- **Escalation reason:** {syn.get('escalation_reason', '')}
+{citation_guard_line}- **Confidence:** {syn.get('confidence', '?')}
 - **Recommendation:** {syn.get('recommendation', '')}
 - **Stances:**
 {stances_md}
@@ -1249,32 +2166,50 @@ could not extract a JSON verdict from the output. See chain-sibling \
 {failed_personas_line}- **Run ID:** {fd.get('deliberation_id', '')}
 """
 
-    # Sonnet section — omitted only when the leg did not run (verdict="skip").
+    # Reference-leg section — omitted only when the leg did not run (verdict="skip").
     # This section is always reference-only (purpose stated in heading).
     # IMPORTANT: always-render is load-bearing, not cosmetic — the whole point is a
     # standing deep signal in every gate run. Do not remove this section or gate it
-    # on any flag other than sonnet_verdict == "skip".
-    sonnet_section = ""
-    if brief.sonnet_verdict != "skip":
-        sonnet_section = f"""
-## Sonnet technical review — reference only (does not affect recommendation)
-- **Verdict:** {brief.sonnet_verdict} (confidence {brief.sonnet_confidence:.2f})
-- **Run ID:** {brief.sonnet_run_id}
+    # on any flag other than reference_verdict == "skip".
+    reference_section = ""
+    if brief.reference_verdict != "skip":
+        claims_checked_str = (
+            str(brief.reference_claims_checked)
+            if brief.reference_claims_checked is not None
+            else "(not reported)"
+        )
+        model_str = brief.reference_model or "model unknown"
+        reference_section = f"""
+## Empiricist ({model_str}) — factual-claim verification, reference only (does not affect recommendation)
+- **Verdict:** {brief.reference_verdict} (confidence {brief.reference_confidence:.2f})
+- **Claims checked:** {claims_checked_str}
+- **Run ID:** {brief.reference_run_id}
 - **Issues:**
 {issues_lines}
 """
 
     # GravityWell section — rendered when the leg ran (gw_ran=True).
-    # Like Sonnet, this is always reference-only and never steers the recommendation.
+    # Like the reference leg, this is always reference-only and never steers the recommendation.
     gw_section = ""
     if brief.gw_ran:
+        gw_parse_failed_block = ""
+        if brief.gw_verdict == "parse_failed" and brief.gw_parse_error:
+            gpe = brief.gw_parse_error
+            gw_parse_failed_block = f"""
+- **File size:** {gpe.get('file_size', 0)} bytes
+- **Head (first 200 chars):** {gpe.get('head', '')}
+- **Tail (last 200 chars):** {gpe.get('tail', '')}
+- **Note:** the GW leg produced output; the orchestration could not extract a JSON \
+verdict from it. See raw output below for what the model actually said.
+"""
         gw_section = f"""
 ## GravityWell reference leg — reference only (does not affect recommendation)
 - **Verdict:** {brief.gw_verdict}
 - **Findings:** {brief.gw_findings_count}
 - **Elapsed:** {brief.elapsed_gw:.1f}s
 - **Transcript:** {brief.gw_transcript_ref or '(not persisted)'}
-"""
+- **Raw output:** {brief.gw_raw_output_ref or '(not persisted)'}
+{gw_parse_failed_block}"""
     elif brief.gw_skip_reason:
         gw_section = f"""
 ## GravityWell reference leg — reference only (does not affect recommendation)
@@ -1287,13 +2222,27 @@ could not extract a JSON verdict from the output. See chain-sibling \
         voicing_lines += f"\n- Facets operator: {facets_operator_line}"
     voicing_section = f"\n**Leg voicing / operator:**\n{voicing_lines}\n" if voicing_lines else ""
 
+    # D2 (lapis-pm-spec-review-grounding-legibility-v0): render what the grounding
+    # was actually checked against — sha only for "verified" (never fabricated for
+    # any other status); reason string only for non-verified statuses. The two are
+    # mutually exclusive by construction (grounding_resolved_sha is only populated
+    # when grounding_status == "verified"). age is a plain integer + "d" suffix,
+    # never prose — grounding_reason's machine-parsable contract extends to this.
+    if brief.grounding_resolved_sha:
+        age_part = f", age: {brief.grounding_age_days}d" if brief.grounding_age_days is not None else ""
+        grounding_reason_str = f" (sha: {brief.grounding_resolved_sha}{age_part})"
+    elif brief.grounding_reason:
+        grounding_reason_str = f" ({brief.grounding_reason})"
+    else:
+        grounding_reason_str = ""
     return f"""# Spec Review: {brief.target_id}
 
 **Spec:** {brief.spec_path}
 **Repo:** {brief.repo}
 **Elapsed:** {brief.elapsed_s:.1f}s
 **Recommendation:** {brief.combined_recommendation}
-{voicing_section}{degraded_summary}{infra_banner}{facets_section}{sonnet_section}{gw_section}
+**Grounding:** {brief.grounding_status}{grounding_reason_str}
+{voicing_section}{degraded_summary}{consumer_criterion_banner}{infra_banner}{facets_section}{reference_section}{gw_section}
 ## Mirror Council deliberation
 - **Status:** {brief.council_status}, confidence {brief.council_confidence}
 - **Run ID:** {brief.council_run_id}
@@ -1311,6 +2260,147 @@ could not extract a JSON verdict from the output. See chain-sibling \
 # ---------------------------------------------------------------------------
 # Cross-session spec-review serialization lock
 # ---------------------------------------------------------------------------
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var defensively — a malformed value logs and falls back
+    to the default instead of raising (DoD9, and the pre-existing
+    SPEC_REVIEW_LOCK_TIMEOUT read this closes over)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        print(
+            f"[spec-review:env-parse-error] {name}={raw!r} is not a valid int; "
+            f"falling back to default={default}",
+            file=sys.stderr,
+        )
+        return default
+
+
+def _progress_path(lock_path: Path) -> Path:
+    """Sibling progress file, same directory as the lock (same-filesystem by
+    construction, so the atomic os.replace below can never cross devices)."""
+    return lock_path.parent / (lock_path.name + ".progress")
+
+
+def _cleanup_stale_progress_temp(progress_path: Path) -> None:
+    """Remove leftover .tmp-* siblings from a crashed holder, on lock acquisition."""
+    try:
+        for tmp in progress_path.parent.glob(progress_path.name + ".tmp-*"):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _write_progress(progress_path: Path, pid: int, phase: str, phase_at: float, beat_at: float) -> None:
+    """Write the progress record atomically: temp file in the lock's own directory,
+    then os.replace over the target. A reader can never observe a torn record."""
+    record = {"pid": pid, "phase": phase, "phase_at": phase_at, "beat_at": beat_at}
+    tmp_path = progress_path.parent / f"{progress_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        tmp_path.write_text(json.dumps(record))
+        os.replace(tmp_path, progress_path)
+    except OSError as e:
+        print(f"[spec-review:progress-write-error] {e}", file=sys.stderr)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _read_progress(progress_path: Path) -> dict | None:
+    """Return the progress record, or None if absent/unreadable/malformed.
+
+    None is the signal the waiter falls back to today's absolute-deadline
+    behaviour on (DoD5) — a mixed-fleet pre-change holder never writes this file.
+    """
+    try:
+        raw = progress_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        record = json.loads(raw.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or not _PROGRESS_FIELDS.issubset(record.keys()):
+        return None
+    return record
+
+
+def _append_gate_queue_event(event: dict) -> None:
+    """Best-effort durable JSONL append to /srv/lapis/gate-queue/history.jsonl.
+
+    Never raises — a logging failure must not abort the gate. One line per
+    queue/acquire/abort event, parseable by json.loads per line (DoD7).
+    """
+    try:
+        _GATE_QUEUE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_GATE_QUEUE_HISTORY_PATH, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError as e:
+        print(f"[spec-review:gate-queue-history-error] {e}", file=sys.stderr)
+
+
+def _send_lock_pushover(msg: str, title: str) -> None:
+    """Fire the existing NORMAL-priority Pushover alert. Isolated so both the
+    legacy timeout path and the new stall/ceiling paths share one call site."""
+    try:
+        from agents_core.notify import send_notification, Priority as _P
+        send_notification(message=msg, title=title, priority=_P.NORMAL)
+    except Exception as _notify_err:
+        print(f"[spec-review:lock-notify-error] {_notify_err}", file=sys.stderr)
+
+
+class _HeartbeatWriter:
+    """Daemon thread that periodically refreshes beat_at in the sibling progress file.
+
+    Ticks every `interval` seconds regardless of phase — a phase transition alone is
+    too coarse to distinguish a stall inside one long phase (facets+council is ~500s
+    on the median). `set_phase` updates phase + phase_at under `_lock` so a reader can
+    never observe a phase string paired with another phase's timestamp (DoD15).
+    Daemon so it can never outlive the process and leave a lying heartbeat.
+    """
+
+    def __init__(self, progress_path: Path, pid: int, interval: float, initial_phase: str):
+        self._progress_path = progress_path
+        self._pid = pid
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._phase = initial_phase
+        self._phase_at = time.time()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def set_phase(self, phase: str) -> None:
+        with self._lock:
+            self._phase = phase
+            self._phase_at = time.time()
+        self._beat()
+
+    def _beat(self) -> None:
+        with self._lock:
+            phase, phase_at = self._phase, self._phase_at
+        _write_progress(self._progress_path, self._pid, phase, phase_at, time.time())
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval):
+            self._beat()
+
+    def start(self) -> None:
+        self._beat()  # publish immediately on acquire — no window with a stale/absent file
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
 
 def _spec_review_lock_path() -> Path:
     """Canonical cross-session lock path derived from os.getuid().
@@ -1353,14 +2443,26 @@ def _spec_review_lock(
     spec_path: Path,
     *,
     _lock_path_override: Path | None = None,
-) -> Iterator[None]:
+) -> Iterator["_HeartbeatWriter"]:
     """Cross-session exclusive advisory flock serializing spec-review GW dispatch.
 
     Lock path: /run/user/<uid>/lapis-pm-spec-review.lock (canonical, no fallback).
     Serializes within BRIX — sufficient since spec-review runs on BRIX.
-    Auto-queues waiters up to SPEC_REVIEW_LOCK_TIMEOUT seconds (default 900).
-    Fail-CLOSED on timeout: a still-held lock means a live hung holder; abort + NORMAL
-    Pushover alert. Never proceed degraded, never kill the holder (PID-reuse risk).
+
+    lapis-pm-gate-queue-progress-aware-wait-v0: the holder publishes a heartbeat to
+    a sibling `<lock_path>.progress` file (yielded to the caller as a _HeartbeatWriter
+    so it can call .set_phase(...)). A waiter judges the holder by *staleness* of that
+    heartbeat (SPEC_REVIEW_STALL_MISSED_BEATS consecutive missed beats -> stall-abort),
+    not by raw elapsed time — a healthy holder that legitimately outruns
+    SPEC_REVIEW_LOCK_TIMEOUT is never penalized. SPEC_REVIEW_LOCK_MAX_WAIT is a
+    separate, always-active backstop against an unbounded queue (not a hang
+    detector). If the progress file is absent or unreadable while the lock is held
+    (mixed-fleet rollout: a pre-change holder never writes it), the waiter falls
+    back to today's exact single-absolute-deadline behaviour on
+    SPEC_REVIEW_LOCK_TIMEOUT (default 900) — same message, same Pushover call.
+
+    Never proceed degraded, never kill the holder (PID-reuse risk). Every queue,
+    acquire, and abort appends one line to /srv/lapis/gate-queue/history.jsonl.
 
     Superseded when the H5 elevator organ activates and spec-review submits through it.
     Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
@@ -1370,16 +2472,27 @@ def _spec_review_lock(
         if _lock_path_override is not None
         else _spec_review_lock_path()
     )
-    timeout_s = int(
-        os.environ.get("SPEC_REVIEW_LOCK_TIMEOUT", str(_SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT))
+    timeout_s = _env_int("SPEC_REVIEW_LOCK_TIMEOUT", _SPEC_REVIEW_LOCK_TIMEOUT_DEFAULT)
+    stall_missed_beats = _env_int(
+        "SPEC_REVIEW_STALL_MISSED_BEATS", _SPEC_REVIEW_STALL_MISSED_BEATS_DEFAULT
     )
+    max_wait_s = _env_int("SPEC_REVIEW_LOCK_MAX_WAIT", _SPEC_REVIEW_LOCK_MAX_WAIT_DEFAULT)
+    heartbeat_interval = _env_int(
+        "SPEC_REVIEW_HEARTBEAT_INTERVAL", _SPEC_REVIEW_HEARTBEAT_INTERVAL_DEFAULT
+    )
+    progress_path = _progress_path(lock_path)
 
     print(f"[spec-review:lock] lock_path={lock_path}", file=sys.stderr)
 
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + timeout_s  # legacy fallback deadline (progress absent)
+        ceiling_deadline = time.monotonic() + max_wait_s  # absolute backstop, always active
+        wait_started_mono = time.monotonic()
         logged_waiting = False
+        missed_beats = 0
+        last_beat_at: float | None = None
+        next_stall_check_mono = wait_started_mono + heartbeat_interval
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1387,42 +2500,114 @@ def _spec_review_lock(
             except BlockingIOError:
                 pass
 
+            now_mono = time.monotonic()
+
             if not logged_waiting:
                 holder_desc = _read_lock_holder(fd)
                 print(
                     f"[spec-review:lock-queued] queued behind active review — {holder_desc}",
                     file=sys.stderr,
                 )
+                _append_gate_queue_event({
+                    "event": "queued",
+                    "ts": time.time(),
+                    "spec_path": str(spec_path),
+                    "holder": holder_desc,
+                })
                 logged_waiting = True
 
-            if time.monotonic() >= deadline:
-                # Lock still held past timeout: holder is alive and hung (a crashed holder
-                # auto-releases via kernel flock, so still-blocked => live hang). Fail CLOSED.
+            progress = _read_progress(progress_path)
+
+            if progress is not None:
+                beat_at = progress.get("beat_at")
+                if now_mono >= next_stall_check_mono:
+                    next_stall_check_mono = now_mono + heartbeat_interval
+                    if last_beat_at is not None and beat_at == last_beat_at:
+                        missed_beats += 1
+                    else:
+                        missed_beats = 0
+                    last_beat_at = beat_at
+
+                if missed_beats >= stall_missed_beats:
+                    # Consecutive missed beats, not raw elapsed time: a genuine stall,
+                    # not a slow fsync or scheduler pause on the holder (single misses
+                    # don't accumulate — see _HeartbeatWriter/DoD3a).
+                    staleness = (
+                        time.time() - beat_at if isinstance(beat_at, (int, float)) else 0.0
+                    )
+                    holder_desc = _read_lock_holder(fd)
+                    msg = (
+                        f"[spec-review:lock-stall] holder heartbeat stalled — last "
+                        f"phase={progress.get('phase')!r} missed_beats={missed_beats} "
+                        f"staleness={staleness:.1f}s (holder: {holder_desc}). Aborting "
+                        f"review of {spec_path}. Do NOT delete {lock_path} — kernel owns "
+                        f"lock state. Investigate and clear the hung process, then re-run."
+                    )
+                    print(msg, file=sys.stderr)
+                    _send_lock_pushover(msg, title="spec-review: lock stall — hung holder")
+                    _append_gate_queue_event({
+                        "event": "stall-abort",
+                        "ts": time.time(),
+                        "spec_path": str(spec_path),
+                        "holder": holder_desc,
+                        "wait_s": now_mono - wait_started_mono,
+                        "holder_phase": progress.get("phase"),
+                    })
+                    raise RuntimeError(msg)
+            else:
+                # No progress signal at all: reproduce today's behaviour exactly (DoD5).
+                if now_mono >= deadline:
+                    # Lock still held past timeout: holder is alive and hung (a crashed
+                    # holder auto-releases via kernel flock, so still-blocked => live
+                    # hang). Fail CLOSED.
+                    holder_desc = _read_lock_holder(fd)
+                    msg = (
+                        f"[spec-review:lock-timeout] lock held for >{timeout_s}s by a live "
+                        f"process (hung holder: {holder_desc}). Aborting review of {spec_path}. "
+                        f"Do NOT delete {lock_path} — kernel owns lock state. "
+                        f"Investigate and clear the hung process, then re-run."
+                    )
+                    print(msg, file=sys.stderr)
+                    _send_lock_pushover(msg, title="spec-review: lock timeout — hung holder")
+                    _append_gate_queue_event({
+                        "event": "stall-abort",
+                        "ts": time.time(),
+                        "spec_path": str(spec_path),
+                        "holder": holder_desc,
+                        "wait_s": now_mono - wait_started_mono,
+                        "holder_phase": None,
+                    })
+                    raise RuntimeError(msg)
+
+            if now_mono >= ceiling_deadline:
+                # Backstop against an unbounded queue — NOT a hang detector. Must not
+                # claim a hung holder (DoD4).
                 holder_desc = _read_lock_holder(fd)
+                holder_phase = progress.get("phase") if progress is not None else None
                 msg = (
-                    f"[spec-review:lock-timeout] lock held for >{timeout_s}s by a live "
-                    f"process (hung holder: {holder_desc}). Aborting review of {spec_path}. "
-                    f"Do NOT delete {lock_path} — kernel owns lock state. "
-                    f"Investigate and clear the hung process, then re-run."
+                    f"[spec-review:lock-ceiling] queue too deep — waited "
+                    f">{max_wait_s}s behind holder ({holder_desc}, phase="
+                    f"{holder_phase!r}). This is a queue-depth backstop, not a "
+                    f"hung-holder detection — the holder may be healthy. Aborting "
+                    f"review of {spec_path}."
                 )
                 print(msg, file=sys.stderr)
-                try:
-                    from agents_core.notify import send_notification, Priority as _P
-                    send_notification(
-                        message=msg,
-                        title="spec-review: lock timeout — hung holder",
-                        priority=_P.NORMAL,
-                    )
-                except Exception as _notify_err:
-                    print(
-                        f"[spec-review:lock-timeout-notify-error] {_notify_err}",
-                        file=sys.stderr,
-                    )
+                _send_lock_pushover(msg, title="spec-review: lock ceiling — queue too deep")
+                _append_gate_queue_event({
+                    "event": "ceiling-abort",
+                    "ts": time.time(),
+                    "spec_path": str(spec_path),
+                    "holder": holder_desc,
+                    "wait_s": now_mono - wait_started_mono,
+                    "holder_phase": holder_phase,
+                })
                 raise RuntimeError(msg)
 
             time.sleep(2)
 
-        # Acquired. Write holder identity so any waiting caller can name us in its log.
+        # Acquired. Clean up any debris a crashed prior holder left, then write
+        # holder identity so any waiting caller can name us in its log.
+        _cleanup_stale_progress_temp(progress_path)
         holder_data = json.dumps({
             "pid": os.getpid(),
             "spec_path": str(spec_path),
@@ -1434,7 +2619,25 @@ def _spec_review_lock(
         os.write(fd, holder_data)
 
         print(f"[spec-review:lock-acquired] acquired spec_path={spec_path}", file=sys.stderr)
-        yield
+        _append_gate_queue_event({
+            "event": "acquired",
+            "ts": time.time(),
+            "spec_path": str(spec_path),
+            "wait_s": time.monotonic() - wait_started_mono,
+        })
+
+        heartbeat = _HeartbeatWriter(
+            progress_path, os.getpid(), heartbeat_interval, initial_phase="acquired"
+        )
+        heartbeat.start()
+        try:
+            yield heartbeat
+        finally:
+            heartbeat.stop()
+            try:
+                progress_path.unlink()
+            except OSError:
+                pass
     finally:
         # Closing the fd releases the flock at the kernel level.
         # Process death also releases it, so stale locks never wedge.
@@ -1455,37 +2658,68 @@ def run_spec_review(
     repo_override: str | None = None,
     authority: str | None = None,
     dispatch_facets: bool = True,
-    sonnet_reviewer: bool = True,
+    # U3a (lapis-pm-gate-defaults-and-dead-poll-v0): OFF by default. The Empiricist
+    # is advisory-only and its verdict is hard-wired out of the combined
+    # recommendation (reference_verdict="skip" is fed to _combined_recommendation
+    # unconditionally below), so the default fast path spends no time on a leg that
+    # provably cannot change the answer. Opt in explicitly to re-enable it.
+    reference_reviewer: bool = False,
     facets_operator: str = "haiku",
-    # Deprecated parameter — kept for back-compat; no-op (sonnet_reviewer is always-on)
+    # Deprecated parameter — kept for back-compat; no-op (reference_reviewer is off by default)
     compare_opus: bool = False,
+    # Deprecated alias for reference_reviewer — remove 90 days after merge (2026-09-05).
+    sonnet_reviewer: bool | None = None,
+    # U3b: the GW reference leg is never submitted by default — no future, no
+    # executor, no orphan possible. Opt in with with_gw=True to submit it and block
+    # until it resolves (or times out, in which case the brief still renders with
+    # grounding_status="failed" — see U3c/U3b's "Open, ruled by Erah" section).
+    with_gw: bool = False,
 ) -> SpecReviewBrief:
-    """Run Facets (PM) + Council (philosophical) + Sonnet deep-reviewer review. Synchronous.
+    """Run Facets (PM) + Council (philosophical) + the reference leg's review. Synchronous.
 
-    The Sonnet spec_reviewer leg fires by default for advisory/hold specs (sonnet_reviewer=True).
-    It is reference-only and never moves combined_recommendation — Facets + Council are
-    the sole recommendation drivers. Disable with sonnet_reviewer=False or
-    SPEC_REVIEW_SONNET_DISABLED=1.
+    The reference leg (the Empiricist, local — see registry.yaml's spec_reviewer seat)
+    is OFF by default (reference_reviewer=False) — it is reference-only and never
+    moves combined_recommendation, so paying its ~18 min cost by default bought
+    nothing. Opt in with reference_reviewer=True. Disabled regardless via
+    SPEC_REVIEW_REFERENCE_DISABLED=1 (deprecated aliases sonnet_reviewer=False /
+    SPEC_REVIEW_SONNET_DISABLED=1 still honored) — those never invert an opt-in.
+
+    The GW reference leg is likewise OFF by default (with_gw=False): nothing is
+    submitted to the executor, so there is no future to abandon and no orphan leg
+    possible. Opt in with with_gw=True; the gate then blocks on the GW result before
+    rendering (see run 2's "render + mark" ruling for the opt-in timeout case).
 
     Facets deliberation is synchronous (blocks ~5 min); Council is async (polled up to
-    timeout). The Sonnet leg is dispatched async BEFORE the Facets block (so it runs
-    concurrently with Facets' blocking subprocess), polled alongside Council.
+    timeout). The reference leg, when enabled, is dispatched async BEFORE the Facets
+    block (so it runs concurrently with Facets' blocking subprocess), polled alongside
+    Council — but its poll happens AFTER the cross-session lock is released (U3d); see
+    _spec_review_lock's call site below.
 
     dispatch_facets=False or FACETS_DISPATCH_DISABLED=1 skips Facets entirely (for
     smoke or testing). authority defaults to None — parsed from spec frontmatter; falls
-    back to "advisory" if not found. Only advisory/hold specs dispatch Facets and Sonnet.
+    back to "advisory" if not found. Only advisory/hold specs dispatch Facets and the
+    reference leg.
 
     facets_operator controls the Facets persona + synthesis model; default haiku.
 
-    compare_opus is accepted for back-compat but is a no-op — the Sonnet leg is already
-    on by default, so passing compare_opus=True has no additional effect. A deprecation
-    note is emitted to stderr. Sunset: remove 90 days after merge (2026-09-05).
+    compare_opus is accepted for back-compat but is a no-op — the reference leg is
+    opt-in now, so passing compare_opus=True has no additional effect. A
+    deprecation note is emitted to stderr. Sunset: remove 90 days after merge (2026-09-05).
     """
+    # Support deprecated sonnet_reviewer parameter alias
+    if sonnet_reviewer is not None:
+        print(
+            "[spec-review] WARNING: sonnet_reviewer= is deprecated; use reference_reviewer= "
+            "(sunset 90 days after merge, 2026-09-05).",
+            file=sys.stderr,
+        )
+        reference_reviewer = sonnet_reviewer
+
     # Emit deprecation note when the caller still passes compare_opus=True
     if compare_opus:
         print(
             "[spec-review] WARNING: --compare-opus / compare_opus is deprecated and has no effect; "
-            "the Sonnet reference leg now runs by default (sunset 90 days after merge).",
+            "the reference leg now runs by default (sunset 90 days after merge).",
             file=sys.stderr,
         )
 
@@ -1506,6 +2740,11 @@ def run_spec_review(
     # 3. Read full spec text
     spec_text = spec_path.read_text(encoding="utf-8")
 
+    # 3b. C7 admission criterion (lapis-pm-gate-consumer-criterion-v0): deterministic,
+    #     evaluated once here and threaded into the brief regardless of what
+    #     Facets/Council conclude — see _build_brief's override of "proceed-to-bind".
+    consumer_criterion = _consumer_criterion_check(spec_text, parsed_target_id)
+
     # 4. Load invariant context
     invariant_context = _load_invariant_context(repo)
 
@@ -1513,14 +2752,20 @@ def run_spec_review(
     # to prevent GW lane contention. Auto-queues up to SPEC_REVIEW_LOCK_TIMEOUT (900s);
     # fail-CLOSED on timeout (hung holder). Superseded when the H5 elevator organ activates.
     # Removable at that point — cite lapis-pm-spec-review-serial-lock-v0.
-    with _spec_review_lock(spec_path):
-        # 4b. Sonnet deep-reviewer leg: dispatch async BEFORE the Facets block so it runs
-        #     concurrently with Facets' blocking subprocess. Always-on for advisory/hold;
-        #     reference-only (never moves the recommendation). Intentional — do not remove.
+    with _spec_review_lock(spec_path) as _gate_heartbeat:
+        _gate_heartbeat.set_phase("reference-dispatch")
+        # 4b. Reference leg (the Empiricist): dispatch async BEFORE the Facets block so it
+        #     runs concurrently with Facets' blocking subprocess. Opt-in only (U3a,
+        #     reference_reviewer=True) for advisory/hold; reference-only (never moves
+        #     the recommendation). Intentional — do not remove.
         spec_reviewer_task_id: str | None = None
-        sonnet_disabled = (not sonnet_reviewer) or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
-        do_sonnet = (not sonnet_disabled) and effective_authority in {"advisory", "hold"}
-        if do_sonnet:
+        reference_disabled = (
+            (not reference_reviewer)
+            or os.getenv("SPEC_REVIEW_REFERENCE_DISABLED") == "1"
+            or os.getenv("SPEC_REVIEW_SONNET_DISABLED") == "1"
+        )
+        do_reference = (not reference_disabled) and effective_authority in {"advisory", "hold"}
+        if do_reference:
             synth_target_id = _synth_target_id(parsed_target_id)
             try:
                 spec_reviewer_task_id = _dispatch_spec_reviewer(
@@ -1531,28 +2776,36 @@ def run_spec_review(
                     invariant_context=invariant_context,
                 ).task_id
                 print(
-                    f"[spec-review:sonnet-reviewer] dispatched reference Sonnet pass "
+                    f"[spec-review:reference-reviewer] dispatched reference pass "
                     f"task_id={spec_reviewer_task_id}",
                     file=sys.stderr,
                 )
             except Exception as e:
-                # Sonnet leg is reference-only; never let its dispatch failure abort the gate.
+                # Reference leg is reference-only; never let its dispatch failure abort the gate.
                 print(
-                    f"[spec-review:sonnet-reviewer-dispatch-error] {e} — continuing Facets-only",
+                    f"[spec-review:reference-reviewer-dispatch-error] {e} — continuing Facets-only",
                     file=sys.stderr,
                 )
                 spec_reviewer_task_id = None
 
         # 4c. GW reference leg: submit to ThreadPoolExecutor BEFORE Facets block so it runs
-        #     in parallel. Always-on for advisory/hold; reference-only (never moves the
-        #     recommendation). Bounded timeout + doorman pre-flight so it NEVER stalls the gate.
+        #     in parallel. Opt-in only (U3b, with_gw=True) for advisory/hold; when off,
+        #     nothing is submitted — no future, no executor, no orphan possible. Bounded
+        #     timeout + doorman pre-flight so it NEVER stalls the gate when it does run.
+        _gate_heartbeat.set_phase("gw-submit")
         gw_future = None
         executor = None
         gw_run_id = str(uuid.uuid4())[:8]
         gw_principal = f"gw-gate-{uuid.uuid4().hex[:12]}"
-        do_gw = effective_authority in {"advisory", "hold"}
+        do_gw = with_gw and effective_authority in {"advisory", "hold"}
+        # Single source of truth for the GW leg's timeout: the join below must wait
+        # on exactly this value, not a separate hardcoded number, or a raised
+        # GW_REVIEWER_TIMEOUT_SEC (e.g. #243's 900->1800) silently fails to take effect.
+        gw_timeout = int(os.environ.get("GW_REVIEWER_TIMEOUT_SEC", "1800"))
+        gw_abandoned_event = threading.Event()
         if do_gw:
             executor = ThreadPoolExecutor(max_workers=1)
+            gw_submit_time = time.time()
             try:
                 gw_future = executor.submit(
                     _dispatch_gw_reviewer,
@@ -1562,6 +2815,7 @@ def run_spec_review(
                     repo=repo,
                     run_id=gw_run_id,
                     gw_principal=gw_principal,
+                    abandoned_event=gw_abandoned_event,
                 )
                 print(
                     f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
@@ -1576,7 +2830,8 @@ def run_spec_review(
 
         # 5. Run shared orchestration (Facets + Council concurrently).
         #    This replaces the bespoke _dispatch_facets + _dispatch_council paths.
-        #    Council runs with its own internal timeout; Sonnet gets its own poll deadline.
+        #    Council runs with its own internal timeout; the reference leg gets its own poll deadline.
+        _gate_heartbeat.set_phase("facets+council")
         facets_deliberation: dict | None = None
         envelope = None
         council_run_id: str | None = None
@@ -1850,21 +3105,31 @@ def run_spec_review(
                             pass
 
         # 7. Collect GW Future (with bounded timeout)
+        _gate_heartbeat.set_phase("gw-join")
         gw_text: str | None = None
         gw_transcript: list[dict] = []
         gw_elapsed: float = 0.0
         gw_skip_reason: str = ""
+        gw_abandoned: bool = False
+        gw_provenance: GwLegProvenance | None = None
         if gw_future is not None:
             try:
-                gw_text, gw_transcript, gw_elapsed, gw_skip_reason = gw_future.result(timeout=300)
+                gw_text, gw_transcript, gw_elapsed, gw_skip_reason, gw_provenance = gw_future.result(timeout=gw_timeout)
             except FuturesTimeoutError:
+                # Real wall-clock elapsed at the moment of abandonment - never the
+                # timeout constant, and never null (AC2). gw_abandoned is the
+                # unambiguous marker a consumer branches on (AC3).
+                gw_elapsed = time.time() - gw_submit_time
+                gw_abandoned = True
+                gw_skip_reason = "timeout"
+                gw_abandoned_event.set()
                 print(
-                    f"[spec-review:gw-reviewer-timeout] GW leg exceeded 300s timeout",
+                    f"[spec-review:gw-reviewer-timeout] GW leg exceeded "
+                    f"{gw_timeout}s configured timeout, abandoning at "
+                    f"elapsed={gw_elapsed:.1f}s",
                     file=sys.stderr,
                 )
                 gw_text = None
-                gw_elapsed = 300.0
-                gw_skip_reason = "timeout"
             except Exception as e:
                 print(
                     f"[spec-review:gw-reviewer-collect-error] {e}",
@@ -1873,106 +3138,149 @@ def run_spec_review(
                 gw_text = None
                 gw_skip_reason = "collection_error"
             finally:
-                # Clean up executor to prevent thread pool leak
+                # Disposal of a possibly-still-running leg (AC4). cancel() alone
+                # cannot stop an already-running LLM call, but it does prevent a
+                # not-yet-started future from starting; shutdown(wait=True) is what
+                # actually reclaims the thread once the call does return, instead of
+                # leaving it running to completion with its result unreachable
+                # (the old wait=False left the abandoned 1344s leg logging its
+                # "completed" line long after the brief had rendered).
+                if gw_future is not None:
+                    gw_future.cancel()
                 if executor is not None:
-                    executor.shutdown(wait=False)
+                    executor.shutdown(wait=True)
 
-        # 8. Poll Sonnet leg to terminal (with independent timeout from Council).
-        #    Council results come directly from the envelope (already complete).
-        sonnet_raw = _poll_sonnet_until_terminal(
-            spec_reviewer_task_id=spec_reviewer_task_id,
-            timeout_s=timeout_s,
-            start_time=start_time,
-        )
+    # 8. Poll the reference leg to terminal (with independent timeout from Council).
+    #    Council results come directly from the envelope (already complete).
+    #    Deliberately OUTSIDE the lock (U3d): the reference leg is a ClaudeQueue task,
+    #    not a GravityWell GPU-lane job, so polling it here serves no purpose the
+    #    lock's contract names, and would otherwise hold the host's only slot for up
+    #    to timeout_s after all GPU work (Facets+Council, and the GW leg on --with-gw)
+    #    is already finished. Do not move this back inside the `with` block above.
+    reference_raw = _poll_reference_until_terminal(
+        spec_reviewer_task_id=spec_reviewer_task_id,
+        timeout_s=timeout_s,
+        start_time=start_time,
+    )
 
-        # 8b. Build council_raw from the envelope. If envelope is None (error path),
-        #     council_raw reflects the error.
-        if envelope is not None and envelope.council_ok:
-            council_raw = {
-                "status": envelope.council_status or "error",
-                "landing": envelope.council_landing or "",
-                "open_questions": envelope.council_open_questions or [],
-                "confidence": envelope.council_confidence or "",
-                "positions": envelope.council_positions or [],
-                "run_id": envelope.council_run_id or "",
-                "voicing_effective": envelope.council_voicing_effective,
-                "voicing_degraded": envelope.council_voicing_degraded,
-                "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
-            }
+    # 8a. Citation command-replay verifier (lapis-pm-citation-command-replay-verifier-v0):
+    #     deterministic replay-and-diff of any HIGH/MED issue's claimed command against
+    #     the pinned GW worktree (torn down by the time we get here in the current GW
+    #     leg lifecycle — see PR body for this known gap). Informational only; never
+    #     raises, never blocks the brief, never feeds combined_recommendation.
+    if reference_raw is not None and reference_raw.get("issues"):
+        _citation_target_repo_path = gw_provenance.worktree_path if gw_provenance is not None else None
+        try:
+            reference_raw["issues"] = _verify_citation_commands(
+                reference_raw["issues"], _citation_target_repo_path
+            )
+        except Exception as e:
+            print(
+                f"[spec-review:citation-verify-error] {e} — leaving issues unverified",
+                file=sys.stderr,
+            )
+
+    # 8b. Build council_raw from the envelope. If envelope is None (error path),
+    #     council_raw reflects the error.
+    if envelope is not None and envelope.council_ok:
+        council_raw = {
+            "status": envelope.council_status or "error",
+            "landing": envelope.council_landing or "",
+            "open_questions": envelope.council_open_questions or [],
+            "confidence": envelope.council_confidence or "",
+            "positions": envelope.council_positions or [],
+            "run_id": envelope.council_run_id or "",
+            "voicing_effective": envelope.council_voicing_effective,
+            "voicing_degraded": envelope.council_voicing_degraded,
+            "voicing_degraded_reason": envelope.council_voicing_degraded_reason or "",
+        }
+    else:
+        # Council leg failed or envelope is None: return error status
+        status = "error"
+        if envelope is not None:
+            status = envelope.council_status or "error"
+            if status not in _COUNCIL_TERMINAL:
+                status = "error"
+        # D2: capture the worker's specific failure reason for legibility.
+        # Priority: preflight-skip reason > envelope error string > empty.
+        if council_not_run_reason:
+            _err_reason = council_not_run_reason
+        elif envelope is not None:
+            _err_reason = envelope.errors.get("council", "")
         else:
-            # Council leg failed or envelope is None: return error status
-            status = "error"
-            if envelope is not None:
-                status = envelope.council_status or "error"
-                if status not in _COUNCIL_TERMINAL:
-                    status = "error"
-            # D2: capture the worker's specific failure reason for legibility.
-            # Priority: preflight-skip reason > envelope error string > empty.
-            if council_not_run_reason:
-                _err_reason = council_not_run_reason
-            elif envelope is not None:
-                _err_reason = envelope.errors.get("council", "")
-            else:
-                _err_reason = ""
-            council_raw = {
-                "status": status,
-                "landing": "",
-                "open_questions": [],
-                "confidence": "",
-                "positions": [],
-                "run_id": envelope.council_run_id if envelope else "",
-                "voicing_effective": None,
-                "voicing_degraded": False,
-                "voicing_degraded_reason": "",
-                "error_reason": _err_reason,
-            }
+            _err_reason = ""
+        council_raw = {
+            "status": status,
+            "landing": "",
+            "open_questions": [],
+            "confidence": "",
+            "positions": [],
+            "run_id": envelope.council_run_id if envelope else "",
+            "voicing_effective": None,
+            "voicing_degraded": False,
+            "voicing_degraded_reason": "",
+            "error_reason": _err_reason,
+        }
 
     elapsed = time.time() - start_time
 
     # 9. Persist GW transcript and divergence record
     gw_verdict: str = "skip"
-    gw_ran: bool = gw_text is not None
+    # A leg abandoned mid-flight ran (gw_ran=True) but produced no text to score;
+    # gw_abandoned distinguishes it from "skipped before starting"/"collection error".
+    gw_ran: bool = (gw_text is not None) or gw_abandoned
     gw_findings_count: int = 0
     gw_transcript_ref: str = ""
+    gw_parse_error: dict | None = None
+    gw_raw_output_ref: str = ""
 
     if gw_ran and gw_text:
-        try:
-            gw_verdict_obj = json.loads(gw_text)
-            gw_verdict = gw_verdict_obj.get("verdict", "error")
-            gw_findings_count = len(gw_verdict_obj.get("issues", []))
-        except json.JSONDecodeError:
-            gw_verdict = "error"
-            gw_findings_count = 0
+        gw_verdict, gw_findings_count, gw_parse_error = _process_gw_verdict(gw_text)
 
-        # Write transcript JSON to /srv/lapis/spec-review-artifacts/<run_id>/gw-transcript.json
+        # Persist artifacts to /srv/lapis/spec-review-artifacts/<run_id>/ — best-effort,
+        # a write failure here must never break the gate or alter the verdict.
         artifacts_dir = room_path('spec_review_artifacts', gw_run_id)
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        transcript_path = artifacts_dir / "gw-transcript.json"
-        try:
-            transcript_path.write_text(json.dumps(gw_transcript, indent=2), encoding="utf-8")
-            gw_transcript_ref = str(transcript_path.resolve())
-        except Exception as e:
-            print(
-                f"[spec-review:gw-transcript-write-error] {e}",
-                file=sys.stderr,
-            )
+        gw_raw_output_ref, gw_transcript_ref = _persist_gw_artifacts(
+            artifacts_dir, gw_text, gw_transcript
+        )
 
     # Write divergence record to mem via subprocess — always, even when gw_ran=False,
     # so that skip-rate visibility is preserved (gw_ran: bool field tracks success/failure)
-    sonnet_verdict_str = sonnet_raw.get("verdict", "skip") if sonnet_raw else "skip"
+    reference_verdict_str = reference_raw.get("verdict", "skip") if reference_raw else "skip"
+    reference_findings_count = len(reference_raw.get("issues", [])) if reference_raw else 0
+    resolved_reference_model = _resolve_reference_model()
     divergence_record = {
         "run_id": gw_run_id,
         "spec_path": str(spec_path),
         "repo": repo,
-        "sonnet_verdict": sonnet_verdict_str,
+        "reference_verdict": reference_verdict_str,
         "gw_verdict": gw_verdict,
-        "agree": (gw_verdict == sonnet_verdict_str) if gw_ran else None,
+        # None when no verdict was actually produced (never ran, or abandoned
+        # mid-flight) - a False/True agreement value implies a real comparison.
+        "agree": (gw_verdict == reference_verdict_str) if (gw_ran and not gw_abandoned) else None,
         "gw_ran": gw_ran,
+        "gw_abandoned": gw_abandoned,
+        "gw_skip_reason": gw_skip_reason,
         "gw_transcript_ref": gw_transcript_ref,
-        "sonnet_findings_count": len(sonnet_raw.get("issues", [])) if sonnet_raw else 0,
+        "reference_findings_count": reference_findings_count,
         "gw_findings_count": gw_findings_count,
         "elapsed_gw": gw_elapsed,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # AC5 — states on its face that both legs are local, so this record cannot be
+        # misread as cross-provider decorrelation evidence (it is stance decorrelation
+        # only; see lapis-pm-reference-leg-provider-neutral-naming-v0).
+        "leg_identity": [
+            {"name": "reference", "model": resolved_reference_model or "unknown", "type": "local"},
+            {"name": "gw", "model": "gravitywell", "type": "local"},
+        ],
+        # Dual-emit back-compat (AC5): the old sonnet_* spelling is retained with values
+        # identical to the reference_* fields above so router/gw-review-divergence/*
+        # stays one readable series for consumers on either spelling. Sunset 90 days
+        # after this unit merges (~2026-10-30) — drop these two keys and this comment
+        # then, per lapis-pm-reference-leg-provider-neutral-naming-v0 AC5.
+        "sonnet_verdict": reference_verdict_str,
+        "sonnet_findings_count": reference_findings_count,
+        "sonnet_dual_emit_sunset": "2026-10-30",
     }
     try:
         from lapis_pm import node_identity as _node_identity
@@ -2001,25 +3309,58 @@ def run_spec_review(
             file=sys.stderr,
         )
 
-    # 10. Build and return brief. sonnet_raw is non-None when the Sonnet leg ran; it is
-    #     rendered for reference but excluded from the recommendation (sonnet_advisory_only).
-    #     GW leg data is also reference-only and non-steering.
+    # 10. Build and return brief. reference_raw is non-None when the reference leg ran;
+    #     it is rendered for reference but excluded from the recommendation
+    #     (reference_advisory_only). GW leg data is also reference-only and non-steering.
+    # U3c/U3b: grounding_status/grounding_reason. Priority order:
+    #   1. A --with-gw timeout is a structural failure of the machinery, not a
+    #      confidence score, and must never be laundered into one (Council OQ2,
+    #      2026-08-02). It wins regardless of what Facets' own grounding looked like.
+    #   2. Facets structurally not dispatched for this run (no facets, or an
+    #      authority that skips it) — grounding never applied, not-applicable.
+    #   3. Otherwise, detect from the Facets deliberation itself.
+    if with_gw and gw_abandoned:
+        grounding_status, grounding_reason = "failed", "gw_timeout"
+    elif not (dispatch_facets and effective_authority in {"advisory", "hold"}):
+        grounding_status, grounding_reason = "not-applicable", ""
+    else:
+        grounding_status, grounding_reason = _detect_grounding_status(facets_deliberation)
+
+    # D2 (lapis-pm-spec-review-grounding-legibility-v0): surface what a "verified"
+    # grounding was actually checked against. resolved_sha only — source_repo
+    # threading is deferred (reaches across the agents_core repo boundary; the
+    # report's own **Repo:** line already names the repo). Best-effort and
+    # never fabricated: a git failure here degrades the render, never the brief.
+    grounding_resolved_sha = ""
+    grounding_age_days: int | None = None
+    if grounding_status == "verified":
+        grounding_resolved_sha, grounding_age_days = _resolve_grounding_sha_and_age(repo)
+
     return _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
         parsed_target_id=parsed_target_id,
         repo=repo,
         elapsed_s=elapsed,
-        sonnet_raw=sonnet_raw,
+        reference_raw=reference_raw,
         facets_deliberation=facets_deliberation,
         authority=effective_authority,
-        sonnet_advisory_only=sonnet_raw is not None,
+        reference_advisory_only=reference_raw is not None,
+        reference_model=resolved_reference_model,
         facets_operator=facets_operator,
         council_voicing_requested=council_voicing,
         gw_verdict=gw_verdict,
         gw_ran=gw_ran,
+        gw_abandoned=gw_abandoned,
         gw_skip_reason=gw_skip_reason,
         gw_findings_count=gw_findings_count,
         elapsed_gw=gw_elapsed,
         gw_transcript_ref=gw_transcript_ref,
+        gw_parse_error=gw_parse_error,
+        gw_raw_output_ref=gw_raw_output_ref,
+        grounding_status=grounding_status,
+        grounding_reason=grounding_reason,
+        grounding_resolved_sha=grounding_resolved_sha,
+        grounding_age_days=grounding_age_days,
+        consumer_criterion=consumer_criterion,
     )

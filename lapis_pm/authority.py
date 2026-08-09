@@ -32,11 +32,30 @@ HELD_PATTERNS = [
     re.compile(r"(^|/)SPEC\.md$"),
     re.compile(r"\.service$"),
     re.compile(r"\.timer$"),
+    # --- lapis-pm-containment-held-paths-v0, Leg 1 (anchored, each with a rationale) ---
+    # The hold list itself, and the classifier that reads it. Remove only if held-path
+    # enforcement moves to a different module.
+    re.compile(r"^lapis_pm/authority\.py$"),
+    # The six-clause autonomous-merge predicate. Remove only if auto-resolve is retired.
+    re.compile(r"^lapis_pm/auto_resolve\.py$"),
+    # The unattended binder: the one path that binds+ticks with no human at 01:30 nightly.
+    re.compile(r"^lapis_pm/bundle_autodispatch\.py$"),
+    # Session hooks the PM executes on its own runs (router-portfolio-stop.py).
+    re.compile(r"^lapis_pm/hooks/"),
+    # Deploy manifest + sync scripts: how merged code reaches the running daemon.
+    re.compile(r"^deploy/"),
+    # Registers the hooks above. Held as a pair with lapis_pm/hooks/ — holding either alone
+    # leaves an escape.
+    re.compile(r"^\.claude/settings(\.local)?\.json$"),
+    # The audit instrument: the checklist Erah follows when reviewing the machine's work.
+    # Both copies — the flat legacy file and the live SKILL.md — or the sibling is the escape.
+    re.compile(r"^\.claude/skills/pm-pr-review(\.md|/SKILL\.md)$"),
 ]
 
 MAX_AUTO_LOC = 400
 DIFF_INLINE_CAP = 200_000
 DIFF_PATH_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
+DIFF_PATH_RE_OLD = re.compile(r"^--- a/(.+)$", re.MULTILINE)
 DIFF_HUNK_LINE_RE = re.compile(r"^[+-](?![+-])", re.MULTILINE)
 
 
@@ -63,7 +82,16 @@ class PRClassification:
 
 
 def changed_paths(diff_text: str) -> list[str]:
-    return sorted(set(DIFF_PATH_RE.findall(diff_text)))
+    """Union the added ('+++ b/') and removed ('--- a/') sides of the diff.
+
+    A pure deletion emits '+++ /dev/null' — the added-side capture alone misses it
+    entirely, so a held file could be deleted without ever tripping the gate. The
+    removed side ('--- a/<path>') catches deletions and renames-away; '/dev/null'
+    is excluded from both sides (it appears on '--- a/' for pure additions).
+    """
+    added = set(DIFF_PATH_RE.findall(diff_text))
+    removed = set(DIFF_PATH_RE_OLD.findall(diff_text))
+    return sorted((added | removed) - {"/dev/null"})
 
 
 def diff_loc(diff_text: str) -> int:

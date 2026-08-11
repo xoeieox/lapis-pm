@@ -1000,3 +1000,118 @@ class TestActLostBriefIdempotency:
         mock_synth2.assert_not_called()
         # Total synthesize calls is still 1
         assert synth_call_count[0] == 1
+
+    # -----------------------------------------------------------------------
+    # Scenario 4e (unbounded-write-v0): repeated stale-mem ticks write the
+    # suppression observation exactly once, not once per tick.
+    # -----------------------------------------------------------------------
+    def _make_suppressed_obs_comment(self, orig_gpu_id: str) -> MagicMock:
+        """Mock a pm:lost-brief-suppressed observation as _act_lost_brief writes it."""
+        return _comment(
+            tags=["pm:lost-brief-suppressed", f"pm:lost-original-gpu={orig_gpu_id}"],
+            ts="2026-05-06T19:00:00-07:00",
+            content=(
+                f"Lost-brief suppressed (mem-stale): orig_gpu={orig_gpu_id} "
+                f"existing_brief=brief-repeat-001 mem_key=None"
+            ),
+        )
+
+    def test_repeated_stale_mem_ticks_write_exactly_one_observation(self):
+        """Three consecutive stale-mem ticks for the same orig_gpu → exactly one
+        pm:lost-brief-suppressed observation total (the unbounded-write regression).
+        """
+        orig = _fixer_record(gpu_id="gpu-repeat-001", status="failed")
+        existing_brief_id = "brief-repeat-001"
+        stale_mem_value = None  # measured behaviour: mem key is absent, not merely different
+
+        options_comment = self._make_options_comment(existing_brief_id, "gpu-repeat-001")
+
+        written_obs = []
+
+        def capture_obs(tid, content, extra_tags=None):
+            written_obs.append((content, extra_tags or []))
+            return MagicMock()
+
+        # Tick 1: only the original brief-options comment exists → stale mem
+        # branch fires, writes the single suppression observation.
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[options_comment]),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
+        ):
+            r1 = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert r1 == "noop:lost-brief-suppressed:gpu=gpu-repeat-001"
+        mock_synth.assert_not_called()
+        assert len(written_obs) == 1
+
+        suppressed_comment = self._make_suppressed_obs_comment("gpu-repeat-001")
+
+        # Ticks 2 and 3: the suppressed observation from tick 1 is now part of
+        # the comment stream. Neither tick should write another observation.
+        for _ in range(2):
+            with (
+                patch(
+                    "lapis_pm.episodic.all_comments",
+                    return_value=[options_comment, suppressed_comment],
+                ),
+                patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
+                patch("lapis_pm.pm_core.brief.synthesize") as mock_synth_n,
+                patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
+            ):
+                r_n = pm_core._act_lost_brief("my-target", orig, None)
+
+            assert r_n == "noop:lost-brief-suppressed:gpu=gpu-repeat-001"
+            mock_synth_n.assert_not_called()
+
+        # Across all three ticks, exactly one observation was ever written.
+        assert len(written_obs) == 1, (
+            f"Expected exactly one suppression observation across 3 ticks, got {len(written_obs)}"
+        )
+
+    def test_stale_mem_branch_does_not_touch_outstanding_brief_key(self):
+        """DoD 3: the stale-mem branch must not write, clear, or re-point the
+        outstanding-brief mem key. State repair was deliberately stripped from
+        this unit by the Facets gate and must not reappear.
+        """
+        orig = _fixer_record(gpu_id="gpu-nomem-001", status="failed")
+        existing_brief_id = "brief-nomem-001"
+        options_comment = self._make_options_comment(existing_brief_id, "gpu-nomem-001")
+
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[options_comment]),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.episodic.write_observation"),
+            patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set,
+            patch("lapis_pm.pm_core.set_outstanding_brief_verified") as mock_set_verified,
+            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+        ):
+            result = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert result == "noop:lost-brief-suppressed:gpu=gpu-nomem-001"
+        mock_synth.assert_not_called()
+        mock_set.assert_not_called()
+        mock_set_verified.assert_not_called()
+        mock_set_brief.assert_not_called()
+
+    def test_clean_path_still_writes_nothing_when_mem_key_matches(self):
+        """DoD 4 regression guard: a target whose mem key is NOT stale still
+        takes the clean silent path — no observation, no brief.
+        """
+        orig = _fixer_record(gpu_id="gpu-clean-001", status="failed")
+        existing_brief_id = "brief-clean-001"
+        options_comment = self._make_options_comment(existing_brief_id, "gpu-clean-001")
+
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[options_comment]),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=existing_brief_id),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.episodic.write_observation") as mock_write_obs,
+        ):
+            result = pm_core._act_lost_brief("my-target", orig, None)
+
+        assert result == "noop:lost-brief-suppressed:gpu=gpu-clean-001"
+        mock_synth.assert_not_called()
+        mock_write_obs.assert_not_called()

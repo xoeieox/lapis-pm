@@ -7435,10 +7435,16 @@ def _act_lost_brief(
     # --- Idempotency guard (Change 2) ---
     gpu_tag = f"pm:lost-original-gpu={orig_id}"
     existing_brief_id: str | None = None
+    already_suppressed = False
     for c in episodic.all_comments(target_id):
-        if "pm:brief-options" not in c.tags:
-            continue
         if gpu_tag not in c.tags:
+            continue
+        if "pm:lost-brief-suppressed" in c.tags:
+            # A prior stale-mem tick already wrote the observation for this
+            # orig_gpu. Don't write another — that's the unbounded-write bug.
+            already_suppressed = True
+            continue
+        if "pm:brief-options" not in c.tags:
             continue
         try:
             data = json.loads(c.content)
@@ -7446,7 +7452,11 @@ def _act_lost_brief(
             continue
         if data.get("trigger") == "lost-dispatch":
             existing_brief_id = data.get("brief_id")
-            break
+
+    if already_suppressed:
+        # Already reported once — the mismatch stays visible from that first
+        # write. No mem key is touched here; state repair is out of scope.
+        return f"noop:lost-brief-suppressed:gpu={orig_id}"
 
     if existing_brief_id is not None:
         current_outstanding = get_outstanding_brief(target_id)

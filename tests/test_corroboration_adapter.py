@@ -335,6 +335,124 @@ class TestScoreClean:
 
 
 # ---------------------------------------------------------------------------
+# leg_status field (lapis-pm-corroboration-producer-leg-status-v1)
+# ---------------------------------------------------------------------------
+
+class TestLegStatus:
+    """leg_status is set correctly at every CorroborationResult construction
+    site and is emitted by to_dict(). This is the field consumers must read
+    instead of string-matching `claim`/`notes` prose."""
+
+    def test_to_dict_emits_leg_status(self):
+        """to_dict() includes leg_status; default is 'ok'."""
+        result = CorroborationResult(
+            verdict="clean",
+            claim="x",
+            citations=[],
+            freshness_stamp="2026-08-10T00:00:00+00:00",
+            scope_id="repo:lapis-pm",
+        )
+        assert result.leg_status == "ok"
+        assert result.to_dict()["leg_status"] == "ok"
+
+    def test_success_path_leg_status_ok_even_when_summary_missing(self):
+        """D3 guard: a healthy pass whose response omits `summary` still
+        reports leg_status == 'ok', even though claim == '' — the field this
+        unit exists for. claim-string matching cannot distinguish this case
+        from a failure marker; leg_status can."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        llm_resp = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "verdict": "clean",
+                        "claims": [{"identifier": "tick", "drift_class": "none", "notes": "ok"}],
+                        # "summary" deliberately omitted
+                    })
+                }
+            }]
+        }
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=lambda: llm_resp,
+                raise_for_status=lambda: None,
+            )
+            result = adapter.score("some diff", substrates, "lapis-pm")
+
+        assert result.claim == "", "expected empty claim when summary is omitted"
+        assert result.verdict == "clean"
+        assert result.leg_status == "ok"
+
+    def test_probe_unreachable_leg_status_substrate_unavailable(self):
+        """Probe-unreachable path sets leg_status='substrate_unavailable'."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+
+        with patch("lapis_pm.corroboration_adapter.node_reachable", return_value=False):
+            result = adapter.score("some diff", substrates, "lapis-pm")
+
+        assert result.verdict == "uncertain"
+        assert result.leg_status == "substrate_unavailable"
+
+    def test_llm_exception_leg_status_substrate_unavailable(self):
+        """LLM-call-exception path sets leg_status='substrate_unavailable'."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=ConnectionError("refused")),
+        ):
+            result = adapter.score("some diff", substrates, "lapis-pm")
+
+        assert result.leg_status == "substrate_unavailable"
+
+    def test_no_identifiers_leg_status_ok(self):
+        """(no identifiers extracted) is a legitimate clean result, not
+        starvation — it must stay leg_status='ok'."""
+        adapter = LapisPMReviewerAdapter()
+        result = adapter.score("", [], "lapis-pm")
+        assert result.claim == "(no identifiers extracted)"
+        assert result.leg_status == "ok"
+
+    def test_make_uncertain_returns_fresh_instances(self):
+        """_make_uncertain returns a brand-new object on every call — never
+        the same shared instance (the D2 root cause)."""
+        from lapis_pm.corroboration_adapter import _make_uncertain
+
+        r1 = _make_uncertain("lapis-pm", "first failure")
+        r2 = _make_uncertain("lapis-pm", "second failure")
+
+        assert r1 is not r2
+        assert r1.notes == "first failure"
+        assert r2.notes == "second failure"
+        assert r1.leg_status == "pass_failed"
+        assert r2.leg_status == "pass_failed"
+
+    def test_pm_core_outer_except_leg_status_pass_failed(self):
+        """pm_core._run_corroboration_pass_sync's outer-except dict carries
+        leg_status='pass_failed' so nothing downstream mistakes it for a
+        healthy result (D1c)."""
+        from lapis_pm import pm_core
+
+        with patch(
+            "lapis_pm.corroboration_adapter.run_corroboration_pass",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = pm_core._run_corroboration_pass_sync("diff", "lapis-pm")
+
+        assert result["leg_status"] == "pass_failed"
+        assert result["verdict"] == "uncertain"
+
+
+# ---------------------------------------------------------------------------
 # Test 5: Reviewer integration — verdict carries corroboration_result;
 #         review-state-cache stores it; resume reads it back unchanged
 # ---------------------------------------------------------------------------
@@ -563,3 +681,44 @@ class TestRunCorroborationPass:
         assert isinstance(result, dict)
         # Must be JSON-serialisable
         json.dumps(result)
+
+    def test_both_nodes_failing_yields_node2_unavailable_never_agree(self):
+        """D2 regression — the single most important test in this unit.
+
+        When both node1 and node2 scoring fail, cross_node_divergence must be
+        'node2_unavailable', never 'agree'. Before the fix, both failure paths
+        aliased one shared `_uncertain` instance, so result_n1 is result_n2 and
+        the divergence test (verdict == verdict) was trivially true — two dead
+        nodes recorded as agreeing with each other.
+        """
+        from lapis_pm.corroboration_adapter import _make_uncertain as real_make_uncertain
+
+        captured: list[CorroborationResult] = []
+
+        def spy_make_uncertain(repo, notes):
+            r = real_make_uncertain(repo, notes)
+            captured.append(r)
+            return r
+
+        with (
+            patch("lapis_pm.corroboration_adapter.LapisPMReviewerAdapter.retrieve",
+                  return_value=[_IdentifierSubstrate("tick", [], [])]),
+            patch("lapis_pm.corroboration_adapter.LapisPMReviewerAdapter.score",
+                  side_effect=RuntimeError("both nodes dead")),
+            patch("lapis_pm.corroboration_adapter._make_uncertain",
+                  side_effect=spy_make_uncertain),
+        ):
+            result = run_corroboration_pass(FIXTURE_DIFF_CLEAN, "lapis-pm")
+
+        # Object identity, not equality: two independent failure results.
+        assert len(captured) == 2, f"expected 2 fresh uncertain results, got {len(captured)}"
+        result_n1, result_n2 = captured
+        assert result_n1 is not result_n2, "result_n1 and result_n2 must not be the same object"
+
+        # The regression: this must never read "agree".
+        assert result["cross_node_divergence"] == "node2_unavailable"
+        assert result["cross_node_divergence"] != "agree"
+
+        # Both legs report themselves failed, independently.
+        assert result["leg_status"] == "pass_failed"
+        assert result["node2_corroboration"]["leg_status"] == "pass_failed"

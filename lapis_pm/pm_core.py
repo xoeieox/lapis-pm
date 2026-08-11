@@ -2128,6 +2128,7 @@ def _run_corroboration_pass_sync(diff_text: str, repo: str) -> dict:
             "drift_class": None,
             "notes": f"corroboration pass unavailable: {type(exc).__name__}",
             "primitive_decomposition": None,
+            "leg_status": "pass_failed",
         }
 
 

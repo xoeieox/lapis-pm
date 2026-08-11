@@ -51,6 +51,11 @@ class CorroborationResult:
     drift_class: str | None = None   # "missing_referent" | "stale_referent" | "renamed_referent" | "none"
     notes: str | None = None
     primitive_decomposition: dict | None = None  # entry-time decomposition; compost-routing handle (spec Compost invariant)
+    # Structured leg health, independent of `claim`/`notes` prose. "claim" can be
+    # empty on a healthy pass (LLM omitted `summary`) and non-empty on a dead leg
+    # (failure-marker prose) — leg_status is the field consumers must read instead
+    # of string-matching either one. See lapis-pm-corroboration-producer-leg-status-v1.
+    leg_status: Literal["ok", "substrate_unavailable", "pass_failed"] = "ok"
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +67,7 @@ class CorroborationResult:
             "drift_class": self.drift_class,
             "notes": self.notes,
             "primitive_decomposition": self.primitive_decomposition,
+            "leg_status": self.leg_status,
         }
 
 
@@ -297,6 +303,7 @@ class LapisPMReviewerAdapter:
                 scope_id=scope_id,
                 drift_class=None,
                 notes="No identifiers found in diff",
+                leg_status="ok",  # legitimate clean result, not starvation
             )
 
         # Build substrate summary for the LLM
@@ -360,6 +367,7 @@ class LapisPMReviewerAdapter:
                     scope_id=scope_id,
                     drift_class=None,
                     notes=f"node unreachable (probe {_PROBE_TIMEOUT}s): {_url}",
+                    leg_status="substrate_unavailable",
                 )
             resp = httpx.post(_url, json=_body, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
             resp.raise_for_status()
@@ -389,6 +397,7 @@ class LapisPMReviewerAdapter:
                 scope_id=scope_id,
                 drift_class=None,
                 notes=f"LLM unavailable: {type(exc).__name__}",
+                leg_status="substrate_unavailable",
             )
 
         verdict = result_data.get("verdict", "uncertain")
@@ -437,6 +446,11 @@ class LapisPMReviewerAdapter:
             scope_id=scope_id,
             drift_class=worst_dc,
             notes=result_data.get("summary"),
+            # A successful pass whose response omits `summary` produces claim=="" —
+            # indistinguishable from a failure marker by string content alone. This
+            # branch reached a real LLM response and parsed it; the leg is healthy
+            # regardless of what `claim` says.
+            leg_status="ok",
         )
 
     def score_provenance(self) -> dict[str, Any]:
@@ -470,6 +484,28 @@ class LapisPMReviewerAdapter:
 # Public entry point for pm_core integration
 # ---------------------------------------------------------------------------
 
+def _make_uncertain(repo: str, notes: str) -> CorroborationResult:
+    """Fresh CorroborationResult for a failed corroboration pass.
+
+    Each call returns a brand-new instance — never share one across the
+    retrieve-failure path and the two node-scoring threads. Those run
+    concurrently (ThreadPoolExecutor(max_workers=2)); a single shared
+    instance means both nodes failing collapses to `result_n1 is result_n2`,
+    which makes the divergence test trivially "agree" and turns `.notes`
+    writes into a race between the two threads.
+    """
+    return CorroborationResult(
+        verdict="uncertain",
+        claim="(corroboration pass failed)",
+        citations=[],
+        freshness_stamp=datetime.now(timezone.utc).isoformat(),
+        scope_id=f"repo:{repo}",
+        drift_class=None,
+        notes=notes,
+        leg_status="pass_failed",
+    )
+
+
 def run_corroboration_pass(
     diff_text: str,
     repo: str,
@@ -492,30 +528,16 @@ def run_corroboration_pass(
     adapter_n1 = LapisPMReviewerAdapter(repo_path=repo_path)
     adapter_n2 = LapisPMReviewerAdapter(repo_path=repo_path)
 
-    _uncertain = CorroborationResult(
-        verdict="uncertain",
-        claim="(corroboration pass failed)",
-        citations=[],
-        freshness_stamp=datetime.now(timezone.utc).isoformat(),
-        scope_id=f"repo:{repo}",
-        drift_class=None,
-        notes="",
-    )
-
     try:
         substrates = adapter_n1.retrieve(diff_text, repo, repo_path)
     except Exception as exc:
-        r = _uncertain
-        r.notes = f"Retrieve error: {type(exc).__name__}: {exc}"
-        return r.to_dict()
+        return _make_uncertain(repo, f"Retrieve error: {type(exc).__name__}: {exc}").to_dict()
 
     def _score_n1() -> CorroborationResult:
         try:
             return adapter_n1.score(diff_text, substrates, repo)
         except Exception as exc:
-            r = _uncertain
-            r.notes = f"Node1 error: {type(exc).__name__}: {exc}"
-            return r
+            return _make_uncertain(repo, f"Node1 error: {type(exc).__name__}: {exc}")
 
     def _score_n2() -> CorroborationResult:
         try:
@@ -526,9 +548,7 @@ def run_corroboration_pass(
                 node_timeout=_NODE2_TIMEOUT,
             )
         except Exception as exc:
-            r = _uncertain
-            r.notes = f"Node2 error: {type(exc).__name__}: {exc}"
-            return r
+            return _make_uncertain(repo, f"Node2 error: {type(exc).__name__}: {exc}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         fut_n1 = pool.submit(_score_n1)
@@ -540,11 +560,12 @@ def run_corroboration_pass(
     n2_dict = result_n2.to_dict()
     combined["node2_corroboration"] = n2_dict
 
-    n2_unavailable = (
-        result_n2.verdict == "uncertain"
-        and result_n2.notes
-        and ("unavailable" in result_n2.notes or "Node2 error" in result_n2.notes)
-    )
+    # Structured status, not prose. The old substring match on `notes` raced
+    # with the shared-`_uncertain` alias above (D2): whichever thread wrote
+    # last owned `.notes`, so the node-2 check could silently miss a real
+    # node-2 failure. leg_status is set correctly by each node's own
+    # CorroborationResult regardless of write order.
+    n2_unavailable = result_n2.leg_status != "ok"
     if n2_unavailable:
         combined["cross_node_divergence"] = "node2_unavailable"
     elif result_n1.verdict == result_n2.verdict:

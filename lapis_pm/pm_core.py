@@ -44,11 +44,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 import yaml
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -535,6 +537,72 @@ _CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = (
     "night_producers.yaml",
     "night_task_menu.py", "night-task-menu.yaml", "night_plan_manager.py",   # Rung B menu (leftover) + Rung C.0 manager
 )
+
+
+# ---------------------------------------------------------------------------
+# GravityWell host-script closure (host-script-deploy-on-land-v0, D1)
+# ---------------------------------------------------------------------------
+# Cross-host sibling of _CONDUCTOR_NIGHT_SCRIPTS above: these are conductor
+# repo-held scripts whose runtime home is gravitywell:/usr/local/sbin/, not
+# /data/agents/scripts. Same source of truth (_CONDUCTOR_SCRIPTS_SRC, the
+# deploy clone — never -working) and the same shared freshness gate
+# (_conductor_source_freshness_gate, D2), but a different destination
+# (remote host, not a local directory) and a different delivery mechanism
+# (atomic scp+install, D6, not a local temp-then-os.replace).
+class _GwHostScript(NamedTuple):
+    """src_name is repo-relative to _CONDUCTOR_SCRIPTS_SRC (scripts/<src_name>).
+    self_attesting gates the extra `--help` self-hash verify (D6) — True iff
+    the script prints a `self-hash:` line, the same mechanism
+    gw_topology.py:_assert_helper_compatible checks. execution_sensitive
+    gates the in_flight_flip skip (D5) — carried explicitly per entry, not
+    inferred from in_flight_flip's own scope (which describes GravityWell's
+    convergence state, the wrong granularity for a manifest that will grow)."""
+    src_name: str
+    dest: str
+    mode: int
+    owner: str
+    self_attesting: bool
+    execution_sensitive: bool
+
+
+# GROWTH OBLIGATION (mirrors the _CONDUCTOR_NIGHT_SCRIPTS growth-obligation
+# comment above): any new conductor script whose runtime home is
+# gravitywell:/usr/local/sbin/ MUST be added here, or it gets no delivery
+# (D1) and no drift report (D7 only covers manifested files).
+# gw-serve (/usr/local/bin) and gw-dual (/usr/local/sbin) are deliberately
+# NOT here — they have no repo source, so a manifest entry naming them would
+# be a no-op at best (spec Out-of-scope).
+_CONDUCTOR_GW_HOST_SCRIPTS: tuple[_GwHostScript, ...] = (
+    _GwHostScript("gw-topology", "/usr/local/sbin/gw-topology", 0o755, "root:root", True, True),
+    _GwHostScript("gw-idle-suspend.sh", "/usr/local/sbin/gw-idle-suspend.sh", 0o755, "root:root", False, True),
+)
+
+# D4: host-reachability policy — never wake, always retry on the next land.
+# Short-timeout ssh probe pattern (mirrors conductor's gpu_lane.py restart_box_service:
+# `ssh -o BatchMode=yes <host> ...`), never DoormanClient/WoL — a probe that can wake
+# the host would violate D4 by construction.
+_GW_SSH_HOST = os.environ.get("LAPIS_PM_GW_SSH_HOST", "gravitywell")
+_GW_SSH_CONNECT_TIMEOUT_SECS = int(os.environ.get("LAPIS_PM_GW_SSH_CONNECT_TIMEOUT_SECS", "5"))
+_GW_SSH_CMD_TIMEOUT_SECS = int(os.environ.get("LAPIS_PM_GW_SSH_CMD_TIMEOUT_SECS", "20"))
+_GW_SCP_TIMEOUT_SECS = int(os.environ.get("LAPIS_PM_GW_SCP_TIMEOUT_SECS", "30"))
+
+# Same self-hash line shape gw_topology.py's _assert_helper_compatible checks
+# (scripts/gw-topology:94 — `echo "self-hash: $(sha256sum "$0" | cut -c1-12)"`).
+_GW_SELF_HASH_RE = re.compile(r"^self-hash:\s*([0-9a-f]+)\s*$", re.MULTILINE)
+
+# D7: drift ledger — dedups the Desk-gem deposit so a persisting undelivered
+# script pages the Desk once, not on every conductor land (DoD 9). Module-level
+# constant so tests can patch it to a tmp path exactly as the existing suite
+# patches _DEPLOY_LOG (:235).
+_GW_HOST_SCRIPT_DRIFT_LEDGER = room_path('lapis_state') / "gw-host-script-drift-ledger.json"
+_GW_HOST_SCRIPT_DRIFT_SIGNATURE = "gw-host-script-drift"
+
+_GW_GEM_OPTIONS = [
+    {"key": "ack_watch", "title": "Known - keep watching",
+     "sub": "stay quiet unless it recurs after a fix", "primary": True},
+    {"key": "not_real", "title": "Not a real issue",
+     "sub": "suppress this finding-class"},
+]
 
 _DEPLOY_LOG = room_path('lapis_state.deploy_log')
 _DEPLOY_CURRENCY_STALE_KEY = "pm/deploy-currency-last-alert"
@@ -1174,44 +1242,38 @@ def _deploy_conductor_night_scripts(trigger: str = "post-land-hook") -> None:
             pass
 
 
-def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
-    clone = _CONDUCTOR_DEPLOY_CLONE
-    src_dir = Path(_CONDUCTOR_SCRIPTS_SRC)
-    dest_dir = Path(_CONDUCTOR_SCRIPTS_DEST)
+def _conductor_source_freshness_gate(clone: str) -> tuple[bool, str]:
+    """R7 source-freshness gate, extracted (host-script-deploy-on-land-v0 D2) so the
+    local night-script copy and the GravityWell host-script install share ONE gate —
+    a fetch failure or a not-clean-on-main source skips BOTH deliveries identically,
+    never re-implemented twice.
 
-    # --- R7: own fetch, not derived from _post_land_git_pull's return bool (which
-    # cannot distinguish "already-current" from "pull-failed"). ---
+    Returns (is_fresh, reason). reason is "" when fresh; otherwise a short
+    machine-parseable string: "fetch_error:<exc>" or "fetch_failed:<stderr>" for a
+    transport-level failure (caller decides alert priority by whether a real
+    delivery was blocked), or "not clean-on-main (<branch>@<head8>)" for a
+    dirty/diverged source (always NORMAL — see callers).
+
+    D3: the tree-level check is `git status --porcelain --untracked-files=no` —
+    untracked editor/tooling directories (.claude/, .vscode/) must not block
+    delivery; only TRACKED modifications are load-bearing dirt. This is
+    deliberately looser than before and is safe only because
+    `_conductor_file_verified_clean` re-checks each manifested file individually
+    before it is copied — the tree check alone would otherwise let an untracked
+    manifested file slip through as though it were reviewed code.
+
+    Never raises — a raised git-subprocess exception here reads as a fetch failure.
+    """
     try:
         fetch_result = subprocess.run(
             ["git", "-C", clone, "fetch", "origin", "main"],
             capture_output=True, text=True, timeout=30,
         )
-        fetch_ok = fetch_result.returncode == 0
-        fetch_err = fetch_result.stderr.strip()[:300] if not fetch_ok else ""
     except (subprocess.TimeoutExpired, OSError) as e:
-        fetch_ok = False
-        fetch_err = str(e)
+        return False, f"fetch_error:{e}"
 
-    if not fetch_ok:
-        would_change = _conductor_copy_would_change(src_dir, dest_dir)
-        print(
-            f"[post-land-deploy:conductor] source fetch failed ({fetch_err}); "
-            f"night-plan copy SKIPPED, runtime preserved",
-            file=sys.stderr,
-        )
-        try:
-            from agents_core.notify import send_notification, Priority as _P
-            send_notification(
-                message=(
-                    f"conductor source fetch failed ({fetch_err}); night-plan copy "
-                    f"SKIPPED, runtime preserved"
-                ),
-                title="conductor: night-plan deploy skipped",
-                priority=_P.NORMAL if would_change else _P.LOW,
-            )
-        except Exception:
-            pass
-        return
+    if fetch_result.returncode != 0:
+        return False, f"fetch_failed:{fetch_result.stderr.strip()[:300]}"
 
     head_proc = subprocess.run(
         ["git", "-C", clone, "rev-parse", "HEAD"],
@@ -1222,7 +1284,7 @@ def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
         capture_output=True, text=True, timeout=5,
     )
     status_proc = subprocess.run(
-        ["git", "-C", clone, "status", "--porcelain"],
+        ["git", "-C", clone, "status", "--porcelain", "--untracked-files=no"],
         capture_output=True, text=True, timeout=15,
     )
     branch_proc = subprocess.run(
@@ -1235,26 +1297,85 @@ def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
     dirty = bool(status_proc.stdout.strip()) if status_proc.returncode == 0 else True
     branch_name = branch_proc.stdout.strip() if branch_proc.returncode == 0 else "unknown"
 
-    is_fresh = bool(head_sha) and head_sha == main_sha and not dirty
+    if bool(head_sha) and head_sha == main_sha and not dirty:
+        return True, ""
 
-    if not is_fresh:
-        head8 = head_sha[:8] if head_sha else "unknown"
-        print(
-            f"[post-land-deploy:conductor] source not clean-on-main ({branch_name}@{head8}); "
-            f"night-plan copy SKIPPED, runtime preserved",
-            file=sys.stderr,
+    head8 = head_sha[:8] if head_sha else "unknown"
+    return False, f"not clean-on-main ({branch_name}@{head8})"
+
+
+def _conductor_file_verified_clean(clone: str, relpath: str) -> bool:
+    """D3 per-file guarantee: `relpath` (repo-relative, e.g. "scripts/gw-topology")
+    must be TRACKED and byte-identical to the deploy clone's own HEAD after the
+    ff-only pull, before it is copied anywhere. Closes the one hole the looser
+    --untracked-files=no tree check opens: an untracked or locally-modified
+    manifested file must never be delivered as though it were reviewed code.
+
+    Baseline is HEAD, not origin/main: during a land the local origin/main ref is
+    behind by definition until the fetch above updates it, so diffing against it
+    would compare reviewed content to a stale reference. HEAD after the ff-only
+    pull is the merge commit's tree — the only truthful "this is reviewed code"
+    reference available at that moment (spec D3). The tree-level gate above
+    already proves HEAD == the fetched origin/main before any copy runs, so this
+    is strictly tighter, not looser.
+
+    Never raises — any git-subprocess failure (timeout, OSError) reads as "not
+    verified clean", the conservative default.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", clone, "ls-files", "--error-unmatch", relpath],
+            capture_output=True, text=True, timeout=10,
         )
+        if tracked.returncode != 0:
+            return False
+        unmodified = subprocess.run(
+            ["git", "-C", clone, "diff", "--quiet", "HEAD", "--", relpath],
+            capture_output=True, timeout=10,
+        )
+        return unmodified.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
+    clone = _CONDUCTOR_DEPLOY_CLONE
+    src_dir = Path(_CONDUCTOR_SCRIPTS_SRC)
+    dest_dir = Path(_CONDUCTOR_SCRIPTS_DEST)
+
+    is_fresh, reason = _conductor_source_freshness_gate(clone)
+    if not is_fresh:
+        is_fetch_reason = reason.startswith(("fetch_failed:", "fetch_error:"))
+        if is_fetch_reason:
+            _, _, err_detail = reason.partition(":")
+            priority_low = not _conductor_copy_would_change(src_dir, dest_dir)
+            print(
+                f"[post-land-deploy:conductor] source fetch failed ({err_detail}); "
+                f"night-plan copy SKIPPED, runtime preserved",
+                file=sys.stderr,
+            )
+            msg = (
+                f"conductor source fetch failed ({err_detail}); night-plan copy "
+                f"SKIPPED, runtime preserved"
+            )
+        else:
+            priority_low = False
+            print(
+                f"[post-land-deploy:conductor] source {reason}; "
+                f"night-plan copy SKIPPED, runtime preserved",
+                file=sys.stderr,
+            )
+            msg = (
+                f"conductor deploy clone {reason}; night-plan script copy "
+                f"SKIPPED, runtime preserved; restore /srv/git/conductor to main "
+                f"— see spec §Go-live (night-plan-conductor-deploy-sync-v0)"
+            )
         try:
             from agents_core.notify import send_notification, Priority as _P
             send_notification(
-                message=(
-                    f"conductor deploy clone not clean-on-main ({branch_name}@{head8}); "
-                    f"night-plan script copy SKIPPED, runtime preserved; restore "
-                    f"/srv/git/conductor to main — see spec §Go-live "
-                    f"(night-plan-conductor-deploy-sync-v0)"
-                ),
+                message=msg,
                 title="conductor: night-plan deploy skipped",
-                priority=_P.NORMAL,
+                priority=_P.LOW if priority_low else _P.NORMAL,
             )
         except Exception:
             pass
@@ -1263,10 +1384,403 @@ def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
     # --- R2/R9: source verified fresh — copy the closure, per-file isolated. ---
     for fname in _CONDUCTOR_NIGHT_SCRIPTS:
         try:
+            # D3: per-file tracked-and-unmodified-vs-HEAD check, in addition to the
+            # tree-level gate above — a manifested file that is itself untracked or
+            # locally modified must never be delivered as though it were reviewed code.
+            if not _conductor_file_verified_clean(clone, f"scripts/{fname}"):
+                print(
+                    f"[post-land-deploy:conductor] {fname} untracked or modified vs "
+                    f"HEAD; skipping copy (D3)",
+                    file=sys.stderr,
+                )
+                continue
             _copy_one_conductor_script(fname, src_dir, dest_dir, trigger)
         except OSError as e:
             print(f"[post-land-deploy:conductor] copy failed for {fname}: {e}", file=sys.stderr)
             continue
+
+
+# ---------------------------------------------------------------------------
+# GravityWell host-script install (host-script-deploy-on-land-v0)
+# ---------------------------------------------------------------------------
+
+def _gw_host_reachable() -> bool:
+    """D4: passive reachability probe, NEVER a wake. BatchMode=yes fails fast on a
+    key prompt; ConnectTimeout bounds the TCP handshake. No retry loop — a single
+    failed probe means skip, full stop, until the next conductor land re-attempts.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes",
+             "-o", f"ConnectTimeout={_GW_SSH_CONNECT_TIMEOUT_SECS}",
+             "-o", "StrictHostKeyChecking=accept-new",
+             _GW_SSH_HOST, "true"],
+            capture_output=True, timeout=_GW_SSH_CONNECT_TIMEOUT_SECS + 5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _gw_ssh_capture(remote_cmd: list, timeout: int = _GW_SSH_CMD_TIMEOUT_SECS) -> str | None:
+    """Run `ssh <host> <remote_cmd...>`, returning stdout on success or None on any
+    failure (nonzero exit, timeout, transport error) — never raises."""
+    try:
+        result = subprocess.run(
+            ["ssh", _GW_SSH_HOST] + list(remote_cmd),
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _gw_next_action(entry: _GwHostScript) -> str:
+    """D7: the expected next action, per manifested script. Delivery always
+    retries on the next conductor land (D4 — self-correcting, no retry loop
+    needed within one pass); what happens meanwhile depends on whether the
+    script self-attests: gw-topology's own guard (_assert_helper_compatible)
+    refuses to converge through a stale copy, gw-idle-suspend.sh has no such
+    guard and drifts silently."""
+    guard = "will refuse reach() until delivered" if entry.self_attesting else "silent - no guard"
+    return f"retries on next conductor land; {guard}"
+
+
+def _gw_result(entry: _GwHostScript, *, status: str, reason: str | None = None) -> dict:
+    """One manifest entry's outcome for this pass. status is one of "delivered",
+    "noop", "skipped", "failed". reason is a structured token (D7 — never prose),
+    populated for "skipped"/"failed" only."""
+    return {
+        "dest": entry.dest,
+        "status": status,
+        "reason": reason,
+        "next_action": _gw_next_action(entry) if status in ("skipped", "failed") else None,
+    }
+
+
+def _install_one_gw_host_script(
+    entry: _GwHostScript, clone: str, src_dir: Path, trigger: str, in_flight_flip: bool,
+) -> dict:
+    """D6: atomic remote install of one manifest entry, verified from the far side.
+
+    Order: per-file tracked-and-unmodified check (D3) -> execution-sensitivity
+    gate (D5) -> remote hash no-op check -> scp to a /tmp temp path -> `sudo
+    install` (atomic replace, the remote equivalent of temp-in-dest-dir +
+    os.replace) -> re-hash verify -> --help self-hash verify for self-attesting
+    entries. A verify mismatch is reported "failed", never "delivered".
+    """
+    src = src_dir / entry.src_name
+    if not src.exists():
+        # A manifest entry naming a file conductor doesn't have is a manifest bug
+        # (mirrors _copy_one_conductor_script's identical local-copy case).
+        print(f"[post-land-deploy:conductor-gw] manifest source missing: {src}", file=sys.stderr)
+        return _gw_result(entry, status="skipped", reason="manifest_source_missing")
+
+    if not _conductor_file_verified_clean(clone, f"scripts/{entry.src_name}"):
+        print(
+            f"[post-land-deploy:conductor-gw] {entry.src_name} untracked or "
+            f"modified vs HEAD; skipping install (D3)",
+            file=sys.stderr,
+        )
+        return _gw_result(entry, status="skipped", reason="file_untracked_or_modified")
+
+    if entry.execution_sensitive and in_flight_flip:
+        # D5: never swap a script out from under a convergence. Per-file, not
+        # global — only entries that declare execution_sensitive=True are gated.
+        print(
+            f"[post-land-deploy:conductor-gw] {entry.dest} skipped: GravityWell "
+            f"in_flight_flip (D5)",
+            file=sys.stderr,
+        )
+        return _gw_result(entry, status="skipped", reason="in_flight_flip")
+
+    local_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+
+    pre_hash_out = _gw_ssh_capture(["sha256sum", entry.dest])
+    pre_hash = pre_hash_out.split()[0] if pre_hash_out else None
+    if pre_hash == local_hash:
+        # D6: no-op when the hash already matches — log the no-op, never reinstall.
+        print(f"[post-land-deploy:conductor-gw] {entry.dest} already current (no-op)", file=sys.stderr)
+        return _gw_result(entry, status="noop")
+
+    tmp_remote = f"/tmp/.lapis-pm-gw-deploy-{uuid.uuid4().hex}-{Path(entry.dest).name}"
+    try:
+        scp_result = subprocess.run(
+            ["scp", "-p", str(src), f"{_GW_SSH_HOST}:{tmp_remote}"],
+            capture_output=True, timeout=_GW_SCP_TIMEOUT_SECS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"[post-land-deploy:conductor-gw] scp to {entry.dest} errored: {e}", file=sys.stderr)
+        return _gw_result(entry, status="failed", reason="scp_failed")
+    if scp_result.returncode != 0:
+        print(f"[post-land-deploy:conductor-gw] scp to {entry.dest} failed rc={scp_result.returncode}", file=sys.stderr)
+        return _gw_result(entry, status="failed", reason="scp_failed")
+
+    owner, _, group = entry.owner.partition(":")
+    install_cmd = ["sudo", "-n", "install", "-o", owner]
+    if group:
+        install_cmd += ["-g", group]
+    install_cmd += ["-m", format(entry.mode, "o"), tmp_remote, entry.dest]
+    try:
+        install_result = subprocess.run(
+            ["ssh", _GW_SSH_HOST] + install_cmd,
+            capture_output=True, text=True, timeout=_GW_SSH_CMD_TIMEOUT_SECS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        install_result = None
+        print(f"[post-land-deploy:conductor-gw] install on {entry.dest} errored: {e}", file=sys.stderr)
+    finally:
+        # Best-effort cleanup of the remote temp regardless of install outcome.
+        _gw_ssh_capture(["rm", "-f", tmp_remote])
+
+    if install_result is None or install_result.returncode != 0:
+        detail = install_result.stderr.strip()[:200] if install_result is not None else "transport error"
+        print(f"[post-land-deploy:conductor-gw] install failed for {entry.dest}: {detail}", file=sys.stderr)
+        return _gw_result(entry, status="failed", reason="install_failed")
+
+    # D6: always re-verify from the far side — a mismatch is a failed install,
+    # never recorded as delivered, so the next land retries.
+    post_hash_out = _gw_ssh_capture(["sha256sum", entry.dest])
+    post_hash = post_hash_out.split()[0] if post_hash_out else None
+    if post_hash != local_hash:
+        print(
+            f"[post-land-deploy:conductor-gw] post-install re-hash mismatch for "
+            f"{entry.dest}: expected {local_hash[:12]}, got {(post_hash or 'unreadable')[:12]}",
+            file=sys.stderr,
+        )
+        return _gw_result(entry, status="failed", reason="verify_hash_mismatch")
+
+    if entry.self_attesting:
+        # Same check gw_topology.py:_assert_helper_compatible performs — a green
+        # verify here means the next reach() cannot refuse on drift. --help
+        # touches nothing (no sudo, no GPU, no health calls).
+        help_out = _gw_ssh_capture([entry.dest, "--help"])
+        match = _GW_SELF_HASH_RE.search(help_out or "")
+        remote_self_hash = match.group(1) if match else None
+        local_self_hash = local_hash[:12]
+        if remote_self_hash != local_self_hash:
+            print(
+                f"[post-land-deploy:conductor-gw] self-hash verify failed for "
+                f"{entry.dest}: expected {local_self_hash}, got {remote_self_hash!r}",
+                file=sys.stderr,
+            )
+            return _gw_result(entry, status="failed", reason="verify_self_hash_mismatch")
+
+    # D8: provenance in the same deploy log every clone sync uses.
+    old_repr = pre_hash[:8] if pre_hash else "absent"
+    _write_deploy_log(f"gravitywell:{entry.dest}", old_repr, local_hash[:8], trigger)
+    print(f"[post-land-deploy:conductor-gw] installed {entry.dest} ({local_hash[:12]})", file=sys.stderr)
+    return _gw_result(entry, status="delivered")
+
+
+def _read_gw_drift_ledger() -> dict:
+    try:
+        return json.loads(_GW_HOST_SCRIPT_DRIFT_LEDGER.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_gw_drift_ledger(ledger: dict) -> None:
+    """Atomic write: write-to-temp-then-os.replace (mirrors deploy_inventory_repair's
+    write_ledger — never a torn/partial file)."""
+    try:
+        _GW_HOST_SCRIPT_DRIFT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(_GW_HOST_SCRIPT_DRIFT_LEDGER.parent),
+            prefix=".gw-host-script-drift-ledger-", suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(ledger, indent=2, sort_keys=True))
+            os.replace(tmp_name, str(_GW_HOST_SCRIPT_DRIFT_LEDGER))
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        print(f"[post-land-deploy:conductor-gw] drift ledger write failed: {e}", file=sys.stderr)
+
+
+def _build_gw_host_script_gem_payload(results: list) -> dict:
+    """D7: one gem per pass with an undelivered entry — reports BOTH the delivered
+    and the undelivered sets (a partial delivery must never read as a clean state),
+    each undelivered entry carrying its destination, structured reason, and
+    expected next action."""
+    delivered = [r for r in results if r["status"] in ("delivered", "noop")]
+    undelivered = [r for r in results if r["status"] in ("skipped", "failed")]
+    undelivered_lines = [f"{r['dest']}: {r['reason']} -> {r['next_action']}" for r in undelivered]
+    delivered_lines = [f"{r['dest']}: {r['status']}" for r in delivered] or ["(none this pass)"]
+    return {
+        "title": f"gravitywell host-script drift: {len(undelivered)} undelivered",
+        "ask": "; ".join(undelivered_lines),
+        "why": (
+            "Repo-held GravityWell scripts (gw-topology, gw-idle-suspend.sh) are "
+            "delivered by this hook, not by hand. An undelivered script either "
+            "refuses the next reach() (self-attesting) or drifts with no guard "
+            "at all (see per-file reasons)."
+        ),
+        "context": [
+            {"label": "Undelivered", "lines": undelivered_lines},
+            {"label": "Delivered this pass", "lines": delivered_lines},
+        ],
+        "options": _GW_GEM_OPTIONS,
+        "state": "needs",
+        "origin": "from · gw-host-script-deploy",
+        "agent": "repair-expert",
+        "deposited_by": "lapis-pm-host-script-deploy-on-land-v0",
+    }
+
+
+def _report_gw_host_script_drift(results: list) -> None:
+    """D7/D9: deposit a Desk gem for any undelivered manifest entry, deduped
+    against a small local ledger so a persisting drift pages the Desk once —
+    not on every conductor land (routes through the same Desk-gem path the
+    deploy-inventory reconciler uses, not per-land Pushover).
+    """
+    undelivered = [r for r in results if r["status"] in ("skipped", "failed")]
+    ledger = _read_gw_drift_ledger()
+    entry = ledger.get(_GW_HOST_SCRIPT_DRIFT_SIGNATURE)
+    now = _now_iso()
+
+    if not undelivered:
+        # Healthy pass: resolve any open ledger entry so a later regression
+        # deposits a fresh gem instead of reading as still-suppressed.
+        if entry is not None and entry.get("status") == "open":
+            entry["status"] = "resolved"
+            entry["last_seen"] = now
+            _write_gw_drift_ledger(ledger)
+        return
+
+    would_deposit = entry is None or entry.get("status") in ("acked", "resolved")
+    if not would_deposit:
+        entry["last_seen"] = now
+        entry["times_seen"] = entry.get("times_seen", 1) + 1
+        _write_gw_drift_ledger(ledger)
+        print(
+            f"[post-land-deploy:conductor-gw] drift still open "
+            f"({len(undelivered)} undelivered) — gem already on the Desk, not re-deposited",
+            file=sys.stderr,
+        )
+        return
+
+    payload = _build_gw_host_script_gem_payload(results)
+    gem_id = None
+    try:
+        from . import deploy_inventory_repair
+        gem_id = deploy_inventory_repair.deposit_gem(payload)
+    except Exception as e:
+        print(f"[post-land-deploy:conductor-gw] drift gem deposit errored: {e}", file=sys.stderr)
+
+    if gem_id is None:
+        print(
+            "[post-land-deploy:conductor-gw] drift gem deposit failed or skipped; "
+            "will retry next land",
+            file=sys.stderr,
+        )
+        return  # ledger untouched — next pass retries the deposit
+
+    ledger[_GW_HOST_SCRIPT_DRIFT_SIGNATURE] = {
+        "gem_id": gem_id,
+        "first_seen": entry.get("first_seen") if entry else now,
+        "last_seen": now,
+        "times_seen": (entry.get("times_seen", 0) + 1) if entry else 1,
+        "status": "open",
+    }
+    _write_gw_drift_ledger(ledger)
+
+
+def _deploy_conductor_gw_host_scripts_impl(trigger: str) -> None:
+    clone = _CONDUCTOR_DEPLOY_CLONE
+    src_dir = Path(_CONDUCTOR_SCRIPTS_SRC)
+
+    is_fresh, reason = _conductor_source_freshness_gate(clone)
+    if not is_fresh:
+        print(
+            f"[post-land-deploy:conductor-gw] source not fresh ({reason}); "
+            f"host-script install SKIPPED for all manifest entries",
+            file=sys.stderr,
+        )
+        results = [
+            _gw_result(entry, status="skipped", reason="source_not_fresh")
+            for entry in _CONDUCTOR_GW_HOST_SCRIPTS
+        ]
+        _report_gw_host_script_drift(results)
+        return
+
+    if not _gw_host_reachable():
+        # D4: unreachable means skip — no WoL, no wake-gravitywell, no retry loop.
+        # Self-correcting: re-attempted on every subsequent conductor land.
+        print(
+            "[post-land-deploy:conductor-gw] gravitywell unreachable; host-script "
+            "install SKIPPED (no wake attempted, D4)",
+            file=sys.stderr,
+        )
+        results = [
+            _gw_result(entry, status="skipped", reason="host_unreachable")
+            for entry in _CONDUCTOR_GW_HOST_SCRIPTS
+        ]
+        _report_gw_host_script_drift(results)
+        return
+
+    in_flight_flip = False
+    try:
+        from agents_core.llm import gw_serving_state
+        state = gw_serving_state()
+        in_flight_flip = bool(state.in_flight_flip)
+    except Exception as e:
+        print(
+            f"[post-land-deploy:conductor-gw] gw_serving_state check failed "
+            f"(treating as not in-flight): {e}",
+            file=sys.stderr,
+        )
+
+    results = []
+    for entry in _CONDUCTOR_GW_HOST_SCRIPTS:
+        try:
+            result = _install_one_gw_host_script(entry, clone, src_dir, trigger, in_flight_flip)
+        except Exception as e:
+            print(
+                f"[post-land-deploy:conductor-gw] unexpected error installing "
+                f"{entry.dest} (non-fatal): {e}",
+                file=sys.stderr,
+            )
+            result = _gw_result(entry, status="failed", reason="unexpected_error")
+        results.append(result)
+
+    _report_gw_host_script_drift(results)
+
+
+def _deploy_conductor_gw_host_scripts(trigger: str = "post-land-hook") -> None:
+    """Cross-host sibling of _deploy_conductor_night_scripts: installs conductor's
+    repo-held GravityWell scripts onto gravitywell:/usr/local/sbin/ (D1-D8).
+
+    Never raises: an unexpected error anywhere in this function is caught, logged,
+    and reported at LOW priority — this runs inside the post-land hook on the merge
+    path for every repo, and a failure here must never fail the merge that
+    triggered it (mirrors _deploy_conductor_night_scripts's own contract).
+
+    Never converges or restarts a GravityWell serving unit, never wakes the host —
+    installing a file is inert; reach() remains the only thing that converges
+    topology (spec Out-of-scope).
+    """
+    try:
+        _deploy_conductor_gw_host_scripts_impl(trigger)
+    except Exception as e:
+        print(
+            f"[post-land-deploy:conductor-gw] unexpected error (non-fatal): {e}",
+            file=sys.stderr,
+        )
+        try:
+            from agents_core.notify import send_notification, Priority as _P
+            send_notification(
+                message=f"conductor GravityWell host-script install hit an unexpected error: {e}",
+                title="conductor: gw host-script deploy error",
+                priority=_P.LOW,
+            )
+        except Exception:
+            pass
 
 
 def _count_inflight_fixers() -> int:
@@ -1785,6 +2299,11 @@ def _post_land_deploy_hook(
     # does not interfere with the restart logic that follows.
     if repo == "conductor":
         _deploy_conductor_night_scripts(trigger=trigger)
+        # host-script-deploy-on-land-v0: cross-host sibling — installs conductor's
+        # repo-held GravityWell scripts (gw-topology, gw-idle-suspend.sh) onto
+        # gravitywell:/usr/local/sbin/. Independent of the local copy above (own
+        # never-raises contract); never converges or restarts a GW serving unit.
+        _deploy_conductor_gw_host_scripts(trigger=trigger)
 
     units = _POST_LAND_RESTART.get(repo)
     if units:

@@ -1,5 +1,6 @@
 """Unit tests for _post_land_deploy_hook in pm_core."""
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -3546,6 +3547,10 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            # host-script-deploy-on-land-v0: the full hook now also fires the GW
+            # host-script install for repo=="conductor" — hermetic isolation for
+            # its own drift ledger, exactly as _DEPLOY_LOG is isolated above.
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-drift-ledger.json"),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
         ):
@@ -3587,6 +3592,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-drift-ledger.json"),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
         ):
@@ -3631,3 +3637,545 @@ class TestConductorNightPlanDeploy:
         result_yaml = (dest_dir / "night_producers.yaml").read_text()
         assert "idea_collider_night_batch_producer" in result_yaml
         assert result_yaml == yaml_content
+
+
+# ---------------------------------------------------------------------------
+# host-script-deploy-on-land-v0: GravityWell host-script install
+# ---------------------------------------------------------------------------
+
+def _git(cwd, *args):
+    result = subprocess.run(["git"] + list(args), cwd=str(cwd), capture_output=True, text=True)
+    assert result.returncode == 0, f"git {args} failed: {result.stderr}"
+    return result
+
+
+def _git_out(cwd, *args) -> str:
+    return _git(cwd, *args).stdout.strip()
+
+
+def _init_real_conductor_clone(clone: Path) -> None:
+    """A real (not mocked) tiny git repo shaped like the conductor deploy clone,
+    for the D3/D4 tests that must run against real git behavior rather than a
+    fixture (spec DoD 3/4)."""
+    clone.mkdir(parents=True, exist_ok=True)
+    _git(clone, "init", "-q")
+    _git(clone, "config", "user.email", "test@test")
+    _git(clone, "config", "user.name", "test")
+
+
+def _real_git_with_stubbed_fetch(real_run):
+    """Passes every git call through to the REAL subprocess.run against the tmp
+    repo except `git fetch origin main`, which is stubbed to a clean success (no
+    real 'origin' remote exists on the tmp repo, and no network is available in
+    the test sandbox)."""
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git" and len(cmd) > 3 and cmd[3] == "fetch":
+            return _make_completed_process(returncode=0)
+        return real_run(cmd, **kwargs)
+    return fake_run
+
+
+def _gw_fake_run(
+    *, git_fake=None, reachable=True, pre_hash=None, post_hash=None,
+    scp_rc=0, install_rc=0, self_hash_line=None, calls=None,
+):
+    """Fake subprocess.run dispatcher for the GW host-script install calls
+    (reachability probe, sha256sum pre/post-install, scp, sudo install, --help
+    self-hash, rm cleanup) — delegates `git` calls to `git_fake` (a
+    `_conductor_git_fake_run`-shaped callable) so the shared freshness gate
+    behaves exactly as it does for the local night-script copy (D2 — gate
+    sharing).
+
+    pre_hash / post_hash / self_hash_line may be a plain string (applies to
+    every dest) or a {dest: value} dict (per-entry, for mixed-pass tests).
+    `calls` — if given, every dispatched cmd is appended to it (call log for
+    assertions like "no scp/install happened").
+    """
+    sha_call_counts: dict = {}
+
+    def _resolve(value, dest):
+        if isinstance(value, dict):
+            return value.get(dest)
+        return value
+
+    def fake_run(cmd, **kwargs):
+        if calls is not None:
+            calls.append(list(cmd))
+        if cmd and cmd[0] == "git":
+            if git_fake is not None:
+                return git_fake(cmd, **kwargs)
+            return _make_completed_process(returncode=0)
+        if cmd and cmd[0] == "ssh" and len(cmd) > 1 and cmd[1] == "-o":
+            return _make_completed_process(returncode=0 if reachable else 1)
+        if cmd and cmd[0] == "scp":
+            return _make_completed_process(
+                returncode=scp_rc, stderr="" if scp_rc == 0 else "scp failed",
+            )
+        if cmd and cmd[0] == "ssh":
+            remote = cmd[2:]
+            if remote[:1] == ["sha256sum"]:
+                dest = remote[1]
+                n = sha_call_counts.get(dest, 0)
+                sha_call_counts[dest] = n + 1
+                value = _resolve(pre_hash, dest) if n == 0 else _resolve(post_hash, dest)
+                if value is None:
+                    return _make_completed_process(returncode=1)
+                return _make_completed_process(returncode=0, stdout=f"{value}  {dest}\n")
+            if remote[:1] == ["rm"]:
+                return _make_completed_process(returncode=0)
+            if remote[:3] == ["sudo", "-n", "install"]:
+                return _make_completed_process(
+                    returncode=install_rc, stderr="" if install_rc == 0 else "install failed",
+                )
+            if len(remote) >= 2 and remote[-1] == "--help":
+                dest = remote[0]
+                value = _resolve(self_hash_line, dest)
+                return _make_completed_process(returncode=0, stdout=value or "")
+        return _make_completed_process(returncode=0)
+
+    return fake_run
+
+
+class TestGwHostScriptDeploy:
+    """Tests for host-script-deploy-on-land-v0 — the cross-host sibling of
+    _deploy_conductor_night_scripts that installs conductor's repo-held
+    GravityWell scripts (gw-topology, gw-idle-suspend.sh) onto
+    gravitywell:/usr/local/sbin/.
+    """
+
+    # --- D1: manifest ---
+
+    def test_manifest_has_both_scripts_correctly_shaped(self):
+        by_dest = {e.dest: e for e in pm_core._CONDUCTOR_GW_HOST_SCRIPTS}
+        assert "/usr/local/sbin/gw-topology" in by_dest
+        assert "/usr/local/sbin/gw-idle-suspend.sh" in by_dest
+
+        topology = by_dest["/usr/local/sbin/gw-topology"]
+        assert topology.src_name == "gw-topology"
+        assert topology.mode == 0o755
+        assert topology.owner == "root:root"
+        assert topology.self_attesting is True
+        assert topology.execution_sensitive is True
+
+        idle = by_dest["/usr/local/sbin/gw-idle-suspend.sh"]
+        assert idle.src_name == "gw-idle-suspend.sh"
+        assert idle.self_attesting is False
+        assert idle.execution_sensitive is True
+
+    def test_gw_serve_and_gw_dual_not_manifested(self):
+        """Out-of-scope: no repo source, so no manifest entry (spec Out-of-scope)."""
+        dests = {e.dest for e in pm_core._CONDUCTOR_GW_HOST_SCRIPTS}
+        assert "/usr/local/bin/gw-serve" not in dests
+        assert "/usr/local/sbin/gw-dual" not in dests
+
+    # --- D2: gate sharing ---
+
+    def test_dirty_source_skips_both_local_copy_and_gw_install(self, tmp_path):
+        """One gate, two consumers (D2): a dirty deploy clone must skip BOTH the
+        local night-script copy and the GravityWell host-script install
+        identically — never re-implemented, never diverging."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+        (src_dir / "gw-topology").write_text("#!/bin/sh\necho hi\n")
+        (src_dir / "gw-idle-suspend.sh").write_text("#!/bin/sh\necho hi\n")
+
+        git_fake = _conductor_git_fake_run(
+            fetch_rc=0, head_sha="aaa", main_sha="aaa",
+            status_stdout="M scripts/night_plan.py\n",
+        )
+        gw_fake = _gw_fake_run(git_fake=git_fake)
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        assert list(dest_dir.iterdir()) == [], "local copy must be skipped on dirty source"
+        # No install artifacts possible to observe directly (remote), but the
+        # gate must have short-circuited before any scp/install call fired.
+
+    # --- D3: untracked-vs-tracked dirt, verified against a real clone ---
+
+    def test_untracked_editor_dirs_no_longer_block_freshness_gate(self, tmp_path):
+        """DoD 3: git status --porcelain --untracked-files=no is in use, verified
+        against a REAL git clone (not a fixture) carrying the exact live finding
+        — untracked .claude/ + .vscode/, neither gitignored — which must no
+        longer skip delivery."""
+        clone = tmp_path / "clone"
+        _init_real_conductor_clone(clone)
+        (clone / "scripts").mkdir()
+        (clone / "scripts" / "gw-topology").write_text("#!/bin/sh\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-q", "-m", "init")
+        head_sha = _git_out(clone, "rev-parse", "HEAD")
+        _git(clone, "update-ref", "refs/remotes/origin/main", head_sha)
+
+        # the exact live finding (finding/lapis-pm-conductor-deploy-gate-blocked-
+        # by-untracked-dirs-2026-08-11): untracked .claude/ + .vscode/ present.
+        (clone / ".claude").mkdir()
+        (clone / ".claude" / "settings.json").write_text("{}")
+        (clone / ".vscode").mkdir()
+        (clone / ".vscode" / "settings.json").write_text("{}")
+
+        with patch(
+            "lapis_pm.pm_core.subprocess.run",
+            side_effect=_real_git_with_stubbed_fetch(subprocess.run),
+        ):
+            is_fresh, reason = pm_core._conductor_source_freshness_gate(str(clone))
+
+        assert is_fresh is True, f"untracked .claude/.vscode must not block freshness: {reason}"
+
+    def test_tracked_dirt_still_blocks_freshness_gate(self, tmp_path):
+        """The other half of D3: a TRACKED modification must still block — the
+        looser untracked check must not become no check at all."""
+        clone = tmp_path / "clone"
+        _init_real_conductor_clone(clone)
+        (clone / "scripts").mkdir()
+        tracked = clone / "scripts" / "gw-topology"
+        tracked.write_text("#!/bin/sh\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-q", "-m", "init")
+        head_sha = _git_out(clone, "rev-parse", "HEAD")
+        _git(clone, "update-ref", "refs/remotes/origin/main", head_sha)
+
+        tracked.write_text("#!/bin/sh\necho modified\n")  # tracked, uncommitted
+
+        with patch(
+            "lapis_pm.pm_core.subprocess.run",
+            side_effect=_real_git_with_stubbed_fetch(subprocess.run),
+        ):
+            is_fresh, reason = pm_core._conductor_source_freshness_gate(str(clone))
+
+        assert is_fresh is False
+        assert "clean-on-main" in reason
+
+    # --- per-file tracked check ---
+
+    def test_untracked_manifested_file_skipped_even_when_tree_clean(self, tmp_path):
+        """An untracked-but-manifested file must be skipped even though the
+        tree-level check (which ignores untracked files) reads clean."""
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        def ls_files_untracked(cmd, **kwargs):
+            if cmd[3] == "ls-files":
+                return _make_completed_process(returncode=1)  # not tracked
+            return git_fake(cmd, **kwargs)
+
+        with patch("lapis_pm.pm_core.subprocess.run", side_effect=ls_files_untracked):
+            clean = pm_core._conductor_file_verified_clean("/fake/clone", "scripts/gw-topology")
+
+        assert clean is False
+
+    def test_per_file_check_baseline_is_head_not_stale_origin_main(self, tmp_path):
+        """DoD 4: the baseline is HEAD, not origin/main. With HEAD ahead of a
+        stale local origin/main ref, a file matching HEAD is delivered and a
+        file matching only the stale ref is not."""
+        clone = tmp_path / "clone"
+        _init_real_conductor_clone(clone)
+        (clone / "scripts").mkdir()
+        f = clone / "scripts" / "gw-idle-suspend.sh"
+
+        f.write_text("old content\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-q", "-m", "old")
+        old_sha = _git_out(clone, "rev-parse", "HEAD")
+        # A stale local origin/main ref — simulates being mid-land, before the
+        # next fetch updates it.
+        _git(clone, "update-ref", "refs/remotes/origin/main", old_sha)
+
+        # HEAD advances (the ff-only pull landing a new merge commit).
+        f.write_text("new content\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-q", "-m", "new")
+
+        # Working tree matches HEAD -> verified clean -> would be delivered.
+        assert pm_core._conductor_file_verified_clean(str(clone), "scripts/gw-idle-suspend.sh") is True
+
+        # Working tree reverted to match ONLY the stale origin/main content ->
+        # must NOT verify clean — proves the baseline is HEAD, not origin/main.
+        f.write_text("old content\n")
+        assert pm_core._conductor_file_verified_clean(str(clone), "scripts/gw-idle-suspend.sh") is False
+
+    # --- D4: unreachable host ---
+
+    def test_unreachable_host_skips_all_no_wake_no_merge_failure(self, tmp_path):
+        """DoD 5: an unreachable GravityWell produces a clean LOW skip — no wake
+        attempt, no scp/install call, and the function never raises."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "gw-topology").write_text("#!/bin/sh\n")
+        (src_dir / "gw-idle-suspend.sh").write_text("#!/bin/sh\n")
+
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        calls: list = []
+        gw_fake = _gw_fake_run(git_fake=git_fake, reachable=False, calls=calls)
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+        ):
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")  # must not raise
+
+        ssh_calls = [c for c in calls if c and c[0] in ("ssh", "scp")]
+        assert len(ssh_calls) == 1, f"expected only the reachability probe, got {ssh_calls}"
+        assert ssh_calls[0][:2] == ["ssh", "-o"], "the one call must be the probe, not scp/install"
+        for c in calls:
+            joined = " ".join(str(x) for x in c)
+            assert "wake" not in joined.lower() and "wol" not in joined.lower()
+
+    # --- D5: in_flight_flip, execution_sensitive per-entry ---
+
+    def test_in_flight_flip_skips_execution_sensitive_only_mixed_pass(self, tmp_path):
+        """DoD 6 + DoD 9: in_flight_flip=True skips ONLY manifest entries marked
+        execution_sensitive; a non-sensitive entry still installs. The resulting
+        mixed pass (one delivered, one skipped) must report BOTH sets — a
+        partial delivery must never read as a clean state."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "sensitive.sh").write_text("#!/bin/sh\nsensitive\n")
+        (src_dir / "not-sensitive.sh").write_text("#!/bin/sh\nnot sensitive\n")
+
+        sensitive_hash = hashlib.sha256((src_dir / "sensitive.sh").read_bytes()).hexdigest()
+        other_hash = hashlib.sha256((src_dir / "not-sensitive.sh").read_bytes()).hexdigest()
+
+        manifest = (
+            pm_core._GwHostScript("sensitive.sh", "/usr/local/sbin/sensitive.sh", 0o755, "root:root", False, True),
+            pm_core._GwHostScript("not-sensitive.sh", "/usr/local/sbin/not-sensitive.sh", 0o755, "root:root", False, False),
+        )
+
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        gw_fake = _gw_fake_run(
+            git_fake=git_fake,
+            pre_hash={"/usr/local/sbin/sensitive.sh": "stale", "/usr/local/sbin/not-sensitive.sh": "stale"},
+            post_hash={"/usr/local/sbin/not-sensitive.sh": other_hash},
+        )
+
+        captured_payload = {}
+
+        def fake_deposit_gem(payload):
+            captured_payload.update(payload)
+            return "gem-123"
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+            patch("lapis_pm.deploy_inventory_repair.deposit_gem", side_effect=fake_deposit_gem),
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=True)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        assert "sensitive.sh: in_flight_flip" in captured_payload.get("ask", ""), captured_payload
+        undelivered_lines = next(
+            c["lines"] for c in captured_payload.get("context", []) if c["label"] == "Undelivered"
+        )
+        delivered_lines = next(
+            c["lines"] for c in captured_payload.get("context", []) if c["label"] == "Delivered this pass"
+        )
+        assert any("sensitive.sh" in ln and "in_flight_flip" in ln for ln in undelivered_lines)
+        assert any("not-sensitive.sh" in ln for ln in delivered_lines)
+
+    # --- D6: verify mismatch ---
+
+    def test_post_install_hash_mismatch_is_not_recorded_as_delivered(self, tmp_path):
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "gw-idle-suspend.sh").write_text("#!/bin/sh\n")
+
+        manifest = (
+            pm_core._GwHostScript(
+                "gw-idle-suspend.sh", "/usr/local/sbin/gw-idle-suspend.sh", 0o755, "root:root", False, True,
+            ),
+        )
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        log_file = tmp_path / "deploy-log.md"
+        gw_fake = _gw_fake_run(
+            git_fake=git_fake, pre_hash="stale", post_hash="wrong-hash-after-install",
+        )
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=False)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        assert not log_file.exists(), "a verify mismatch must never write a delivered provenance line"
+
+    def test_self_hash_mismatch_is_not_recorded_as_delivered(self, tmp_path):
+        """The --help self-hash verify (self-attesting entries only): a mismatch
+        must be reported failed, even though the plain re-hash matched."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        content = "#!/bin/sh\necho self-attest\n"
+        (src_dir / "gw-topology").write_text(content)
+        local_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        manifest = (
+            pm_core._GwHostScript("gw-topology", "/usr/local/sbin/gw-topology", 0o755, "root:root", True, True),
+        )
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        log_file = tmp_path / "deploy-log.md"
+        gw_fake = _gw_fake_run(
+            git_fake=git_fake, pre_hash="stale", post_hash=local_hash,
+            self_hash_line="self-hash: 000000000000\n",  # deliberately wrong
+        )
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=False)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        assert not log_file.exists(), "a self-hash mismatch must never write a delivered provenance line"
+
+    def test_self_hash_verify_passes_and_records_delivery(self, tmp_path):
+        """The green-path counterpart: matching re-hash AND matching self-hash
+        records a delivered provenance line — a green verify here is exactly
+        what stops _assert_helper_compatible refusing the next reach()."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        content = "#!/bin/sh\necho self-attest\n"
+        (src_dir / "gw-topology").write_text(content)
+        local_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        manifest = (
+            pm_core._GwHostScript("gw-topology", "/usr/local/sbin/gw-topology", 0o755, "root:root", True, True),
+        )
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        log_file = tmp_path / "deploy-log.md"
+        gw_fake = _gw_fake_run(
+            git_fake=git_fake, pre_hash="stale", post_hash=local_hash,
+            self_hash_line=f"self-hash: {local_hash[:12]}\n",
+        )
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=False)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        log_text = log_file.read_text()
+        assert "gravitywell:/usr/local/sbin/gw-topology" in log_text
+        assert local_hash[:8] in log_text
+
+    # --- D7/D8: no-op path ---
+
+    def test_noop_when_remote_hash_already_matches_no_reinstall(self, tmp_path):
+        """DoD 8: a matching remote hash is a logged no-op — no scp, no install."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        content = "#!/bin/sh\n"
+        (src_dir / "gw-idle-suspend.sh").write_text(content)
+        local_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        manifest = (
+            pm_core._GwHostScript(
+                "gw-idle-suspend.sh", "/usr/local/sbin/gw-idle-suspend.sh", 0o755, "root:root", False, True,
+            ),
+        )
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        log_file = tmp_path / "deploy-log.md"
+        calls: list = []
+        gw_fake = _gw_fake_run(git_fake=git_fake, pre_hash=local_hash, calls=calls)
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=False)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        scp_or_install_calls = [
+            c for c in calls
+            if (c and c[0] == "scp") or (c and c[0] == "ssh" and "install" in c)
+        ]
+        assert scp_or_install_calls == [], f"no-op must never scp/install: {scp_or_install_calls}"
+        assert not log_file.exists(), "no-op must not write a provenance line"
+
+    # --- fault isolation between manifest entries ---
+
+    def test_fault_isolation_one_entry_error_does_not_block_the_other(self, tmp_path):
+        """An unexpected exception installing one manifest entry must not prevent
+        the other entry from being attempted (mirrors _copy_one_conductor_script's
+        per-file isolation for the local copy)."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "broken.sh").write_text("#!/bin/sh\n")
+        (src_dir / "fine.sh").write_text("#!/bin/sh\n")
+        fine_hash = hashlib.sha256((src_dir / "fine.sh").read_bytes()).hexdigest()
+
+        manifest = (
+            pm_core._GwHostScript("broken.sh", "/usr/local/sbin/broken.sh", 0o755, "root:root", False, False),
+            pm_core._GwHostScript("fine.sh", "/usr/local/sbin/fine.sh", 0o755, "root:root", False, False),
+        )
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        # ONE shared closure instance (not reconstructed per-call) so its internal
+        # pre/post sha256sum call counter persists across dispatched commands.
+        inner_fake = _gw_fake_run(
+            git_fake=git_fake, pre_hash="stale", post_hash={"/usr/local/sbin/fine.sh": fine_hash},
+        )
+
+        def raising_gw_fake(cmd, **kwargs):
+            if (
+                cmd and cmd[0] == "ssh" and len(cmd) > 3
+                and cmd[2:4] == ["sha256sum", "/usr/local/sbin/broken.sh"]
+            ):
+                raise RuntimeError("simulated transport corruption")
+            return inner_fake(cmd, **kwargs)
+
+        log_file = tmp_path / "deploy-log.md"
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=raising_gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=False)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")  # must not raise
+
+        log_text = log_file.read_text()
+        assert "gravitywell:/usr/local/sbin/fine.sh" in log_text, (
+            "the entry after the failing one must still install"
+        )
+        assert "broken.sh" not in log_text

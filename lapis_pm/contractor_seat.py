@@ -29,6 +29,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, asdict
 
+from lapis_pm.completion_text import extract_completion_text
+
 CONTRACTOR_BACKEND_URL = "http://127.0.0.1:8413"
 CONTRACTOR_MODEL = "deepseek/deepseek-v4-flash"
 
@@ -98,12 +100,21 @@ def classify_response(status_code: int | None, body: dict | None, exc: Exception
         return STATE_UPSTREAM_5XX, f"upstream {status_code}"
 
     if status_code == 200:
-        content = ""
+        # Read content||reasoning||reasoning_content, not content alone — a
+        # thinking-model seat that reasons but never emits `content` was being
+        # misclassified as empty (the same false-dead-seat class this repo's
+        # corroboration leg had) even though it answered at HTTP 200. See
+        # lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0 Gate
+        # outcome §4.
+        message = None
+        finish_reason = None
         if body:
             choices = body.get("choices") or []
             if choices:
-                content = (choices[0].get("message") or {}).get("content") or ""
-        if not content.strip():
+                message = choices[0].get("message")
+                finish_reason = choices[0].get("finish_reason")
+        extracted = extract_completion_text(message, finish_reason)
+        if not extracted.has_text:
             return STATE_EMPTY_CONTENT, "200 with empty content"
         return STATE_HEALTHY, "200, non-empty content"
 

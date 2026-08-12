@@ -722,3 +722,255 @@ class TestRunCorroborationPass:
         # Both legs report themselves failed, independently.
         assert result["leg_status"] == "pass_failed"
         assert result["node2_corroboration"]["leg_status"] == "pass_failed"
+
+
+# ---------------------------------------------------------------------------
+# Thinking-model parse + truncation loudness
+# (lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0)
+# ---------------------------------------------------------------------------
+
+class TestThinkingModelParseAndTruncation:
+    """Regression coverage for the real reproduction (2026-08-12 13:15 PT,
+    GravityWell :8081): content=None, reasoning populated, finish_reason
+    "length", HTTP 200. Pre-fix this raised AttributeError on `.strip()`
+    inside the bare `except Exception`, which reported leg_status=
+    "substrate_unavailable" — indistinguishable from a genuinely dead node."""
+
+    def _make_thinking_response(self, *, content, reasoning, finish_reason, model="gravitywell-27b"):
+        return {
+            "model": model,
+            "choices": [{
+                "message": {"content": content, "reasoning": reasoning},
+                "finish_reason": finish_reason,
+            }],
+        }
+
+    def test_none_content_with_reasoning_and_length_does_not_raise_and_is_truncated(self):
+        """DoD #1: the real reproduction — usable text, truncated=True, no
+        AttributeError."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        llm_resp = self._make_thinking_response(
+            content=None,
+            reasoning="the model reasons here but never emits content...",
+            finish_reason="length",
+        )
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=lambda: llm_resp,
+                raise_for_status=lambda: None,
+            )
+            result = adapter.score("some diff", substrates, "lapis-pm")
+
+        # Must not raise (the pre-fix AttributeError path is gone) and must
+        # report the distinct truncated classification, not substrate_unavailable.
+        assert result.verdict == "uncertain"
+        assert result.leg_status == "truncated"
+        assert result.leg_status != "substrate_unavailable"
+        assert "truncat" in (result.notes or "").lower()
+
+    def test_truncated_is_visibly_different_from_substrate_unavailable(self):
+        """DoD #4: a reader must be able to tell 'cut off' from 'unreachable'
+        without reading code — assert the claim/leg_status pair differs."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+
+        truncated_resp = self._make_thinking_response(
+            content=None, reasoning="partial...", finish_reason="length",
+        )
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: truncated_resp, raise_for_status=lambda: None,
+            )
+            truncated_result = adapter.score("diff", substrates, "lapis-pm")
+
+        with patch("lapis_pm.corroboration_adapter.node_reachable", return_value=False):
+            unavailable_result = adapter.score("diff", substrates, "lapis-pm")
+
+        assert truncated_result.leg_status == "truncated"
+        assert unavailable_result.leg_status == "substrate_unavailable"
+        assert truncated_result.leg_status != unavailable_result.leg_status
+        assert truncated_result.claim != unavailable_result.claim
+
+    def test_content_only_stop_still_parses_normally(self):
+        """finish_reason=stop, content populated — ordinary success path unaffected."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        llm_resp = {
+            "model": "gravitywell-27b",
+            "choices": [{
+                "message": {"content": json.dumps({
+                    "verdict": "clean",
+                    "claims": [{"identifier": "tick", "drift_class": "none", "notes": "ok"}],
+                    "summary": "all clear",
+                })},
+                "finish_reason": "stop",
+            }],
+        }
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None,
+            )
+            result = adapter.score("diff", substrates, "lapis-pm")
+
+        assert result.verdict == "clean"
+        assert result.leg_status == "ok"
+
+    def test_reasoning_content_llamacpp_shape_also_parses(self):
+        """llama.cpp's reasoning_content field is honoured as a fallback too."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        payload = json.dumps({
+            "verdict": "clean",
+            "claims": [{"identifier": "tick", "drift_class": "none", "notes": "ok"}],
+            "summary": "all clear",
+        })
+        llm_resp = {
+            "model": "local-llamacpp",
+            "choices": [{
+                "message": {"content": "", "reasoning_content": payload},
+                "finish_reason": "stop",
+            }],
+        }
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None,
+            )
+            result = adapter.score("diff", substrates, "lapis-pm")
+
+        assert result.verdict == "clean"
+        assert result.leg_status == "ok"
+
+    def test_no_usable_text_anywhere_is_substrate_unavailable_not_crash(self):
+        """content, reasoning, and reasoning_content all empty, finish_reason
+        stop — a distinct condition, reported as substrate_unavailable, never
+        an unhandled exception."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+
+        llm_resp = {
+            "model": "gravitywell-27b",
+            "choices": [{"message": {"content": None}, "finish_reason": "stop"}],
+        }
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None,
+            )
+            result = adapter.score("diff", substrates, "lapis-pm")
+
+        assert result.leg_status == "substrate_unavailable"
+
+    def test_exception_message_included_not_just_class_name(self):
+        """Honest diagnostics: the except path carries the exception message,
+        not just type(exc).__name__ — a bare class name is what hid this
+        defect for over a week."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=ConnectionError("connection refused by peer")),
+        ):
+            result = adapter.score("diff", substrates, "lapis-pm")
+
+        assert result.leg_status == "substrate_unavailable"
+        assert "ConnectionError" in result.notes
+        assert "connection refused by peer" in result.notes
+
+    def test_max_tokens_raised_and_grammar_constraint_present(self):
+        """Scope 5: max_tokens raised well above 512, json_schema/strict
+        grammar adopted — copied from local_reviewer_witness.py's proven shape."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        llm_resp = {
+            "model": "gravitywell-27b",
+            "choices": [{
+                "message": {"content": json.dumps({
+                    "verdict": "clean",
+                    "claims": [{"identifier": "tick", "drift_class": "none", "notes": "ok"}],
+                    "summary": "ok",
+                })},
+                "finish_reason": "stop",
+            }],
+        }
+
+        captured_bodies: list[dict] = []
+
+        def capture_post(url, *, json=None, timeout=None):
+            captured_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None)
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=capture_post),
+        ):
+            adapter.score("diff", substrates, "lapis-pm")
+
+        assert captured_bodies, "expected httpx.post to be called"
+        body = captured_bodies[0]
+        assert body["max_tokens"] > 512
+        assert body["max_tokens"] == 4096
+        assert body.get("response_format", {}).get("type") == "json_schema"
+        assert body["response_format"]["json_schema"]["strict"] is True
+
+    def test_grammar_rejected_degrades_to_plain_call_never_hard_fails(self):
+        """Risk: a seat that rejects json_schema (HTTP 4xx on the grammar
+        attempt) must degrade to a plain call, never hard-fail — mirrors
+        local_reviewer_witness.py's HTTP-4xx retry precedent."""
+        adapter = LapisPMReviewerAdapter()
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        llm_resp = {
+            "model": "node2-mlx",
+            "choices": [{
+                "message": {"content": json.dumps({
+                    "verdict": "clean",
+                    "claims": [{"identifier": "tick", "drift_class": "none", "notes": "ok"}],
+                    "summary": "ok",
+                })},
+                "finish_reason": "stop",
+            }],
+        }
+
+        bad_resp = MagicMock(status_code=422, raise_for_status=lambda: None, json=lambda: {})
+        good_resp = MagicMock(status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None)
+
+        call_count = [0]
+
+        def side_effect(url, *, json=None, timeout=None):
+            call_count[0] += 1
+            return bad_resp if call_count[0] == 1 else good_resp
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=side_effect),
+        ):
+            result = adapter.score("diff", substrates, "lapis-pm")
+
+        assert call_count[0] == 2, "expected a retry without grammar after the 4xx"
+        assert result.verdict == "clean"
+        assert result.leg_status == "ok"

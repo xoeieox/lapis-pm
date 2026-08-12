@@ -754,3 +754,113 @@ class TestNoDivergenceObservationOnAgree:
         assert not div_obs, (
             f"Expected NO pm:reviewer-divergence observation on agree, got: {div_obs}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Thinking-model parse + truncation loudness
+# (lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0 Scope 2:
+# "the witness has the SAME one-field read... masked today only by its 4096
+# budget and its grammar constraint. The shared helper genuinely repairs it
+# too rather than merely tidying it.")
+# ---------------------------------------------------------------------------
+
+class TestThinkingModelParseAndTruncation:
+
+    def test_reasoning_only_content_none_still_parses(self):
+        """content=None but reasoning carries the JSON payload — the shared
+        helper's fallback makes this parse where the old content-only read
+        would have raised."""
+        payload = json.dumps({"verdict": "clean", "issues": [], "confidence": 0.9})
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "model": "gravitywell-27b",
+            "choices": [{"message": {"content": None, "reasoning": payload}, "finish_reason": "stop"}],
+        }
+        resp.raise_for_status = MagicMock()
+
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
+            result = run_local_reviewer_witness(
+                diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
+                spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
+            )
+
+        assert result.verdict == "clean"
+        assert result.json_valid is True
+        assert result.truncated is False
+
+    def test_finish_reason_length_reports_truncated_distinct_from_other_failures(self):
+        """finish_reason=='length' is reported as a distinct truncated=True
+        failure, not lumped in with a generic local_failed / empty-content
+        classification."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "model": "gravitywell-27b",
+            "choices": [{"message": {"content": None, "reasoning": "cut off mid-thought"}, "finish_reason": "length"}],
+        }
+        resp.raise_for_status = MagicMock()
+
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
+            result = run_local_reviewer_witness(
+                diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
+                spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
+            )
+
+        assert result.agreement == "local_failed"
+        assert result.truncated is True
+        assert "truncat" in (result.error or "").lower()
+
+    def test_truncated_field_defaults_false_on_success(self):
+        resp = _make_httpx_response("clean", [], 0.95)
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=resp),
+        ):
+            result = run_local_reviewer_witness(
+                diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
+                spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
+            )
+        assert result.truncated is False
+        assert result.to_dict()["truncated"] is False
+
+    def test_truncated_is_visibly_different_from_connect_error(self):
+        """A reader must be able to tell 'cut off' from 'unreachable' without
+        reading code — assert the two failure shapes differ."""
+        import httpx as httpx_mod
+
+        trunc_resp = MagicMock()
+        trunc_resp.status_code = 200
+        trunc_resp.json.return_value = {
+            "model": "gravitywell-27b",
+            "choices": [{"message": {"content": None, "reasoning": "partial"}, "finish_reason": "length"}],
+        }
+        trunc_resp.raise_for_status = MagicMock()
+
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", return_value=trunc_resp),
+        ):
+            truncated_result = run_local_reviewer_witness(
+                diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
+                spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
+            )
+
+        with (
+            patch("lapis_pm.local_reviewer_witness.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=httpx_mod.ConnectError("refused")),
+        ):
+            unavailable_result = run_local_reviewer_witness(
+                diff_text=FAKE_DIFF, repo="lapis-pm", pr_number=7,
+                spec_summary="spec", claude_verdict=_CLAUDE_CLEAN,
+            )
+
+        assert truncated_result.truncated is True
+        assert unavailable_result.truncated is False
+        assert truncated_result.error != unavailable_result.error

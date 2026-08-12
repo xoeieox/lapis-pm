@@ -105,6 +105,73 @@ class TestStarvedLegs:
         assert is_panel_starved(v) is True
         assert len(starved_legs(v)) == 1
 
+    def test_corroboration_truncated_leg_status_counts_as_down(self):
+        """lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0
+        DoD #4: a truncated leg is still a down leg — panel_starvation's
+        existing any-leg-down behaviour must be preserved for the new
+        leg_status value."""
+        v = _healthy_verdict()
+        v["corroboration_result"] = {
+            "verdict": "uncertain",
+            "claim": "(response truncated)",
+            "notes": "LLM response truncated (finish_reason=length): model exhausted its token budget",
+            "leg_status": "truncated",
+            "cross_node_divergence": "agree",
+        }
+        assert "corroboration" in starved_legs(v)
+        assert is_panel_starved(v) is True
+
+    def test_truncated_and_substrate_unavailable_are_both_down_but_distinct_notes(self):
+        """A reader must be able to tell 'the model was cut off' from 'the
+        machine was unreachable' without reading code — both count as down,
+        but the underlying claim/notes differ."""
+        truncated = _healthy_verdict()
+        truncated["corroboration_result"] = {
+            "verdict": "uncertain",
+            "claim": "(response truncated)",
+            "notes": "LLM response truncated (finish_reason=length)",
+            "leg_status": "truncated",
+            "cross_node_divergence": "agree",
+        }
+        unavailable = _healthy_verdict()
+        unavailable["corroboration_result"] = {
+            "verdict": "uncertain",
+            "claim": "(substrate unavailable)",
+            "notes": "LLM unavailable: ConnectionError: refused",
+            "leg_status": "substrate_unavailable",
+            "cross_node_divergence": "agree",
+        }
+
+        assert "corroboration" in starved_legs(truncated)
+        assert "corroboration" in starved_legs(unavailable)
+        assert truncated["corroboration_result"]["claim"] != unavailable["corroboration_result"]["claim"]
+        assert truncated["corroboration_result"]["leg_status"] != unavailable["corroboration_result"]["leg_status"]
+
+    def test_corroboration_ok_leg_status_with_legacy_claim_marker_absent_is_not_starved(self):
+        """leg_status='ok' takes precedence over any claim-string heuristics."""
+        v = _healthy_verdict()
+        v["corroboration_result"] = {
+            "verdict": "clean",
+            "claim": "",
+            "notes": None,
+            "leg_status": "ok",
+            "cross_node_divergence": "agree",
+        }
+        assert "corroboration" not in starved_legs(v)
+
+    def test_legacy_verdict_without_leg_status_falls_back_to_claim_marker(self):
+        """Backward compat: a verdict predating the leg_status field (no key
+        at all) still classifies correctly via the old claim-string check."""
+        v = _healthy_verdict()
+        v["corroboration_result"] = {
+            "verdict": "uncertain",
+            "claim": "(substrate unavailable)",
+            "notes": "LLM unavailable: AttributeError",
+            "cross_node_divergence": "agree",
+            # no "leg_status" key — simulates a pre-existing stored verdict
+        }
+        assert "corroboration" in starved_legs(v)
+
 
 class TestAttenuateConfidence:
     def test_zero_legs_down_leaves_confidence_unchanged(self):

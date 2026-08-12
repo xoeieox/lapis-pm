@@ -40,20 +40,30 @@ def _local_witness_down(verdict: dict) -> bool:
 
 
 def _corroboration_down(verdict: dict) -> bool:
-    """True if the corroboration (node1) pass could not reach substrate/LLM.
+    """True if the corroboration (node1) pass could not reach substrate/LLM,
+    or reached it but was cut off before producing a usable answer.
 
-    `corroboration_adapter.LapisPMReviewerAdapter.score()` sets
-    `claim="(substrate unavailable)"` on both of its failure paths (probed
-    node unreachable, or any exception from the LLM call) — see
-    corroboration_adapter.py ~:352-392. A verdict of "uncertain" because
-    there were simply no identifiers to check ("(no identifiers extracted)")
-    is a legitimate clean result, not starvation, so this checks the claim
-    marker rather than the verdict value. Absence of the block entirely
+    `corroboration_adapter.LapisPMReviewerAdapter.score()` sets `leg_status`
+    to something other than "ok" on every failure path — "substrate_unavailable"
+    (probed node unreachable, or any exception from the LLM call) and
+    "truncated" (HTTP 200 but finish_reason=="length" cut the model off; see
+    lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0) both
+    count as down. leg_status is the field consumers must read instead of
+    string-matching `claim`/`notes` prose (see CorroborationResult's own
+    docstring) — a verdict of "uncertain" because there were simply no
+    identifiers to check ("(no identifiers extracted)") is leg_status="ok", a
+    legitimate clean result, not starvation. Absence of the block entirely
     (pass never attached) also counts as down.
+
+    Falls back to the pre-leg_status claim-marker check for verdicts written
+    before that field existed (no `leg_status` key at all).
     """
     corr = verdict.get("corroboration_result")
     if not corr:
         return True
+    leg_status = corr.get("leg_status")
+    if leg_status is not None:
+        return leg_status != "ok"
     return corr.get("claim") == "(substrate unavailable)"
 
 

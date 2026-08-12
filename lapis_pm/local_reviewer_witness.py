@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
+from lapis_pm.completion_text import ExtractedText, extract_completion_text
 from lapis_pm.node_probe import node_reachable
 
 _PROBE_TIMEOUT = 3    # seconds for connect probe before POST
@@ -166,6 +167,12 @@ class LocalReviewerWitnessResult:
     prompt_hash: str           # sha256 of the prompt (for provenance)
     dispatched_at: str         # ISO8601
     error: str | None          # populated on failure
+    # True iff the call reached the substrate (HTTP 200) but finish_reason=="length"
+    # cut the model off before it produced a usable answer — a distinct condition
+    # from every other local_failed cause (unreachable endpoint, HTTP error,
+    # malformed JSON). See lapis-pm-corroboration-thinking-parse-and-truncation-
+    # loudness-v0. Default False for every non-truncation failure and every success.
+    truncated: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -179,6 +186,7 @@ class LocalReviewerWitnessResult:
             "prompt_hash": self.prompt_hash,
             "dispatched_at": self.dispatched_at,
             "error": self.error,
+            "truncated": self.truncated,
         }
 
 
@@ -270,7 +278,9 @@ def run_local_reviewer_witness(
     )
     prompt_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
-    def _make_failure(latency_ms: int, error: str) -> LocalReviewerWitnessResult:
+    def _make_failure(
+        latency_ms: int, error: str, *, model: str | None = None, truncated: bool = False,
+    ) -> LocalReviewerWitnessResult:
         return LocalReviewerWitnessResult(
             verdict=None,
             issues=[],
@@ -278,14 +288,15 @@ def run_local_reviewer_witness(
             agreement="local_failed",
             latency_ms=latency_ms,
             json_valid=False,
-            model=None,
+            model=model,
             prompt_hash=prompt_hash,
             dispatched_at=dispatched_at,
             error=error,
+            truncated=truncated,
         )
 
-    def _do_post(use_grammar: bool) -> tuple[dict | None, int, str | None, str | None]:
-        """POST to endpoint. Returns (resp_json, latency_ms, raw_content, error)."""
+    def _do_post(use_grammar: bool) -> tuple[dict | None, int, ExtractedText | None, str | None]:
+        """POST to endpoint. Returns (resp_json, latency_ms, extracted_text, error)."""
         body: dict = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
@@ -310,8 +321,9 @@ def run_local_reviewer_witness(
                 return None, lat, None, f"HTTP {resp.status_code}"
             resp.raise_for_status()
             rj = resp.json()
-            raw = rj["choices"][0]["message"]["content"]
-            return rj, lat, raw, None
+            choice0 = rj["choices"][0]
+            extracted = extract_completion_text(choice0.get("message"), choice0.get("finish_reason"))
+            return rj, lat, extracted, None
         except httpx.TimeoutException as exc:
             return None, int((time.time() - start) * 1000), None, f"TimeoutException: {exc}"
         except httpx.ConnectError as exc:
@@ -328,27 +340,39 @@ def run_local_reviewer_witness(
         )
 
     # First attempt: with grammar (json_schema)
-    resp_json, latency_ms, raw, err = _do_post(_use_grammar)
+    resp_json, latency_ms, extracted, err = _do_post(_use_grammar)
 
     # Graceful degradation: retry once with json_object if 4xx on first attempt
     if err is not None and err.startswith("HTTP ") and _use_grammar:
-        resp_json2, lat2, raw2, err2 = _do_post(False)
+        resp_json2, lat2, extracted2, err2 = _do_post(False)
         latency_ms += lat2
         if err2 is not None:
             return _make_failure(latency_ms, f"json_schema: {err}; json_object: {err2}")
-        resp_json, raw, err = resp_json2, raw2, None
+        resp_json, extracted, err = resp_json2, extracted2, None
 
     if err is not None:
         return _make_failure(latency_ms, err)
 
-    if not raw:
-        return _make_failure(latency_ms, "empty response content")
-
     # Extract model name from response
     resp_model = resp_json.get("model") if resp_json else None
 
+    if extracted is not None and extracted.truncated:
+        # Truncation is a named failure, not a substrate claim: the call reached
+        # the substrate (HTTP 200) but finish_reason=="length" cut the model off —
+        # visibly different from every other local_failed cause.
+        return _make_failure(
+            latency_ms,
+            "LLM response truncated (finish_reason=length): model exhausted its "
+            "token budget before producing a complete answer",
+            model=resp_model,
+            truncated=True,
+        )
+
+    if extracted is None or not extracted.has_text:
+        return _make_failure(latency_ms, "empty response content", model=resp_model)
+
     # Parse response
-    cleaned = _clean_model_output(raw)
+    cleaned = _clean_model_output(extracted.text)
     try:
         parsed = json.loads(cleaned)
         json_valid = True

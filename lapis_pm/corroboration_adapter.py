@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from archetypes_core.corroboration import Citation
+from lapis_pm.completion_text import NO_USABLE_TEXT, extract_completion_text
 from lapis_pm.node_probe import node_reachable
 
 
@@ -55,7 +56,11 @@ class CorroborationResult:
     # empty on a healthy pass (LLM omitted `summary`) and non-empty on a dead leg
     # (failure-marker prose) — leg_status is the field consumers must read instead
     # of string-matching either one. See lapis-pm-corroboration-producer-leg-status-v1.
-    leg_status: Literal["ok", "substrate_unavailable", "pass_failed"] = "ok"
+    # "truncated" (lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0):
+    # the call reached the substrate (HTTP 200) but finish_reason=="length" cut the
+    # model off — a distinct condition from "substrate_unavailable" (never reached
+    # the substrate at all). Both are down legs for panel_starvation purposes.
+    leg_status: Literal["ok", "substrate_unavailable", "pass_failed", "truncated"] = "ok"
 
     def to_dict(self) -> dict:
         return {
@@ -227,9 +232,22 @@ def _llm_url() -> str:
     return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
 
 
-_LLM_TIMEOUT = 45  # seconds; Haiku-scale call, should be fast
+# _LLM_TIMEOUT stays at 45s deliberately — measured live on the GravityWell seat
+# 2026-08-12 (corroboration-shaped prompt, max_tokens=4096, grammar on and off):
+# both arms finished in 11-16s, well under this budget. A token cap is a runaway
+# guard, not a size estimate (Erah, 2026-08-12) — raising the timeout here would be
+# sizing by precaution rather than measurement. See lapis-pm-corroboration-thinking-
+# parse-and-truncation-loudness-v0 Scope 5.
+_LLM_TIMEOUT = 45  # seconds; measured 11-16s live, unchanged from pre-fix value
 _PROBE_TIMEOUT = 3   # seconds for connect probe before POST
 _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _LLM_TIMEOUT)
+
+# A runaway guard, not a size estimate: too-small silently corrupts every call by
+# starving a thinking model's reasoning channel before it reaches an answer (the
+# root cause this unit repairs), too-large only costs when a model actually reaches
+# it. Raised from 512 toward local_reviewer_witness.py's proven 4096 — same seat,
+# same day, measured to parse cleanly at this budget.
+_MAX_TOKENS = 4096
 
 # Node 2 — MacBook Pro M4 Max / Gemma-3-27b (MLX, port 8080)
 # Architecturally distinct from GravityWell Qwen (formerly StarHouse Qwen, repointed
@@ -237,6 +255,34 @@ _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _L
 _NODE2_URL = "http://100.124.203.15:8080/v1/chat/completions"
 _NODE2_MODEL = "/Users/user/Tools/mlx-models/gemma-3-27b-it-4bit"
 _NODE2_TIMEOUT = 120  # MLX on M4 Max is slower than StarHouse llama.cpp; large prompts approach 60s
+
+# Grammar constraint, copied from local_reviewer_witness.py's REVIEWER_JSON_SCHEMA
+# shape — proven on this exact GravityWell seat 2026-08-12 (measured FASTER than no
+# grammar: 11.0s vs 15.6s, ~30% less reasoning). Stops the model reasoning freely
+# into an unusable response at any budget; more important than the budget raise.
+CORROBORATION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["clean", "flagged", "uncertain"]},
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "identifier": {"type": "string"},
+                    "drift_class": {
+                        "type": "string",
+                        "enum": ["missing_referent", "stale_referent", "renamed_referent", "none"],
+                    },
+                    "notes": {"type": "string"},
+                },
+                "required": ["identifier", "drift_class", "notes"],
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["verdict", "claims", "summary"],
+}
 
 
 class LapisPMReviewerAdapter:
@@ -345,17 +391,30 @@ class LapisPMReviewerAdapter:
             f"No prose outside the JSON."
         )
 
+        def _build_body(use_grammar: bool) -> dict:
+            body: dict = {
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": _MAX_TOKENS,
+            }
+            if node_model:
+                body["model"] = node_model
+            if use_grammar:
+                body["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "CorroborationVerdict",
+                        "strict": True,
+                        "schema": CORROBORATION_JSON_SCHEMA,
+                    },
+                }
+            return body
+
         try:
             import httpx
             _url = node_url or _llm_url()
             _timeout = node_timeout or _LLM_TIMEOUT
-            _body: dict = {
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 512,
-            }
-            if node_model:
-                _body["model"] = node_model
+
             if not node_reachable(_url, timeout=_PROBE_TIMEOUT):
                 self._last_model = None
                 self._last_prompt_hash = None
@@ -369,10 +428,58 @@ class LapisPMReviewerAdapter:
                     notes=f"node unreachable (probe {_PROBE_TIMEOUT}s): {_url}",
                     leg_status="substrate_unavailable",
                 )
-            resp = httpx.post(_url, json=_body, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
+
+            resp = httpx.post(_url, json=_build_body(True), timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
+            if resp.status_code in (400, 422):
+                # Grammar-not-supported vs validation-failed, per the precedent at
+                # local_reviewer_witness.py:330-345: an HTTP 4xx on the first
+                # (grammar-carrying) attempt means the endpoint rejects json_schema —
+                # degrade to a plain call rather than hard-failing a seat that can't
+                # take the grammar (e.g. node2/MLX). One retry, never a hard fail.
+                resp = httpx.post(_url, json=_build_body(False), timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
             resp.raise_for_status()
             resp_json = resp.json()
-            content = resp_json["choices"][0]["message"]["content"].strip()
+
+            choice0 = resp_json["choices"][0]
+            extracted = extract_completion_text(choice0.get("message"), choice0.get("finish_reason"))
+
+            if extracted.truncated:
+                # Truncation is a named failure, not a substrate claim: the call
+                # reached the substrate (HTTP 200) but finish_reason=="length" cut
+                # the model off before it produced a usable answer — visibly
+                # different from "the machine was unreachable".
+                self._last_model = None
+                self._last_prompt_hash = None
+                return CorroborationResult(
+                    verdict="uncertain",
+                    claim="(response truncated)",
+                    citations=[],
+                    freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                    scope_id=scope_id,
+                    drift_class=None,
+                    notes=(
+                        f"LLM response truncated (finish_reason=length): model "
+                        f"exhausted its {_MAX_TOKENS}-token budget before producing "
+                        f"a complete answer"
+                    ),
+                    leg_status="truncated",
+                )
+
+            if not extracted.has_text:
+                self._last_model = None
+                self._last_prompt_hash = None
+                return CorroborationResult(
+                    verdict="uncertain",
+                    claim="(substrate unavailable)",
+                    citations=[],
+                    freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                    scope_id=scope_id,
+                    drift_class=None,
+                    notes=f"LLM unavailable: {NO_USABLE_TEXT}",
+                    leg_status="substrate_unavailable",
+                )
+
+            content = extracted.text.strip()
             # Strip markdown fences if present
             if content.startswith("```"):
                 content = re.sub(r"^```(?:json)?\s*", "", content)
@@ -396,7 +503,9 @@ class LapisPMReviewerAdapter:
                 freshness_stamp=datetime.now(timezone.utc).isoformat(),
                 scope_id=scope_id,
                 drift_class=None,
-                notes=f"LLM unavailable: {type(exc).__name__}",
+                # Message included, not just the exception class name — a bare
+                # class name is what hid this defect for over a week.
+                notes=f"LLM unavailable: {type(exc).__name__}: {exc}",
                 leg_status="substrate_unavailable",
             )
 

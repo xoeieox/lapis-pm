@@ -40,6 +40,39 @@ class TestClassifyResponse:
         state, _ = cs.classify_response(200, {"choices": [{"message": {"content": ""}}]}, None)
         assert state == cs.STATE_EMPTY_CONTENT
 
+    def test_200_with_reasoning_only_is_healthy_not_empty(self):
+        """lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0
+        Gate outcome §4: this site is a health classifier, not a parse site —
+        a thinking seat that reasons but never emits `content` was being
+        misclassified as empty (same false-dead-seat class the corroboration
+        leg had). content=None + reasoning populated must now read healthy."""
+        state, detail = cs.classify_response(
+            200,
+            {"choices": [{"message": {"content": None, "reasoning": "pong (reasoned)"}}]},
+            None,
+        )
+        assert state == cs.STATE_HEALTHY
+        assert detail == "200, non-empty content"
+
+    def test_200_with_reasoning_content_only_is_healthy(self):
+        """llama.cpp's reasoning_content convention is honoured too."""
+        state, _ = cs.classify_response(
+            200,
+            {"choices": [{"message": {"content": "", "reasoning_content": "pong"}}]},
+            None,
+        )
+        assert state == cs.STATE_HEALTHY
+
+    def test_200_with_none_of_the_three_fields_is_still_empty_content(self):
+        """The fix widens the fallback; it does not stop detecting a genuinely
+        empty response."""
+        state, _ = cs.classify_response(
+            200,
+            {"choices": [{"message": {"content": None, "reasoning": None}}]},
+            None,
+        )
+        assert state == cs.STATE_EMPTY_CONTENT
+
     def test_429_is_transient_throttled_never_terminal(self):
         """The core correction: x-ratelimit-limit: 0 does NOT mean dead
         account. A 429 must classify as upstream_throttled (retryable),

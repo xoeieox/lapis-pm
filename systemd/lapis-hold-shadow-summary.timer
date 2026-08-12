@@ -1,0 +1,9 @@
+[Unit]
+Description=lapis-pm hold-shadow Thursday summary — groups the overnight shadow log by classification and deposits one Desk gem (06:45 America/Los_Angeles)
+
+[Timer]
+OnCalendar=Thu *-*-* 06:45:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target

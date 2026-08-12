@@ -50,6 +50,11 @@ HELD_PATTERNS = [
     # The audit instrument: the checklist Erah follows when reviewing the machine's work.
     # Both copies — the flat legacy file and the live SKILL.md — or the sibling is the escape.
     re.compile(r"^\.claude/skills/pm-pr-review(\.md|/SKILL\.md)$"),
+    # lapis-pm-hold-shadow-observer-v0: the hold-shadow classification rules table —
+    # what an enforce-mode successor would eventually act on. Held for the same
+    # reason this file holds itself just above: the fixer must not autonomously
+    # edit the boundary Erah's Thursday reading is measuring.
+    re.compile(r"^lapis_pm/hold_shadow_rules\.py$"),
 ]
 
 MAX_AUTO_LOC = 400

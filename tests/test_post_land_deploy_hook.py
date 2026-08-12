@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import re
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -3082,6 +3083,14 @@ class TestConductorNightPlanDeploy:
         ):
             assert fname in pm_core._CONDUCTOR_NIGHT_SCRIPTS
 
+    def test_manifest_includes_gw_phase_models(self):
+        """lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0: gw_phase_models.py
+        is a true night_plan.py closure member (a top-level import since 2026-08-01,
+        c35e8f2) — it belongs in _CONDUCTOR_NIGHT_SCRIPTS itself, NOT in the new
+        sibling _CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS manifest."""
+        assert "gw_phase_models.py" in pm_core._CONDUCTOR_NIGHT_SCRIPTS
+        assert "gw_phase_models.py" not in pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
+
     def test_fixture_closure_matches_manifest(self):
         """Always-on drift guard: recompute the transitive scripts/-local import
         closure from the committed fixture (seed = {night_plan, night_coordinator,
@@ -3121,7 +3130,7 @@ class TestConductorNightPlanDeploy:
             "idea_collider_night_batch", "podcast_engine", "kami_producer",
             "kami_batch", "kami_selector", "kami_sweep", "kami_adjudicator",
             "kami_small", "enlightenment_producer", "enlightenment_reader",
-            "research_headings",
+            "research_headings", "gw_phase_models",
         ]
         for mod in fixture_modules:
             sys.modules.pop(mod, None)
@@ -3637,6 +3646,160 @@ class TestConductorNightPlanDeploy:
         result_yaml = (dest_dir / "night_producers.yaml").read_text()
         assert "idea_collider_night_batch_producer" in result_yaml
         assert result_yaml == yaml_content
+
+
+class TestConductorBrixGwRuntimeDeploy:
+    """Tests for lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0.
+
+    Adds the BRIX-side GW actuator family (doorman, flip-controller, gw_topology's
+    own helper-hash reference copy, scout-night-pre) to the post-land local-copy
+    machinery, as a manifest sibling to _CONDUCTOR_NIGHT_SCRIPTS delivered by the
+    SAME _deploy_conductor_night_scripts copy pass (see that function's docstring
+    for why this is one combined pass, not a second independent call: R10
+    single-alert-ownership). The manifest itself stays separate because this
+    family sits outside night_plan.py's producer-import closure, so it cannot be
+    a naive append to _CONDUCTOR_NIGHT_SCRIPTS (see TestConductorNightPlanDeploy's
+    exact-equality tests above).
+    """
+
+    # --- manifest membership ---
+
+    @pytest.mark.parametrize("fname", [
+        "gw_topology.py", "gw_actuator.py", "gw_host_safety.py", "flip_controller.py",
+        "gw-topology", "gw-night-pre.py", "gw-night-post.py", "scout-night-pre.py",
+    ])
+    def test_manifest_includes_gw_runtime_family_member(self, fname):
+        assert fname in pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
+
+    def test_manifest_is_exactly_the_eight_files(self):
+        """No more, no fewer — the deliberately-out-of-scope files
+        (gw_topology_cache.py, gw_enforce_rearm_ab.py, gw-serve, gw-dual) must not
+        be present."""
+        assert set(pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS) == {
+            "gw_topology.py", "gw_actuator.py", "gw_host_safety.py",
+            "flip_controller.py", "gw-topology", "gw-night-pre.py",
+            "gw-night-post.py", "scout-night-pre.py",
+        }
+
+    def test_manifest_disjoint_from_night_scripts(self):
+        """The two manifests must not overlap — each file has exactly one owner."""
+        assert not (
+            set(pm_core._CONDUCTOR_NIGHT_SCRIPTS) & set(pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS)
+        )
+
+    # --- real-filesystem copy: delivery + mode preservation ---
+
+    def test_real_fs_copy_delivers_all_files_with_modes_preserved(self, tmp_path):
+        """DoD (scope §3): a real-filesystem copy test confirming the new family
+        lands with modes preserved — copystat preserves the repo mode exactly as
+        the night-plan family's own copy mechanics already do. Driven through the
+        actual production entry point (_deploy_conductor_night_scripts), which now
+        carries both manifests in one pass."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+
+        contents = {}
+        modes = {}
+        for i, fname in enumerate(pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS):
+            content = f"# {fname} v1\n"
+            contents[fname] = content
+            mode = 0o755 if i % 2 == 0 else 0o644
+            modes[fname] = mode
+            path = src_dir / fname
+            path.write_text(content)
+            path.chmod(mode)
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        log_text = log_file.read_text()
+        for fname in pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS:
+            dest_path = dest_dir / fname
+            assert dest_path.read_text() == contents[fname]
+            assert stat.S_IMODE(dest_path.stat().st_mode) == modes[fname], (
+                f"{fname} mode not preserved by copystat"
+            )
+            assert f"conductor:scripts/{fname}" in log_text
+        assert "created" in log_text
+
+    def test_fetch_fail_skips_copy_of_both_manifests_and_alerts_once(self, tmp_path):
+        """R10 single-alert-ownership, now covering both manifests: a fetch
+        failure must skip BOTH families' copies (never deliver stale content) and
+        alert exactly once — not once per manifest."""
+        from agents_core.notify import Priority
+
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('v1')")
+        (src_dir / "gw_topology.py").write_text("print('v1')")
+
+        notify_calls = []
+
+        def fake_notify(message, title, priority, **kwargs):
+            notify_calls.append(priority)
+            return True
+
+        fake_run = _conductor_git_fake_run(fetch_rc=1, fetch_stderr="could not resolve host")
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch("agents_core.notify.send_notification", fake_notify),
+        ):
+            pm_core._deploy_conductor_night_scripts(trigger="test")
+
+        assert list(dest_dir.iterdir()) == [], "fetch-fail must copy zero files, not stale content"
+        assert len(notify_calls) == 1, f"expected exactly one alert, got {notify_calls}"
+        assert notify_calls[0] == Priority.NORMAL
+
+    def test_fired_from_post_land_hook_alongside_gw_host_install(self, tmp_path):
+        """Scope §2: fired from _post_land_deploy_hook for repo=='conductor'
+        alongside the existing GW-host-script-install call — both local-copy
+        manifests land in the same pass (DoD 3's 'same pass' requirement), and the
+        cross-host GW-host install still runs independently."""
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        log_file = tmp_path / "deploy-log.md"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        (src_dir / "night_plan.py").write_text("print('night')")
+        (src_dir / "gw_topology.py").write_text("print('topology')")
+        (src_dir / "gw-topology").write_text("#!/bin/bash\necho hi\n")
+
+        fake_run = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+
+        with (
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            # host-script-deploy-on-land-v0's cross-host install also fires for
+            # repo=="conductor" — hermetic isolation for its own drift ledger,
+            # exactly as _DEPLOY_LOG is isolated above.
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-drift-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+        ):
+            pm_core._post_land_deploy_hook("conductor")
+
+        assert (dest_dir / "night_plan.py").read_text() == "print('night')"
+        assert (dest_dir / "gw_topology.py").read_text() == "print('topology')"
+        assert (dest_dir / "gw-topology").read_text() == "#!/bin/bash\necho hi\n"
 
 
 # ---------------------------------------------------------------------------

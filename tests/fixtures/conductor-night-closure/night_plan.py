@@ -11,6 +11,10 @@ Also carries `import night_plan_manager` (real file :2047 imports it deferred,
 inside a function, behind NIGHT_PLAN_MANAGER_ENABLED; reproduced here at top
 level per night-manager-deploy-manifest-wiring-v0 R2b — _IMPORT_RE is
 indent-agnostic so the simpler top-level form is an equally valid edge).
+
+Also carries `from gw_phase_models import GW_SERVED_MODEL_BY_PHASE` (real file
+:53, a top-level import since 2026-08-01 / c35e8f2 —
+lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import importlib
 
 from agents_core.slots import IS_MASTER, TERMINAL_STATUSES, SlotStore  # noqa: F401
+from gw_phase_models import GW_SERVED_MODEL_BY_PHASE  # noqa: F401
 import night_plan_manager  # noqa: F401
 
 

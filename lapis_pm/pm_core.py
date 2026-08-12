@@ -515,6 +515,9 @@ _CONDUCTOR_SCRIPTS_DEST = "/data/agents/scripts"
 # unmanifested file is a silent runtime gap the next conductor merge will not fill.
 _CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = (
     "night_plan.py",
+    "gw_phase_models.py",  # night_plan.py's own top-level import since 2026-08-01
+                            # (c35e8f2) — GW phase->served-model map, a true leaf
+                            # (lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0)
     "night_coordinator.py",
     "gpu_lane.py",
     "scout_producer.py",
@@ -576,6 +579,52 @@ _CONDUCTOR_GW_HOST_SCRIPTS: tuple[_GwHostScript, ...] = (
     _GwHostScript("gw-topology", "/usr/local/sbin/gw-topology", 0o755, "root:root", True, True),
     _GwHostScript("gw-idle-suspend.sh", "/usr/local/sbin/gw-idle-suspend.sh", 0o755, "root:root", False, True),
     _GwHostScript("gw_resume_grace.py", "/usr/local/sbin/gw_resume_grace.py", 0o755, "root:root", False, False),
+)
+
+
+# ---------------------------------------------------------------------------
+# BRIX-side GW actuator runtime closure
+# (lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0)
+# ---------------------------------------------------------------------------
+# Local sibling of _CONDUCTOR_NIGHT_SCRIPTS above: same source of truth
+# (_CONDUCTOR_SCRIPTS_SRC), same destination (_CONDUCTOR_SCRIPTS_DEST —
+# /data/agents/scripts), same local-copy mechanics (_copy_one_conductor_script),
+# and copied in the SAME pass as _CONDUCTOR_NIGHT_SCRIPTS by
+# _deploy_conductor_night_scripts_impl (one shared D2/D3 freshness-gate call, so a
+# fetch failure pages once — R10 — not twice). A SEPARATE manifest, not an append
+# to _CONDUCTOR_NIGHT_SCRIPTS itself, because this family's consumers (doorman's
+# _wake_generic_posture, flip-controller.service, gw_topology.py's own
+# _local_helper_self_hash reference copy, scout-night.service) sit outside
+# night_plan.py's producer-import closure — the two exact-equality closure tests
+# above (test_fixture_closure_matches_manifest / test_live_conductor_closure_
+# matches_fixture) would fail on a naive append.
+#
+# A plain filename tuple (like _CONDUCTOR_NIGHT_SCRIPTS), not a _GwHostScript
+# NamedTuple: every entry shares one destination directory, so the per-entry
+# dest/mode/owner fields _CONDUCTOR_GW_HOST_SCRIPTS needs (different destination,
+# a remote host) are not needed here.
+#
+# `gw-topology` (no .py — the bash helper) is delivered here as the hash-reference
+# copy _local_helper_self_hash reads on every reach() (gw_topology.py:1838-1842);
+# it is NEVER executed on BRIX, only read for its hash.
+#
+# GROWTH OBLIGATION (mirrors the _CONDUCTOR_NIGHT_SCRIPTS growth-obligation
+# comment above): any new conductor scripts/-local file the doorman/
+# flip-controller/gw_topology runtime imports on BRIX MUST be added here, or it
+# is a silent hand-copy gap — the defect this manifest closes.
+#
+# Deliberately excluded (spec Out-of-scope): gw_topology_cache.py (its systemd
+# unit is not installed — inert), gw_enforce_rearm_ab.py (experiment artifact,
+# no service consumer), gw-serve/gw-dual (no repo source).
+_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS: tuple[str, ...] = (
+    "gw_topology.py",
+    "gw_actuator.py",
+    "gw_host_safety.py",
+    "flip_controller.py",
+    "gw-topology",
+    "gw-night-pre.py",
+    "gw-night-post.py",
+    "scout-night-pre.py",
 )
 
 # D4: host-reachability policy — never wake, always retry on the next land.
@@ -1154,13 +1203,16 @@ def _write_conductor_copy_log(fname: str, old_repr: str, new_sha: str, trigger: 
         print(f"[post-land-deploy:conductor] deploy log write failed: {e}", file=sys.stderr)
 
 
-def _conductor_copy_would_change(src_dir: Path, dest_dir: Path) -> bool:
+def _conductor_copy_would_change(manifest: tuple[str, ...], src_dir: Path, dest_dir: Path) -> bool:
     """True if at least one manifested file's copy would create-or-update dest.
 
     Used only to pick alert priority when the R7 fetch itself fails (NORMAL if real
     delivery was blocked, LOW if the runtime already matches the local source).
+    `manifest` is threaded explicitly (not read off a module global) so this is
+    shared, unmodified, between the _CONDUCTOR_NIGHT_SCRIPTS and
+    _CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS callers.
     """
-    for fname in _CONDUCTOR_NIGHT_SCRIPTS:
+    for fname in manifest:
         src = src_dir / fname
         dst = dest_dir / fname
         if not src.exists():
@@ -1209,6 +1261,15 @@ def _copy_one_conductor_script(fname: str, src_dir: Path, dest_dir: Path, trigge
 
 def _deploy_conductor_night_scripts(trigger: str = "post-land-hook") -> None:
     """Copy the night-plan script closure into the /data/agents/scripts runtime.
+
+    lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0: this call ALSO carries
+    the BRIX-side GW actuator family (_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS) in the
+    same combined copy pass, deliberately — not a second independent function —
+    so a source fetch failure or dirty-source condition still pages exactly once
+    (R10 single-alert-ownership; see TestConductorNightPlanDeploy's
+    test_*_via_full_hook_emits_exactly_one_alert tests). The two manifests remain
+    separate tuples (_CONDUCTOR_NIGHT_SCRIPTS stays the exact night_plan.py import
+    closure the two closure tests assert against); only the copy pass is shared.
 
     R3/R7 — source-freshness gate: this function does its OWN `git fetch origin main`
     against the conductor deploy clone before copying anything. A fetch failure means
@@ -1343,13 +1404,16 @@ def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
     clone = _CONDUCTOR_DEPLOY_CLONE
     src_dir = Path(_CONDUCTOR_SCRIPTS_SRC)
     dest_dir = Path(_CONDUCTOR_SCRIPTS_DEST)
+    # lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0: one combined pass over
+    # both manifests — see the docstring above for why this isn't two functions.
+    manifest = _CONDUCTOR_NIGHT_SCRIPTS + _CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
 
     is_fresh, reason = _conductor_source_freshness_gate(clone)
     if not is_fresh:
         is_fetch_reason = reason.startswith(("fetch_failed:", "fetch_error:"))
         if is_fetch_reason:
             _, _, err_detail = reason.partition(":")
-            priority_low = not _conductor_copy_would_change(src_dir, dest_dir)
+            priority_low = not _conductor_copy_would_change(manifest, src_dir, dest_dir)
             print(
                 f"[post-land-deploy:conductor] source fetch failed ({err_detail}); "
                 f"night-plan copy SKIPPED, runtime preserved",
@@ -1383,7 +1447,7 @@ def _deploy_conductor_night_scripts_impl(trigger: str) -> None:
         return
 
     # --- R2/R9: source verified fresh — copy the closure, per-file isolated. ---
-    for fname in _CONDUCTOR_NIGHT_SCRIPTS:
+    for fname in manifest:
         try:
             # D3: per-file tracked-and-unmodified-vs-HEAD check, in addition to the
             # tree-level gate above — a manifested file that is itself untracked or
@@ -2299,6 +2363,11 @@ def _post_land_deploy_hook(
     # below (R5 — night scripts are timer-oneshot, no restart needed), so this branch
     # does not interfere with the restart logic that follows.
     if repo == "conductor":
+        # lapis-pm-conductor-brix-gw-runtime-deploy-manifest-v0: _deploy_conductor_
+        # night_scripts below now also carries the GW actuator family
+        # (_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS) in the SAME copy pass — one combined
+        # pass, not a second independent call, so a source fetch failure still
+        # pages exactly once (R10 single-alert-ownership, see the closure tests).
         _deploy_conductor_night_scripts(trigger=trigger)
         # host-script-deploy-on-land-v0: cross-host sibling — installs conductor's
         # repo-held GravityWell scripts (gw-topology, gw-idle-suspend.sh) onto

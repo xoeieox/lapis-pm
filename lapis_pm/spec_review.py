@@ -3336,7 +3336,7 @@ def run_spec_review(
     if grounding_status == "verified":
         grounding_resolved_sha, grounding_age_days = _resolve_grounding_sha_and_age(repo)
 
-    return _build_brief(
+    brief = _build_brief(
         council_raw=council_raw,
         spec_path=spec_path,
         parsed_target_id=parsed_target_id,
@@ -3364,3 +3364,11 @@ def run_spec_review(
         grounding_age_days=grounding_age_days,
         consumer_criterion=consumer_criterion,
     )
+    # lapis-pm-hold-shadow-observer-v0: act-free shadow record of this gate
+    # outcome (SHADOW MODE ONLY, Erah 2026-08-12). Hooked here — inside
+    # run_spec_review, at its single return point — so every invoker
+    # (interactive CLI, the 01:30 bundle-autodispatch, MCP) is captured with
+    # no per-caller wiring. Never-raise; cannot affect the returned brief.
+    from . import hold_shadow as _hold_shadow
+    _hold_shadow.observe_gate_outcome(brief, authority=effective_authority)
+    return brief

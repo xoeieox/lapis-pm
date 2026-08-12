@@ -5546,8 +5546,9 @@ def _auto_resolve_record(target_id: str, pr_number: int) -> None:
 
 def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     cls: authority.PRClassification = payload["classification"]
+    hold_comment = None
     if hold:
-        episodic.write_hold(
+        hold_comment = episodic.write_hold(
             target_id,
             f"PR #{cls.pr_number} held: {'; '.join(cls.reasons)}\n"
             f"Title: {cls.title}\n{cls.html_url}",
@@ -5708,6 +5709,22 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     _set_brief_outstanding(target_id, b, verified=True)
     if hold:
         kind = "hold"
+        # lapis-pm-hold-shadow-observer-v0: act-free shadow record of this
+        # PR hold (SHADOW MODE ONLY, Erah 2026-08-12). Both hold_comment_id
+        # and brief_comment_id are known only here, at the end of the hold
+        # branch — never-raise; cannot affect the brief already emitted.
+        from . import hold_shadow as _hold_shadow
+        _hold_shadow.observe_hold_fact(
+            target_id=target_id,
+            pr_number=cls.pr_number,
+            repo=cls.repo,
+            hold_reasons=cls.reasons,
+            hold_comment_id=hold_comment.id if hold_comment is not None else "",
+            brief_comment_id=b.comment_id,
+            pm_authority=_target.pm_authority if _target is not None else "hold",
+            spec_bound_ts=_spec_bound_ts(target_id),
+            has_issues=bool(cls.issues),
+        )
     elif cls.issues:
         kind = "advisory_screen_issue"
     else:

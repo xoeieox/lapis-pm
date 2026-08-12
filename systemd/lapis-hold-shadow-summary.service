@@ -1,0 +1,21 @@
+[Unit]
+Description=lapis-pm hold-shadow Thursday summary — groups /srv/lapis/hold-shadow/*.jsonl by proposed classification, deposits one Desk gem
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStart=/usr/bin/python3 -m lapis_pm.cli hold-shadow-summary
+EnvironmentFile=-/data/agents/config/conductor.env
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+TimeoutStartSec=120
+
+# SHADOW MODE ONLY (lapis-pm-hold-shadow-observer-v0, Erah 2026-08-12): this
+# pass only reads /srv/lapis/hold-shadow/*.jsonl and deposits one Desk gem. It
+# never binds, never dispatches, never writes pm/brief-gem/map/ — the gem
+# it deposits is structurally unactionable (see hold_shadow_summary.py).
+
+[Install]
+WantedBy=multi-user.target

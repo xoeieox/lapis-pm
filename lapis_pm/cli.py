@@ -2074,6 +2074,25 @@ def cmd_bundle_autodispatch(args) -> int:
     return 1 if results["failed"] else 0
 
 
+def cmd_hold_shadow_summary(args) -> int:
+    """Handle `lapis-pm hold-shadow-summary`.
+
+    lapis-pm-hold-shadow-observer-v0's Thursday summary pass: groups the
+    accumulated /srv/lapis/hold-shadow/*.jsonl records by proposed classification
+    and deposits exactly one Desk gem. Runs OUT of tick, off its own systemd
+    timer (systemd/lapis-hold-shadow-summary.timer, ~06:45 America/Los_Angeles)
+    — never called from the tick loop itself.
+    """
+    from .hold_shadow_summary import run_thursday_summary
+
+    gem_id = run_thursday_summary()
+    if gem_id:
+        print(f"hold-shadow-summary: deposited gem {gem_id}")
+        return 0
+    print("hold-shadow-summary: gem deposit failed (weaver unreachable or error)", file=sys.stderr)
+    return 1
+
+
 def cmd_steer(args) -> int:
     """File a typed steer message for mid-run PM course-correction."""
     type_ = args.type
@@ -3026,6 +3045,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard timeout for the spec-review gate in seconds (default: 1800).",
     )
     bad.set_defaults(func=cmd_bundle_autodispatch)
+
+    # ------------------------------------------------------------------
+    # hold-shadow-summary — Thursday grouped-by-classification Desk gem
+    # ------------------------------------------------------------------
+    hss = sub.add_parser(
+        "hold-shadow-summary",
+        help=(
+            "Group /srv/lapis/hold-shadow/*.jsonl records by proposed classification "
+            "and deposit one Desk gem (lapis-pm-hold-shadow-observer-v0)."
+        ),
+    )
+    hss.set_defaults(func=cmd_hold_shadow_summary)
 
     # ------------------------------------------------------------------
     # steer — file a typed mid-run steer message

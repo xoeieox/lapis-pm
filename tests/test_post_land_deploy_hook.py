@@ -3749,6 +3749,7 @@ class TestGwHostScriptDeploy:
         by_dest = {e.dest: e for e in pm_core._CONDUCTOR_GW_HOST_SCRIPTS}
         assert "/usr/local/sbin/gw-topology" in by_dest
         assert "/usr/local/sbin/gw-idle-suspend.sh" in by_dest
+        assert "/usr/local/sbin/gw_resume_grace.py" in by_dest
 
         topology = by_dest["/usr/local/sbin/gw-topology"]
         assert topology.src_name == "gw-topology"
@@ -3761,6 +3762,17 @@ class TestGwHostScriptDeploy:
         assert idle.src_name == "gw-idle-suspend.sh"
         assert idle.self_attesting is False
         assert idle.execution_sensitive is True
+
+        # gw_resume_grace.py (lapis-pm-gw-host-script-manifest-add-resume-grace-v0):
+        # gw-idle-suspend.sh's guard-rule-0b companion, delivered but not
+        # execution_sensitive — see spec Scope for the execution_sensitive=False
+        # rationale.
+        grace = by_dest["/usr/local/sbin/gw_resume_grace.py"]
+        assert grace.src_name == "gw_resume_grace.py"
+        assert grace.mode == 0o755
+        assert grace.owner == "root:root"
+        assert grace.self_attesting is False
+        assert grace.execution_sensitive is False
 
     def test_gw_serve_and_gw_dual_not_manifested(self):
         """Out-of-scope: no repo source, so no manifest entry (spec Out-of-scope)."""
@@ -4089,6 +4101,69 @@ class TestGwHostScriptDeploy:
         log_text = log_file.read_text()
         assert "gravitywell:/usr/local/sbin/gw-topology" in log_text
         assert local_hash[:8] in log_text
+
+    def test_gw_resume_grace_full_install_path_mode_owner_atomic_verified(self, tmp_path):
+        """lapis-pm-gw-host-script-manifest-add-resume-grace-v0 DoD 2: full
+        install-path coverage for the new gw_resume_grace.py entry — mirrors
+        the gw-topology / gw-idle-suspend.sh coverage above. Confirms delivery
+        at mode 0o755, owner root:root, via the atomic scp-to-temp +
+        `sudo install` path (never a direct overwrite of dest), with the
+        post-install re-hash verify, and that self_attesting=False correctly
+        skips the --help self-hash check (unlike gw-topology)."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        content = "#!/usr/bin/env python3\nprint('grace')\n"
+        (src_dir / "gw_resume_grace.py").write_text(content)
+        local_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        manifest = (
+            pm_core._GwHostScript(
+                "gw_resume_grace.py", "/usr/local/sbin/gw_resume_grace.py", 0o755, "root:root", False, False,
+            ),
+        )
+        git_fake = _conductor_git_fake_run(fetch_rc=0, head_sha="aaa", main_sha="aaa")
+        log_file = tmp_path / "deploy-log.md"
+        calls: list = []
+        gw_fake = _gw_fake_run(
+            git_fake=git_fake, pre_hash="stale", post_hash=local_hash, calls=calls,
+        )
+
+        with (
+            patch.object(pm_core, "_CONDUCTOR_GW_HOST_SCRIPTS", manifest),
+            patch.object(pm_core, "_CONDUCTOR_DEPLOY_CLONE", str(tmp_path / "clone")),
+            patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
+            patch.object(pm_core, "_DEPLOY_LOG", log_file),
+            patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
+            patch("agents_core.llm.gw_serving_state") as mock_state,
+        ):
+            mock_state.return_value = MagicMock(in_flight_flip=False)
+            pm_core._deploy_conductor_gw_host_scripts(trigger="test")
+
+        log_text = log_file.read_text()
+        assert "gravitywell:/usr/local/sbin/gw_resume_grace.py" in log_text
+        assert local_hash[:8] in log_text
+
+        scp_calls = [c for c in calls if c and c[0] == "scp"]
+        assert len(scp_calls) == 1, f"expected exactly one scp call, got {scp_calls}"
+        assert scp_calls[0][:2] == ["scp", "-p"]
+        tmp_remote = scp_calls[0][3].split(":", 1)[1]
+        assert tmp_remote.startswith("/tmp/"), "must scp to a temp path, never overwrite dest directly (atomic install)"
+
+        install_calls = [
+            c for c in calls
+            if c and c[0] == "ssh" and len(c) > 4 and c[2:5] == ["sudo", "-n", "install"]
+        ]
+        assert len(install_calls) == 1, f"expected exactly one install call, got {install_calls}"
+        install_cmd = install_calls[0][2:]
+        assert install_cmd[:5] == ["sudo", "-n", "install", "-o", "root"], install_cmd
+        assert install_cmd[5:7] == ["-g", "root"], install_cmd
+        assert install_cmd[7:9] == ["-m", "755"], install_cmd
+        assert install_cmd[-2] == tmp_remote, "install must move the scp'd temp path, not re-fetch"
+        assert install_cmd[-1] == "/usr/local/sbin/gw_resume_grace.py"
+
+        help_calls = [c for c in calls if c and c[0] == "ssh" and len(c) >= 4 and c[-1] == "--help"]
+        assert help_calls == [], "self_attesting=False must skip the --help self-hash verify"
 
     # --- D7/D8: no-op path ---
 

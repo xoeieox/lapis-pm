@@ -61,6 +61,41 @@ import pytest as _pytest
 _BLOCKED_ENDPOINT_MARKERS = (":8081", ":8401", ":19999")
 
 
+@_pytest.fixture(autouse=True, scope="session")
+def _pin_room_root_to_tmp():
+    """lapis-pm-hold-shadow-observer-v0 (PM review finding on PR #285,
+    2026-08-12 ~12:40, reproduced live): hold_shadow.py's two hooks live
+    inside run_spec_review's single return point and _act_brief's hold
+    branch — call sites dozens of pre-existing tests already drive with no
+    awareness of hold_shadow. Every one of those tests was silently
+    appending real records (and, on the hold hook, a `TypeError: Object of
+    type MagicMock is not JSON serializable` fault line) into the
+    production /srv/lapis/hold-shadow/*.jsonl files: 98 fictional gate-outcome
+    records were already present before merge, and re-running one existing
+    26-test file alone appended six more. That is the exact artifact
+    Erah's Thursday enforce-boundary reading depends on.
+
+    Pin ROOM_ROOT for the whole test session to a throwaway tmp dir — the
+    override _room_root() (and every other ROOM_ROOT reader in this repo)
+    already honours — so no test run, present or future, can reach
+    production /room through this path. Same shape as agents-core's
+    LOCALITY_LEDGER_ROOT / ELEVATOR_DB_PATH convention. A test that wants a
+    specific ROOM_ROOT of its own still calls monkeypatch.setenv itself
+    (e.g. tests/test_hold_shadow_records.py, tests/test_node_identity.py's
+    explicit delenv) — that per-test override wins for the duration of the
+    test and is undone back to this session-wide pin on teardown, since
+    pytest's function-scoped monkeypatch snapshots and restores around the
+    current environ rather than replacing it wholesale.
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+
+    mp = MonkeyPatch()
+    tmp_root = tempfile.mkdtemp(prefix="lapis-pm-test-room-root-")
+    mp.setenv("ROOM_ROOT", tmp_root)
+    yield tmp_root
+    mp.undo()
+
+
 @_pytest.fixture(autouse=True)
 def _block_sleeping_node_http(monkeypatch):
     import httpx

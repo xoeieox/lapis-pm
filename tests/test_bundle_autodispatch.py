@@ -14,6 +14,7 @@ Coverage:
 from __future__ import annotations
 
 import logging
+import re
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -73,6 +74,43 @@ AUTODISPATCH_SPEC = textwrap.dedent("""\
     **Repo:** `lapis-pm`
 """)
 
+# A bundle spec with a parseable "## Items" section (Debt ID + source PR per
+# item) — for salvage-path tests. Matches bundle_autodispatch._parse_bundle_items'
+# own regex contract, not code_reviewer/debt_bundle.py's real renderer (out of
+# this repo) — see the module docstring on _SPEC_ITEMS_SECTION_RE.
+BUNDLE_SPEC_WITH_ITEMS = textwrap.dedent("""\
+    ---
+    spec_id: cr-bundle-myrepo-2026-08-12
+    status: draft
+    created: 2026-08-12
+    source: code-reviewer-debt-bundle-v0 nightly sweep
+    ---
+
+    # Spec: cr-bundle-myrepo-2026-08-12 — agentic debt fix-bundle
+
+    **Repo:** `myrepo`
+    **Authority:** advisory
+
+    ## Goal
+
+    Resolve 3 open MED-severity debt items in `myrepo`.
+
+    ## Items
+
+    1. **Debt ID:** `debt-abc123`
+       Flagged in PR #`219`.
+
+    2. **Debt ID:** `debt-def456`
+       Flagged in PR #`220`.
+
+    3. **Debt ID:** `debt-ghi789`
+       Flagged in PR #`221`.
+
+    ## Next steps
+
+    **Suggested bind:** `lapis-pm bind cr-bundle-myrepo-2026-08-12 --repo myrepo --authority advisory --create --title "Resolve 3 aged MED debt items in myrepo"`
+""")
+
 
 def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") -> Path:
     p = tmp_path / name
@@ -80,9 +118,31 @@ def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") ->
     return p
 
 
-def _make_brief(recommendation: str = "proceed-to-bind"):
+def _write_items_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-08-12.md") -> Path:
+    p = tmp_path / name
+    p.write_text(BUNDLE_SPEC_WITH_ITEMS, encoding="utf-8")
+    return p
+
+
+def _make_brief(recommendation: str = "proceed-to-bind", **overrides):
+    """A safely-defaulted brief mock. lapis-pm-bundle-autodispatch-enforce-v0's
+    three-way classifier reads several fields beyond combined_recommendation
+    (facets_deliberation, council_open_questions, council_status, ...) — a bare
+    MagicMock() auto-creates those as truthy sub-mocks, which crashes the
+    classifier's `list(...)` calls and would silently attempt a real GW call.
+    Explicit safe defaults here keep every pre-existing test hermetic; pass
+    overrides= for tests that need a specific classifier-relevant field."""
     brief = MagicMock()
     brief.combined_recommendation = recommendation
+    brief.facets_deliberation = overrides.pop("facets_deliberation", None)
+    brief.council_open_questions = overrides.pop("council_open_questions", [])
+    brief.council_status = overrides.pop("council_status", "resolved")
+    brief.council_positions = overrides.pop("council_positions", [])
+    brief.parse_error = overrides.pop("parse_error", None)
+    brief.council_error_reason = overrides.pop("council_error_reason", "")
+    brief.council_run_id = overrides.pop("council_run_id", "run-test")
+    for k, v in overrides.items():
+        setattr(brief, k, v)
     return brief
 
 
@@ -331,9 +391,14 @@ class TestProceedToBind:
 
 class TestHoldDefer:
     @pytest.mark.parametrize("recommendation", [
-        "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
+        "amend-spec", "shape-with-Erah",
     ])
     def test_non_proceed_defers_no_bind(self, tmp_path, recommendation):
+        """amend-spec / shape-with-Erah with no facets/council grounds present
+        (the default _make_brief) route through the salvage classifier, find
+        empty grounds, and fail-closed to DEFER — same observable outcome as
+        the pre-enforce behavior. See TestThreeWayClassification for the
+        infra/salvage split with real grounds present."""
         _write_spec(tmp_path)
         mock_brief = _make_brief(recommendation)
 
@@ -350,6 +415,31 @@ class TestHoldDefer:
         mock_tick.assert_not_called()
         assert len(results["deferred"]) == 1
         assert results["deferred"][0]["reason"] == f"gate:{recommendation}"
+
+    @pytest.mark.parametrize("recommendation", [
+        "incomplete", "parse_failed",
+    ])
+    def test_incomplete_and_parse_failed_are_infra_not_defer(self, tmp_path, recommendation):
+        """lapis-pm-bundle-autodispatch-enforce-v0: incomplete/parse_failed are
+        now INFRA triggers, not blanket defer — never bound, never deferred to
+        human, counted in the new `faulted` bucket."""
+        _write_spec(tmp_path)
+        mock_brief = _make_brief(recommendation)
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True) as mock_tick,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        mock_tick.assert_not_called()
+        assert results["deferred"] == []
+        assert len(results["faulted"]) == 1
+        assert recommendation in results["faulted"][0]["ground"]
 
     @pytest.mark.parametrize("recommendation", [
         "amend-spec", "shape-with-Erah", "incomplete",
@@ -407,20 +497,26 @@ class TestGWUnreachable:
         assert not bad._pending_marker(spec_path).exists()
         assert not bad._failed_marker(spec_path).exists()
 
-    def test_gate_none_return_defers(self, tmp_path):
-        """_run_gate returning None (timeout/error) defers without bind."""
+    def test_gate_none_return_is_infra_not_defer(self, tmp_path):
+        """lapis-pm-bundle-autodispatch-enforce-v0: _run_gate returning None
+        (timeout/error) is now an INFRA trigger — retried once (its own text
+        names a timeout), never bound, never deferred to a human."""
         _write_spec(tmp_path)
 
         with (
             patch.object(bad, "_target_yaml_exists", return_value=False),
             patch.object(bad, "_gw_serving", return_value=True),
-            patch.object(bad, "_run_gate", return_value=None),
+            patch.object(bad, "_run_gate", return_value=None) as mock_gate,
             patch.object(bad, "_bind") as mock_bind,
         ):
             results = _reconcile(tmp_path)
 
         mock_bind.assert_not_called()
-        assert results["deferred"][0]["reason"] == "gate_timeout_or_error"
+        assert results["deferred"] == []
+        assert len(results["faulted"]) == 1
+        assert results["faulted"][0]["retried"] is True
+        # retried once: initial gate call + the one infra retry
+        assert mock_gate.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +708,10 @@ class TestExternalBindSkip:
             results = _reconcile(tmp_path)
 
         # Excluded by filename — never reaches state-check
-        assert results == {"bound": [], "deferred": [], "skipped": [], "failed": []}
+        assert results == {
+            "bound": [], "deferred": [], "skipped": [], "failed": [],
+            "faulted": [], "salvaged": [],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -870,3 +969,371 @@ class TestCLI:
             rc = cmd_bundle_autodispatch(args)
 
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Journal-line contract sentinel (lapis-pm-bundle-autodispatch-enforce-v0,
+# gate-amended 2026-08-13, Council — DoD 7a).
+#
+# loupe's navigator (loupe/navigator/subjects.py) greps the service journal
+# for the LITERAL "run complete: bound=" substring and regexes bound=(\d+)
+# to judge subject health. This is enforced law, not convention: the
+# existing bound/deferred/skipped/failed buckets must never reorder or
+# rename, and "bound=" must never be preceded by anything else. New buckets
+# (faulted, salvaged) are APPENDED only. This test fails loudly on any
+# rearrangement disguised as improvement — including a well-intentioned
+# alphabetical resort or a rename for "clarity".
+# ---------------------------------------------------------------------------
+
+class TestJournalLineSentinel:
+    _EXPECTED_LINE_RE = re.compile(
+        r"run complete: "
+        r"bound=(\d+) deferred=(\d+) skipped=(\d+) failed=(\d+) "
+        r"faulted=(\d+) salvaged=(\d+)$"
+    )
+
+    def test_journal_line_bound_is_first_and_buckets_are_not_reordered(self, tmp_path, caplog):
+        """The literal contract loupe's navigator parses: 'bound=' must be
+        the first bucket in the line, immediately after 'run complete: ',
+        and the six buckets must appear in exactly this order with exactly
+        these names. Any reorder, rename, or insertion before bound= is a
+        contract break for loupe, silently, in production."""
+        caplog.set_level(logging.INFO, logger="lapis_pm.bundle_autodispatch")
+
+        with (
+            patch.object(bad, "_discover_specs", return_value=[]),
+        ):
+            bad.reconcile(spec_dir=tmp_path, dry_run=True, run_ts=_RUN_TS)
+
+        complete_lines = [
+            r.getMessage() for r in caplog.records if "run complete:" in r.getMessage()
+        ]
+        assert len(complete_lines) == 1, (
+            f"expected exactly one 'run complete:' journal line, got {complete_lines!r}"
+        )
+        line = complete_lines[0]
+
+        # bound= must be the literal substring immediately following
+        # "run complete: " — nothing else may precede it.
+        idx = line.index("run complete: ")
+        after = line[idx + len("run complete: "):]
+        assert after.startswith("bound="), (
+            f"'bound=' must be the first bucket after 'run complete: ', got: {after!r}"
+        )
+
+        m = self._EXPECTED_LINE_RE.search(line)
+        assert m is not None, (
+            f"journal line does not match the pinned bound/deferred/skipped/failed/"
+            f"faulted/salvaged contract (order + names): {line!r}"
+        )
+
+    def test_journal_line_buckets_reflect_actual_counts(self, tmp_path, caplog):
+        """Sanity companion to the sentinel above: the six counts in the
+        journal line must reflect the actual results dict, not just match
+        the regex shape."""
+        caplog.set_level(logging.INFO, logger="lapis_pm.bundle_autodispatch")
+
+        with patch.object(bad, "_discover_specs", return_value=[]):
+            results = bad.reconcile(spec_dir=tmp_path, dry_run=True, run_ts=_RUN_TS)
+
+        line = next(
+            r.getMessage() for r in caplog.records if "run complete:" in r.getMessage()
+        )
+        m = self._EXPECTED_LINE_RE.search(line)
+        assert m is not None
+        assert [int(g) for g in m.groups()] == [
+            len(results["bound"]), len(results["deferred"]), len(results["skipped"]),
+            len(results["failed"]), len(results["faulted"]), len(results["salvaged"]),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Three-way classification: infra / salvage / defer (gate-amended 2026-08-13
+# additions, DoD 7b/7c/7d).
+# ---------------------------------------------------------------------------
+
+class TestThreeWayClassification:
+    def test_infra_wins_over_salvage_on_dual_match(self):
+        """run 9b54d3f6: shape-with-Erah label, but the ground is a
+        synthesis timeout — INFRA wins over SALVAGE precedence, and the
+        salvage classifier (an LLM call) is never reached."""
+        brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={
+                "synthesis": {
+                    "escalation_reason": "Synthesis error: queue-side call did not complete within 210s",
+                },
+            },
+        )
+        with patch("agents_core.llm.call_operator") as mock_call:
+            enforce_class, ground = bad._classify_enforce(brief)
+
+        assert enforce_class == "infra"
+        assert "did not complete within 210s" in ground
+        mock_call.assert_not_called()
+
+    def test_permanent_fault_text_yields_zero_retries(self, tmp_path):
+        """DoD 7c: a fault whose own text proves permanent (malformed /
+        not recoverable) goes straight to record with ZERO retries — never
+        a second _run_gate call."""
+        _write_spec(tmp_path)
+        mock_brief = _make_brief(
+            "incomplete",
+            parse_error={"detail": "parse error: malformed spec header, not recoverable"},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert results["deferred"] == []
+        assert len(results["faulted"]) == 1
+        assert results["faulted"][0]["retried"] is False
+        assert mock_gate.call_count == 1  # zero retries
+
+    def test_transient_fault_text_retries_exactly_once(self, tmp_path):
+        """Companion positive case: a transient marker (queue/timeout) does
+        retry, exactly once — never twice."""
+        _write_spec(tmp_path)
+        mock_brief = _make_brief(
+            "incomplete",
+            parse_error={"detail": "queue-side synthesis call timed out"},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert len(results["faulted"]) == 1
+        assert results["faulted"][0]["retried"] is True
+        assert mock_gate.call_count == 2
+
+    def test_salvage_classifier_receives_byte_identical_grounds(self):
+        """DoD 7b: the salvage classifier consumes escalation_reason +
+        council open questions BYTE-IDENTICAL as stored — never a
+        re-summarized or LLM-paraphrased version."""
+        distinctive_reason = (
+            "Ground Zero: Item #7 references a REMOVED module (verbatim, do-not-reword)."
+        )
+        distinctive_question = "Is `debt-xyz` still valid given PR #999 reverted the change?"
+        brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": distinctive_reason}},
+            council_open_questions=[distinctive_question],
+        )
+
+        captured = {}
+
+        def _fake_call_operator(operator, prompt):
+            captured["prompt"] = prompt
+            return '{"classification": "salvage"}'
+
+        with patch("agents_core.llm.call_operator", side_effect=_fake_call_operator):
+            verdict = bad._classify_salvage_via_gw(brief)
+
+        assert verdict is not None
+        assert verdict["is_salvage"] is True
+        # The exact stored strings appear byte-for-byte in the prompt sent to GW.
+        assert distinctive_reason in captured["prompt"]
+        assert distinctive_question in captured["prompt"]
+        # And the ground returned to the caller (for the enforce record) is
+        # the same verbatim text, not a re-derived summary.
+        assert distinctive_reason in verdict["ground"]
+
+    def test_salvage_classifier_fault_returns_none_fail_closed(self):
+        brief = _make_brief(
+            "amend-spec",
+            facets_deliberation={"synthesis": {"escalation_reason": "some ground"}},
+        )
+        with patch("agents_core.llm.call_operator", side_effect=RuntimeError("gw down")):
+            verdict = bad._classify_salvage_via_gw(brief)
+        assert verdict is None
+
+    def test_salvage_dropped_items_carry_confidence_and_inference_source(self, tmp_path):
+        """DoD 7d: salvage records carry a per-item confidence marker +
+        inference source — both in the amended spec's '## Salvage record'
+        section and in the enforce record's salvage_dropped_items."""
+        spec_path = _write_items_spec(tmp_path)
+        mock_brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": "debt-abc123 is stale"}},
+        )
+        regate_brief = _make_brief("proceed-to-bind")
+
+        gate_calls = {"n": 0}
+
+        def _fake_run_gate(path, timeout):
+            gate_calls["n"] += 1
+            return mock_brief if gate_calls["n"] == 1 else regate_brief
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", side_effect=_fake_run_gate),
+            patch.object(
+                bad, "_classify_salvage_via_gw",
+                return_value={"is_salvage": True, "ground": "debt-abc123 is stale"},
+            ),
+            patch.object(
+                bad, "_classify_invalid_items_via_gw",
+                return_value=[
+                    {"debt_id": "debt-abc123", "confidence": "high", "source": "escalation_reason"},
+                ],
+            ),
+            patch.object(bad, "_mark_debt_invalid", return_value=True) as mock_mark,
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            results = _reconcile(tmp_path)
+
+        assert len(results["salvaged"]) == 1
+        dropped = results["salvaged"][0]["dropped_items"]
+        assert dropped == [{
+            "debt_id": "debt-abc123", "confidence": "high",
+            "source": "escalation_reason", "source_pr": 219,
+        }]
+        mock_mark.assert_called_once()
+
+        new_text = spec_path.read_text(encoding="utf-8")
+        assert "## Salvage record" in new_text
+        items_section, _, salvage_section = new_text.partition("## Salvage record")
+        # The dropped item's own block is gone from ## Items; the other two remain.
+        assert "debt-abc123" not in items_section
+        assert "debt-def456" in items_section
+        assert "debt-ghi789" in items_section
+        # The Salvage record names the dropped item with confidence + source.
+        assert "`debt-abc123`" in salvage_section
+        assert "Confidence:** high" in salvage_section
+        assert "Inference source:** escalation_reason" in salvage_section
+
+    def test_salvage_refuses_second_attempt_same_night(self, tmp_path):
+        """HARD BOUND: one salvage attempt per spec per night."""
+        spec_path = _write_items_spec(tmp_path)
+        bad._salvage_attempted_marker(spec_path).write_text(
+            "salvage-attempted: spec_id=test ts=earlier\n", encoding="utf-8",
+        )
+        mock_brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": "debt-abc123 is stale"}},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(
+                bad, "_classify_salvage_via_gw",
+                return_value={"is_salvage": True, "ground": "debt-abc123 is stale"},
+            ),
+            patch.object(
+                bad, "_classify_invalid_items_via_gw",
+                return_value=[{"debt_id": "debt-abc123", "confidence": "high", "source": "x"}],
+            ) as mock_classify,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        mock_classify.assert_not_called()  # refused before any item classification
+        assert mock_gate.call_count == 1  # no re-gate attempted
+        assert len(results["deferred"]) == 1
+        assert results["deferred"][0]["reason"] == "salvage_already_attempted"
+
+    def test_salvage_classifier_fault_fails_closed_to_defer(self, tmp_path):
+        spec_path = _write_items_spec(tmp_path)
+        mock_brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": "debt-abc123 is stale"}},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(
+                bad, "_classify_salvage_via_gw",
+                return_value={"is_salvage": True, "ground": "debt-abc123 is stale"},
+            ),
+            patch.object(bad, "_classify_invalid_items_via_gw", return_value=None),
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert len(results["deferred"]) == 1
+        assert results["deferred"][0]["reason"] == "gate:salvage_classifier_fault"
+        # Spec is untouched — no partial amendment on a fail-closed path.
+        assert "## Salvage record" not in spec_path.read_text(encoding="utf-8")
+
+    def test_infra_retry_mechanically_healthy_reclassifies_to_defer(self, tmp_path):
+        """PR #287 fix: the first gate infra-faults on transient text
+        ("did not complete within 210s"), retries ONCE, and the retry comes
+        back shape-with-Erah with a genuine council block (mechanically
+        healthy — not itself an infra fault). This must land in
+        results["deferred"], never results["faulted"] — burying a real
+        council block in the faulted bucket contradicts Ruling 1(c) (genuine
+        council blocks are always Erah's) and the machine-hiccup framing
+        the morning brief gives 'faulted' would hide it until the 04:30
+        bundler supersedes the set. The enforce record must carry the
+        retry's verbatim ground, not the original infra text — and only
+        ONE gate retry may ever occur (the reclassification itself must
+        never call _run_gate again)."""
+        _write_spec(tmp_path)
+        first_brief = _make_brief(
+            "incomplete",
+            parse_error={"detail": "Synthesis error: did not complete within 210s"},
+        )
+        retry_ground_reason = "Council block: this bundle's design direction needs Erah's call"
+        retry_brief = _make_brief(
+            "shape-with-Erah",
+            council_positions=[{"position": "block", "voice": "council-a"}],
+            council_open_questions=[retry_ground_reason],
+        )
+
+        gate_calls = {"n": 0}
+
+        def _fake_run_gate(path, timeout):
+            gate_calls["n"] += 1
+            return first_brief if gate_calls["n"] == 1 else retry_brief
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", side_effect=_fake_run_gate) as mock_gate,
+            # A genuine fork, not invalid items — the salvage classifier fails
+            # closed to DEFER (fail-closed pin; also exercised by returning None).
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None) as mock_salvage_classify,
+            patch.object(bad, "_write_enforce_record") as mock_write_record,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert results["faulted"] == []
+        assert len(results["deferred"]) == 1
+        assert results["deferred"][0]["spec"] == "cr-bundle-myrepo-2026-06-26"
+        # Exactly one gate retry — reclassification must never call _run_gate again.
+        assert mock_gate.call_count == 2
+        mock_salvage_classify.assert_called_once()
+
+        # The enforce record carries the retry's verbatim ground, never the
+        # stale original infra text.
+        mock_write_record.assert_called_once()
+        _, call_kwargs = mock_write_record.call_args
+        args = mock_write_record.call_args.args
+        written_class = args[2] if len(args) > 2 else call_kwargs.get("enforce_class")
+        written_ground = args[3] if len(args) > 3 else call_kwargs.get("ground")
+        assert written_class == "defer"
+        assert retry_ground_reason in written_ground
+        assert "did not complete within 210s" not in written_ground

@@ -2674,6 +2674,13 @@ def run_spec_review(
     # until it resolves (or times out, in which case the brief still renders with
     # grounding_status="failed" — see U3c/U3b's "Open, ruled by Erah" section).
     with_gw: bool = False,
+    # lapis-pm-bundle-autodispatch-enforce-v0: explicit invoker name for the
+    # hold_shadow gate-outcome hook. bundle_autodispatch runs this on a
+    # ThreadPoolExecutor worker (see bundle_autodispatch.py's _run_gate), so
+    # hold_shadow's own stack-walk never sees the caller's frame — passing
+    # it explicitly is correct regardless of executor hops. None preserves
+    # the prior stack-walk fallback for interactive-CLI / MCP callers.
+    invoked_by: str | None = None,
 ) -> SpecReviewBrief:
     """Run Facets (PM) + Council (philosophical) + the reference leg's review. Synchronous.
 
@@ -3367,8 +3374,8 @@ def run_spec_review(
     # lapis-pm-hold-shadow-observer-v0: act-free shadow record of this gate
     # outcome (SHADOW MODE ONLY, Erah 2026-08-12). Hooked here — inside
     # run_spec_review, at its single return point — so every invoker
-    # (interactive CLI, the 01:30 bundle-autodispatch, MCP) is captured with
+    # (interactive CLI, the 05:15 bundle-autodispatch, MCP) is captured with
     # no per-caller wiring. Never-raise; cannot affect the returned brief.
     from . import hold_shadow as _hold_shadow
-    _hold_shadow.observe_gate_outcome(brief, authority=effective_authority)
+    _hold_shadow.observe_gate_outcome(brief, authority=effective_authority, invoked_by=invoked_by)
     return brief

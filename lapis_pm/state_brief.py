@@ -35,6 +35,15 @@ read as a good week. A reading below threshold deposits a Desk gem per the
 ratified OK->BAD state machine (fire on crossing, silent while BAD, escalate
 once per streak, re-arm on recovery) — see _evaluate_locality_gem.
 
+Daily briefs additionally render a "Bundle autodispatch enforce" bucket
+(lapis-pm-bundle-autodispatch-enforce-v0, Design 3) — what bound (via infra
+retry or salvage), what salvaged (dropped items + PR comment owed), what
+faulted, and what deferred and why, verbatim, since start_ts. Reads
+hold_shadow's enforce-outcomes.jsonl directly; degrades to no section on any
+read failure or when the file has no records in-window. Weekly-omitted
+(mirroring Climate/Locality's daily-omitted symmetry in reverse) — see
+_read_autodispatch.
+
 Temporal compression hierarchy (Gardener observations only):
   daily cadences (morning/afternoon/live) → single latest gardener/derived
   entry, capped at 10 observations ("weather today")
@@ -85,6 +94,7 @@ B_AWAITING = "Awaiting your call"
 B_GARDENER = "Gardener Cross-Cutting Observations"
 B_CLIMATE = "Climate"
 B_LOCALITY = "Locality"
+B_AUTODISPATCH = "Bundle autodispatch enforce"
 
 # Parses flat markdown bullets from gardener/writeback.py:derive_context output, e.g.
 # "- [Critical] <text>  (evidence: ...)". Info/Unclassified are filtered out upstream
@@ -262,6 +272,13 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
     except Exception:
         locality_items = []
 
+    # --- Bundle autodispatch enforce (daily cadence only) ---
+    # A brief must never fail because hold-shadow is unavailable.
+    try:
+        autodispatch_items = _read_autodispatch(start_ts, period=period)
+    except Exception:
+        autodispatch_items = []
+
     return {
         B_BUILT: built_items,
         B_RATIFICATIONS: ratification_items,
@@ -271,6 +288,7 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
         B_GARDENER: gardener_items,
         B_CLIMATE: climate_items,
         B_LOCALITY: locality_items,
+        B_AUTODISPATCH: autodispatch_items,
     }
 
 
@@ -1025,6 +1043,85 @@ def _read_locality(start_ts: datetime, *, period: str = "weekly") -> list[str]:
         _evaluate_locality_gem(summary)
     except Exception as exc:
         logger.warning("locality: gem evaluation failed: %s", exc)
+
+    return lines
+
+
+# --- Bundle autodispatch enforce (lapis-pm-bundle-autodispatch-enforce-v0,
+# Design 3): what bound-via-enforce, salvaged, faulted, and deferred, since
+# start_ts. Daily-cadence only (morning/afternoon/live) — the autodispatch
+# timer fires nightly at 05:15 LA and Erah's ruling names the morning brief
+# specifically as the surface ("it binds for real, and reports in the
+# brief"). Reads directly from hold_shadow's enforce-outcomes.jsonl
+# (Design 3's new record type); a plain proceed-to-bind bundle bind that
+# never touched the classifier emits no enforce record and is already
+# visible via the existing Built/In flight buckets — this section adds
+# exactly the enforce-classification information that was invisible before.
+# ---------------------------------------------------------------------------
+
+def _read_autodispatch(start_ts: datetime, *, period: str = "daily") -> list[str]:
+    """Autodispatch bucket: reads enforce-outcomes.jsonl since start_ts and
+    renders what bound (via infra retry or salvage), what salvaged (items
+    dropped + PR comment owed), what faulted, and what deferred and why —
+    verbatim, per Design 3. Never raises; degrades to [] on any failure so
+    a hold-shadow outage never blocks the brief. Daily-cadence only,
+    mirroring Climate/Locality's weekly-only symmetry in reverse."""
+    if period == "weekly":
+        return []
+
+    try:
+        from . import hold_shadow as _hold_shadow
+    except ImportError:
+        return []
+
+    try:
+        path = _hold_shadow.enforce_outcomes_path()
+        if not path.exists():
+            return []
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # a torn/partial line never aborts the brief
+    except Exception:
+        return []
+
+    recent = [
+        rec for rec in records
+        if (ts := _parse_iso_ts(rec.get("ts_utc"))) is not None and ts >= start_ts
+    ]
+    if not recent:
+        return []
+
+    lines: list[str] = []
+    for rec in recent:
+        spec = rec.get("spec", "?")
+        enforce_class = rec.get("enforce_class", "?")
+        action = rec.get("enforce_action", "?")
+        ground = (rec.get("verbatim_grounds") or "").strip()
+        ground_snippet = ground[:200] + ("…" if len(ground) > 200 else "")
+
+        if action in ("retried_then_bound", "salvage_bound"):
+            lines.append(f"BOUND (via {enforce_class}): {spec} — {action}")
+        elif enforce_class == "salvage":
+            dropped = rec.get("salvage_dropped_items") or []
+            dropped_desc = ", ".join(
+                f"{d.get('debt_id', '?')} (confidence={d.get('confidence', '?')}, "
+                f"source_pr=#{d.get('source_pr', '?')}, PR comment owed)"
+                for d in dropped
+            ) or "(no items recorded)"
+            lines.append(
+                f"SALVAGED: {spec} — dropped [{dropped_desc}] — outcome={action} "
+                f"— ground: {ground_snippet}"
+            )
+        elif enforce_class == "infra":
+            lines.append(f"FAULTED: {spec} — {ground_snippet}")
+        else:
+            lines.append(f"DEFERRED: {spec} — {action} — ground: {ground_snippet}")
 
     return lines
 

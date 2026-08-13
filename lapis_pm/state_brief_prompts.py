@@ -32,6 +32,13 @@ unavailable or the ledger has literally never been written). Unlike Climate,
 an empty *reading* is not the same as an empty *section* — a healthy ledger
 reporting 0% local, or a stale ledger, both produce non-empty lines and are
 rendered; see state_brief._read_locality.
+
+Daily briefs also render a "Bundle autodispatch enforce" bucket
+(lapis-pm-bundle-autodispatch-enforce-v0, Design 3) the same way — a normal
+header + already-composed prose-ready lines. Omitted entirely for weekly
+cadence (mirroring Climate/Locality's daily-omitted symmetry in reverse) and
+omitted from daily output when there is nothing to report (no enforce
+records in-window); see state_brief._read_autodispatch.
 """
 
 from __future__ import annotations
@@ -45,11 +52,13 @@ BUCKET_ORDER = [
     "Gardener Cross-Cutting Observations",
     "Climate",
     "Locality",
+    "Bundle autodispatch enforce",
 ]
 
 _GARDENER_BUCKET = "Gardener Cross-Cutting Observations"
 _CLIMATE_BUCKET = "Climate"
 _LOCALITY_BUCKET = "Locality"
+_AUTODISPATCH_BUCKET = "Bundle autodispatch enforce"
 
 DAILY_SYSTEM = """You are the Lapis PM state-brief narrator. Your job is to write
 clear, terse prose for Erah — the principal engineer — summarising the current
@@ -62,7 +71,14 @@ For the Gardener Cross-Cutting Observations bucket, preserve the urgency labels
 insights from Gardener's overnight synthesis — treat them as high-priority.
 Gardener is a standing observer, not an enforcement mechanism: Critical signals
 indicate systemic issues that may need human attention, but do NOT automatically
-block or invalidate claims in any other bucket."""
+block or invalidate claims in any other bucket.
+
+For the Bundle autodispatch enforce bucket, report each line plainly — it is
+already-classified fact (BOUND/SALVAGED/FAULTED/DEFERRED), not raw data to
+interpret. Preserve verbatim grounds and Debt IDs exactly as given; do not
+editorialize or infer a verdict the classifier didn't state. A FAULTED line
+is an expected transient (already retried per policy), not an incident to
+flag."""
 
 DAILY_TEMPLATE = """\
 Write a short prose paragraph under each header exactly as given below.
@@ -169,6 +185,15 @@ def format_bucket_sections(buckets: dict[str, list[str]], start_label: str, *, p
             items = buckets.get(name, [])
             if not items:
                 continue  # reader had nothing to say (Leg 1 absent / never written)
+            body = "\n".join(f"- {item}" for item in items)
+            sections.append(f"## {name}\n{body}")
+            continue
+        if name == _AUTODISPATCH_BUCKET:
+            if period == "weekly":
+                continue  # daily-only, mirroring Climate/Locality in reverse
+            items = buckets.get(name, [])
+            if not items:
+                continue  # no enforce records in-window — no empty-section noise
             body = "\n".join(f"- {item}" for item in items)
             sections.append(f"## {name}\n{body}")
             continue

@@ -1,5 +1,18 @@
 [Unit]
-Description=lapis-pm bundle-autodispatch nightly timer — fires at 01:30 LA, after code-reviewer-sweep (00:30 LA)
+Description=lapis-pm bundle-autodispatch nightly timer — fires at 05:15 LA, after code-reviewer-conglomerate (04:30 LA, the actual bundle producer)
+
+# lapis-pm-bundle-autodispatch-enforce-v0 (Design 5, gate-amended 2026-08-13:
+# Facets and all three Council voices ruled it non-negotiable): moved from
+# 01:30 to 05:15 LA. The old 01:30 fire time predated the bundler by three
+# hours and enforced on the PRIOR morning's already-superseded set (the
+# 08-12 bundle set was gated 01:46-02:25 and renamed to superseded/ at
+# 04:30:03 the same morning) — every salvage/defer record would have been a
+# measurement artifact about ghosts. The comment above also named the wrong
+# producer: the bundler is code-reviewer-conglomerate.timer at 04:30 LA, NOT
+# the 00:30 code-reviewer-sweep this comment used to claim. Fence check: four
+# gates took 55min on 2026-08-13; 05:15 + 55min clears the 06:30 LA manager
+# fence with margin, and the GW night-wrapper converge (conductor #859)
+# already brackets the run.
 
 # Enable with:
 #   sudo cp systemd/lapis-bundle-autodispatch.service /etc/systemd/system/
@@ -8,7 +21,7 @@ Description=lapis-pm bundle-autodispatch nightly timer — fires at 01:30 LA, af
 #   sudo systemctl enable --now lapis-bundle-autodispatch.timer
 
 [Timer]
-OnCalendar=*-*-* 01:30:00 America/Los_Angeles
+OnCalendar=*-*-* 05:15:00 America/Los_Angeles
 Persistent=true
 Unit=lapis-bundle-autodispatch.service
 

@@ -67,9 +67,22 @@ def _read_jsonl(path: Path) -> list[dict]:
     return records
 
 
-def build_summary(gate_outcomes: list[dict], hold_facts: list[dict]) -> dict:
+def build_summary(
+    gate_outcomes: list[dict],
+    hold_facts: list[dict],
+    enforce_outcomes: list[dict] | None = None,
+) -> dict:
     """Pure function: group records by proposed classification. No I/O —
-    the caller (run_thursday_summary) does all reading/writing."""
+    the caller (run_thursday_summary) does all reading/writing.
+
+    enforce_outcomes (lapis-pm-bundle-autodispatch-enforce-v0, Design 3):
+    the bundle-autodispatch three-way classifier's own record type,
+    grouped by enforce_class (infra/salvage/defer) alongside the existing
+    hold-fact and gate-outcome groupings. Optional + defaulted so every
+    pre-existing caller (this module's own tests included) keeps working
+    unchanged."""
+    enforce_outcomes = enforce_outcomes or []
+
     by_hold_class: dict[str, list[dict]] = defaultdict(list)
     for rec in hold_facts:
         by_hold_class[rec.get("hold_class", "other")].append(rec)
@@ -78,21 +91,30 @@ def build_summary(gate_outcomes: list[dict], hold_facts: list[dict]) -> dict:
     for rec in gate_outcomes:
         by_recommendation[rec.get("combined_recommendation", "unknown")].append(rec)
 
+    by_enforce_class: dict[str, list[dict]] = defaultdict(list)
+    for rec in enforce_outcomes:
+        by_enforce_class[rec.get("enforce_class", "unknown")].append(rec)
+
     return {
         "hold_facts_total": len(hold_facts),
         "gate_outcomes_total": len(gate_outcomes),
+        "enforce_outcomes_total": len(enforce_outcomes),
         "by_hold_class": {k: len(v) for k, v in by_hold_class.items()},
         "by_combined_recommendation": {k: len(v) for k, v in by_recommendation.items()},
+        "by_enforce_class": {k: len(v) for k, v in by_enforce_class.items()},
         "hold_facts_grouped": dict(by_hold_class),
         "gate_outcomes_grouped": dict(by_recommendation),
+        "enforce_outcomes_grouped": dict(by_enforce_class),
     }
 
 
 def _render_gem_payload(summary: dict) -> dict:
-    total = summary["hold_facts_total"] + summary["gate_outcomes_total"]
+    enforce_total = summary.get("enforce_outcomes_total", 0)
+    total = summary["hold_facts_total"] + summary["gate_outcomes_total"] + enforce_total
     lines = [
         f"Hold-shadow overnight log: {summary['hold_facts_total']} hold-fact "
-        f"record(s), {summary['gate_outcomes_total']} gate-outcome record(s).",
+        f"record(s), {summary['gate_outcomes_total']} gate-outcome record(s), "
+        f"{enforce_total} enforce-outcome record(s).",
         "",
         "By proposed classification (hold-fact):",
     ]
@@ -106,6 +128,16 @@ def _render_gem_payload(summary: dict) -> dict:
     if summary["by_combined_recommendation"]:
         for rec, n in sorted(summary["by_combined_recommendation"].items()):
             lines.append(f"  - {rec}: {n}")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+    lines.append(
+        "By enforce classification (enforce-outcome, bundle_autodispatch's "
+        "three-way infra/salvage/defer classifier):"
+    )
+    if summary.get("by_enforce_class"):
+        for enforce_class, n in sorted(summary["by_enforce_class"].items()):
+            lines.append(f"  - {enforce_class}: {n}")
     else:
         lines.append("  (none)")
 
@@ -136,7 +168,8 @@ def run_thursday_summary() -> str | None:
     instead — see cli.py's hold-shadow-summary subcommand)."""
     gate_outcomes = _read_jsonl(hold_shadow_dir() / "gate-outcomes.jsonl")
     hold_facts = _read_jsonl(hold_shadow_dir() / "hold-facts.jsonl")
-    summary = build_summary(gate_outcomes, hold_facts)
+    enforce_outcomes = _read_jsonl(hold_shadow_dir() / "enforce-outcomes.jsonl")
+    summary = build_summary(gate_outcomes, hold_facts, enforce_outcomes)
     payload = _render_gem_payload(summary)
 
     try:

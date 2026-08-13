@@ -35,6 +35,13 @@ def _hold_fact(hold_class: str) -> dict:
     }
 
 
+def _enforce_outcome(enforce_class: str) -> dict:
+    return {
+        "schema_version": "enforce-outcome/v1",
+        "enforce_class": enforce_class,
+    }
+
+
 def test_build_summary_groups_by_classification():
     gate_outcomes = [
         _gate_outcome("proceed-to-bind"),
@@ -61,6 +68,27 @@ def test_build_summary_empty_inputs_do_not_error():
     assert result["hold_facts_total"] == 0
     assert result["by_hold_class"] == {}
     assert result["by_combined_recommendation"] == {}
+    # enforce_outcomes is optional/defaulted — omitting it entirely (the
+    # pre-enforce two-arg call shape) must not error and must still
+    # produce a well-formed (empty) enforce grouping.
+    assert result["enforce_outcomes_total"] == 0
+    assert result["by_enforce_class"] == {}
+
+
+def test_build_summary_groups_enforce_outcomes_by_class():
+    """lapis-pm-bundle-autodispatch-enforce-v0: enforce-outcomes group by
+    enforce_class (infra/salvage/defer) alongside the existing groupings."""
+    enforce_outcomes = [
+        _enforce_outcome("infra"),
+        _enforce_outcome("salvage"),
+        _enforce_outcome("salvage"),
+        _enforce_outcome("defer"),
+    ]
+    result = summary.build_summary([], [], enforce_outcomes)
+
+    assert result["enforce_outcomes_total"] == 4
+    assert result["by_enforce_class"] == {"infra": 1, "salvage": 2, "defer": 1}
+    assert len(result["enforce_outcomes_grouped"]["salvage"]) == 2
 
 
 def test_render_gem_payload_shape_and_deposited_by():
@@ -75,6 +103,13 @@ def test_render_gem_payload_shape_and_deposited_by():
     assert "brief_id" not in payload
     assert "option_id" not in payload
     assert "gem_id" not in payload
+
+
+def test_render_gem_payload_includes_enforce_grouping():
+    result = summary.build_summary([], [], [_enforce_outcome("salvage")])
+    payload = summary._render_gem_payload(result)
+    assert "enforce" in payload["why"].lower()
+    assert "salvage: 1" in payload["why"]
 
 
 def test_render_gem_payload_empty_log_still_valid():
@@ -95,6 +130,9 @@ def test_run_thursday_summary_reads_jsonl_files(monkeypatch, tmp_path):
     (hs_dir / "hold-facts.jsonl").write_text(
         json.dumps(_hold_fact("held_path")) + "\n" + "not-json\n",
         encoding="utf-8",
+    )
+    (hs_dir / "enforce-outcomes.jsonl").write_text(
+        json.dumps(_enforce_outcome("infra")) + "\n", encoding="utf-8",
     )
 
     captured = {}
@@ -132,6 +170,8 @@ def test_run_thursday_summary_reads_jsonl_files(monkeypatch, tmp_path):
     # A torn line ("not-json") never aborts the pass — the one valid hold-fact
     # record still made it into the summary.
     assert "held_path" in captured["payload"]["why"]
+    # enforce-outcomes.jsonl is read alongside the two existing files.
+    assert "infra: 1" in captured["payload"]["why"]
 
 
 def test_run_thursday_summary_fail_soft_on_network_error(monkeypatch, tmp_path):

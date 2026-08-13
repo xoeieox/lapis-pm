@@ -74,10 +74,53 @@ AUTODISPATCH_SPEC = textwrap.dedent("""\
     **Repo:** `lapis-pm`
 """)
 
+# A bundle spec with a parseable "## Items" section (Debt ID + source PR per
+# item) — for salvage-path tests. Matches bundle_autodispatch._parse_bundle_items'
+# own regex contract, not code_reviewer/debt_bundle.py's real renderer (out of
+# this repo) — see the module docstring on _SPEC_ITEMS_SECTION_RE.
+BUNDLE_SPEC_WITH_ITEMS = textwrap.dedent("""\
+    ---
+    spec_id: cr-bundle-myrepo-2026-08-12
+    status: draft
+    created: 2026-08-12
+    source: code-reviewer-debt-bundle-v0 nightly sweep
+    ---
+
+    # Spec: cr-bundle-myrepo-2026-08-12 — agentic debt fix-bundle
+
+    **Repo:** `myrepo`
+    **Authority:** advisory
+
+    ## Goal
+
+    Resolve 3 open MED-severity debt items in `myrepo`.
+
+    ## Items
+
+    1. **Debt ID:** `debt-abc123`
+       Flagged in PR #`219`.
+
+    2. **Debt ID:** `debt-def456`
+       Flagged in PR #`220`.
+
+    3. **Debt ID:** `debt-ghi789`
+       Flagged in PR #`221`.
+
+    ## Next steps
+
+    **Suggested bind:** `lapis-pm bind cr-bundle-myrepo-2026-08-12 --repo myrepo --authority advisory --create --title "Resolve 3 aged MED debt items in myrepo"`
+""")
+
 
 def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") -> Path:
     p = tmp_path / name
     p.write_text(BUNDLE_SPEC, encoding="utf-8")
+    return p
+
+
+def _write_items_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-08-12.md") -> Path:
+    p = tmp_path / name
+    p.write_text(BUNDLE_SPEC_WITH_ITEMS, encoding="utf-8")
     return p
 
 
@@ -1002,3 +1045,221 @@ class TestJournalLineSentinel:
             len(results["bound"]), len(results["deferred"]), len(results["skipped"]),
             len(results["failed"]), len(results["faulted"]), len(results["salvaged"]),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Three-way classification: infra / salvage / defer (gate-amended 2026-08-13
+# additions, DoD 7b/7c/7d).
+# ---------------------------------------------------------------------------
+
+class TestThreeWayClassification:
+    def test_infra_wins_over_salvage_on_dual_match(self):
+        """run 9b54d3f6: shape-with-Erah label, but the ground is a
+        synthesis timeout — INFRA wins over SALVAGE precedence, and the
+        salvage classifier (an LLM call) is never reached."""
+        brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={
+                "synthesis": {
+                    "escalation_reason": "Synthesis error: queue-side call did not complete within 210s",
+                },
+            },
+        )
+        with patch("agents_core.llm.call_operator") as mock_call:
+            enforce_class, ground = bad._classify_enforce(brief)
+
+        assert enforce_class == "infra"
+        assert "did not complete within 210s" in ground
+        mock_call.assert_not_called()
+
+    def test_permanent_fault_text_yields_zero_retries(self, tmp_path):
+        """DoD 7c: a fault whose own text proves permanent (malformed /
+        not recoverable) goes straight to record with ZERO retries — never
+        a second _run_gate call."""
+        _write_spec(tmp_path)
+        mock_brief = _make_brief(
+            "incomplete",
+            parse_error={"detail": "parse error: malformed spec header, not recoverable"},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert results["deferred"] == []
+        assert len(results["faulted"]) == 1
+        assert results["faulted"][0]["retried"] is False
+        assert mock_gate.call_count == 1  # zero retries
+
+    def test_transient_fault_text_retries_exactly_once(self, tmp_path):
+        """Companion positive case: a transient marker (queue/timeout) does
+        retry, exactly once — never twice."""
+        _write_spec(tmp_path)
+        mock_brief = _make_brief(
+            "incomplete",
+            parse_error={"detail": "queue-side synthesis call timed out"},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert len(results["faulted"]) == 1
+        assert results["faulted"][0]["retried"] is True
+        assert mock_gate.call_count == 2
+
+    def test_salvage_classifier_receives_byte_identical_grounds(self):
+        """DoD 7b: the salvage classifier consumes escalation_reason +
+        council open questions BYTE-IDENTICAL as stored — never a
+        re-summarized or LLM-paraphrased version."""
+        distinctive_reason = (
+            "Ground Zero: Item #7 references a REMOVED module (verbatim, do-not-reword)."
+        )
+        distinctive_question = "Is `debt-xyz` still valid given PR #999 reverted the change?"
+        brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": distinctive_reason}},
+            council_open_questions=[distinctive_question],
+        )
+
+        captured = {}
+
+        def _fake_call_operator(operator, prompt):
+            captured["prompt"] = prompt
+            return '{"classification": "salvage"}'
+
+        with patch("agents_core.llm.call_operator", side_effect=_fake_call_operator):
+            verdict = bad._classify_salvage_via_gw(brief)
+
+        assert verdict is not None
+        assert verdict["is_salvage"] is True
+        # The exact stored strings appear byte-for-byte in the prompt sent to GW.
+        assert distinctive_reason in captured["prompt"]
+        assert distinctive_question in captured["prompt"]
+        # And the ground returned to the caller (for the enforce record) is
+        # the same verbatim text, not a re-derived summary.
+        assert distinctive_reason in verdict["ground"]
+
+    def test_salvage_classifier_fault_returns_none_fail_closed(self):
+        brief = _make_brief(
+            "amend-spec",
+            facets_deliberation={"synthesis": {"escalation_reason": "some ground"}},
+        )
+        with patch("agents_core.llm.call_operator", side_effect=RuntimeError("gw down")):
+            verdict = bad._classify_salvage_via_gw(brief)
+        assert verdict is None
+
+    def test_salvage_dropped_items_carry_confidence_and_inference_source(self, tmp_path):
+        """DoD 7d: salvage records carry a per-item confidence marker +
+        inference source — both in the amended spec's '## Salvage record'
+        section and in the enforce record's salvage_dropped_items."""
+        spec_path = _write_items_spec(tmp_path)
+        mock_brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": "debt-abc123 is stale"}},
+        )
+        regate_brief = _make_brief("proceed-to-bind")
+
+        gate_calls = {"n": 0}
+
+        def _fake_run_gate(path, timeout):
+            gate_calls["n"] += 1
+            return mock_brief if gate_calls["n"] == 1 else regate_brief
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", side_effect=_fake_run_gate),
+            patch.object(
+                bad, "_classify_invalid_items_via_gw",
+                return_value=[
+                    {"debt_id": "debt-abc123", "confidence": "high", "source": "escalation_reason"},
+                ],
+            ),
+            patch.object(bad, "_mark_debt_invalid", return_value=True) as mock_mark,
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            results = _reconcile(tmp_path)
+
+        assert len(results["salvaged"]) == 1
+        dropped = results["salvaged"][0]["dropped_items"]
+        assert dropped == [{
+            "debt_id": "debt-abc123", "confidence": "high",
+            "source": "escalation_reason", "source_pr": 219,
+        }]
+        mock_mark.assert_called_once()
+
+        new_text = spec_path.read_text(encoding="utf-8")
+        assert "## Salvage record" in new_text
+        items_section, _, salvage_section = new_text.partition("## Salvage record")
+        # The dropped item's own block is gone from ## Items; the other two remain.
+        assert "debt-abc123" not in items_section
+        assert "debt-def456" in items_section
+        assert "debt-ghi789" in items_section
+        # The Salvage record names the dropped item with confidence + source.
+        assert "`debt-abc123`" in salvage_section
+        assert "Confidence:** high" in salvage_section
+        assert "Inference source:** escalation_reason" in salvage_section
+
+    def test_salvage_refuses_second_attempt_same_night(self, tmp_path):
+        """HARD BOUND: one salvage attempt per spec per night."""
+        spec_path = _write_items_spec(tmp_path)
+        bad._salvage_attempted_marker(spec_path).write_text(
+            "salvage-attempted: spec_id=test ts=earlier\n", encoding="utf-8",
+        )
+        mock_brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": "debt-abc123 is stale"}},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(
+                bad, "_classify_invalid_items_via_gw",
+                return_value=[{"debt_id": "debt-abc123", "confidence": "high", "source": "x"}],
+            ) as mock_classify,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        mock_classify.assert_not_called()  # refused before any item classification
+        assert mock_gate.call_count == 1  # no re-gate attempted
+        assert len(results["deferred"]) == 1
+        assert results["deferred"][0]["reason"] == "salvage_already_attempted"
+
+    def test_salvage_classifier_fault_fails_closed_to_defer(self, tmp_path):
+        spec_path = _write_items_spec(tmp_path)
+        mock_brief = _make_brief(
+            "shape-with-Erah",
+            facets_deliberation={"synthesis": {"escalation_reason": "debt-abc123 is stale"}},
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_classify_invalid_items_via_gw", return_value=None),
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert len(results["deferred"]) == 1
+        assert results["deferred"][0]["reason"] == "gate:salvage_classifier_fault"
+        # Spec is untouched — no partial amendment on a fail-closed path.
+        assert "## Salvage record" not in spec_path.read_text(encoding="utf-8")

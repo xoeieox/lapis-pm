@@ -153,6 +153,19 @@ def _failed_marker(spec_path: Path) -> Path:
     return Path(str(spec_path) + ".autodispatch-failed")
 
 
+def _salvage_attempted_marker(spec_path: Path) -> Path:
+    """HARD BOUND: one salvage attempt per spec per night. Sibling marker,
+    same directory as the .autodispatch* family. Tolerant of the 04:30
+    supersede rename in the same sense the existing .autodispatch* markers
+    already are: debt_bundle.py's _move_to_superseded moves only the spec
+    .md file (not sibling markers) — an accepted, pre-existing property this
+    unit does not change. By the time a spec would be superseded, autodispatch
+    has already run against it for the night that matters (and post the
+    Design 5 timer-sequencing fix, autodispatch runs AFTER the bundler, so
+    it always sees the live, not-yet-superseded set)."""
+    return Path(str(spec_path) + ".autodispatch-salvage-attempted")
+
+
 # ---------------------------------------------------------------------------
 # State checks
 # ---------------------------------------------------------------------------
@@ -193,6 +206,11 @@ def _run_gate(spec_path: Path, timeout_s: int) -> "SpecReviewBrief | None":
         authority="advisory",
         dispatch_facets=True,
         sonnet_reviewer=False,
+        # lapis-pm-bundle-autodispatch-enforce-v0: pass the invoker explicitly
+        # rather than relying on hold_shadow's stack-walk, which never sees
+        # this frame — the gate runs on this ThreadPoolExecutor worker, not
+        # on the caller's own stack.
+        invoked_by="bundle_autodispatch",
     )
     grace = 120  # seconds above the inner timeout before we give up
     try:
@@ -284,6 +302,613 @@ def _verify_dispatched(spec_id: str) -> bool:
     from lapis_pm import pm_core
     dispatched = pm_core.load_dispatched(spec_id)
     return len(dispatched) >= 1
+
+
+def _do_bind_tick_verify(
+    spec_id: str, repo: str, spec_path: Path, run_ts: str, results: dict,
+) -> None:
+    """Write-ahead pending marker, bind, tick, verify — the crash-guarded
+    bind path (unchanged from the pre-enforce flow). Shared by the direct
+    proceed-to-bind case and the post-salvage clean-re-gate case, so both
+    get the identical crash-guard discipline."""
+    _pending_marker(spec_path).write_text(
+        f"autodispatch-pending: spec_id={spec_id} repo={repo} ts={run_ts}\n",
+        encoding="utf-8",
+    )
+    logger.info(
+        "[bundle-autodispatch] wrote .autodispatch-pending for %s (ts=%s)", spec_id, run_ts,
+    )
+
+    logger.info(
+        "[bundle-autodispatch] binding %s → repo=%s authority=advisory", spec_id, repo,
+    )
+    if not _bind(spec_id, repo, spec_path):
+        logger.error(
+            "[bundle-autodispatch] !!! %s bind failed — "
+            "renaming .autodispatch-pending → .autodispatch-failed",
+            spec_id,
+        )
+        _pending_marker(spec_path).rename(_failed_marker(spec_path))
+        results["failed"].append({"spec": spec_id, "reason": "bind_failed"})
+        return
+
+    logger.info("[bundle-autodispatch] firing initial tick for %s", spec_id)
+    if not _tick(spec_id, repo):
+        logger.error(
+            "[bundle-autodispatch] !!! %s tick failed after bind — "
+            "renaming .autodispatch-pending → .autodispatch-failed",
+            spec_id,
+        )
+        _pending_marker(spec_path).rename(_failed_marker(spec_path))
+        results["failed"].append({"spec": spec_id, "reason": "tick_failed"})
+        return
+
+    if not _verify_dispatched(spec_id):
+        logger.error(
+            "[bundle-autodispatch] !!! %s dispatched<1 after tick — "
+            "renaming .autodispatch-pending → .autodispatch-failed",
+            spec_id,
+        )
+        _pending_marker(spec_path).rename(_failed_marker(spec_path))
+        results["failed"].append({"spec": spec_id, "reason": "dispatch_not_verified"})
+        return
+
+    _pending_marker(spec_path).rename(_autodispatch_marker(spec_path))
+    logger.info(
+        "[bundle-autodispatch] successfully bound+ticked+verified %s — "
+        ".autodispatch-pending renamed to .autodispatch",
+        spec_id,
+    )
+    results["bound"].append({"spec": spec_id, "repo": repo})
+
+
+# ---------------------------------------------------------------------------
+# Three-class enforce classifier (lapis-pm-bundle-autodispatch-enforce-v0)
+#
+# Erah ruled 2026-08-13 (AskUserQuestion): infra-faulted gates retry once
+# then record (never bind, never escalate); an auto-generated debt bundle
+# whose items are partly invalid may be salvaged in place (drop the invalid
+# items, record them to the debt ledger, re-gate once); genuine council
+# blocks / forks always defer to Erah. INFRA wins over SALVAGE on a dual
+# match (run 9b54d3f6: shape-with-Erah label, but the ground is a synthesis
+# timeout — retry before salvaging). Classifier faults / unparseable output
+# fail closed to DEFER, never bind.
+# ---------------------------------------------------------------------------
+
+# Markers naming a genuine infra fault whose OWN text leaves room for
+# transient recovery — retry once. Absence of a transient marker, or
+# presence of a permanent one, means zero retries (gate-amended
+# 2026-08-13: fault-text retry test, DoD 7c).
+_TRANSIENT_FAULT_MARKERS = (
+    "timeout", "timed out", "time out", "queue", "unreachable",
+    "connection reset", "connection refused", "temporarily unavailable",
+    "did not complete within",
+)
+_PERMANENT_FAULT_MARKERS = (
+    "malformed", "invalid syntax", "not recoverable", "permanently",
+    "unsupported", "parse error", "syntax error",
+)
+_SYNTHESIS_ERROR_MARKERS = (
+    "synthesis error", "did not complete within", "queue-side", "queue timeout",
+)
+
+
+def _is_transient_fault_text(text: str) -> bool:
+    """True only when the fault's own text names a transient-recovery
+    marker and no permanent marker. A permanent marker always wins (a fault
+    that says both "queue" and "malformed" is not a transient queue hiccup)."""
+    if not text:
+        return False
+    low = text.lower()
+    if any(m in low for m in _PERMANENT_FAULT_MARKERS):
+        return False
+    return any(m in low for m in _TRANSIENT_FAULT_MARKERS)
+
+
+def _infra_fault_text(brief) -> str | None:
+    """Return the verbatim fault text if *brief* matches an INFRA trigger,
+    else None. Checked BEFORE salvage/defer so a dual-match (a synthesis
+    fault rendered as shape-with-Erah) always classifies infra."""
+    if brief is None:
+        return "gate returned no brief (timeout or error)"
+
+    rec = getattr(brief, "combined_recommendation", "")
+    if rec in ("incomplete", "parse_failed"):
+        pe = getattr(brief, "parse_error", None)
+        if isinstance(pe, dict) and pe.get("detail"):
+            return str(pe["detail"])
+        return f"combined_recommendation={rec}"
+
+    status = getattr(brief, "council_status", "")
+    if status in ("failed", "error"):
+        reason = getattr(brief, "council_error_reason", "") or ""
+        return reason or f"council_status={status}"
+
+    fd = getattr(brief, "facets_deliberation", None)
+    synthesis = fd.get("synthesis") if isinstance(fd, dict) else None
+    if isinstance(synthesis, dict):
+        escalation_reason = synthesis.get("escalation_reason") or ""
+        if escalation_reason and any(
+            m in escalation_reason.lower() for m in _SYNTHESIS_ERROR_MARKERS
+        ):
+            return escalation_reason
+
+    return None
+
+
+def _defer_ground(brief) -> str:
+    """Verbatim reasons for a DEFER, preserved as stored — never paraphrased."""
+    if brief is None:
+        return "gate returned no brief (timeout or error)"
+    rec = getattr(brief, "combined_recommendation", "unknown")
+    open_questions = list(getattr(brief, "council_open_questions", None) or [])
+    parts = [f"combined_recommendation={rec}"]
+    if open_questions:
+        parts.append("open_questions: " + " | ".join(open_questions))
+    return "; ".join(parts)
+
+
+def _gw_grounds_text(brief) -> str:
+    """The byte-identical stored grounds — escalation_reason + council open
+    questions, AS STORED in the gate record — pinned verbatim (gate-amended
+    2026-08-13, Facets). Never a re-summarized or LLM-paraphrased version."""
+    fd = getattr(brief, "facets_deliberation", None)
+    synthesis = fd.get("synthesis") if isinstance(fd, dict) else None
+    escalation_reason = ""
+    if isinstance(synthesis, dict):
+        escalation_reason = synthesis.get("escalation_reason") or ""
+    open_questions = list(getattr(brief, "council_open_questions", None) or [])
+    parts = []
+    if escalation_reason:
+        parts.append(escalation_reason)
+    if open_questions:
+        parts.append("\n".join(open_questions))
+    return "\n".join(parts)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Tolerate a fenced code block around the classifier's JSON. Returns
+    None (never raises) on anything that doesn't parse as a JSON object."""
+    import json as _json
+
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:]
+        stripped = stripped.strip()
+    try:
+        parsed = _json.loads(stripped)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _classify_salvage_via_gw(brief) -> dict | None:
+    """GW-voiced classification: are the gate's stated grounds about invalid
+    or stale bundle ITEMS (salvage) or a genuine design fork (defer)?
+    Precedent-blind (gate-amended, Council): no prior night's outcomes are
+    ever fed in. Returns None on any fault, missing grounds, or unparseable
+    output — callers must fail-closed to DEFER on None."""
+    grounds_text = _gw_grounds_text(brief)
+    if not grounds_text.strip():
+        return None
+
+    prompt = (
+        "You are classifying why an automated debt-bundle spec-review gate "
+        "did not proceed to bind. Read the verbatim grounds below and decide "
+        "whether the gate's concern is that some bundle ITEMS are invalid or "
+        "stale (SALVAGE — the bundle can be amended by dropping those items "
+        "and re-gated), or whether the concern is a genuine design fork that "
+        "needs a human decision (DEFER). Judge this night's grounds alone — "
+        "you have no memory of prior nights.\n\n"
+        f"Verbatim grounds (byte-identical, as stored):\n{grounds_text}\n\n"
+        "Respond with STRICT JSON only, no prose: "
+        '{"classification": "salvage" | "defer"}'
+    )
+    try:
+        from agents_core.llm import call_operator
+        result = call_operator("gravitywell", prompt)
+        if not result:
+            return None
+        parsed = _extract_json_object(result)
+        if parsed is None:
+            return None
+        cls = parsed.get("classification")
+        if cls not in ("salvage", "defer"):
+            return None
+        return {"is_salvage": cls == "salvage", "ground": grounds_text}
+    except Exception as exc:
+        logger.warning(
+            "[bundle-autodispatch] salvage classifier fault: %s — fail-closed to DEFER", exc,
+        )
+        return None
+
+
+def _classify_enforce(brief) -> tuple[str, str]:
+    """Classify a non-bind gate outcome into infra | salvage | defer.
+    Returns (enforce_class, verbatim_ground)."""
+    infra_text = _infra_fault_text(brief)
+    if infra_text is not None:
+        return "infra", infra_text
+
+    rec = getattr(brief, "combined_recommendation", "")
+    if rec in ("shape-with-Erah", "amend-spec"):
+        verdict = _classify_salvage_via_gw(brief)
+        if verdict is None:
+            return "defer", _defer_ground(brief)
+        if verdict["is_salvage"]:
+            return "salvage", verdict["ground"]
+        return "defer", _defer_ground(brief)
+
+    return "defer", _defer_ground(brief)
+
+
+def _write_enforce_record(
+    spec_id: str,
+    brief,
+    enforce_class: str,
+    ground: str,
+    action: str,
+    salvage_dropped_items: list[dict] | None = None,
+) -> None:
+    from . import hold_shadow as _hold_shadow
+
+    run_id = getattr(brief, "council_run_id", "") if brief is not None else ""
+    _hold_shadow.observe_enforce_outcome(
+        run_id=run_id,
+        spec=spec_id,
+        enforce_class=enforce_class,
+        enforce_action=action,
+        verbatim_grounds=ground,
+        salvage_dropped_items=salvage_dropped_items,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Salvage: amend the bundle spec in place, ledger write-back, one re-gate
+# (Design 2 + 2c). Machine amendment of spec bodies is barred elsewhere in
+# this codebase (spec_attestation.py is frontmatter-only by invariant) —
+# the bundle corpus is exempt because these specs are machine-generated
+# from the debt ledger with no human author (Erah's salvage ruling, and no
+# other corpus).
+# ---------------------------------------------------------------------------
+
+_SPEC_DEBT_ID_RE = re.compile(r"\*\*Debt ID:\*\*\s+`([^`]+)`")
+_SPEC_SOURCE_PR_RE = re.compile(r"in PR #`(\d+)`")
+_SPEC_ITEMS_SECTION_RE = re.compile(
+    r"(^## Items\n\n)(.*?)(\n\n## )", re.DOTALL | re.MULTILINE,
+)
+
+
+def _parse_bundle_items(spec_text: str) -> list[dict]:
+    """Parse each item block out of the spec's '## Items' section. Returns
+    [{"debt_id", "block" (verbatim text, re-joined unchanged for kept
+    items), "source_pr"}]. Empty list if the section isn't found or has no
+    parseable items — callers must fail-closed to DEFER on empty."""
+    m = _SPEC_ITEMS_SECTION_RE.search(spec_text)
+    if not m:
+        return []
+    items_block = m.group(2)
+    entries = re.split(r"\n\n(?=\d+\.\s+\*\*Debt ID:\*\*)", items_block)
+    items = []
+    for entry in entries:
+        idm = _SPEC_DEBT_ID_RE.search(entry)
+        if not idm:
+            continue
+        prm = _SPEC_SOURCE_PR_RE.search(entry)
+        items.append({
+            "debt_id": idm.group(1),
+            "block": entry,
+            "source_pr": int(prm.group(1)) if prm else None,
+        })
+    return items
+
+
+def _classify_invalid_items_via_gw(grounds_text: str, items: list[dict]) -> list[dict] | None:
+    """Ask GW exactly which Debt IDs (from *items*) the verbatim grounds
+    name as invalid/stale. Returns None (fail-closed to DEFER) on any
+    fault, unparseable output, or an ID/confidence the model invented.
+    Empty list means the classifier found nothing concretely invalid — also
+    treated as fail-closed by the caller (a salvage classification with no
+    droppable item is not actionable)."""
+    id_list = "\n".join(f"- {it['debt_id']}" for it in items)
+    prompt = (
+        "A bundle-spec gate review concluded some items in the list below "
+        "are invalid or stale and should be dropped from the bundle (the "
+        "rest bind as-is). The verbatim grounds are given below; decide "
+        "EXACTLY which Debt IDs from the list are invalid, and name which "
+        "stored field grounded each verdict.\n\n"
+        f"Debt IDs in this bundle:\n{id_list}\n\n"
+        f"Verbatim grounds (byte-identical, as stored):\n{grounds_text}\n\n"
+        "Respond with STRICT JSON only, no prose: "
+        '{"invalid_items": [{"debt_id": "<id>", '
+        '"confidence": "high" | "medium" | "low", '
+        '"source": "<which stored field grounded this, e.g. escalation_reason, open_question>"}]}'
+        ' If no item is clearly invalid, return {"invalid_items": []}.'
+    )
+    try:
+        from agents_core.llm import call_operator
+        result = call_operator("gravitywell", prompt)
+        if not result:
+            return None
+        parsed = _extract_json_object(result)
+        if parsed is None:
+            return None
+        raw_items = parsed.get("invalid_items")
+        if not isinstance(raw_items, list):
+            return None
+        valid_ids = {it["debt_id"] for it in items}
+        out = []
+        for ri in raw_items:
+            if not isinstance(ri, dict):
+                return None
+            did = ri.get("debt_id")
+            conf = ri.get("confidence")
+            if did not in valid_ids or conf not in ("high", "medium", "low"):
+                return None
+            out.append({
+                "debt_id": did,
+                "confidence": conf,
+                "source": str(ri.get("source", ""))[:200] or "escalation_reason",
+            })
+        return out
+    except Exception as exc:
+        logger.warning(
+            "[bundle-autodispatch] invalid-item classifier fault: %s — fail-closed", exc,
+        )
+        return None
+
+
+def _amend_spec_salvage(
+    spec_path: Path,
+    items: list[dict],
+    drop_items: list[dict],
+    ground_text: str,
+    run_ts: str,
+) -> list[dict]:
+    """Rewrite *spec_path* in place: drop the items named in drop_items from
+    '## Items', append a '## Salvage record' section naming, per dropped
+    item, its Debt ID, the verbatim ground, confidence, and inference
+    source. Returns the dropped-item detail list (debt_id, confidence,
+    source, source_pr) for the enforce record + ledger write-back."""
+    text = spec_path.read_text(encoding="utf-8")
+    dropped_meta = {d["debt_id"]: d for d in drop_items}
+    keep_blocks = []
+    dropped_details = []
+    for it in items:
+        meta = dropped_meta.get(it["debt_id"])
+        if meta is not None:
+            dropped_details.append({**it, **meta})
+            continue
+        keep_blocks.append(it["block"])
+    new_items_block = "\n\n".join(keep_blocks)
+
+    new_text = _SPEC_ITEMS_SECTION_RE.sub(
+        lambda m: m.group(1) + new_items_block + m.group(3), text, count=1,
+    )
+
+    salvage_lines = [
+        "",
+        "## Salvage record",
+        "",
+        f"Salvaged by bundle_autodispatch enforce (gate-amended 2026-08-13, "
+        f"Erah's salvage ruling) at {run_ts}. The items below were dropped as "
+        f"invalid/stale per the gate's verbatim ground, and the bundle was "
+        f"re-gated once. No item disappears silently: ledger status flips to "
+        f"`invalid` and a source-PR comment is owed (not yet posted by this "
+        f"unit — see the enforce record).",
+        "",
+    ]
+    for d in dropped_details:
+        salvage_lines.append(
+            f"- **Debt ID:** `{d['debt_id']}` — **Ground:** {ground_text.strip()} "
+            f"— **Confidence:** {d['confidence']} — **Inference source:** {d['source']} "
+            f"— **PR comment owed:** source PR #{d.get('source_pr', '?')}."
+        )
+    new_text = new_text.rstrip("\n") + "\n" + "\n".join(salvage_lines) + "\n"
+
+    spec_path.write_text(new_text, encoding="utf-8")
+    return dropped_details
+
+
+def _mark_debt_invalid(repo: str, debt_id: str, ground_text: str) -> bool:
+    """Flip review/debt/<repo>/<debt_id>'s status to invalid via direct mem
+    keys (code_reviewer is NOT importable from the deploy python — the
+    write-back must go through agents_core.mem.MemoryStore keys directly,
+    mirroring the tag convention code_reviewer/memory.py's
+    update_debt_status already uses). Never raises — a ledger write-back
+    failure must not abort the salvage that already amended the spec; it is
+    logged loudly instead."""
+    try:
+        import yaml as _yaml
+        from agents_core.mem import MemoryStore
+
+        store = MemoryStore()
+        key = f"review/debt/{repo}/{debt_id}"
+        rec = store.get(key)
+        if not rec:
+            logger.warning(
+                "[bundle-autodispatch] salvage: debt ledger key %s not found for write-back",
+                key,
+            )
+            return False
+        body = _yaml.safe_load(rec.get("content", "")) or {}
+        body["status"] = "invalid"
+        body["invalid_ground"] = ground_text[:500]
+        store.set(
+            key,
+            _yaml.safe_dump(body, sort_keys=False),
+            tags=["review-debt", f"repo-{repo}", "debt-invalid"],
+            source="bundle-autodispatch-enforce",
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[bundle-autodispatch] salvage: ledger write-back failed for %s/%s: %s",
+            repo, debt_id, exc,
+        )
+        return False
+
+
+def _handle_infra(
+    spec_id: str,
+    repo: str,
+    spec_path: Path,
+    brief,
+    ground: str,
+    gate_timeout_s: int,
+    run_ts: str,
+    results: dict,
+) -> None:
+    """INFRA: retry the gate ONCE, and ONLY when the fault's own text leaves
+    room for transient recovery. Otherwise zero retries, straight to
+    record. Never 'deferring to human', never bind — a faulted spec lands
+    in the `faulted` bucket, not `deferred`."""
+    retried = False
+    final_ground = ground
+    final_brief = brief
+
+    if _is_transient_fault_text(ground):
+        retried = True
+        logger.warning(
+            "[bundle-autodispatch] %s: infra fault looks transient (%s) — retrying gate ONCE",
+            spec_id, ground,
+        )
+        retry_brief = _run_gate(spec_path, gate_timeout_s)
+        if retry_brief is not None and retry_brief.combined_recommendation == "proceed-to-bind":
+            logger.info(
+                "[bundle-autodispatch] %s: infra retry recovered — proceeding to bind", spec_id,
+            )
+            _write_enforce_record(spec_id, retry_brief, "infra", ground, action="retried_then_bound")
+            _do_bind_tick_verify(spec_id, repo, spec_path, run_ts, results)
+            return
+        final_brief = retry_brief
+        retry_infra_text = _infra_fault_text(retry_brief)
+        if retry_infra_text is not None:
+            final_ground = retry_infra_text
+    else:
+        logger.warning(
+            "[bundle-autodispatch] %s: infra fault looks permanent (%s) — "
+            "zero retries, straight to record",
+            spec_id, ground,
+        )
+
+    logger.warning(
+        "[bundle-autodispatch] %s: infra fault recorded (retried=%s) — "
+        "never deferred to human, never bound",
+        spec_id, retried,
+    )
+    _write_enforce_record(spec_id, final_brief, "infra", final_ground, action="faulted")
+    results["faulted"].append({"spec": spec_id, "ground": final_ground[:300], "retried": retried})
+
+
+def _handle_salvage(
+    spec_id: str,
+    repo: str,
+    spec_path: Path,
+    brief,
+    ground: str,
+    gate_timeout_s: int,
+    run_ts: str,
+    results: dict,
+) -> None:
+    """SALVAGE: amend the bundle in place (drop invalid items, ledger
+    write-back), re-gate ONCE. proceed-to-bind -> bind/tick/verify.
+    Anything else -> DEFER (fail-closed toward the human)."""
+    marker = _salvage_attempted_marker(spec_path)
+    if marker.exists():
+        logger.warning(
+            "[bundle-autodispatch] %s: salvage already attempted tonight — refusing a second attempt",
+            spec_id,
+        )
+        _write_enforce_record(spec_id, brief, "salvage", ground, action="refused_second_attempt")
+        results["deferred"].append({"spec": spec_id, "reason": "salvage_already_attempted"})
+        return
+
+    text = spec_path.read_text(encoding="utf-8")
+    items = _parse_bundle_items(text)
+    if not items:
+        logger.warning(
+            "[bundle-autodispatch] %s: salvage classified but no items parsed — fail-closed DEFER",
+            spec_id,
+        )
+        _write_enforce_record(spec_id, brief, "defer", ground, action="deferred")
+        results["deferred"].append({"spec": spec_id, "reason": "gate:salvage_no_items_parsed"})
+        return
+
+    drop_items = _classify_invalid_items_via_gw(ground, items)
+    if not drop_items:
+        reason = (
+            "gate:salvage_classifier_fault" if drop_items is None
+            else "gate:salvage_no_invalid_items_identified"
+        )
+        logger.warning(
+            "[bundle-autodispatch] %s: %s — fail-closed DEFER", spec_id, reason,
+        )
+        _write_enforce_record(spec_id, brief, "defer", ground, action="deferred")
+        results["deferred"].append({"spec": spec_id, "reason": reason})
+        return
+
+    # Claim the one salvage attempt BEFORE mutating the spec.
+    marker.write_text(f"salvage-attempted: spec_id={spec_id} ts={run_ts}\n", encoding="utf-8")
+
+    dropped_details = _amend_spec_salvage(spec_path, items, drop_items, ground, run_ts)
+    logger.warning(
+        "[bundle-autodispatch] %s: salvage amended spec in place, dropped %d item(s): %s",
+        spec_id, len(dropped_details), [d["debt_id"] for d in dropped_details],
+    )
+    for d in dropped_details:
+        _mark_debt_invalid(repo, d["debt_id"], ground)
+
+    logger.info("[bundle-autodispatch] %s: re-gating amended spec (salvage, one attempt)", spec_id)
+    regate_brief = _run_gate(spec_path, gate_timeout_s)
+
+    salvage_record_items = [
+        {
+            "debt_id": d["debt_id"],
+            "confidence": d["confidence"],
+            "source": d["source"],
+            "source_pr": d.get("source_pr"),
+        }
+        for d in dropped_details
+    ]
+
+    if regate_brief is not None and regate_brief.combined_recommendation == "proceed-to-bind":
+        _write_enforce_record(
+            spec_id, regate_brief, "salvage", ground, action="salvage_bound",
+            salvage_dropped_items=salvage_record_items,
+        )
+        results["salvaged"].append({
+            "spec": spec_id, "dropped_items": salvage_record_items, "outcome": "bound",
+        })
+        _do_bind_tick_verify(spec_id, repo, spec_path, run_ts, results)
+        return
+
+    logger.warning(
+        "[bundle-autodispatch] %s: salvage re-gate did not proceed-to-bind — DEFER (fail-closed)",
+        spec_id,
+    )
+    _write_enforce_record(
+        spec_id, regate_brief, "salvage", ground, action="salvage_regate_deferred",
+        salvage_dropped_items=salvage_record_items,
+    )
+    results["salvaged"].append({
+        "spec": spec_id, "dropped_items": salvage_record_items, "outcome": "deferred",
+    })
+    results["deferred"].append({"spec": spec_id, "reason": "gate:salvage_regate_not_proceed_to_bind"})
+
+
+def _handle_defer(spec_id: str, brief, ground: str, results: dict) -> None:
+    """DEFER: council blocks, laid-down, or a genuine fork — today's defer
+    path, verbatim reasons preserved."""
+    rec = getattr(brief, "combined_recommendation", None) if brief is not None else None
+    reason = f"gate:{rec}" if rec is not None else "gate_timeout_or_error"
+    logger.warning(
+        "[bundle-autodispatch] %s gate defers to human (%s) — %s", spec_id, reason, ground,
+    )
+    _write_enforce_record(spec_id, brief, "defer", ground, action="deferred")
+    results["deferred"].append({"spec": spec_id, "reason": reason})
 
 
 # ---------------------------------------------------------------------------
@@ -384,79 +1009,35 @@ def _reconcile_one(
     )
     brief = _run_gate(spec_path, gate_timeout_s)
 
-    if brief is None:
-        logger.warning(
-            "[bundle-autodispatch] gate timed out or errored for %s — deferring to human",
-            spec_id,
+    if brief is not None:
+        logger.info(
+            "[bundle-autodispatch] gate recommendation for %s: %s",
+            spec_id, brief.combined_recommendation,
         )
-        results["deferred"].append({"spec": spec_id, "reason": "gate_timeout_or_error"})
+
+    # Direct proceed-to-bind — unchanged crash-guarded bind/tick/verify path.
+    if brief is not None and brief.combined_recommendation == "proceed-to-bind":
+        _do_bind_tick_verify(spec_id, repo, spec_path, run_ts, results)
         return
 
-    rec = brief.combined_recommendation
-    logger.info("[bundle-autodispatch] gate recommendation for %s: %s", spec_id, rec)
-
-    if rec != "proceed-to-bind":
-        logger.warning(
-            "[bundle-autodispatch] %s gate returned %r — deferring to human",
-            spec_id, rec,
-        )
-        results["deferred"].append({"spec": spec_id, "reason": f"gate:{rec}"})
-        return
-
-    # Write-ahead intent marker before bind (atomic resolve: pending→success or pending→failed)
-    _pending_marker(spec_path).write_text(
-        f"autodispatch-pending: spec_id={spec_id} repo={repo} ts={run_ts}\n",
-        encoding="utf-8",
-    )
+    # Three-class enforce (lapis-pm-bundle-autodispatch-enforce-v0): everything
+    # that is not a clean proceed-to-bind is now infra / salvage / defer,
+    # replacing the old blanket "defer to human" for both brief-is-None and
+    # rec != proceed-to-bind.
+    enforce_class, ground = _classify_enforce(brief)
     logger.info(
-        "[bundle-autodispatch] wrote .autodispatch-pending for %s (ts=%s)", spec_id, run_ts,
+        "[bundle-autodispatch] %s classified enforce_class=%s", spec_id, enforce_class,
     )
 
-    # Bind
-    logger.info(
-        "[bundle-autodispatch] binding %s → repo=%s authority=advisory", spec_id, repo,
-    )
-    if not _bind(spec_id, repo, spec_path):
-        logger.error(
-            "[bundle-autodispatch] !!! %s bind failed — "
-            "renaming .autodispatch-pending → .autodispatch-failed",
-            spec_id,
-        )
-        _pending_marker(spec_path).rename(_failed_marker(spec_path))
-        results["failed"].append({"spec": spec_id, "reason": "bind_failed"})
+    if enforce_class == "infra":
+        _handle_infra(spec_id, repo, spec_path, brief, ground, gate_timeout_s, run_ts, results)
         return
 
-    # Tick (initial fixer dispatch)
-    logger.info("[bundle-autodispatch] firing initial tick for %s", spec_id)
-    if not _tick(spec_id, repo):
-        logger.error(
-            "[bundle-autodispatch] !!! %s tick failed after bind — "
-            "renaming .autodispatch-pending → .autodispatch-failed",
-            spec_id,
-        )
-        _pending_marker(spec_path).rename(_failed_marker(spec_path))
-        results["failed"].append({"spec": spec_id, "reason": "tick_failed"})
+    if enforce_class == "salvage":
+        _handle_salvage(spec_id, repo, spec_path, brief, ground, gate_timeout_s, run_ts, results)
         return
 
-    # Verify dispatched:1
-    if not _verify_dispatched(spec_id):
-        logger.error(
-            "[bundle-autodispatch] !!! %s dispatched<1 after tick — "
-            "renaming .autodispatch-pending → .autodispatch-failed",
-            spec_id,
-        )
-        _pending_marker(spec_path).rename(_failed_marker(spec_path))
-        results["failed"].append({"spec": spec_id, "reason": "dispatch_not_verified"})
-        return
-
-    # Success: atomically rename .autodispatch-pending → .autodispatch
-    _pending_marker(spec_path).rename(_autodispatch_marker(spec_path))
-    logger.info(
-        "[bundle-autodispatch] successfully bound+ticked+verified %s — "
-        ".autodispatch-pending renamed to .autodispatch",
-        spec_id,
-    )
-    results["bound"].append({"spec": spec_id, "repo": repo})
+    _handle_defer(spec_id, brief, ground, results)
 
 
 # ---------------------------------------------------------------------------
@@ -474,13 +1055,20 @@ def reconcile(
     run_ts is the caller-supplied ISO timestamp for pending marker provenance.
     It must be supplied by the CLI entry point, never generated inside this function.
 
-    Returns a results dict with keys: bound, deferred, skipped, failed.
-    Each value is a list of dicts describing the outcome for each spec.
+    Returns a results dict with keys: bound, deferred, skipped, failed,
+    faulted, salvaged. Each value is a list of dicts describing the outcome
+    for each spec. `faulted` (infra) and `salvaged` are cross-cutting
+    descriptors, not exclusive partitions — a salvaged spec that goes on to
+    bind appears in both `bound` and `salvaged`; one that fails its re-gate
+    appears in both `deferred` and `salvaged` (see _handle_salvage).
     """
     if spec_dir is None:
         spec_dir = _DEFAULT_SPEC_DIR
 
-    results: dict = {"bound": [], "deferred": [], "skipped": [], "failed": []}
+    results: dict = {
+        "bound": [], "deferred": [], "skipped": [], "failed": [],
+        "faulted": [], "salvaged": [],
+    }
 
     specs = _discover_specs(spec_dir)
     logger.info(
@@ -490,11 +1078,18 @@ def reconcile(
     for spec_path in specs:
         _reconcile_one(spec_path, dry_run, gate_timeout_s, run_ts, results)
 
+    # loupe's navigator (loupe/navigator/subjects.py) greps the service
+    # journal for the literal "run complete: bound=" substring and regexes
+    # bound=(\d+) to judge subject health — bound= MUST stay first and the
+    # existing buckets MUST never reorder/rename. New buckets are APPENDED
+    # only (see tests/test_bundle_autodispatch_enforce.py's sentinel test).
     logger.info(
-        "[bundle-autodispatch] run complete: bound=%d deferred=%d skipped=%d failed=%d",
+        "[bundle-autodispatch] run complete: bound=%d deferred=%d skipped=%d failed=%d faulted=%d salvaged=%d",
         len(results["bound"]),
         len(results["deferred"]),
         len(results["skipped"]),
         len(results["failed"]),
+        len(results["faulted"]),
+        len(results["salvaged"]),
     )
     return results

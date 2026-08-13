@@ -2058,7 +2058,9 @@ def cmd_bundle_autodispatch(args) -> int:
         f"bound={len(results['bound'])} "
         f"deferred={len(results['deferred'])} "
         f"skipped={len(results['skipped'])} "
-        f"failed={len(results['failed'])}"
+        f"failed={len(results['failed'])} "
+        f"faulted={len(results.get('faulted', []))} "
+        f"salvaged={len(results.get('salvaged', []))}"
     )
     for entry in results["bound"]:
         prefix = "[dry-run] " if entry.get("dry_run") else ""
@@ -2069,8 +2071,17 @@ def cmd_bundle_autodispatch(args) -> int:
         print(f"  SKIPPED: {entry['spec']} ({entry.get('reason', '?')})")
     for entry in results["failed"]:
         print(f"  FAILED: {entry['spec']} ({entry.get('reason', '?')})")
+    for entry in results.get("faulted", []):
+        print(f"  FAULTED: {entry['spec']} ({entry.get('ground', '?')[:120]}, retried={entry.get('retried')})")
+    for entry in results.get("salvaged", []):
+        print(
+            f"  SALVAGED: {entry['spec']} "
+            f"(dropped={len(entry.get('dropped_items', []))}, outcome={entry.get('outcome', '?')})"
+        )
 
-    # Exit 1 if any failed (bound-but-dead state), 0 otherwise
+    # Exit 1 if any failed (bound-but-dead state), 0 otherwise. Faults are
+    # expected transients (infra retried once then recorded) — never gate
+    # the exit code (lapis-pm-bundle-autodispatch-enforce-v0 Design 1).
     return 1 if results["failed"] else 0
 
 

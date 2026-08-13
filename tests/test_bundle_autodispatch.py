@@ -80,9 +80,25 @@ def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") ->
     return p
 
 
-def _make_brief(recommendation: str = "proceed-to-bind"):
+def _make_brief(recommendation: str = "proceed-to-bind", **overrides):
+    """A safely-defaulted brief mock. lapis-pm-bundle-autodispatch-enforce-v0's
+    three-way classifier reads several fields beyond combined_recommendation
+    (facets_deliberation, council_open_questions, council_status, ...) — a bare
+    MagicMock() auto-creates those as truthy sub-mocks, which crashes the
+    classifier's `list(...)` calls and would silently attempt a real GW call.
+    Explicit safe defaults here keep every pre-existing test hermetic; pass
+    overrides= for tests that need a specific classifier-relevant field."""
     brief = MagicMock()
     brief.combined_recommendation = recommendation
+    brief.facets_deliberation = overrides.pop("facets_deliberation", None)
+    brief.council_open_questions = overrides.pop("council_open_questions", [])
+    brief.council_status = overrides.pop("council_status", "resolved")
+    brief.council_positions = overrides.pop("council_positions", [])
+    brief.parse_error = overrides.pop("parse_error", None)
+    brief.council_error_reason = overrides.pop("council_error_reason", "")
+    brief.council_run_id = overrides.pop("council_run_id", "run-test")
+    for k, v in overrides.items():
+        setattr(brief, k, v)
     return brief
 
 
@@ -331,9 +347,14 @@ class TestProceedToBind:
 
 class TestHoldDefer:
     @pytest.mark.parametrize("recommendation", [
-        "amend-spec", "shape-with-Erah", "incomplete", "parse_failed",
+        "amend-spec", "shape-with-Erah",
     ])
     def test_non_proceed_defers_no_bind(self, tmp_path, recommendation):
+        """amend-spec / shape-with-Erah with no facets/council grounds present
+        (the default _make_brief) route through the salvage classifier, find
+        empty grounds, and fail-closed to DEFER — same observable outcome as
+        the pre-enforce behavior. See TestThreeWayClassification for the
+        infra/salvage split with real grounds present."""
         _write_spec(tmp_path)
         mock_brief = _make_brief(recommendation)
 
@@ -350,6 +371,31 @@ class TestHoldDefer:
         mock_tick.assert_not_called()
         assert len(results["deferred"]) == 1
         assert results["deferred"][0]["reason"] == f"gate:{recommendation}"
+
+    @pytest.mark.parametrize("recommendation", [
+        "incomplete", "parse_failed",
+    ])
+    def test_incomplete_and_parse_failed_are_infra_not_defer(self, tmp_path, recommendation):
+        """lapis-pm-bundle-autodispatch-enforce-v0: incomplete/parse_failed are
+        now INFRA triggers, not blanket defer — never bound, never deferred to
+        human, counted in the new `faulted` bucket."""
+        _write_spec(tmp_path)
+        mock_brief = _make_brief(recommendation)
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True) as mock_tick,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        mock_tick.assert_not_called()
+        assert results["deferred"] == []
+        assert len(results["faulted"]) == 1
+        assert recommendation in results["faulted"][0]["ground"]
 
     @pytest.mark.parametrize("recommendation", [
         "amend-spec", "shape-with-Erah", "incomplete",
@@ -407,20 +453,26 @@ class TestGWUnreachable:
         assert not bad._pending_marker(spec_path).exists()
         assert not bad._failed_marker(spec_path).exists()
 
-    def test_gate_none_return_defers(self, tmp_path):
-        """_run_gate returning None (timeout/error) defers without bind."""
+    def test_gate_none_return_is_infra_not_defer(self, tmp_path):
+        """lapis-pm-bundle-autodispatch-enforce-v0: _run_gate returning None
+        (timeout/error) is now an INFRA trigger — retried once (its own text
+        names a timeout), never bound, never deferred to a human."""
         _write_spec(tmp_path)
 
         with (
             patch.object(bad, "_target_yaml_exists", return_value=False),
             patch.object(bad, "_gw_serving", return_value=True),
-            patch.object(bad, "_run_gate", return_value=None),
+            patch.object(bad, "_run_gate", return_value=None) as mock_gate,
             patch.object(bad, "_bind") as mock_bind,
         ):
             results = _reconcile(tmp_path)
 
         mock_bind.assert_not_called()
-        assert results["deferred"][0]["reason"] == "gate_timeout_or_error"
+        assert results["deferred"] == []
+        assert len(results["faulted"]) == 1
+        assert results["faulted"][0]["retried"] is True
+        # retried once: initial gate call + the one infra retry
+        assert mock_gate.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +664,10 @@ class TestExternalBindSkip:
             results = _reconcile(tmp_path)
 
         # Excluded by filename — never reaches state-check
-        assert results == {"bound": [], "deferred": [], "skipped": [], "failed": []}
+        assert results == {
+            "bound": [], "deferred": [], "skipped": [], "failed": [],
+            "faulted": [], "salvaged": [],
+        }
 
 
 # ---------------------------------------------------------------------------

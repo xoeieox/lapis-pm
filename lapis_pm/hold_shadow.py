@@ -48,6 +48,7 @@ from . import hold_shadow_rules as rules
 GATE_OUTCOME_SCHEMA = "gate-outcome/v1"
 HOLD_FACT_SCHEMA = "hold-fact/v1"
 FAULT_SCHEMA = "hold-shadow-fault/v1"
+ENFORCE_OUTCOME_SCHEMA = "enforce-outcome/v1"
 
 _GATE_OUTCOME_REQUIRED_KEYS = frozenset({
     "schema_version", "run_id", "ts_utc", "spec_path", "repo", "authority",
@@ -58,6 +59,11 @@ _HOLD_FACT_REQUIRED_KEYS = frozenset({
     "brief_comment_id", "hold_comment_id", "pr_number", "repo", "pm_authority",
     "spec_bound_ts", "hold_class", "hold_reasons_verbatim", "would_have_action",
     "would_have_params", "confidence", "dedupe_key",
+})
+_ENFORCE_CLASSES = frozenset({"infra", "salvage", "defer"})
+_ENFORCE_OUTCOME_REQUIRED_KEYS = frozenset({
+    "schema_version", "record_id", "ts_utc", "run_id", "spec", "enforce_class",
+    "enforce_action", "salvage_dropped_items", "verbatim_grounds",
 })
 
 
@@ -80,6 +86,23 @@ def validate_gate_outcome_record(record: dict) -> None:
     for k in ("status", "sha"):
         if k not in record["grounding"]:
             raise ValueError(f"gate-outcome record.grounding missing key: {k}")
+
+
+def validate_enforce_outcome_record(record: dict) -> None:
+    """Raise ValueError on any schema violation. Checks schema_version
+    first, same idiom as validate_gate_outcome_record. lapis-pm-bundle-
+    autodispatch-enforce-v0: enforce-outcome/v1 records are a NEW record
+    type appended to their own JSONL (enforce-outcomes.jsonl) — gate-outcome/v1
+    records stay untouched (schema stays honest, spec Design 3)."""
+    if record.get("schema_version") != ENFORCE_OUTCOME_SCHEMA:
+        raise ValueError(f"unexpected schema_version: {record.get('schema_version')!r}")
+    missing = _ENFORCE_OUTCOME_REQUIRED_KEYS - record.keys()
+    if missing:
+        raise ValueError(f"enforce-outcome record missing keys: {sorted(missing)}")
+    if record["enforce_class"] not in _ENFORCE_CLASSES:
+        raise ValueError(f"invalid enforce_class: {record['enforce_class']!r}")
+    if not isinstance(record["salvage_dropped_items"], list):
+        raise ValueError("salvage_dropped_items must be a list")
 
 
 def validate_hold_fact_record(record: dict) -> None:
@@ -119,6 +142,10 @@ def gate_outcomes_path() -> Path:
 
 def hold_facts_path() -> Path:
     return hold_shadow_dir() / "hold-facts.jsonl"
+
+
+def enforce_outcomes_path() -> Path:
+    return hold_shadow_dir() / "enforce-outcomes.jsonl"
 
 
 def faults_path() -> Path:
@@ -180,15 +207,24 @@ def _detect_invoked_by() -> str:
 # Hook 1: gate-outcome/v1 — spec_review.run_spec_review completion
 # ---------------------------------------------------------------------------
 
-def observe_gate_outcome(brief, authority: str) -> None:
-    """Never-raise hook. Call once, at run_spec_review's return point."""
+def observe_gate_outcome(brief, authority: str, invoked_by: str | None = None) -> None:
+    """Never-raise hook. Call once, at run_spec_review's return point.
+
+    invoked_by: explicit invoker name, passed by the caller. lapis-pm-bundle-
+    autodispatch-enforce-v0 fixes the live defect where the stack-walk in
+    _detect_invoked_by never saw the bundle_autodispatch frame — _run_gate
+    runs the gate on a ThreadPoolExecutor worker, so the caller's frame is
+    gone by the time this hook's stack is walked. Passing invoked_by
+    explicitly is invoker-agnostic and correct across any executor hop;
+    falls back to the best-effort stack-walk when omitted (existing
+    interactive-CLI / MCP callers are unaffected)."""
     try:
-        _write_gate_outcome(brief, authority)
+        _write_gate_outcome(brief, authority, invoked_by)
     except Exception as exc:
         _log_fault("gate-outcome", f"{type(exc).__name__}: {exc}")
 
 
-def _write_gate_outcome(brief, authority: str) -> None:
+def _write_gate_outcome(brief, authority: str, invoked_by: str | None = None) -> None:
     fd = getattr(brief, "facets_deliberation", None) or {}
     synthesis = fd.get("synthesis") if isinstance(fd, dict) else None
     if not isinstance(synthesis, dict):
@@ -219,9 +255,74 @@ def _write_gate_outcome(brief, authority: str) -> None:
             "status": getattr(brief, "grounding_status", ""),
             "sha": getattr(brief, "grounding_resolved_sha", ""),
         },
-        "invoked_by": _detect_invoked_by(),
+        "invoked_by": invoked_by if invoked_by is not None else _detect_invoked_by(),
     }
     _append_jsonl(gate_outcomes_path(), record)
+
+
+# ---------------------------------------------------------------------------
+# Hook 3: enforce-outcome/v1 — bundle_autodispatch's three-way classifier
+# (lapis-pm-bundle-autodispatch-enforce-v0, Design 3). A NEW record type on
+# its own JSONL: gate-outcome/v1 records are written before _reconcile_one
+# classifies (spec_review.py's single return point), and JSONL is
+# append-only (see _append_jsonl above) — so enforce classification cannot
+# be folded back into the gate-outcome record and needs its own writer.
+# Passive: called BY bundle_autodispatch, never the reverse; this module
+# still imports nothing from the act surface (isolation invariant intact —
+# this hook only ever appends to its own file, same as the other two).
+# ---------------------------------------------------------------------------
+
+def observe_enforce_outcome(
+    *,
+    run_id: str,
+    spec: str,
+    enforce_class: str,
+    enforce_action: str,
+    verbatim_grounds: str,
+    salvage_dropped_items: list[dict] | None = None,
+) -> None:
+    """Never-raise hook. Call once per classified gate outcome, from
+    bundle_autodispatch's three-way classifier (infra / salvage / defer).
+
+    verbatim_grounds is the byte-identical stored text that drove the
+    classification (escalation_reason / council open questions / parse
+    error) — never an LLM-paraphrased restatement (gate-amended
+    2026-08-13, Facets: the verbatim-input pin)."""
+    try:
+        _write_enforce_outcome(
+            run_id=run_id,
+            spec=spec,
+            enforce_class=enforce_class,
+            enforce_action=enforce_action,
+            verbatim_grounds=verbatim_grounds,
+            salvage_dropped_items=salvage_dropped_items,
+        )
+    except Exception as exc:
+        _log_fault("enforce-outcome", f"{type(exc).__name__}: {exc}")
+
+
+def _write_enforce_outcome(
+    *,
+    run_id: str,
+    spec: str,
+    enforce_class: str,
+    enforce_action: str,
+    verbatim_grounds: str,
+    salvage_dropped_items: list[dict] | None,
+) -> None:
+    record = {
+        "schema_version": ENFORCE_OUTCOME_SCHEMA,
+        "record_id": str(uuid.uuid4()),
+        "ts_utc": _now_utc_iso(),
+        "run_id": run_id,
+        "spec": spec,
+        "enforce_class": enforce_class,
+        "enforce_action": enforce_action,
+        "salvage_dropped_items": list(salvage_dropped_items or []),
+        "verbatim_grounds": verbatim_grounds,
+    }
+    validate_enforce_outcome_record(record)
+    _append_jsonl(enforce_outcomes_path(), record)
 
 
 # ---------------------------------------------------------------------------

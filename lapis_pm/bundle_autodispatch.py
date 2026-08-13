@@ -764,7 +764,16 @@ def _handle_infra(
     """INFRA: retry the gate ONCE, and ONLY when the fault's own text leaves
     room for transient recovery. Otherwise zero retries, straight to
     record. Never 'deferring to human', never bind — a faulted spec lands
-    in the `faulted` bucket, not `deferred`."""
+    in the `faulted` bucket, not `deferred`.
+
+    A mechanically-successful retry (a brief that is neither proceed-to-bind
+    nor itself infra-faulted) is a genuine gate outcome, not a fault — it is
+    re-classified via _classify_enforce and dispatched to salvage/defer
+    (PR #287: falling through to `faulted` here buried genuine council
+    blocks in a bucket the morning brief renders as a machine hiccup,
+    contradicting Ruling 1(c) — genuine council blocks are always Erah's).
+    This never issues a second gate retry from this function; the one
+    _run_gate call above is the hard cap."""
     retried = False
     final_ground = ground
     final_brief = brief
@@ -787,6 +796,25 @@ def _handle_infra(
         retry_infra_text = _infra_fault_text(retry_brief)
         if retry_infra_text is not None:
             final_ground = retry_infra_text
+        else:
+            # retry_brief is guaranteed not None here — _infra_fault_text(None)
+            # always returns text, so a None retry_infra_text means the retry
+            # produced a real brief with no infra fault. Re-enter classification
+            # on the retry's own brief/ground; do NOT record faulted.
+            reclass_class, reclass_ground = _classify_enforce(retry_brief)
+            logger.info(
+                "[bundle-autodispatch] %s: infra retry mechanically healthy — "
+                "reclassified as %s, dispatching (no further gate retry)",
+                spec_id, reclass_class,
+            )
+            if reclass_class == "salvage":
+                _handle_salvage(
+                    spec_id, repo, spec_path, retry_brief, reclass_ground,
+                    gate_timeout_s, run_ts, results,
+                )
+            else:
+                _handle_defer(spec_id, retry_brief, reclass_ground, results)
+            return
     else:
         logger.warning(
             "[bundle-autodispatch] %s: infra fault looks permanent (%s) — "

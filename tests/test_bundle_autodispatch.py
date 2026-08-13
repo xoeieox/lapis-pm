@@ -1275,3 +1275,65 @@ class TestThreeWayClassification:
         assert results["deferred"][0]["reason"] == "gate:salvage_classifier_fault"
         # Spec is untouched — no partial amendment on a fail-closed path.
         assert "## Salvage record" not in spec_path.read_text(encoding="utf-8")
+
+    def test_infra_retry_mechanically_healthy_reclassifies_to_defer(self, tmp_path):
+        """PR #287 fix: the first gate infra-faults on transient text
+        ("did not complete within 210s"), retries ONCE, and the retry comes
+        back shape-with-Erah with a genuine council block (mechanically
+        healthy — not itself an infra fault). This must land in
+        results["deferred"], never results["faulted"] — burying a real
+        council block in the faulted bucket contradicts Ruling 1(c) (genuine
+        council blocks are always Erah's) and the machine-hiccup framing
+        the morning brief gives 'faulted' would hide it until the 04:30
+        bundler supersedes the set. The enforce record must carry the
+        retry's verbatim ground, not the original infra text — and only
+        ONE gate retry may ever occur (the reclassification itself must
+        never call _run_gate again)."""
+        _write_spec(tmp_path)
+        first_brief = _make_brief(
+            "incomplete",
+            parse_error={"detail": "Synthesis error: did not complete within 210s"},
+        )
+        retry_ground_reason = "Council block: this bundle's design direction needs Erah's call"
+        retry_brief = _make_brief(
+            "shape-with-Erah",
+            council_positions=[{"position": "block", "voice": "council-a"}],
+            council_open_questions=[retry_ground_reason],
+        )
+
+        gate_calls = {"n": 0}
+
+        def _fake_run_gate(path, timeout):
+            gate_calls["n"] += 1
+            return first_brief if gate_calls["n"] == 1 else retry_brief
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", side_effect=_fake_run_gate) as mock_gate,
+            # A genuine fork, not invalid items — the salvage classifier fails
+            # closed to DEFER (fail-closed pin; also exercised by returning None).
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None) as mock_salvage_classify,
+            patch.object(bad, "_write_enforce_record") as mock_write_record,
+            patch.object(bad, "_bind") as mock_bind,
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        assert results["faulted"] == []
+        assert len(results["deferred"]) == 1
+        assert results["deferred"][0]["spec"] == "cr-bundle-myrepo-2026-06-26"
+        # Exactly one gate retry — reclassification must never call _run_gate again.
+        assert mock_gate.call_count == 2
+        mock_salvage_classify.assert_called_once()
+
+        # The enforce record carries the retry's verbatim ground, never the
+        # stale original infra text.
+        mock_write_record.assert_called_once()
+        _, call_kwargs = mock_write_record.call_args
+        args = mock_write_record.call_args.args
+        written_class = args[2] if len(args) > 2 else call_kwargs.get("enforce_class")
+        written_ground = args[3] if len(args) > 3 else call_kwargs.get("ground")
+        assert written_class == "defer"
+        assert retry_ground_reason in written_ground
+        assert "did not complete within 210s" not in written_ground

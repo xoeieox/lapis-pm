@@ -14,6 +14,7 @@ Coverage:
 from __future__ import annotations
 
 import logging
+import re
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -925,3 +926,79 @@ class TestCLI:
             rc = cmd_bundle_autodispatch(args)
 
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Journal-line contract sentinel (lapis-pm-bundle-autodispatch-enforce-v0,
+# gate-amended 2026-08-13, Council — DoD 7a).
+#
+# loupe's navigator (loupe/navigator/subjects.py) greps the service journal
+# for the LITERAL "run complete: bound=" substring and regexes bound=(\d+)
+# to judge subject health. This is enforced law, not convention: the
+# existing bound/deferred/skipped/failed buckets must never reorder or
+# rename, and "bound=" must never be preceded by anything else. New buckets
+# (faulted, salvaged) are APPENDED only. This test fails loudly on any
+# rearrangement disguised as improvement — including a well-intentioned
+# alphabetical resort or a rename for "clarity".
+# ---------------------------------------------------------------------------
+
+class TestJournalLineSentinel:
+    _EXPECTED_LINE_RE = re.compile(
+        r"run complete: "
+        r"bound=(\d+) deferred=(\d+) skipped=(\d+) failed=(\d+) "
+        r"faulted=(\d+) salvaged=(\d+)$"
+    )
+
+    def test_journal_line_bound_is_first_and_buckets_are_not_reordered(self, tmp_path, caplog):
+        """The literal contract loupe's navigator parses: 'bound=' must be
+        the first bucket in the line, immediately after 'run complete: ',
+        and the six buckets must appear in exactly this order with exactly
+        these names. Any reorder, rename, or insertion before bound= is a
+        contract break for loupe, silently, in production."""
+        caplog.set_level(logging.INFO, logger="lapis_pm.bundle_autodispatch")
+
+        with (
+            patch.object(bad, "_discover_specs", return_value=[]),
+        ):
+            bad.reconcile(spec_dir=tmp_path, dry_run=True, run_ts=_RUN_TS)
+
+        complete_lines = [
+            r.getMessage() for r in caplog.records if "run complete:" in r.getMessage()
+        ]
+        assert len(complete_lines) == 1, (
+            f"expected exactly one 'run complete:' journal line, got {complete_lines!r}"
+        )
+        line = complete_lines[0]
+
+        # bound= must be the literal substring immediately following
+        # "run complete: " — nothing else may precede it.
+        idx = line.index("run complete: ")
+        after = line[idx + len("run complete: "):]
+        assert after.startswith("bound="), (
+            f"'bound=' must be the first bucket after 'run complete: ', got: {after!r}"
+        )
+
+        m = self._EXPECTED_LINE_RE.search(line)
+        assert m is not None, (
+            f"journal line does not match the pinned bound/deferred/skipped/failed/"
+            f"faulted/salvaged contract (order + names): {line!r}"
+        )
+
+    def test_journal_line_buckets_reflect_actual_counts(self, tmp_path, caplog):
+        """Sanity companion to the sentinel above: the six counts in the
+        journal line must reflect the actual results dict, not just match
+        the regex shape."""
+        caplog.set_level(logging.INFO, logger="lapis_pm.bundle_autodispatch")
+
+        with patch.object(bad, "_discover_specs", return_value=[]):
+            results = bad.reconcile(spec_dir=tmp_path, dry_run=True, run_ts=_RUN_TS)
+
+        line = next(
+            r.getMessage() for r in caplog.records if "run complete:" in r.getMessage()
+        )
+        m = self._EXPECTED_LINE_RE.search(line)
+        assert m is not None
+        assert [int(g) for g in m.groups()] == [
+            len(results["bound"]), len(results["deferred"]), len(results["skipped"]),
+            len(results["failed"]), len(results["faulted"]), len(results["salvaged"]),
+        ]

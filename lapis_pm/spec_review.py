@@ -3374,7 +3374,7 @@ def run_spec_review(
     # lapis-pm-hold-shadow-observer-v0: act-free shadow record of this gate
     # outcome (SHADOW MODE ONLY, Erah 2026-08-12). Hooked here — inside
     # run_spec_review, at its single return point — so every invoker
-    # (interactive CLI, the 01:30 bundle-autodispatch, MCP) is captured with
+    # (interactive CLI, the 05:15 bundle-autodispatch, MCP) is captured with
     # no per-caller wiring. Never-raise; cannot affect the returned brief.
     from . import hold_shadow as _hold_shadow
     _hold_shadow.observe_gate_outcome(brief, authority=effective_authority, invoked_by=invoked_by)

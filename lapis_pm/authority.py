@@ -38,7 +38,9 @@ HELD_PATTERNS = [
     re.compile(r"^lapis_pm/authority\.py$"),
     # The six-clause autonomous-merge predicate. Remove only if auto-resolve is retired.
     re.compile(r"^lapis_pm/auto_resolve\.py$"),
-    # The unattended binder: the one path that binds+ticks with no human at 01:30 nightly.
+    # The unattended binder: the one path that binds+ticks with no human at
+    # 05:15 nightly (lapis-pm-bundle-autodispatch-enforce-v0 Design 5: moved
+    # from 01:30 to fire after the 04:30 bundler, not before it).
     re.compile(r"^lapis_pm/bundle_autodispatch\.py$"),
     # Session hooks the PM executes on its own runs (router-portfolio-stop.py).
     re.compile(r"^lapis_pm/hooks/"),

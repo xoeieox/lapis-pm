@@ -1181,6 +1181,10 @@ class TestThreeWayClassification:
             patch.object(bad, "_gw_serving", return_value=True),
             patch.object(bad, "_run_gate", side_effect=_fake_run_gate),
             patch.object(
+                bad, "_classify_salvage_via_gw",
+                return_value={"is_salvage": True, "ground": "debt-abc123 is stale"},
+            ),
+            patch.object(
                 bad, "_classify_invalid_items_via_gw",
                 return_value=[
                     {"debt_id": "debt-abc123", "confidence": "high", "source": "escalation_reason"},
@@ -1229,6 +1233,10 @@ class TestThreeWayClassification:
             patch.object(bad, "_gw_serving", return_value=True),
             patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
             patch.object(
+                bad, "_classify_salvage_via_gw",
+                return_value={"is_salvage": True, "ground": "debt-abc123 is stale"},
+            ),
+            patch.object(
                 bad, "_classify_invalid_items_via_gw",
                 return_value=[{"debt_id": "debt-abc123", "confidence": "high", "source": "x"}],
             ) as mock_classify,
@@ -1253,6 +1261,10 @@ class TestThreeWayClassification:
             patch.object(bad, "_target_yaml_exists", return_value=False),
             patch.object(bad, "_gw_serving", return_value=True),
             patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(
+                bad, "_classify_salvage_via_gw",
+                return_value={"is_salvage": True, "ground": "debt-abc123 is stale"},
+            ),
             patch.object(bad, "_classify_invalid_items_via_gw", return_value=None),
             patch.object(bad, "_bind") as mock_bind,
         ):

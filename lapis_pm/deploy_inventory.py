@@ -7,6 +7,11 @@ The maps are allowlists a human must remember to update; nothing previously
 compared them against what is actually running. This module is the
 comparison.
 
+It also detects a related but distinct hazard (lapis-pm-deploy-inventory-
+runtime-symlink-into-dev-tree-v0): a runtime config path resolving, through
+a symlink chain, into a `-working` PM investigation tree the maps above do
+not cover — see `find_runtime_symlink_findings`.
+
 Detection-only (spec item 8): this module never mutates a clone or a unit.
 It only fetches (read-only), inspects, and writes a status JSON. No pull,
 checkout, reset, branch change, or service restart lives here.
@@ -22,6 +27,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field, asdict
@@ -45,6 +51,23 @@ _STALE_LOCK_THRESHOLD_SECS = 6 * 3600  # default 6h (spec item 4)
 # PM-managed clone roots — only paths resolving under one of these are inventoried
 # (spec: editable-install scope + PYTHONPATH boundary / Council dependency-shadow reservation).
 _CLONE_ROOT_PREFIXES = ("/srv/git", "/data/agents")
+
+# A PM investigation ("-working") tree, by definition (D1), is a direct child
+# of THIS root whose basename ends in "-working" — distinct from
+# _CLONE_ROOT_PREFIXES (where we *walk* for symlinks, which also includes
+# /data/agents) since a "-working" tree can only ever live under /srv/git.
+_DEV_TREE_ROOT = "/srv/git"
+
+# ELOOP-style bound on symlink chain length (D1a — transitive resolution).
+# Matches the usual Linux kernel default; a chain this long is itself a
+# malformed-input signal, not a real config route.
+_MAX_SYMLINK_HOPS = 40
+
+# The two finding kinds a bare/legacy `.deploy-unmapped-ack` (no content, or
+# content naming nothing) has always silenced, by the pre-existing per-clone
+# boolean at reconcile_inventory(). `runtime_symlink_into_dev_tree` is
+# deliberately excluded from this set (D4) — see `_ack_kinds()`.
+_LEGACY_ACK_KINDS = frozenset({"unmapped_live_clone", "pull_without_restart"})
 
 _STATUS_FILE = room_path('lapis_state') / "deploy-inventory-status.json"
 _LOCK_DIR = room_path('lapis_state') / "deploy-pull-lock"
@@ -410,6 +433,240 @@ def reconcile_inventory(
     return findings_by_clone
 
 
+def _ack_kinds(clone_path: str) -> frozenset[str]:
+    """Which finding kinds the `.deploy-unmapped-ack` marker at `clone_path`
+    acknowledges (D4).
+
+    The marker's mere *presence* — empty file, or content naming nothing —
+    acknowledges only `_LEGACY_ACK_KINDS`, matching the pre-existing
+    per-clone-boolean behaviour every current ack relies on
+    (`reconcile_inventory`'s `acked = (Path(path) / _ACK_MARKER).exists()`).
+    To additionally acknowledge `runtime_symlink_into_dev_tree` (or any future
+    kind), the marker's CONTENTS must name it explicitly, one kind per line
+    (blank lines and `#`-comments ignored). This is the collision guard: a
+    bare legacy ack dropped to silence an unrelated `unmapped_live_clone`
+    finding must never also silence a HIGH symlink-into-dev-tree finding on
+    the same clone.
+
+    Returns frozenset() if no marker exists at all.
+    """
+    marker = Path(clone_path) / _ACK_MARKER
+    if not marker.exists():
+        return frozenset()
+    try:
+        text = marker.read_text()
+    except OSError:
+        # Present but unreadable — fail open to the legacy existence-only
+        # behaviour rather than silently un-acking every clone with a
+        # permission-restricted marker.
+        return _LEGACY_ACK_KINDS
+    named = {
+        line.strip() for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    return _LEGACY_ACK_KINDS | named if named else _LEGACY_ACK_KINDS
+
+
+# ---------------------------------------------------------------------------
+# Runtime symlink into dev-tree detection (D1/D1a/D2-D7) — a runtime config
+# path that resolves, through a symlink chain, into a `-working` PM
+# investigation tree makes a production service's live config whatever
+# branch that tree happens to have checked out. This is a distinct defect
+# class from the gap findings above: it is not about an unmapped clone, it
+# is about a clone silently reading a DIFFERENT clone's dev copy.
+# ---------------------------------------------------------------------------
+
+def _working_tree_root(path_str: str) -> str | None:
+    """If `path_str` lies under a `-working` PM investigation tree directly
+    beneath `_DEV_TREE_ROOT`, return that tree's root path. Else None.
+
+    A "-working" tree is, by definition (D1), a direct child of
+    `_DEV_TREE_ROOT` whose basename ends in "-working" — e.g.
+    `/srv/git/conductor-working`, not `/srv/git/facets-working/deep/dir`'s
+    grandparent-of-grandparent or some other indirect ancestor match.
+    """
+    try:
+        rel = Path(path_str).relative_to(_DEV_TREE_ROOT)
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None
+    top = rel.parts[0]
+    if not top.endswith("-working"):
+        return None
+    return str(Path(_DEV_TREE_ROOT) / top)
+
+
+def _iter_symlinks(root: str):
+    """Yield every symlink (file or directory) under `root`, fail-open (D5)
+    on a missing root or any per-entry/per-directory probe error — logged
+    and skipped, never raised.
+
+    `followlinks=False` (the default) keeps `os.walk` from descending
+    *through* a symlinked directory — it still yields the symlink itself as
+    a dirnames/filenames entry, it just never recurses into its target a
+    second time (avoids both duplicate scanning and infinite recursion on a
+    self-referential symlinked directory).
+    """
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return
+
+    def _on_walk_error(err: OSError) -> None:
+        logger.warning("[deploy-inventory] symlink walk error under %s: %s", root, err)
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error, followlinks=False):
+        # Never descend into a clone's .git internals — irrelevant to runtime
+        # config routing and can be enormous.
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        for name in dirnames + filenames:
+            candidate = Path(dirpath) / name
+            try:
+                if candidate.is_symlink():
+                    yield candidate
+            except OSError as e:
+                logger.warning("[deploy-inventory] symlink stat failed for %s: %s", candidate, e)
+
+
+def _resolve_symlink_chain(symlink_path: Path) -> tuple[list[str], str] | None:
+    """Follow `symlink_path`'s symlink chain hop by hop, TRANSITIVELY (D1a).
+
+    `Path.resolve()` would do this silently in one call; this function makes
+    each hop explicit so a finding's `detail` can name the provenance chain
+    (D1a's DoD requirement) and so a future refactor to a one-hop primitive
+    (e.g. bare `os.readlink()`) would visibly fail this function's own tests
+    rather than silently regressing.
+
+    Returns `(hops, terminus)`: `hops` is every path visited in order,
+    starting with `symlink_path` itself and then each link's resolved
+    target; `terminus` is the final hop — either a real, existing,
+    non-symlink path, or the first hop that lands outside `_DEV_TREE_ROOT` or
+    inside a `-working` tree (D1a: both are deliberate stopping points, not
+    failures — the point is the resolved *route*, not whether one specific
+    leaf file exists).
+
+    Returns None — fail-open (D5) — on an unreadable link, a dangling/broken
+    terminus, a resolution loop, or a chain longer than
+    `_MAX_SYMLINK_HOPS`. Never raises.
+    """
+    current = symlink_path
+    hops = [str(symlink_path)]
+    seen = {str(symlink_path)}
+    dev_root = _DEV_TREE_ROOT.rstrip("/")
+
+    for _ in range(_MAX_SYMLINK_HOPS):
+        try:
+            is_link = current.is_symlink()
+        except OSError as e:
+            logger.warning("[deploy-inventory] symlink probe failed for %s: %s", current, e)
+            return None
+
+        if not is_link:
+            if not current.exists():
+                logger.warning(
+                    "[deploy-inventory] broken symlink chain — %s does not exist (chain: %s)",
+                    current, hops,
+                )
+                return None  # dangling terminus — fail open, no finding
+            return hops, str(current)
+
+        try:
+            raw_target = os.readlink(current)
+        except OSError as e:
+            logger.warning("[deploy-inventory] unreadable symlink %s: %s", current, e)
+            return None
+
+        target = Path(raw_target)
+        next_path = target if target.is_absolute() else (current.parent / target)
+        next_str = str(Path(os.path.normpath(str(next_path))))
+
+        if next_str in seen:
+            logger.warning(
+                "[deploy-inventory] symlink resolution loop at %s (chain: %s)", next_str, hops,
+            )
+            return None
+        seen.add(next_str)
+        hops.append(next_str)
+
+        # D1a stop conditions — leaving the dev-tree root, or landing inside
+        # a `-working` tree, both terminate the chase here without an
+        # existence check.
+        if next_str != dev_root and not next_str.startswith(dev_root + "/"):
+            return hops, next_str
+        if _working_tree_root(next_str) is not None:
+            return hops, next_str
+
+        current = Path(next_str)
+
+    logger.warning(
+        "[deploy-inventory] symlink chain exceeded %d hops starting at %s — treating as a "
+        "resolution failure (fail-open)", _MAX_SYMLINK_HOPS, symlink_path,
+    )
+    return None
+
+
+def find_runtime_symlink_findings(post_land_pull: dict[str, list[str]]) -> dict[str, list[Finding]]:
+    """D1/D1a/D2-D5: walk `_CLONE_ROOT_PREFIXES` for symlinks whose fully
+    (transitively) resolved target lies inside a `-working` PM investigation
+    tree that `_POST_LAND_PULL` does not cover. One HIGH
+    `runtime_symlink_into_dev_tree` finding per such symlink (D2), keyed by
+    the clone that CONTAINS the symlink (D7 — so it renders on that clone's
+    own operator-board row, e.g. `/data/agents` for the two 2026-08-13
+    instances), downgraded to INFO by a kind-scoped ack (D4).
+
+    A symlink that already lives *inside* the same `-working` tree it
+    resolves into is excluded — that is ordinary internal tooling plumbing
+    (a venv's `bin/python` symlink, a `node_modules/.bin` shim), not a
+    runtime path crossing from a deploy clone into a foreign dev tree. Without
+    this exclusion the live host produces dozens of false positives from
+    every `-working` tree's own virtualenv and `node_modules` (verified
+    2026-08-13 against the actual host — see DoD item 8).
+
+    Fail-open throughout (D5): every per-symlink resolution failure is
+    logged and skipped by `_resolve_symlink_chain`/`_iter_symlinks`, never
+    turned into a finding. Detection only (D6): no subprocess call here
+    mutates anything — `_resolve_git_root` (used to attribute the "owning
+    clone") issues only `git rev-parse --show-toplevel`, already in this
+    module's allowed read-only verb set.
+    """
+    reverse_map = _reverse_pull_map(post_land_pull)  # resolved_path -> repo
+    findings_by_clone: dict[str, list[Finding]] = {}
+
+    for root in _CLONE_ROOT_PREFIXES:
+        for symlink_path in _iter_symlinks(root):
+            resolved = _resolve_symlink_chain(symlink_path)
+            if resolved is None:
+                continue
+            hops, terminus = resolved
+
+            working_tree = _working_tree_root(terminus)
+            if working_tree is None:
+                continue  # never landed inside a `-working` tree — not this defect
+
+            if _working_tree_root(str(symlink_path)) == working_tree:
+                continue  # symlink already lives inside the tree it points to
+
+            if working_tree in reverse_map:
+                continue  # the tree IS post-land-pulled — no defect
+
+            owning_clone = _resolve_git_root(str(symlink_path.parent)) or str(symlink_path.parent)
+            ack_kinds = _ack_kinds(owning_clone)
+            severity = "INFO" if "runtime_symlink_into_dev_tree" in ack_kinds else "HIGH"
+
+            chain_desc = " -> ".join(hops)
+            detail = (
+                f"{symlink_path} resolves to {terminus} (chain: {chain_desc}) inside PM "
+                f"investigation tree {working_tree}, which is not present in _POST_LAND_PULL "
+                f"and so is never pulled after a land"
+            )
+            findings_by_clone.setdefault(owning_clone, []).append(
+                Finding("runtime_symlink_into_dev_tree", severity, detail)
+            )
+
+    return findings_by_clone
+
+
 # ---------------------------------------------------------------------------
 # Currency assertion (spec item 3) — three independent checks per clone
 # ---------------------------------------------------------------------------
@@ -577,9 +834,10 @@ def run_reconcile_pass(
     """
     inventory = derive_deploy_inventory()
     findings_by_clone = reconcile_inventory(inventory, post_land_pull, post_land_restart, post_land_restart_user)
+    symlink_findings_by_clone = find_runtime_symlink_findings(post_land_pull)
     reverse_map = _reverse_pull_map(post_land_pull)
 
-    all_paths = sorted(set(inventory.keys()) | set(reverse_map.keys()))
+    all_paths = sorted(set(inventory.keys()) | set(reverse_map.keys()) | set(symlink_findings_by_clone.keys()))
     fetch_done: set = set()
 
     clones_out = []
@@ -593,6 +851,11 @@ def run_reconcile_pass(
 
         findings = list(findings_by_clone.get(path, []))
         findings = _apply_ack_downgrade(findings, acked)
+        # Severity for runtime_symlink_into_dev_tree is already final (D4's
+        # kind-scoped ack was applied inside find_runtime_symlink_findings) —
+        # _apply_ack_downgrade above only ever touches _LEGACY_ACK_KINDS, so
+        # these pass through untouched regardless of call order.
+        findings.extend(symlink_findings_by_clone.get(path, []))
         findings.extend(currency.findings)
         if lock_finding is not None:
             findings.append(lock_finding)
@@ -677,6 +940,22 @@ def _worst_severity(findings: list[dict]) -> str | None:
     return best
 
 
+def _worst_finding(findings: list[dict]) -> dict | None:
+    """The single finding dict carrying the worst (lowest _SEVERITY_ORDER)
+    severity — ties broken by first-seen order. Used to name the finding
+    *kind* on the operator board (D7): a bare severity color tells Erah
+    something is wrong but not which finding — e.g. `runtime_symlink_into_
+    dev_tree` needs to be legible as itself, not folded into an undifferentiated
+    "HIGH".
+    """
+    best = None
+    for f in findings:
+        sev = f.get("severity")
+        if best is None or _SEVERITY_ORDER.get(sev, 3) < _SEVERITY_ORDER.get(best.get("severity"), 3):
+            best = f
+    return best
+
+
 def _truncate_units(backing_units: list[dict], width: int = 30) -> str:
     names = [bu["unit"] for bu in backing_units]
     joined = ", ".join(names)
@@ -715,9 +994,11 @@ def render_deploy_status(status: dict) -> str:
         if c.get("untracked_present"):
             clean_repr = f"{_COLOR_AMBER_BOLD_UNDERLINE}{clean_repr}{_RESET}"
         mapped = "yes" if c.get("mapped") else "no"
-        worst = _worst_severity(c.get("findings", []))
+        worst_finding = _worst_finding(c.get("findings", []))
+        worst = worst_finding.get("severity") if worst_finding else None
         color = _COLORS.get(worst, "")
-        worst_repr = f"{color}{worst or '-'}{_RESET}" if color else (worst or "-")
+        label = f"{worst} {worst_finding.get('kind', '?')}" if worst_finding else "-"
+        worst_repr = f"{color}{label}{_RESET}" if color else label
         lines.append(
             f"{name:<24} {units:<32} {behind_repr:>7} {branch_ok:>10} {clean_repr:>7} {mapped:>7}  {worst_repr}"
         )

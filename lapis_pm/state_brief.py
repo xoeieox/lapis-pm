@@ -109,6 +109,16 @@ _GARDENER_DAILY_CAP = 10
 # truncated and a landed target never mis-counts as in-flight.
 _LANDED_PREFIX_LIMIT = 10_000
 
+# Per-family prefix scans replace the tag-wide scan (state-brief-inflight-window-v0).
+# A tag-wide limit truncates the OLDEST in-flight targets first, i.e. hides the work that
+# has been waiting longest. Each limit is >= 5x the live count measured 2026-08-17
+# (dispatched 967, chain 194, thread 54, outstanding-brief 0) and mirrors the
+# _LANDED_PREFIX_LIMIT pattern above.
+_INFLIGHT_DISPATCHED_LIMIT = 5_000
+_INFLIGHT_CHAIN_LIMIT = 5_000
+_CAPTURED_THREAD_LIMIT = 5_000
+_AWAITING_OUTSTANDING_LIMIT = 5_000
+
 # --- Arc-Climate reconciler (gardener-arc-climate-v0, Unit 1) ---
 # Global staleness threshold — a single named constant, trivially tunable
 # (OQ-2 RESOLVED: Facets-endorsed 21 days; per-arc importance-scaling deferred
@@ -146,7 +156,10 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
     """Read all data sources and return buckets dict.
 
     All reads are deterministic; performed before any LLM call.
-    Uses list_all(tag="lapis-pm", since=...) + client-side prefix filter.
+    Built/Notable ratifications use list_all(tag="lapis-pm", since=...) +
+    client-side prefix filter. In flight/Captured/Awaiting your call use one
+    list_by_prefix() scan per family (state-brief-inflight-window-v0) +
+    client-side tag filter, since list_by_prefix has no tag parameter.
     Does NOT use mem.search() (no since= support).
 
     Args:
@@ -197,7 +210,7 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
     # over-reports. Same precedence rule as the reference oracle,
     # trajectory._derive_node_state ("landed if pm/landed/<tid> exists" wins
     # over any dispatched signal). Built from a dedicated pm/landed/ prefix
-    # scan (limit well above the current 626 dual-key count) rather than a
+    # scan (limit well above the current 851 dual-key count) rather than a
     # per-target mem round-trip inside the loop below. Degrades to an empty
     # landed set on failure (matches the Gardener/Climate degrade pattern
     # below) rather than blocking the whole brief on a mem outage.
@@ -211,7 +224,63 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
         if e.get("key", "").startswith("pm/landed/")
     }
 
-    all_keys = mem.list_all(tag="lapis-pm", limit=1000)
+    # In-flight/Captured/Awaiting all used to come from one tag-wide
+    # list_all(tag="lapis-pm", limit=1_000) scan (state-brief-inflight-window-v0).
+    # That scan is updated_at-DESC, so a 1,000-row cap silently truncates the
+    # OLDEST in-flight targets first — the direction a decision surface must
+    # never move, and one that shrinks further as the machinery gets busier.
+    # Replaced with one list_by_prefix() per family (each with its own named
+    # limit, see above) so no family's window can shrink because another
+    # family got noisy. None of these four prefixes overlap EXHAUST_PREFIXES
+    # today (elevator/, weather/, router/gw-review-divergence/ —
+    # mem_exhaust.py:72-76), so list_by_prefix's sibling-exhaust merge is inert
+    # here; routing any of them to exhaust later would change brief semantics.
+    # Each family scan degrades to empty on its own failure (matches the
+    # landed-scan degrade pattern immediately above) so one family's mem
+    # trouble never blocks the other three or the rest of the brief. A family
+    # that comes back at exactly its limit logs a warning naming the family
+    # and the limit — a future truncation must be attributable, not silent.
+    all_keys: list[dict] = []
+    for _prefix, _limit in (
+        ("pm/dispatched/", _INFLIGHT_DISPATCHED_LIMIT),
+        ("chain/", _INFLIGHT_CHAIN_LIMIT),
+        ("thread/", _CAPTURED_THREAD_LIMIT),
+        ("pm/outstanding-brief/", _AWAITING_OUTSTANDING_LIMIT),
+    ):
+        try:
+            _entries = mem.list_by_prefix(_prefix, limit=_limit)
+        except Exception:
+            logger.warning(
+                "_read_buckets: %s scan failed; degrading to empty for this family",
+                _prefix,
+            )
+            continue
+        if len(_entries) == _limit:
+            logger.warning(
+                "_read_buckets: %s scan hit its limit (%d) — results may be truncated",
+                _prefix, _limit,
+            )
+        all_keys.extend(_entries)
+
+    # list_by_prefix has no tag parameter (key LIKE only — mem.py:233,253); the
+    # old list_all(tag="lapis-pm") call did this filtering, so restore it here
+    # or unrelated rows leak in (measured 2026-08-17: 25 of 54 thread/ rows are
+    # Zephyrium/research threads, not lapis-pm; 1 of 968 pm/dispatched/ rows).
+    all_keys = [
+        e for e in all_keys
+        if "lapis-pm" in [t.strip() for t in e.get("tags", "").split(",")]
+    ]
+
+    # list_by_prefix returns key-ascending (mem.py:234); list_all returned
+    # updated_at DESC (mem.py:226). Re-sort the merged, heterogeneous set to
+    # (updated_at DESC, key ASC) — a stable ascending-key sort followed by a
+    # stable descending-updated_at sort — so keys that were visible under the
+    # old window render in the same relative order, and newly-visible keys
+    # (the ones the old window dropped) interleave at their true updated_at
+    # position. That is the point of the fix, not a regression.
+    all_keys.sort(key=lambda e: e.get("key", ""))
+    all_keys.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
+
     in_flight_items: list[str] = []
     for entry in all_keys:
         k = entry.get("key", "")

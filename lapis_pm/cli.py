@@ -2078,6 +2078,14 @@ def cmd_bundle_autodispatch(args) -> int:
             f"  SALVAGED: {entry['spec']} "
             f"(dropped={len(entry.get('dropped_items', []))}, outcome={entry.get('outcome', '?')})"
         )
+    for entry in results.get("triage", []):
+        if entry.get("class") == "mechanical":
+            print(
+                f"  TRIAGE-MECHANICAL: {entry['spec']}/{entry['debt_id']} → "
+                f"{entry.get('target_id', '?')} (bound={entry.get('bound')})"
+            )
+        else:
+            print(f"  TRIAGE-FORK: {entry['spec']}/{entry['debt_id']} ({entry.get('reason', '?')})")
 
     # Exit 1 if any failed (bound-but-dead state), 0 otherwise. Faults are
     # expected transients (infra retried once then recorded) — never gate

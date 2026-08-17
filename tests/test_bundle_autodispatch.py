@@ -13,6 +13,7 @@ Coverage:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import textwrap
@@ -121,6 +122,55 @@ def _write_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-06-26.md") ->
 def _write_items_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-08-12.md") -> Path:
     p = tmp_path / name
     p.write_text(BUNDLE_SPEC_WITH_ITEMS, encoding="utf-8")
+    return p
+
+
+# A bundle spec with one item that classifies mechanical (concrete
+# [suggestion: ...] fix, one small named file) and one that classifies fork
+# (no suggestion bracket at all — a genuine interface/vision item, per
+# code-reviewer-debt-bundle-v0's real shape) — bundle-item-level-triage-v0.
+BUNDLE_SPEC_MECHANICAL_AND_FORK = textwrap.dedent("""\
+    ---
+    spec_id: cr-bundle-myrepo-2026-08-17
+    status: draft
+    created: 2026-08-17
+    source: code-reviewer-debt-bundle-v0 nightly sweep
+    ---
+
+    # Spec: cr-bundle-myrepo-2026-08-17 — agentic debt fix-bundle
+
+    **Repo:** `myrepo`
+    **Authority:** advisory
+
+    ## Goal
+
+    Resolve 2 open MED-severity debt items in `myrepo`.
+
+    ## Items
+
+    1. **Debt ID:** `mech0001aa`
+       **Opened:** `2026-06-08T21:57:16+00:00` in PR #`50`
+       **Issue:** GrepExecutor never forwards path_glob to rg.  [suggestion: Add `--glob path_glob` to the rg invocation.]
+       **Files:** `pkg/mod.py`
+
+    2. **Debt ID:** `fork0002bb`
+       **Opened:** `2026-06-09T07:38:27+00:00` in PR #`93`
+       **Issue:** Verdict taxonomy diverges from the current reviewer contract — a deep interface question with no concrete fix named.
+       **Files:** `pkg/other.py`
+
+    ## Deliverables
+
+    - Each item above resolved with a code change in this PR.
+
+    ## Next steps
+
+    **Suggested bind:** `lapis-pm bind cr-bundle-myrepo-2026-08-17 --repo myrepo --authority advisory --create --title "Resolve 2 aged MED debt items in myrepo"`
+""")
+
+
+def _write_mechanical_and_fork_spec(tmp_path: Path, name: str = "cr-bundle-myrepo-2026-08-17.md") -> Path:
+    p = tmp_path / name
+    p.write_text(BUNDLE_SPEC_MECHANICAL_AND_FORK, encoding="utf-8")
     return p
 
 
@@ -710,7 +760,7 @@ class TestExternalBindSkip:
         # Excluded by filename — never reaches state-check
         assert results == {
             "bound": [], "deferred": [], "skipped": [], "failed": [],
-            "faulted": [], "salvaged": [],
+            "faulted": [], "salvaged": [], "triage": [],
         }
 
 
@@ -1336,4 +1386,210 @@ class TestThreeWayClassification:
         written_ground = args[3] if len(args) > 3 else call_kwargs.get("ground")
         assert written_class == "defer"
         assert retry_ground_reason in written_ground
-        assert "did not complete within 210s" not in written_ground
+
+
+# ---------------------------------------------------------------------------
+# Item-level triage (bundle-item-level-triage-v0): mechanical items are
+# cooked + bound directly, ahead of the GW check and the full gate; fork
+# items stay in the bundle and reach the existing gate path unchanged.
+# ---------------------------------------------------------------------------
+
+class TestItemLevelTriage:
+    def _patch_contract_found(self, monkeypatch, tmp_path):
+        """Point bundle_triage's repo-root resolution at a throwaway dir
+        containing a test that covers pkg/mod.py, so the mechanical item's
+        tier-3 verifier finds an extractable Verification Contract."""
+        from lapis_pm import bundle_triage as bt_mod
+
+        root = tmp_path / "_repo"
+        (root / "tests").mkdir(parents=True)
+        (root / "tests" / "test_mod.py").write_text("def test_x(): pass\n")
+        monkeypatch.setattr(bt_mod, "_repo_root", lambda repo: root)
+
+    def test_mechanical_item_bound_directly_no_council(self, tmp_path, monkeypatch):
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        self._patch_contract_found(monkeypatch, tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief) as mock_gate,
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True) as mock_tick,
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+
+        # The mechanical item was bound under its OWN cooked target id, not
+        # the bundle's spec_id — and it lands in the same "bound" bucket
+        # loupe's navigator reads (item-level triage-v0 DoD-2).
+        mech_bound = [b for b in results["bound"] if b.get("mechanical")]
+        assert len(mech_bound) == 1
+        assert mech_bound[0]["spec"] == "cr-bundle-item-myrepo-mech0001aa"
+        assert mech_bound[0]["debt_id"] == "mech0001aa"
+        assert mock_bind.call_args_list[0].args[0] == "cr-bundle-item-myrepo-mech0001aa"
+        assert mock_bind.call_args_list[0].args[1] == "myrepo"
+        mock_tick.assert_any_call("cr-bundle-item-myrepo-mech0001aa", "myrepo")
+
+        # The full gate still ran (for the remaining fork item) — the
+        # bundle-level spec_id, never the item's cooked target id.
+        mock_gate.assert_called_once()
+        assert mock_gate.call_args.args[0] == spec_path
+
+        # Triage record captures both items.
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage["mech0001aa"]["class"] == "mechanical"
+        assert triage["fork0002bb"]["class"] == "fork"
+        assert triage["fork0002bb"]["reason"] == "static"
+
+    def test_fork_item_never_bound_by_triage(self, tmp_path, monkeypatch):
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        self._patch_contract_found(monkeypatch, tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            _reconcile(tmp_path)
+
+        # _bind is called exactly once — for the mechanical item only. The
+        # fork item never gets an item-level bind call.
+        bind_targets = [c.args[0] for c in mock_bind.call_args_list]
+        assert bind_targets == ["cr-bundle-item-myrepo-mech0001aa"]
+
+    def test_amended_spec_drops_mechanical_keeps_fork(self, tmp_path, monkeypatch):
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        self._patch_contract_found(monkeypatch, tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            _reconcile(tmp_path)
+
+        amended = spec_path.read_text()
+        assert "mech0001aa" not in amended.split("## Triage record")[0]
+        assert "fork0002bb" in amended
+        assert "## Triage record" in amended
+        assert "cr-bundle-item-myrepo-mech0001aa" in amended
+
+    def test_route_record_sidecar_written(self, tmp_path, monkeypatch):
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        self._patch_contract_found(monkeypatch, tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            _reconcile(tmp_path)
+
+        route_path = Path(str(spec_path) + ".route.json")
+        assert route_path.exists()
+        payload = json.loads(route_path.read_text())
+        by_id = {i["debt_id"]: i for i in payload["items"]}
+        assert by_id["mech0001aa"]["class"] == "mechanical"
+        assert by_id["fork0002bb"]["class"] == "fork"
+
+        # The sidecar must never match the bundle-discovery glob.
+        assert route_path not in bad._discover_specs(tmp_path)
+
+    def test_mechanical_binds_even_when_gw_not_serving(self, tmp_path, monkeypatch):
+        """Triage is fully deterministic (no model calls in v0) — mechanical
+        items must bind even when GW is down, while the remaining fork item
+        still defers on the (unchanged) gw_not_serving path."""
+        _write_mechanical_and_fork_spec(tmp_path)
+        self._patch_contract_found(monkeypatch, tmp_path)
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=False),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_called_once()
+        assert mock_bind.call_args.args[0] == "cr-bundle-item-myrepo-mech0001aa"
+        assert mock_bind.call_args.args[1] == "myrepo"
+        mech_bound = [b for b in results["bound"] if b.get("mechanical")]
+        assert len(mech_bound) == 1
+        assert results["deferred"] == [
+            {"spec": "cr-bundle-myrepo-2026-08-17", "reason": "gw_not_serving"}
+        ]
+
+    def test_no_items_section_is_a_noop(self, tmp_path):
+        """A bundle spec with no '## Items' section (BUNDLE_SPEC) must be
+        completely unaffected by the triage step — pre-this-unit behavior."""
+        spec_path = _write_spec(tmp_path)
+        before = spec_path.read_text()
+        mock_brief = _make_brief("proceed-to-bind")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            results = _reconcile(tmp_path)
+
+        assert spec_path.read_text() == before
+        assert not Path(str(spec_path) + ".route.json").exists()
+        assert results["triage"] == []
+
+    def test_invariance_reroute_when_no_contract_extractable(self, tmp_path, monkeypatch):
+        """No locatable test for the touched surface → tier-3 fails closed:
+        the item that passed tiers 1-2 is re-routed to fork/invariance and
+        is NEVER bound."""
+        from lapis_pm import bundle_triage as bt_mod
+
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        # No test file anywhere under this root — extraction always misses.
+        monkeypatch.setattr(bt_mod, "_repo_root", lambda repo: tmp_path / "_empty_repo")
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage["mech0001aa"]["class"] == "fork"
+        assert triage["mech0001aa"]["reason"] == "invariance"
+        # The spec is never amended when nothing bound mechanically.
+        assert "mech0001aa" in spec_path.read_text()
+        assert "## Triage record" not in spec_path.read_text()

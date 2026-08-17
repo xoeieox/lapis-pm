@@ -580,12 +580,38 @@ _SPEC_ITEMS_SECTION_RE = re.compile(
     r"(^## Items\n\n)(.*?)(\n\n## )", re.DOTALL | re.MULTILINE,
 )
 
+# bundle-item-level-triage-v0: item schema extension. fix_description comes
+# from the debt-bundle renderer's own "[suggestion: ...]" bracket (the
+# concrete, actionable fix — code-reviewer-debt-bundle-v0's own shape, not
+# invented here); touched_surfaces from the "**Files:**" line (comma-
+# separated, backticked paths). Both are None/[] when absent — the triage
+# classifier fails closed to "fork" on either, never invents a fix.
+_SPEC_ITEM_SUGGESTION_RE = re.compile(r"\[suggestion:\s*(.*?)\]", re.DOTALL)
+_SPEC_ITEM_FILES_RE = re.compile(r"^\s*\*\*Files:\*\*\s*(.+)$", re.MULTILINE)
+
+
+def _parse_item_fix_description(entry: str) -> str | None:
+    m = _SPEC_ITEM_SUGGESTION_RE.search(entry)
+    if not m:
+        return None
+    text = re.sub(r"\s+", " ", m.group(1)).strip()
+    return text or None
+
+
+def _parse_item_touched_surfaces(entry: str) -> list[str]:
+    m = _SPEC_ITEM_FILES_RE.search(entry)
+    if not m:
+        return []
+    paths = [p.strip().strip("`").strip() for p in m.group(1).split(",")]
+    return [p for p in paths if p]
+
 
 def _parse_bundle_items(spec_text: str) -> list[dict]:
     """Parse each item block out of the spec's '## Items' section. Returns
     [{"debt_id", "block" (verbatim text, re-joined unchanged for kept
-    items), "source_pr"}]. Empty list if the section isn't found or has no
-    parseable items — callers must fail-closed to DEFER on empty."""
+    items), "source_pr", "fix_description", "touched_surfaces"}]. Empty list
+    if the section isn't found or has no parseable items — callers must
+    fail-closed to DEFER (or, for triage, to "fork") on empty."""
     m = _SPEC_ITEMS_SECTION_RE.search(spec_text)
     if not m:
         return []
@@ -601,6 +627,8 @@ def _parse_bundle_items(spec_text: str) -> list[dict]:
             "debt_id": idm.group(1),
             "block": entry,
             "source_pr": int(prm.group(1)) if prm else None,
+            "fix_description": _parse_item_fix_description(entry),
+            "touched_surfaces": _parse_item_touched_surfaces(entry),
         })
     return items
 
@@ -710,6 +738,152 @@ def _amend_spec_salvage(
 
     spec_path.write_text(new_text, encoding="utf-8")
     return dropped_details
+
+
+# ---------------------------------------------------------------------------
+# Item-level triage (bundle-item-level-triage-v0): classify each bundle item
+# mechanical | fork BEFORE the full spec-review gate runs. Mechanical items
+# are cooked into their own fix spec and bound directly (advisory, no
+# council); fork items are left in the bundle — its '## Items' section is
+# amended to drop the mechanical ones — so they reach the existing full gate
+# exactly as before. Fully deterministic (no model calls in v0), so it runs
+# ahead of the GW-liveness check: mechanical items bind even when GW is down,
+# which is exactly the defer-everything path this unit fixes.
+# ---------------------------------------------------------------------------
+
+def _amend_spec_drop_mechanical_items(
+    spec_path: Path,
+    items: list[dict],
+    dropped_debt_ids: list[str],
+    triage_by_debt_id: dict[str, dict],
+    run_ts: str,
+) -> None:
+    """Rewrite spec_path in place: drop items bound mechanically from
+    '## Items', append a '## Triage record' section naming each mechanical
+    item's cooked spec, target id, and bind outcome. Mirrors
+    _amend_spec_salvage's minimal-touch style but never touches the debt
+    ledger — a mechanical item is being FIXED, not invalidated."""
+    text = spec_path.read_text(encoding="utf-8")
+    dropped = set(dropped_debt_ids)
+    keep_blocks = [it["block"] for it in items if it["debt_id"] not in dropped]
+    new_items_block = "\n\n".join(keep_blocks)
+
+    new_text = _SPEC_ITEMS_SECTION_RE.sub(
+        lambda m: m.group(1) + new_items_block + m.group(3), text, count=1,
+    )
+
+    lines = [
+        "",
+        "## Triage record",
+        "",
+        f"bundle-item-level-triage-v0 classified the items below `mechanical` "
+        f"at {run_ts} and bound each directly (advisory, no council) via its "
+        f"own cooked fix spec. See each cooked spec's Definition of Done for "
+        f"the Verification Contract.",
+        "",
+    ]
+    for debt_id in dropped_debt_ids:
+        rec = triage_by_debt_id.get(debt_id, {})
+        lines.append(
+            f"- **Debt ID:** `{debt_id}` — **Cooked spec:** "
+            f"`{rec.get('cooked_spec', '?')}` — **Target:** "
+            f"`{rec.get('target_id', '?')}` — **Bound:** {rec.get('bound')}"
+        )
+    new_text = new_text.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+
+    spec_path.write_text(new_text, encoding="utf-8")
+
+
+def _triage_bundle_items(
+    spec_id: str, repo: str, spec_path: Path, run_ts: str, results: dict,
+) -> None:
+    """Classify every bundle item mechanical | fork, cook + bind the
+    mechanical ones directly, and amend the spec to drop them so the
+    existing full-gate path below only ever sees fork items. A spec with no
+    parseable '## Items' section is a no-op — the pre-this-unit gate path
+    runs completely unchanged."""
+    from lapis_pm import bundle_triage
+
+    text = spec_path.read_text(encoding="utf-8")
+    items = _parse_bundle_items(text)
+    if not items:
+        return
+
+    route_records: list[dict] = []
+    triage_by_debt_id: dict[str, dict] = {}
+    mechanical_bound_ids: list[str] = []
+
+    for item in items:
+        item["repo"] = repo
+        debt_id = item["debt_id"]
+        cls, reason = bundle_triage.classify_item(item)
+
+        if cls == "mechanical":
+            # Extraction-only Verification Contract: lives in the triage
+            # record and is rendered VERBATIM into the cooked spec's DoD by
+            # cook_item_to_spec (rendering, not analysis — see its docstring).
+            contract = bundle_triage.extract_verification_contract(item)
+            if contract is None:
+                cls, reason = "fork", "invariance"
+            else:
+                item["verification_contract"] = contract
+                target_id = bundle_triage.mechanical_item_target_id(repo, debt_id)
+                cooked_path = bundle_triage.cook_item_to_spec(item)
+
+                # Tier 3 — the POST-COOK BIND-GATE VERIFIER (not a
+                # classification-time tier): re-confirms the contract still
+                # holds now that the spec is cooked, and BEFORE the
+                # mechanical bind below fires. A miss here re-routes to
+                # fork/invariance — never a silent bind.
+                holds, _ = bundle_triage.verify_behavioral_invariance(item)
+                if not holds:
+                    cls, reason = "fork", "invariance"
+                else:
+                    bound_ok = _bind(target_id, repo, cooked_path)
+                    ticked_ok = bound_ok and _tick(target_id, repo)
+                    verified_ok = ticked_ok and _verify_dispatched(target_id)
+
+                    rec = {
+                        "debt_id": debt_id, "class": "mechanical", "reason": None,
+                        "target_id": target_id, "cooked_spec": str(cooked_path),
+                        "contract": contract, "bound": verified_ok,
+                    }
+                    route_records.append(rec)
+                    triage_by_debt_id[debt_id] = rec
+                    results["triage"].append({"spec": spec_id, **rec})
+                    logger.info(
+                        "[bundle-autodispatch] %s item %s: mechanical → cooked %s, bound=%s",
+                        spec_id, debt_id, cooked_path.name, verified_ok,
+                    )
+                    if verified_ok:
+                        mechanical_bound_ids.append(debt_id)
+                        results["bound"].append({
+                            "spec": target_id, "repo": repo, "mechanical": True,
+                            "source_bundle": spec_id, "debt_id": debt_id,
+                        })
+                    else:
+                        results["failed"].append({
+                            "spec": target_id, "reason": "mechanical_bind_failed",
+                            "source_bundle": spec_id, "debt_id": debt_id,
+                        })
+                    continue
+
+        # fork — either from classify_item directly, or a tier-3 re-route.
+        rec = {"debt_id": debt_id, "class": "fork", "reason": reason}
+        route_records.append(rec)
+        triage_by_debt_id[debt_id] = rec
+        results["triage"].append({"spec": spec_id, **rec})
+        logger.info(
+            "[bundle-autodispatch] %s item %s: fork (%s) — routed to Erah via the full gate",
+            spec_id, debt_id, reason,
+        )
+
+    bundle_triage.write_route_record(spec_path, repo, route_records)
+
+    if mechanical_bound_ids:
+        _amend_spec_drop_mechanical_items(
+            spec_path, items, mechanical_bound_ids, triage_by_debt_id, run_ts,
+        )
 
 
 def _mark_debt_invalid(repo: str, debt_id: str, ground_text: str) -> bool:
@@ -1007,7 +1181,8 @@ def _reconcile_one(
         results["skipped"].append({"spec": spec_id, "reason": "externally_bound"})
         return
 
-    # 5. Fresh spec → gate + bind
+    # 5. Fresh spec → per-item triage (bundle-item-level-triage-v0), then
+    #    gate + bind over whatever fork items remain.
     logger.info("[bundle-autodispatch] processing %s (repo=%s)", spec_id, repo)
 
     if dry_run:
@@ -1019,6 +1194,12 @@ def _reconcile_one(
             logger.info("[bundle-autodispatch] [dry-run] would run gate + bind+tick for %s", spec_id)
             results["bound"].append({"spec": spec_id, "repo": repo, "dry_run": True})
         return
+
+    # Item-level triage: fully deterministic (no model calls in v0), so it
+    # runs ahead of the GW-liveness check below — mechanical items bind even
+    # when GW is down. Amends spec_path in place to drop mechanical items
+    # before the gate (and every downstream read of spec_path) ever sees it.
+    _triage_bundle_items(spec_id, repo, spec_path, run_ts, results)
 
     # GW liveness pre-check
     if not _gw_serving():
@@ -1084,18 +1265,23 @@ def reconcile(
     It must be supplied by the CLI entry point, never generated inside this function.
 
     Returns a results dict with keys: bound, deferred, skipped, failed,
-    faulted, salvaged. Each value is a list of dicts describing the outcome
-    for each spec. `faulted` (infra) and `salvaged` are cross-cutting
+    faulted, salvaged, triage. Each value is a list of dicts describing the
+    outcome for each spec. `faulted` (infra) and `salvaged` are cross-cutting
     descriptors, not exclusive partitions — a salvaged spec that goes on to
     bind appears in both `bound` and `salvaged`; one that fails its re-gate
     appears in both `deferred` and `salvaged` (see _handle_salvage).
+    `triage` (bundle-item-level-triage-v0) is per-ITEM, not per-spec: one
+    entry per bundle item classified mechanical|fork before the gate ran.
+    A mechanically-bound item's own bind/tick/verify outcome ALSO appears in
+    `bound`/`failed` (item-level triage-v0 DoD-2: the run summary's `bound`
+    count must rise with mechanical binds, same as any other bind).
     """
     if spec_dir is None:
         spec_dir = _DEFAULT_SPEC_DIR
 
     results: dict = {
         "bound": [], "deferred": [], "skipped": [], "failed": [],
-        "faulted": [], "salvaged": [],
+        "faulted": [], "salvaged": [], "triage": [],
     }
 
     specs = _discover_specs(spec_dir)
@@ -1119,5 +1305,18 @@ def reconcile(
         len(results["failed"]),
         len(results["faulted"]),
         len(results["salvaged"]),
+    )
+
+    # bundle-item-level-triage-v0 deliverable (b): per-item triage counts in
+    # the run summary. A SEPARATE line — never appended to the pinned
+    # "run complete: bound=..." sentinel line above (loupe's navigator
+    # regexes that line verbatim; see the comment on it).
+    mechanical = [t for t in results["triage"] if t["class"] == "mechanical"]
+    fork = [t for t in results["triage"] if t["class"] == "fork"]
+    logger.info(
+        "[bundle-autodispatch] triage complete: mechanical=%d (bound=%d) fork=%d",
+        len(mechanical),
+        sum(1 for t in mechanical if t.get("bound")),
+        len(fork),
     )
     return results

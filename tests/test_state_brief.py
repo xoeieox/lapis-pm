@@ -10,6 +10,7 @@ Tests verify:
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -851,21 +852,44 @@ class TestInFlightLandedJoin:
     pm/landed/<tid> but clear_landed_state keeps pm/dispatched/<tid> for
     audit-query, so key-prefix-only selection over-reports "in flight"."""
 
-    def _list_by_prefix(self, prefix, limit=50):
-        if prefix == "pm/landed/":
-            return [{"key": "pm/landed/both-tid", "value": "{}"}]
-        return []
+    @staticmethod
+    def _entry(key, tags="lapis-pm", updated_at="2026-08-01T00:00:00+00:00", value=""):
+        """Build a fake list_by_prefix() row (state-brief-inflight-window-v0
+        reads key/tags/updated_at directly from the row, not via mem.get())."""
+        return {"key": key, "value": value, "tags": tags, "updated_at": updated_at}
+
+    def _list_by_prefix_factory(self, *, dispatched=None, chain=None, landed=None):
+        """Route list_by_prefix() calls by prefix, mirroring the real per-family
+        scan _read_buckets now performs (dispatched/chain/thread/outstanding-brief
+        + the pre-existing landed scan)."""
+        dispatched = dispatched or []
+        chain = chain or []
+        if landed is None:
+            landed = [self._entry("pm/landed/both-tid", value="{}")]
+
+        def _list_by_prefix(prefix, limit=50):
+            if prefix == "pm/landed/":
+                return landed
+            if prefix == "pm/dispatched/":
+                return dispatched
+            if prefix == "chain/":
+                return chain
+            return []
+
+        return _list_by_prefix
 
     def test_dispatched_and_landed_tid_excluded_from_in_flight(self):
         """DoD-3: a tid with BOTH pm/dispatched and pm/landed keys is NOT
         counted in the In-flight bucket."""
-        entries = [
-            {"key": "pm/dispatched/both-tid", "value": ""},
-            {"key": "pm/dispatched/dispatched-only-tid", "value": ""},
+        dispatched = [
+            self._entry("pm/dispatched/both-tid"),
+            self._entry("pm/dispatched/dispatched-only-tid"),
         ]
         with patch("lapis_pm.state_brief._mem") as mock_mem:
-            mock_mem.return_value.list_all.return_value = entries
-            mock_mem.return_value.list_by_prefix.side_effect = self._list_by_prefix
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = (
+                self._list_by_prefix_factory(dispatched=dispatched)
+            )
             mock_mem.return_value.get.return_value = {"value": ""}
 
             buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
@@ -877,13 +901,15 @@ class TestInFlightLandedJoin:
 
     def test_dispatched_only_tid_is_counted(self):
         """DoD-3: a tid with pm/dispatched but no pm/landed key IS counted."""
-        entries = [
-            {"key": "pm/dispatched/both-tid", "value": ""},
-            {"key": "pm/dispatched/dispatched-only-tid", "value": ""},
+        dispatched = [
+            self._entry("pm/dispatched/both-tid"),
+            self._entry("pm/dispatched/dispatched-only-tid"),
         ]
         with patch("lapis_pm.state_brief._mem") as mock_mem:
-            mock_mem.return_value.list_all.return_value = entries
-            mock_mem.return_value.list_by_prefix.side_effect = self._list_by_prefix
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = (
+                self._list_by_prefix_factory(dispatched=dispatched)
+            )
             mock_mem.return_value.get.return_value = {"value": ""}
 
             buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
@@ -895,10 +921,12 @@ class TestInFlightLandedJoin:
 
     def test_chain_keys_unaffected_by_landed_join(self):
         """DoD-4: chain/* entries are unaffected by the landed join."""
-        entries = [{"key": "chain/some-chain-group", "value": ""}]
+        chain = [self._entry("chain/some-chain-group")]
         with patch("lapis_pm.state_brief._mem") as mock_mem:
-            mock_mem.return_value.list_all.return_value = entries
-            mock_mem.return_value.list_by_prefix.return_value = []
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = (
+                self._list_by_prefix_factory(chain=chain)
+            )
 
             buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
 
@@ -907,11 +935,20 @@ class TestInFlightLandedJoin:
     def test_landed_scan_failure_degrades_to_old_behavior_not_crash(self):
         """If the pm/landed/ prefix scan itself fails, _read_buckets degrades
         (empty landed set) rather than raising — matches the Gardener/Climate
-        degrade pattern elsewhere in this module."""
-        entries = [{"key": "pm/dispatched/some-tid", "value": ""}]
+        degrade pattern elsewhere in this module. The pm/dispatched/ family
+        scan is unaffected by the landed scan's failure."""
+        dispatched = [self._entry("pm/dispatched/some-tid")]
+
+        def _list_by_prefix(prefix, limit=50):
+            if prefix == "pm/landed/":
+                raise OSError("mem unreachable")
+            if prefix == "pm/dispatched/":
+                return dispatched
+            return []
+
         with patch("lapis_pm.state_brief._mem") as mock_mem:
-            mock_mem.return_value.list_all.return_value = entries
-            mock_mem.return_value.list_by_prefix.side_effect = OSError("mem unreachable")
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = _list_by_prefix
             mock_mem.return_value.get.return_value = {"value": ""}
 
             buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
@@ -928,6 +965,156 @@ class TestInFlightLandedJoin:
         with patch("lapis_pm.trajectory._mem") as mock_mem:
             mock_mem.return_value.get.return_value = None
             assert trajectory._derive_node_state("bound-tid", {}, {}) == "bound"
+
+
+class TestInflightWindowFix:
+    """Tests for state-brief-inflight-window-v0: the tag-wide
+    list_all(tag="lapis-pm", limit=1000) scan that fed In flight/Captured/
+    Awaiting is replaced with one list_by_prefix() scan per family, so the
+    decision window no longer shrinks as the machinery gets busier."""
+
+    @staticmethod
+    def _entry(key, tags="lapis-pm", updated_at="2026-01-01T00:00:00+00:00", value=""):
+        """Build a fake list_by_prefix() row. The new code reads key/tags/
+        updated_at directly off the row (never a redundant mem.get() for
+        those fields), matching the real MemoryStore row shape."""
+        return {"key": key, "value": value, "tags": tags, "updated_at": updated_at}
+
+    def test_old_window_truncated_targets_now_all_present(self):
+        """DoD Leg 2.1: a lapis-pm-tagged fixture (300 old pm/dispatched/ rows
+        plus 1,000 more-recently-updated rows elsewhere in the tag — the
+        spec's illustrative "1,200 rows, oldest 300 predate the window",
+        sized here to 1,300 so the 300 unambiguously fall outside a literal
+        1,000-row cap, matching the live corpus where ~14,530 newer rows
+        crowd out the oldest 300). (a) the retired algorithm — updated_at
+        DESC, capped at 1,000 — provably drops all 300; (b) the current
+        per-family scan keeps all 300, because pm/dispatched/'s own
+        5,000-row limit can no longer be crowded out by unrelated volume."""
+        old_dispatched = [
+            self._entry(
+                f"pm/dispatched/old-tid-{i}",
+                updated_at=f"2026-01-01T00:{i % 60:02d}:00+00:00",
+            )
+            for i in range(300)
+        ]
+        newer_rows = [
+            self._entry(
+                f"decision/newer-{i}",
+                updated_at=f"2026-08-01T00:{i % 60:02d}:00+00:00",
+            )
+            for i in range(1000)
+        ]
+        fixture = old_dispatched + newer_rows
+        assert len(fixture) == 1300
+
+        # (a) the retired algorithm, applied directly to the fixture.
+        old_window = sorted(fixture, key=lambda e: e["updated_at"], reverse=True)[:1000]
+        old_window_keys = {e["key"] for e in old_window}
+        assert not any(e["key"] in old_window_keys for e in old_dispatched), (
+            "fixture is wrong: the retired 1,000-row window should drop all 300 old rows"
+        )
+
+        # (b) the current implementation, via the real code path.
+        def _list_by_prefix(prefix, limit=50):
+            if prefix == "pm/dispatched/":
+                return old_dispatched
+            return []
+
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = _list_by_prefix
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        in_flight_ids = {item.split(":")[0] for item in buckets[state_brief.B_IN_FLIGHT]}
+        for i in range(300):
+            assert f"old-tid-{i}" in in_flight_ids, (
+                f"old-tid-{i} missing from In-flight — window still truncating"
+            )
+
+    def test_family_scan_at_limit_logs_truncation_warning(self, caplog):
+        """DoD Leg 2.2: a store with 6,000 pm/dispatched/ rows returns exactly
+        the family's named limit (5,000); _read_buckets logs an attributable
+        warning naming the family and the limit rather than truncating
+        silently."""
+        limit = state_brief._INFLIGHT_DISPATCHED_LIMIT
+        store_rows = [self._entry(f"pm/dispatched/tid-{i}") for i in range(6000)]
+
+        def _list_by_prefix(prefix, limit=50):
+            if prefix == "pm/dispatched/":
+                return store_rows[:limit]
+            return []
+
+        with patch("lapis_pm.state_brief._mem") as mock_mem, \
+                caplog.at_level(logging.WARNING, logger=state_brief.logger.name):
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = _list_by_prefix
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        assert any(
+            "pm/dispatched/" in rec.message and str(limit) in rec.message
+            for rec in caplog.records
+        ), f"expected a truncation warning naming pm/dispatched/ and {limit}"
+
+    def test_untagged_thread_row_excluded_from_captured(self):
+        """DoD Leg 2.4: list_by_prefix has no tag parameter, so a thread/ row
+        NOT tagged lapis-pm (e.g. a Zephyrium/research thread) must be
+        excluded by the post-fetch tag filter — otherwise unrelated threads
+        leak into Captured on day one."""
+        thread_rows = [
+            self._entry("thread/lapis-thread", tags="lapis-pm"),
+            self._entry("thread/other-thread", tags="zephyrium,research"),
+        ]
+
+        def _list_by_prefix(prefix, limit=50):
+            if prefix == "thread/":
+                return thread_rows
+            return []
+
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = _list_by_prefix
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        captured = buckets[state_brief.B_CAPTURED]
+        assert any(item.startswith("lapis-thread") for item in captured), (
+            f"tagged thread row missing from Captured: {captured}"
+        )
+        assert not any(item.startswith("other-thread") for item in captured), (
+            f"untagged thread row leaked into Captured: {captured}"
+        )
+
+    def test_render_order_matches_updated_at_desc_key_asc(self):
+        """DoD Leg 2.3: the merged, tag-filtered set renders in
+        (updated_at DESC, key ASC) order. Keys visible under the old window
+        keep their old relative order (updated_at DESC); ties are broken by
+        key ascending for a deterministic render."""
+        dispatched = [
+            self._entry("pm/dispatched/b-tid", updated_at="2026-08-10T00:00:00+00:00"),
+            self._entry("pm/dispatched/a-tid", updated_at="2026-08-10T00:00:00+00:00"),
+            self._entry("pm/dispatched/newest-tid", updated_at="2026-08-15T00:00:00+00:00"),
+            self._entry("pm/dispatched/oldest-tid", updated_at="2026-08-01T00:00:00+00:00"),
+        ]
+
+        def _list_by_prefix(prefix, limit=50):
+            if prefix == "pm/dispatched/":
+                return dispatched
+            return []
+
+        with patch("lapis_pm.state_brief._mem") as mock_mem:
+            mock_mem.return_value.list_all.return_value = []
+            mock_mem.return_value.list_by_prefix.side_effect = _list_by_prefix
+            mock_mem.return_value.get.return_value = {"value": ""}
+
+            buckets = state_brief._read_buckets(datetime.now(tz=timezone.utc))
+
+        ordered_ids = [item.split(":")[0] for item in buckets[state_brief.B_IN_FLIGHT]]
+        assert ordered_ids == ["newest-tid", "a-tid", "b-tid", "oldest-tid"]
 
 
 class TestClimateBucketRendering:

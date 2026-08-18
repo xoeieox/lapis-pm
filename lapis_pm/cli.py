@@ -17,6 +17,7 @@ Commands:
     land <target_id> [--dry-run]
     friction list [--target ID] [--repo REPO] [--limit N] [--json] [--exclude-suspect]
     friction backfill-provenance [--apply]
+    spec-id-backfill [--apply]
     brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
     brief-resolve <target_id> <option_id>
     review-gate {status,resume}
@@ -916,6 +917,36 @@ def cmd_friction_backfill(args) -> int:
     )
     if not apply and result["tagged"]:
         print("Re-run with --apply to write tags to the queue.")
+    return 0
+
+
+def cmd_spec_id_backfill(args) -> int:
+    """spec-corpus-id-backfill-v0: backfill `spec_id: <stem>` into
+    /srv/lapis/planning/specs/*.md frontmatter for specs that lack it. Dry-run by
+    default; --apply writes. Report always written; see D4."""
+    import datetime as _datetime
+
+    from . import spec_id_backfill
+
+    apply = getattr(args, "apply", False)
+    date_str = _datetime.date.today().isoformat()
+    try:
+        report = spec_id_backfill.run_backfill(apply=apply, date_str=date_str)
+    except (spec_id_backfill.DuplicateStemError, spec_id_backfill.DuplicateSpecIdValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    mode = "APPLIED" if apply else "DRY-RUN"
+    print(
+        f"[{mode}] scanned={report.scanned} "
+        f"modified={len(report.modified)} "
+        f"already_carrying={len(report.already_carrying)} "
+        f"skipped={len(report.skipped)} "
+        f"mismatches={len(report.mismatches)}"
+    )
+    print(f"report: {report.report_path}")
+    if not apply and report.modified:
+        print("Re-run with --apply to write spec_id: into the listed candidates.")
     return 0
 
 
@@ -2273,6 +2304,15 @@ def build_parser() -> argparse.ArgumentParser:
     frb.add_argument("--apply", action="store_true",
                       help="Write tags to the queue (default: dry-run, prints summary only).")
     frb.set_defaults(func=cmd_friction_backfill)
+
+    sib = sub.add_parser(
+        "spec-id-backfill",
+        help="One-shot: backfill spec_id: <stem> into /srv/lapis/planning/specs/*.md "
+             "frontmatter for specs that lack it. Dry-run by default.",
+    )
+    sib.add_argument("--apply", action="store_true",
+                      help="Write spec_id: into candidate files (default: dry-run, report only).")
+    sib.set_defaults(func=cmd_spec_id_backfill)
 
     rat = sub.add_parser(
         "ratify",

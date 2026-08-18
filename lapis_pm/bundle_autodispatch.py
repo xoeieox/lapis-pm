@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError
 from pathlib import Path
 
@@ -796,12 +797,19 @@ def _amend_spec_drop_mechanical_items(
 
 def _triage_bundle_items(
     spec_id: str, repo: str, spec_path: Path, run_ts: str, results: dict,
+    deadline_monotonic: float | None = None,
 ) -> None:
     """Classify every bundle item mechanical | fork, cook + bind the
     mechanical ones directly, and amend the spec to drop them so the
     existing full-gate path below only ever sees fork items. A spec with no
     parseable '## Items' section is a no-op — the pre-this-unit gate path
-    runs completely unchanged."""
+    runs completely unchanged.
+
+    `deadline_monotonic` is the per-reconcile-run baseline budget deadline
+    (verification-contract-main-baseline-v0) — threaded into every
+    extract_verification_contract / verify_behavioral_invariance call below
+    so a run that has exhausted BASELINE_RUN_BUDGET_S fails closed
+    (unverified/budget_exhausted -> fork) rather than running indefinitely."""
     from lapis_pm import bundle_triage
 
     text = spec_path.read_text(encoding="utf-8")
@@ -822,7 +830,13 @@ def _triage_bundle_items(
             # Extraction-only Verification Contract: lives in the triage
             # record and is rendered VERBATIM into the cooked spec's DoD by
             # cook_item_to_spec (rendering, not analysis — see its docstring).
-            contract = bundle_triage.extract_verification_contract(item)
+            # Sets item["verification_baseline"] as a side effect (additive
+            # baseline record — verification-contract-main-baseline-v0),
+            # whether or not a contract was extracted, so a tier-3 fork
+            # re-route below still carries its categorized baseline reason.
+            contract = bundle_triage.extract_verification_contract(
+                item, deadline_monotonic=deadline_monotonic,
+            )
             if contract is None:
                 cls, reason = "fork", "invariance"
             else:
@@ -835,7 +849,9 @@ def _triage_bundle_items(
                 # holds now that the spec is cooked, and BEFORE the
                 # mechanical bind below fires. A miss here re-routes to
                 # fork/invariance — never a silent bind.
-                holds, _ = bundle_triage.verify_behavioral_invariance(item)
+                holds, _ = bundle_triage.verify_behavioral_invariance(
+                    item, deadline_monotonic=deadline_monotonic,
+                )
                 if not holds:
                     cls, reason = "fork", "invariance"
                 else:
@@ -847,6 +863,7 @@ def _triage_bundle_items(
                         "debt_id": debt_id, "class": "mechanical", "reason": None,
                         "target_id": target_id, "cooked_spec": str(cooked_path),
                         "contract": contract, "bound": verified_ok,
+                        "baseline": item.get("verification_baseline"),
                     }
                     route_records.append(rec)
                     triage_by_debt_id[debt_id] = rec
@@ -869,7 +886,13 @@ def _triage_bundle_items(
                     continue
 
         # fork — either from classify_item directly, or a tier-3 re-route.
-        rec = {"debt_id": debt_id, "class": "fork", "reason": reason}
+        # `baseline` is None for a static/blast-radius fork (no baseline was
+        # ever attempted) and populated for an invariance re-route (Erah's
+        # audit of every fork carries its categorized baseline reason).
+        rec = {
+            "debt_id": debt_id, "class": "fork", "reason": reason,
+            "baseline": item.get("verification_baseline"),
+        }
         route_records.append(rec)
         triage_by_debt_id[debt_id] = rec
         results["triage"].append({"spec": spec_id, **rec})
@@ -1123,6 +1146,7 @@ def _reconcile_one(
     gate_timeout_s: int,
     run_ts: str,
     results: dict,
+    deadline_monotonic: float | None = None,
 ) -> None:
     """Reconcile one spec file. Mutates results dict in-place.
 
@@ -1199,7 +1223,7 @@ def _reconcile_one(
     # runs ahead of the GW-liveness check below — mechanical items bind even
     # when GW is down. Amends spec_path in place to drop mechanical items
     # before the gate (and every downstream read of spec_path) ever sees it.
-    _triage_bundle_items(spec_id, repo, spec_path, run_ts, results)
+    _triage_bundle_items(spec_id, repo, spec_path, run_ts, results, deadline_monotonic)
 
     # GW liveness pre-check
     if not _gw_serving():
@@ -1284,13 +1308,29 @@ def reconcile(
         "faulted": [], "salvaged": [], "triage": [],
     }
 
+    # verification-contract-main-baseline-v0: the stale-worktree prune pass
+    # runs ONCE here, at run start, before any item-level baseline — never
+    # at individual worktree-creation time (gate hardening fold: unpruned
+    # stale worktrees under /tmp/lapis-pm-baselines/ are a disk-exhaustion
+    # cascade into `unverified` for every item in the run). The per-run
+    # baseline budget deadline is computed once here too and threaded
+    # through every spec's item-level triage below.
+    from lapis_pm import bundle_triage
+    pruned = bundle_triage.prune_stale_baseline_worktrees()
+    if pruned:
+        logger.info(
+            "[bundle-autodispatch] pruned %d stale baseline worktree(s): %s",
+            len(pruned), ", ".join(pruned),
+        )
+    deadline_monotonic = time.monotonic() + bundle_triage.BASELINE_RUN_BUDGET_S
+
     specs = _discover_specs(spec_dir)
     logger.info(
         "[bundle-autodispatch] discovered %d cr-bundle debt-bundle spec(s) in %s", len(specs), spec_dir,
     )
 
     for spec_path in specs:
-        _reconcile_one(spec_path, dry_run, gate_timeout_s, run_ts, results)
+        _reconcile_one(spec_path, dry_run, gate_timeout_s, run_ts, results, deadline_monotonic)
 
     # loupe's navigator (loupe/navigator/subjects.py) greps the service
     # journal for the literal "run complete: bound=" substring and regexes
@@ -1311,12 +1351,25 @@ def reconcile(
     # the run summary. A SEPARATE line — never appended to the pinned
     # "run complete: bound=..." sentinel line above (loupe's navigator
     # regexes that line verbatim; see the comment on it).
+    #
+    # verification-contract-main-baseline-v0: baseline state counts are
+    # APPENDED to this same free-form line only — the pinned sentinel line
+    # above stays byte-identical.
     mechanical = [t for t in results["triage"] if t["class"] == "mechanical"]
     fork = [t for t in results["triage"] if t["class"] == "fork"]
+    baseline_counts = {"green": 0, "annotated": 0, "unverified": 0}
+    for t in results["triage"]:
+        b = t.get("baseline")
+        if b and b.get("state") in baseline_counts:
+            baseline_counts[b["state"]] += 1
     logger.info(
-        "[bundle-autodispatch] triage complete: mechanical=%d (bound=%d) fork=%d",
+        "[bundle-autodispatch] triage complete: mechanical=%d (bound=%d) fork=%d "
+        "baseline=green:%d annotated:%d unverified:%d",
         len(mechanical),
         sum(1 for t in mechanical if t.get("bound")),
         len(fork),
+        baseline_counts["green"],
+        baseline_counts["annotated"],
+        baseline_counts["unverified"],
     )
     return results

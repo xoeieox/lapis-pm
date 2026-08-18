@@ -1398,13 +1398,30 @@ class TestItemLevelTriage:
     def _patch_contract_found(self, monkeypatch, tmp_path):
         """Point bundle_triage's repo-root resolution at a throwaway dir
         containing a test that covers pkg/mod.py, so the mechanical item's
-        tier-3 verifier finds an extractable Verification Contract."""
+        tier-3 verifier finds an extractable Verification Contract. Also
+        stubs out baseline_suite_for_item with a canned green baseline
+        (verification-contract-main-baseline-v0) — these integration tests
+        exercise the triage/bind wiring, not real git/subprocess baseline
+        execution, which TestBaselineSuiteForItem in test_bundle_triage.py
+        already covers hermetically."""
         from lapis_pm import bundle_triage as bt_mod
 
         root = tmp_path / "_repo"
         (root / "tests").mkdir(parents=True)
         (root / "tests" / "test_mod.py").write_text("def test_x(): pass\n")
         monkeypatch.setattr(bt_mod, "_repo_root", lambda repo: root)
+        monkeypatch.setattr(
+            bt_mod, "baseline_suite_for_item",
+            lambda item, deadline_monotonic=None: bt_mod.Baseline(
+                main_sha="abc1234def5678", test_rel="tests/test_mod.py", state="green",
+                red=[], n_tests=1, duration_s=0.1, ts="2026-08-18T00:00:00+00:00",
+                surface="pkg/mod.py",
+            ),
+        )
+        # Tier 3's own fast-path sha-compare — same sha as the canned
+        # baseline above, so verify_behavioral_invariance's fast path holds
+        # without a second (real) subprocess call.
+        monkeypatch.setattr(bt_mod, "_resolve_main_sha", lambda root: "abc1234def5678")
 
     def test_mechanical_item_bound_directly_no_council(self, tmp_path, monkeypatch):
         spec_path = _write_mechanical_and_fork_spec(tmp_path)
@@ -1593,3 +1610,233 @@ class TestItemLevelTriage:
         # The spec is never amended when nothing bound mechanically.
         assert "mech0001aa" in spec_path.read_text()
         assert "## Triage record" not in spec_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# verification-contract-main-baseline-v0: the baseline machinery wired into
+# _triage_bundle_items / reconcile().
+# ---------------------------------------------------------------------------
+
+class TestVerificationContractBaseline:
+    def _patch_common(self, monkeypatch, tmp_path, baseline):
+        from lapis_pm import bundle_triage as bt_mod
+
+        root = tmp_path / "_repo"
+        (root / "tests").mkdir(parents=True)
+        (root / "tests" / "test_mod.py").write_text("def test_x(): pass\n")
+        monkeypatch.setattr(bt_mod, "_repo_root", lambda repo: root)
+        monkeypatch.setattr(
+            bt_mod, "baseline_suite_for_item",
+            lambda item, deadline_monotonic=None: baseline,
+        )
+        monkeypatch.setattr(bt_mod, "_resolve_main_sha", lambda root: baseline.main_sha)
+        return bt_mod
+
+    def test_red_on_main_still_binds_annotated(self, tmp_path, monkeypatch):
+        from lapis_pm import bundle_triage as bt_mod
+
+        baseline = bt_mod.Baseline(
+            main_sha="abc1234def5678", test_rel="tests/test_mod.py", state="annotated",
+            red=["tests/test_mod.py::test_known_red"], n_tests=51, duration_s=0.4,
+            ts="2026-08-18T00:00:00+00:00", surface="pkg/mod.py",
+        )
+        self._patch_common(monkeypatch, tmp_path, baseline)
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+
+        # Pre-existing reds on main do NOT fork the item — annotation, not
+        # a fork (spec Design "the two red cases", re-framed to file-level).
+        mech_bound = [b for b in results["bound"] if b.get("mechanical")]
+        assert len(mech_bound) == 1
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage["mech0001aa"]["class"] == "mechanical"
+        assert triage["mech0001aa"]["baseline"]["state"] == "annotated"
+        assert triage["mech0001aa"]["baseline"]["red"] == ["tests/test_mod.py::test_known_red"]
+        assert "FILE-LEVEL" in triage["mech0001aa"]["contract"]
+
+        route_path = Path(str(spec_path) + ".route.json")
+        payload = json.loads(route_path.read_text())
+        by_id = {i["debt_id"]: i for i in payload["items"]}
+        assert by_id["mech0001aa"]["baseline"]["state"] == "annotated"
+
+    def test_baseline_timeout_reroutes_to_fork_invariance(self, tmp_path, monkeypatch):
+        from lapis_pm import bundle_triage as bt_mod
+
+        baseline = bt_mod.Baseline(
+            main_sha="abc1234def5678", test_rel="tests/test_mod.py", state="unverified",
+            red=[], n_tests=0, duration_s=180.0, ts="2026-08-18T00:00:00+00:00",
+            reason="timeout", surface="pkg/mod.py",
+        )
+        self._patch_common(monkeypatch, tmp_path, baseline)
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage["mech0001aa"]["class"] == "fork"
+        assert triage["mech0001aa"]["reason"] == "invariance"
+        assert triage["mech0001aa"]["baseline"]["reason"] == "timeout"
+
+        route_path = Path(str(spec_path) + ".route.json")
+        payload = json.loads(route_path.read_text())
+        by_id = {i["debt_id"]: i for i in payload["items"]}
+        assert by_id["mech0001aa"]["baseline"]["reason"] == "timeout"
+
+    def test_triage_journal_line_carries_baseline_counts(self, tmp_path, monkeypatch, caplog):
+        from lapis_pm import bundle_triage as bt_mod
+
+        baseline = bt_mod.Baseline(
+            main_sha="abc1234def5678", test_rel="tests/test_mod.py", state="green",
+            red=[], n_tests=1, duration_s=0.1, ts="2026-08-18T00:00:00+00:00",
+            surface="pkg/mod.py",
+        )
+        self._patch_common(monkeypatch, tmp_path, baseline)
+        _write_mechanical_and_fork_spec(tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+        caplog.set_level(logging.INFO, logger="lapis_pm.bundle_autodispatch")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            _reconcile(tmp_path)
+
+        line = next(
+            r.getMessage() for r in caplog.records if "triage complete:" in r.getMessage()
+        )
+        assert "baseline=green:1 annotated:0 unverified:0" in line
+
+    def test_run_complete_sentinel_line_unaffected(self, tmp_path, monkeypatch, caplog):
+        """DoD-4: the pinned 'run complete: bound=...' sentinel line stays
+        byte-identical in shape — no baseline detail leaks into it."""
+        from lapis_pm import bundle_triage as bt_mod
+
+        baseline = bt_mod.Baseline(
+            main_sha="abc1234def5678", test_rel="tests/test_mod.py", state="green",
+            red=[], n_tests=1, duration_s=0.1, ts="2026-08-18T00:00:00+00:00",
+            surface="pkg/mod.py",
+        )
+        self._patch_common(monkeypatch, tmp_path, baseline)
+        _write_mechanical_and_fork_spec(tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+        caplog.set_level(logging.INFO, logger="lapis_pm.bundle_autodispatch")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            _reconcile(tmp_path)
+
+        line = next(
+            r.getMessage() for r in caplog.records if "run complete:" in r.getMessage()
+        )
+        assert re.search(
+            r"run complete: bound=\d+ deferred=\d+ skipped=\d+ failed=\d+ faulted=\d+ salvaged=\d+$",
+            line,
+        )
+
+    def test_prune_pass_runs_once_per_reconcile_run(self, tmp_path, monkeypatch):
+        """Two bundle specs in one reconcile() call — the prune pass must
+        fire exactly once (run-scoped), not once per spec."""
+        from lapis_pm import bundle_triage as bt_mod
+
+        baseline = bt_mod.Baseline(
+            main_sha="abc1234def5678", test_rel="tests/test_mod.py", state="green",
+            red=[], n_tests=1, duration_s=0.1, ts="2026-08-18T00:00:00+00:00",
+            surface="pkg/mod.py",
+        )
+        self._patch_common(monkeypatch, tmp_path, baseline)
+        _write_mechanical_and_fork_spec(tmp_path, name="cr-bundle-myrepo-2026-08-17.md")
+        _write_mechanical_and_fork_spec(tmp_path, name="cr-bundle-otherrepo-2026-08-18.md")
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        calls = []
+        monkeypatch.setattr(
+            bt_mod, "prune_stale_baseline_worktrees",
+            lambda: calls.append(1) or [],
+        )
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            _reconcile(tmp_path)
+
+        assert len(calls) == 1
+
+    def test_budget_exhausted_reroutes_to_fork(self, tmp_path, monkeypatch):
+        """A per-run deadline already in the past -> every baseline call
+        short-circuits to unverified/budget_exhausted -> fork/invariance,
+        never a silent bind."""
+        from lapis_pm import bundle_triage as bt_mod
+
+        root = tmp_path / "_repo"
+        (root / "tests").mkdir(parents=True)
+        (root / "tests" / "test_mod.py").write_text("def test_x(): pass\n")
+        monkeypatch.setattr(bt_mod, "_repo_root", lambda repo: root)
+        # Deadline already exhausted at the moment reconcile() computes it
+        # (time.monotonic() + BASELINE_RUN_BUDGET_S) — negative budget puts
+        # the deadline in the past unconditionally.
+        monkeypatch.setattr(bt_mod, "BASELINE_RUN_BUDGET_S", -3600)
+        spec_path = _write_mechanical_and_fork_spec(tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+
+        mock_bind.assert_not_called()
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage["mech0001aa"]["class"] == "fork"
+        assert triage["mech0001aa"]["reason"] == "invariance"
+        assert triage["mech0001aa"]["baseline"]["reason"] == "budget_exhausted"

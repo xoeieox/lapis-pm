@@ -769,6 +769,17 @@ def _print_target_status(t, explain: bool = False):
             if verdict != "pending":
                 print(f"  last-verdict:  {verdict}"
                       + (f", {issues} issue(s)" if verdict == "fixable" else ""))
+
+        # R3 (lapis-pm-reviewer-defer-backoff-v0): rendered independently of
+        # review_state above — during an active backoff the failed attempt
+        # has no pending reviewer and no verdict yet, exactly the shape
+        # _active_review_state skips (see its docstring). Prefixed
+        # "reviewer-backoff:" (not "paused:") — a temporary retreat must not
+        # read as a defeat.
+        backoff = _pm._active_reviewer_backoff(t.id, open_prs)
+        if backoff:
+            print(f"  reviewer-backoff: attempt {backoff['infra_count']}/{backoff['infra_budget']} "
+                  f"reason={backoff['last_infra_reason']} next_retry_at={backoff['next_retry_at']}")
     except Exception:
         pass  # status display is best-effort
 

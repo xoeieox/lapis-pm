@@ -15,6 +15,7 @@ percepts as comments is bookkeeping, not action.
 Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
   Noop:   noop:no_change | noop:paused | noop:reviewer_in_flight:pr=N:cycle=K
           | noop:fixer_in_flight:dispatch=ID | noop:awaiting_chain_dependency:waiting_on=TID
+          | noop:reviewer_infra_backoff:until=ISO8601 (spaced infra-retry, see R2 below)
   Action: action:auto_merge:pr=N | action:auto_land:pr=N:arc=PATH
           | action:needs_review:pr=N:reason=... (merge conflict, cannot merge cleanly)
           | action:merge_attempted:mergeability_unknown:pr=N (mergeable=None, indeterminate)
@@ -261,6 +262,19 @@ REVIEWER_ATTEMPT_CEILING_ENV = "LAPIS_PM_REVIEWER_ATTEMPT_CEILING"
 # hiccup without burning attempts, but still a hard stop, not a retry-forever.
 REVIEWER_INFRA_RETRY_BUDGET_DEFAULT = 6
 REVIEWER_INFRA_RETRY_BUDGET_ENV = "LAPIS_PM_REVIEWER_INFRA_RETRY_BUDGET"
+
+# Reviewer defer backoff (lapis-pm-reviewer-defer-backoff-v0, R1): the infra
+# budget above bounds *how many* infra-classified attempts happen, but says
+# nothing about *when* — before this, consecutive attempts fired every tick,
+# so the whole budget spent itself in minutes against gate occupancies
+# (spec-review protected leases on GravityWell) that run 40+ minutes. This
+# explicit lookup table — not a formula, per the spec's gate finding — is
+# indexed by infra_count (1-based: the Nth consecutive infra failure waits
+# schedule[N-1] seconds before the next attempt). 2/4/8/16/20/20 minutes,
+# ~70 min total span for the default budget of 6, outlasting every observed
+# gate occupancy with margin. One entry per REVIEWER_INFRA_RETRY_BUDGET_DEFAULT
+# attempt; _reviewer_infra_backoff_seconds clamps beyond the table's length.
+REVIEWER_INFRA_BACKOFF_SCHEDULE_SEC = [120, 240, 480, 960, 1200, 1200]
 
 # Hardcoded allow-list of infrastructure-unavailability reasons, owned by
 # lapis-pm and scoped to the vocabulary the reviewer's actual call path
@@ -4447,6 +4461,9 @@ def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
         "infra_count": 0,
         "last_infra_reason": None,
         "last_infra_wait_s": None,
+        # R1 (lapis-pm-reviewer-defer-backoff-v0): missing == no backoff, so
+        # records written before this unit landed keep working unchanged.
+        "next_retry_at": None,
     }
     rec = _mem().get(_reviewer_attempt_key(target_id, pr_number, cycle))
     if not rec:
@@ -4459,6 +4476,7 @@ def _reviewer_attempt_state(target_id: str, pr_number: int, cycle: int) -> dict:
             "infra_count": int(data.get("infra_count", 0)),
             "last_infra_reason": data.get("last_infra_reason"),
             "last_infra_wait_s": data.get("last_infra_wait_s"),
+            "next_retry_at": data.get("next_retry_at"),
         }
     except (ValueError, TypeError, json.JSONDecodeError):
         return default
@@ -4483,7 +4501,8 @@ def _increment_reviewer_attempt(target_id: str, pr_number: int, cycle: int) -> i
 
 def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, reason: str,
                                     review_gate_ts: str | None = None,
-                                    wait_s: float | None = None) -> None:
+                                    wait_s: float | None = None,
+                                    completed_at: str | None = None) -> None:
     """Stash the most recent failure reason for this pr+cycle, as-reported and
     unverified — see DoD 3b. Classifies the reason against
     REVIEWER_INFRA_FAIL_REASONS (D1): an infrastructure-classified failure
@@ -4510,7 +4529,16 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
     and records the non-run in the separate diagnostic infra ledger. Any
     other outcome (unclassified failure, review_gate_ts absent because the
     dispatch record predates this field) leaves the kill-switch entry
-    standing — the runaway guard must not be weakened."""
+    standing — the runaway guard must not be weakened.
+
+    lapis-pm-reviewer-defer-backoff-v0 (R1): an infra-classified failure also
+    stamps next_retry_at = completed_at + backoff(infra_count) via the
+    REVIEWER_INFRA_BACKOFF_SCHEDULE_SEC table — decide()'s redispatch path
+    (_reviewer_infra_backoff_check) honours this before its next dispatch.
+    A non-infra failure — a genuine review defect, not a non-run — clears
+    next_retry_at: it breaks a consecutive-infra streak, so a mixed-failure
+    sequence never silently spends the backoff window against a stale clock
+    left over from an earlier infra run."""
     state = _reviewer_attempt_state(target_id, pr_number, cycle)
     state["last_reason"] = reason
     infra_reason = _classify_reviewer_infra_reason(reason)
@@ -4518,6 +4546,9 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
         state["infra_count"] = state.get("infra_count", 0) + 1
         state["last_infra_reason"] = infra_reason
         state["last_infra_wait_s"] = wait_s
+        state["next_retry_at"] = _reviewer_infra_backoff_until(completed_at, state["infra_count"])
+    else:
+        state["next_retry_at"] = None
     _mem().set(
         _reviewer_attempt_key(target_id, pr_number, cycle),
         json.dumps(state),
@@ -4526,6 +4557,54 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
     if infra_reason is not None:
         _retract_review_gate_counter_entry(review_gate_ts)
         _record_infra_nonrun()
+
+
+def _reviewer_infra_backoff_seconds(infra_count: int) -> int:
+    """Look up the backoff duration (seconds) for the Nth consecutive infra
+    failure (1-indexed) in REVIEWER_INFRA_BACKOFF_SCHEDULE_SEC. Clamps to the
+    table's last entry for infra_count beyond its length — the infra budget
+    stops at REVIEWER_INFRA_RETRY_BUDGET_DEFAULT == len(table), so this is a
+    defensive floor, not a live path — and to the first entry for infra_count
+    < 1 (shouldn't happen; fail toward the shortest wait rather than crash)."""
+    table = REVIEWER_INFRA_BACKOFF_SCHEDULE_SEC
+    index = min(max(infra_count, 1), len(table)) - 1
+    return table[index]
+
+
+def _reviewer_infra_backoff_until(completed_at: str | None, infra_count: int) -> str:
+    """Compute next_retry_at = completed_at + backoff(infra_count) (R1).
+    Falls back to now() if completed_at is missing/unparseable — an
+    unmeasured completion time still deserves a backoff window, just
+    anchored to when we noticed rather than when the attempt actually
+    ended."""
+    anchor = None
+    if completed_at:
+        try:
+            anchor = datetime.fromisoformat(completed_at)
+        except (ValueError, TypeError):
+            anchor = None
+    if anchor is None:
+        anchor = datetime.now(PACIFIC)
+    seconds = _reviewer_infra_backoff_seconds(infra_count)
+    return (anchor + timedelta(seconds=seconds)).isoformat(timespec="microseconds")
+
+
+def _clear_reviewer_infra_backoff(target_id: str, pr_number: int, cycle: int) -> None:
+    """Clear next_retry_at for this attempt-state record without touching
+    count/infra_count/last_infra_reason (R1) — those stay historical.
+    Called on any non-infra completion of this pr+cycle: a real verdict
+    (here) or a non-infra failure (inline in
+    _record_reviewer_attempt_reason). A no-op, not a write, when there's
+    nothing to clear."""
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    if state.get("next_retry_at") is None:
+        return
+    state["next_retry_at"] = None
+    _mem().set(
+        _reviewer_attempt_key(target_id, pr_number, cycle),
+        json.dumps(state),
+        tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"],
+    )
 
 
 def clear_reviewer_attempts(target_id: str) -> int:
@@ -4800,6 +4879,47 @@ def _active_review_state(target_id: str, open_prs: list[dict]) -> dict | None:
             "cycle": cycle,
             "verdict": verdict_info.get("verdict") if verdict_info else "pending",
             "issues": len(verdict_info.get("issues", [])) if verdict_info else 0,
+        }
+    return None
+
+
+def _active_reviewer_backoff(target_id: str, open_prs: list[dict]) -> dict | None:
+    """Return the currently-active reviewer-infra-backoff state for status
+    display (R3, lapis-pm-reviewer-defer-backoff-v0), or None.
+
+    Deliberately separate from _active_review_state: during a backoff window
+    the failed attempt has already flipped pending -> failed (so
+    _has_pending_reviewer_for_pr is False) and no verdict has ever landed
+    (so cycle == 0) — exactly the shape _active_review_state's "not started
+    yet" bail-out skips. Checking the attempt-state record directly avoids
+    that blind spot, so a waiting target stays distinguishable from
+    healthy-idle rather than silently reading the same as "nothing here yet".
+    """
+    classified_ids = _classified_pr_ids(target_id)
+    for pr in open_prs:
+        pr_number = pr.get("number")
+        if pr_number in classified_ids:
+            continue
+        cycle = _reviewer_cycle_count(target_id, pr_number)
+        attempt_cycle = cycle + 1
+        state = _reviewer_attempt_state(target_id, pr_number, attempt_cycle)
+        next_retry_at = state.get("next_retry_at")
+        if not next_retry_at:
+            continue
+        try:
+            deadline = datetime.fromisoformat(next_retry_at)
+        except (ValueError, TypeError):
+            continue
+        now = datetime.now(deadline.tzinfo or PACIFIC)
+        if now >= deadline:
+            continue  # window elapsed — not "active" anymore
+        return {
+            "pr_number": pr_number,
+            "cycle": attempt_cycle,
+            "infra_count": state.get("infra_count", 0),
+            "infra_budget": _reviewer_infra_retry_budget(),
+            "last_infra_reason": state.get("last_infra_reason"),
+            "next_retry_at": next_retry_at,
         }
     return None
 
@@ -5125,6 +5245,7 @@ class Decision:
     kind: str   # "merge" | "advisory_brief" | "hold_brief" | "retry" | "abandon_brief" | "directive_ack"
                #  | "noop_no_change" | "noop_reviewer_in_flight" | "noop_fixer_in_flight"
                #  | "reviewer_attempt_ceiling" | "reviewer_infra_budget_exhausted"
+               #  | "reviewer_infra_backoff"
     payload: dict
 
 
@@ -5170,6 +5291,42 @@ def _reviewer_attempt_ceiling_check(target_id: str, pr_number: int, cycle: int) 
     return None
 
 
+def _reviewer_infra_backoff_check(target_id: str, pr_number: int, cycle: int) -> Decision | None:
+    """Return a noop Decision while this pr+cycle's most recent infra failure
+    hasn't cleared its backoff window yet (R2, lapis-pm-reviewer-defer-
+    backoff-v0), else None. Reads next_retry_at from the attempt-state record
+    (R1) — set on a consecutive infra failure, cleared on any non-infra
+    completion — so a stale window never outlives the streak that set it.
+
+    Deliberately a SEPARATE check from _reviewer_attempt_ceiling_check, not
+    folded into it: every caller checks the ceiling first (an exhausted
+    budget must still pause exactly as before — R4), then this. Kept
+    separate rather than merged because the held-path caller maps any
+    ceiling hit to hold_brief unconditionally (a held PR always needs the
+    human hand once bounded) but must NOT do that for a mere pacing wait —
+    a backoff noop is not a bound being hit.
+    """
+    state = _reviewer_attempt_state(target_id, pr_number, cycle)
+    next_retry_at = state.get("next_retry_at")
+    if not next_retry_at:
+        return None
+    try:
+        deadline = datetime.fromisoformat(next_retry_at)
+    except (ValueError, TypeError):
+        return None
+    now = datetime.now(deadline.tzinfo or PACIFIC)
+    if now >= deadline:
+        return None
+    return Decision("reviewer_infra_backoff", {
+        "pr_number": pr_number,
+        "cycle": cycle,
+        "infra_count": state.get("infra_count", 0),
+        "infra_budget": _reviewer_infra_retry_budget(),
+        "reason": state.get("last_infra_reason"),
+        "next_retry_at": next_retry_at,
+    })
+
+
 def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
                    verification: str = "pm-live-test") -> Decision:
     spec_summary = episodic.spec_summary(target_id)
@@ -5205,6 +5362,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, 1)
             if ceiling_decision is not None:
                 return Decision("hold_brief", payload)
+            backoff_decision = _reviewer_infra_backoff_check(target_id, pr_number, 1)
+            if backoff_decision is not None:
+                return backoff_decision
             return Decision("dispatch_reviewer", {
                 "pr": pr, "cls": cls, "mode": "fresh", "cycle": 1, "held_path": True,
             })
@@ -5284,6 +5444,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
         ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
         if ceiling_decision is not None:
             return ceiling_decision
+        backoff_decision = _reviewer_infra_backoff_check(target_id, pr_number, next_cycle)
+        if backoff_decision is not None:
+            return backoff_decision
         return Decision("dispatch_reviewer", {
             "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
         })
@@ -5299,6 +5462,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
         ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
         if ceiling_decision is not None:
             return ceiling_decision
+        backoff_decision = _reviewer_infra_backoff_check(target_id, pr_number, next_cycle)
+        if backoff_decision is not None:
+            return backoff_decision
         return Decision("dispatch_reviewer", {
             "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
         })
@@ -7376,6 +7542,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     target_id, rec["pr_number"], rec.get("cycle", 1), reported_reason,
                     review_gate_ts=rec.get("review_gate_ts"),
                     wait_s=_reviewer_dispatch_wait_seconds(rec),
+                    completed_at=rec.get("completed_at"),
                 )
             failed_for_retry.append(rec)
         else:
@@ -7383,6 +7550,12 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
             if rec.get("agent_type") in _REVIEWER_AGENT_TYPES:
                 pr_num = rec.get("pr_number", "?")
                 cycle_num = rec.get("cycle", 1)
+                # R1 (lapis-pm-reviewer-defer-backoff-v0): a real verdict is a
+                # non-infra completion — clear any backoff left over from
+                # earlier infra failures on this same pr+cycle so a stale
+                # next_retry_at never lingers past a successful attempt.
+                if isinstance(pr_num, int):
+                    _clear_reviewer_infra_backoff(target_id, pr_num, cycle_num)
                 raw_output = text.strip()
                 if raw_output.startswith("```"):
                     raw_output = re.sub(r"^```(?:json)?\s*", "", raw_output)
@@ -7791,6 +7964,7 @@ def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
                 target_id, rec["pr_number"], rec.get("cycle", 1), t["error"],
                 review_gate_ts=rec.get("review_gate_ts"),
                 wait_s=_reviewer_dispatch_wait_seconds(rec),
+                completed_at=rec.get("completed_at"),
             )
 
         # Close the project-slot + emit its deposit for slots whose terminal flip
@@ -8626,6 +8800,9 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                     decision_str = _act_reviewer_attempt_ceiling_pause(target_id, decision.payload)
                 elif decision.kind == "reviewer_infra_budget_exhausted":
                     decision_str = _act_reviewer_infra_budget_pause(target_id, decision.payload)
+                elif decision.kind == "reviewer_infra_backoff":
+                    p = decision.payload
+                    decision_str = f"noop:reviewer_infra_backoff:until={p['next_retry_at']}"
                 elif decision.kind == "noop_reviewer_in_flight":
                     p = decision.payload
                     decision_str = f"noop:reviewer_in_flight:pr={p['pr_number']}:cycle={p['cycle']}"

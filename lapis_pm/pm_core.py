@@ -3621,6 +3621,74 @@ def clear_landed_state(target_id: str) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Debt-ledger close at land time (debt-ledger-merge-flip-v0)
+# ---------------------------------------------------------------------------
+
+# Anchored full-string match only — never used as a substring search. Greedy
+# repo group + anchored 10-hex suffix recovers (repo, debt_id) from a
+# mechanical-item tid (bundle_triage.py:549-554 mechanical_item_target_id);
+# repos contain hyphens (e.g. "lapis-pm"), so the suffix anchor is what makes
+# the split unambiguous.
+_DEBT_ITEM_TID_RE = re.compile(r"^cr-bundle-item-(.+)-([0-9a-f]{10})$")
+
+
+def close_resolved_debt_for_target(
+    target_id: str,
+    *,
+    resolved_by_pr: int | None = None,
+    ground: str,
+) -> bool:
+    """Flip review/debt/<repo>/<debt_id>'s ledger entry to resolved at land time.
+
+    Called beside clear_landed_state at each of the three land choke points
+    (cli.py cmd_land, pm_core._act_auto_land, pm_core._act_auto_land_already_
+    satisfied) so a shipped bundle-item debt entry stops being re-harvested
+    by the nightly `debt-open` tag-bucket sweep.
+
+    Fail-soft throughout, mirroring the never-raise precedent at
+    bundle_autodispatch._mark_debt_invalid: any failure returns False and is
+    logged, never raised — a debt-flip failure must never alter the land
+    outcome. `ground` is a required keyword so each call site's write stays
+    distinguishable from any other reconciliation of the same key.
+    """
+    m = _DEBT_ITEM_TID_RE.match(target_id)
+    if not m:
+        return False
+    repo, debt_id = m.group(1), m.group(2)
+    key = f"review/debt/{repo}/{debt_id}"
+    try:
+        mem = _mem()
+        rec = mem.get(key)
+        if not rec:
+            logger.warning(
+                "[pm_core] debt-ledger-close: key %s not found for target %s",
+                key, target_id,
+            )
+            return False
+        body = yaml.safe_load(rec.get("content", "")) or {}
+        if body.get("status") != "open":
+            # Already resolved/invalid/deferred — no-clobber, idempotent.
+            return False
+        body["status"] = "resolved"
+        body["resolved_by_pr"] = resolved_by_pr
+        body["resolved_at"] = _now_iso()
+        body["resolved_ground"] = str(ground)[:500]
+        mem.set(
+            key,
+            yaml.safe_dump(body, sort_keys=False),
+            tags=["review-debt", f"repo-{repo}", "debt-resolved"],
+            source="lapis-pm-land-close",
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[pm_core] debt-ledger-close: failed for %s (target %s): %s",
+            key, target_id, exc,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Already-satisfied verdict helpers
 # ---------------------------------------------------------------------------
 
@@ -3949,6 +4017,9 @@ def _act_auto_land(target_id: str) -> str:
     target = store.get(target_id)
     target.unbind_pm()
     target.save()
+    close_resolved_debt_for_target(
+        target_id, resolved_by_pr=pr_num, ground=f"auto-land pr={pr_num}",
+    )
     clear_landed_state(target_id)
 
     # Opportunistic compaction of old landed targets (non-fatal).
@@ -4030,6 +4101,9 @@ def _act_auto_land_already_satisfied(target_id: str) -> str:
     target = store.get(target_id)
     target.unbind_pm()
     target.save()
+    close_resolved_debt_for_target(
+        target_id, resolved_by_pr=pr_num, ground="already-satisfied verdict",
+    )
     clear_landed_state(target_id)
 
     # Opportunistic compaction of old landed targets (non-fatal).

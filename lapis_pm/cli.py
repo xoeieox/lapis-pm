@@ -1017,6 +1017,12 @@ def cmd_land(args) -> int:
     target = store.get(args.target_id)     # re-read after archive saved
     target.unbind_pm()
     target.save()
+    merged = pm_core._merged_pr_numbers_observed(args.target_id)
+    pm_core.close_resolved_debt_for_target(
+        args.target_id,
+        resolved_by_pr=max(merged) if merged else None,
+        ground="manual land",
+    )
     cleared = pm_core.clear_landed_state(args.target_id)
     cleared_summary = ", ".join(f"{k}={v}" for k, v in cleared.items() if v)
     print(

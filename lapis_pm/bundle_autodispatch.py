@@ -919,9 +919,9 @@ def _mark_debt_invalid(repo: str, debt_id: str, ground_text: str) -> bool:
     logged loudly instead."""
     try:
         import yaml as _yaml
-        from agents_core.mem import MemoryStore
+        from . import node_identity
 
-        store = MemoryStore()
+        store = node_identity.writable_store()
         key = f"review/debt/{repo}/{debt_id}"
         rec = store.get(key)
         if not rec:

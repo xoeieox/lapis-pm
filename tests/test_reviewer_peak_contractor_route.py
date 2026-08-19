@@ -1,14 +1,16 @@
-"""Tests for lapis-pm-reviewer-peak-contractor-route-v0 D2: dispatch-time-only
-TOU-peak routing of reviewer_fresh -> reviewer_fresh_contractor.
+"""Tests for lapis-pm-phala-test-key D2/D5.1: the TOU-peak
+contractor route is removed. A fresh-mode reviewer dispatch now selects the
+local `reviewer_fresh` seat in every window — the clock no longer changes
+the outcome.
 
-Invariants under test:
-  - Inside peak, a fresh-mode reviewer dispatch selects reviewer_fresh_contractor.
-  - Outside peak, a fresh-mode reviewer dispatch selects reviewer_fresh.
-  - same-mode ("reviewer") dispatch is never redirected, peak or not.
-  - The dispatch record carries the model actually used (auditability, D2).
-  - No exception handler anywhere may switch seats — grepped structurally
-    below, since the invariant is about the SHAPE of the code, not a single
-    runtime behavior.
+Formerly (lapis-pm-reviewer-peak-contractor-route-v0) this file asserted the
+opposite: that a dispatch inside the 16:00-21:00 PT window redirected to
+`reviewer_fresh_contractor`. That route, and the seat backing it, are gone
+(Erah, 2026-08-19: "Drop Phala as contractor, the rotating setup breaks
+whatever we have often enough that it shouldn't be relied upon for
+Machinery."). This file is rewritten, not deleted, per spec D5.6 — it still
+covers the invariant that mattered (same-mode is never redirected), now
+updated to also cover the fresh-mode invariant post-removal.
 """
 
 from __future__ import annotations
@@ -45,8 +47,8 @@ CLS = authority.PRClassification(
     diff="",
 )
 
-PEAK_TIME = datetime(2026, 8, 4, 18, 0, tzinfo=PACIFIC)     # 18:00 PT — inside 16:00-21:00
-OFFPEAK_TIME = datetime(2026, 8, 4, 10, 0, tzinfo=PACIFIC)  # 10:00 PT — outside
+PEAK_TIME = datetime(2026, 8, 4, 18, 0, tzinfo=PACIFIC)     # 18:00 PT — formerly 16:00-21:00 peak
+OFFPEAK_TIME = datetime(2026, 8, 4, 10, 0, tzinfo=PACIFIC)  # 10:00 PT — formerly outside
 
 
 def _make_dispatch_result():
@@ -86,17 +88,21 @@ def _call_reviewer(mode, now, records=None):
     return captured_agent_type.get("value"), dispatched_records
 
 
-class TestPeakRouting:
+class TestNoMoreContractorRoute:
+    """D5.1: the clock no longer decides the seat. Fresh mode always
+    dispatches to the local reviewer_fresh seat, peak window or not."""
 
-    def test_fresh_mode_in_peak_selects_contractor(self):
-        agent_type, _ = _call_reviewer("fresh", PEAK_TIME)
-        assert agent_type == "reviewer_fresh_contractor"
+    def test_fresh_mode_in_former_peak_window_selects_reviewer_fresh(self):
+        agent_type, records = _call_reviewer("fresh", PEAK_TIME)
+        assert agent_type == "reviewer_fresh"
+        assert records[0]["agent_type"] == "reviewer_fresh"
 
     def test_fresh_mode_offpeak_selects_reviewer_fresh(self):
-        agent_type, _ = _call_reviewer("fresh", OFFPEAK_TIME)
+        agent_type, records = _call_reviewer("fresh", OFFPEAK_TIME)
         assert agent_type == "reviewer_fresh"
+        assert records[0]["agent_type"] == "reviewer_fresh"
 
-    def test_same_mode_never_redirected_in_peak(self):
+    def test_same_mode_never_redirected_in_former_peak_window(self):
         agent_type, _ = _call_reviewer("same", PEAK_TIME)
         assert agent_type == "reviewer"
 
@@ -104,50 +110,40 @@ class TestPeakRouting:
         agent_type, _ = _call_reviewer("same", OFFPEAK_TIME)
         assert agent_type == "reviewer"
 
-    def test_dispatch_record_carries_model_in_peak(self):
+    def test_no_dispatch_record_ever_carries_contractor_agent_type(self):
+        _, records_peak = _call_reviewer("fresh", PEAK_TIME)
+        _, records_offpeak = _call_reviewer("fresh", OFFPEAK_TIME)
+        for records in (records_peak, records_offpeak):
+            assert len(records) == 1
+            assert records[0]["agent_type"] != "reviewer_fresh_contractor"
+            assert "route" not in records[0]
+
+    def test_dispatch_record_carries_local_seat_model(self):
         _, records = _call_reviewer("fresh", PEAK_TIME)
-        assert len(records) == 1
-        assert records[0]["agent_type"] == "reviewer_fresh_contractor"
-        assert records[0]["model"] == "deepseek/deepseek-v4-flash"
-        assert records[0]["route"] == "peak-window-policy"
-
-    def test_dispatch_record_carries_model_offpeak(self):
-        _, records = _call_reviewer("fresh", OFFPEAK_TIME)
-        assert len(records) == 1
-        assert records[0]["agent_type"] == "reviewer_fresh"
         assert records[0]["model"] == "gravitywell-slot1"
-        assert "route" not in records[0]
 
 
-class TestNoExceptionHandlerSwitchesSeats:
-    """Structural invariant (D2): the routing decision belongs at dispatch
-    time only. Assert by source inspection that no `except` block anywhere
-    in pm_core.py assigns agent_type to "reviewer_fresh_contractor" — the
-    only assignment site must be the dispatch-time clock check in
-    _act_dispatch_reviewer.
-    """
+class TestNoLiveContractorAssignmentSite:
+    """Structural invariant: no code path in pm_core.py assigns agent_type
+    to "reviewer_fresh_contractor" anymore — the only surviving mentions of
+    the name are the legacy compat tuple/family mapping and their comments
+    (D4)."""
 
-    def test_contractor_assignment_appears_at_known_dispatch_time_sites(self):
-        """Two legitimate assignment sites are expected: the TOU-peak check
-        (D2) and the dead-seat gap-spanner check
-        (lapis-pm-reviewer-seat-phala-test-key) — both dispatch-time
-        routing inputs in _act_dispatch_reviewer, neither exception-driven.
-        A third site would indicate an undocumented new routing input."""
+    def test_no_assignment_of_agent_type_to_contractor(self):
         src = Path(pm_core.__file__).read_text()
         assignment_lines = [
             i for i, line in enumerate(src.splitlines())
             if re.search(r'agent_type\s*=\s*"reviewer_fresh_contractor"', line)
         ]
-        assert len(assignment_lines) == 2, (
-            f"expected exactly two assignments of agent_type to "
-            f"reviewer_fresh_contractor (TOU-peak + gap-spanner), "
-            f"found {len(assignment_lines)}"
+        assert assignment_lines == [], (
+            f"expected zero live assignments of agent_type to "
+            f"reviewer_fresh_contractor post-removal, found at lines "
+            f"{[i + 1 for i in assignment_lines]}"
         )
 
     def test_no_except_block_mentions_contractor_seat(self):
         """No `except` clause body (up to the next top-level statement) may
-        reference reviewer_fresh_contractor — that would be exactly the
-        "call the contractor on failure" pattern D2 forbids."""
+        reference reviewer_fresh_contractor."""
         src = Path(pm_core.__file__).read_text()
         lines = src.splitlines()
         in_except = False

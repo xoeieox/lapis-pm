@@ -100,7 +100,6 @@ except ImportError as _e:
 from . import episodic, brief, authority, intent_artifact as _intent_artifact, steer
 from . import node_identity
 from . import signed_directive
-from . import tou_window
 
 try:
     from . import eval_gate as _eval_gate
@@ -130,11 +129,14 @@ MAX_DISPATCH_RETRIES = 2
 _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 
 # Every agent_type that dispatches a local-reviewer read-only judge leg.
-# reviewer_fresh_contractor (lapis-pm-reviewer-peak-contractor-route-v0) is
-# the TOU-peak seat swap of reviewer_fresh — it must be treated identically
-# by every reviewer-record classification site (attempt ceiling, review-gate
-# kill-switch, verdict decode, output-file processing) or dispatches routed
-# to it silently fall outside all of that accounting.
+# reviewer_fresh_contractor (formerly the TOU-peak/dead-seat contractor
+# route, lapis-pm-reviewer-peak-contractor-route-v0 /
+# lapis-pm-reviewer-seat-phala-test-key) is kept here as a read-only
+# parsing artifact only (lapis-pm-phala-test-key, D4) — no live
+# code path produces this agent_type anymore. It stays in the tuple so
+# historical dispatch records containing it still classify correctly
+# (attempt ceiling, review-gate kill-switch, verdict decode, output-file
+# processing) instead of silently falling outside that accounting.
 _REVIEWER_AGENT_TYPES = ("reviewer", "reviewer_fresh", "reviewer_fresh_contractor")
 
 # lapis-pm-reviewer-absence-grounding-rule-v0: flag-gated obligation block,
@@ -5828,39 +5830,6 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     spec_summary = episodic.spec_summary(target_id)
 
     agent_type = "reviewer_fresh" if mode == "fresh" else "reviewer"
-    # TOU-peak contractor route (lapis-pm-reviewer-peak-contractor-route-v0,
-    # D2): dispatch-time-only routing, decided by the clock at the moment of
-    # THIS dispatch and nowhere else. No exception handler may switch seats
-    # (decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30) —
-    # this is the ONLY place agent_type is redirected to the contractor seat.
-    # Only reviewer_fresh (the local-GravityWell fresh-read leg) has a
-    # contractor counterpart; plain "reviewer" (same-reviewer mode) is
-    # unaffected.
-    if agent_type == "reviewer_fresh" and tou_window.is_peak_window():
-        agent_type = "reviewer_fresh_contractor"
-
-    # Dead-seat gap-spanner route (lapis-pm-reviewer-seat-phala-test-key):
-    # a second, explicitly-named routing input alongside the TOU-window check
-    # above — not an exception-driven flip (that pattern remains forbidden per
-    # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30).
-    # Only reviewer_fresh has a contractor counterpart, so this is scoped the
-    # same way the TOU branch is. Threshold is 1 prior seat_no_tool_calls on
-    # THIS exact PR/cycle: probe_seat_tool_call already tries
-    # PROBE_DEFAULT_ATTEMPTS=3 deterministic tool-order variants before
-    # reporting seat_no_tool_calls, so one occurrence already reflects 3/3
-    # failed perturbations — waiting for a second just burns another cycle
-    # against the same poisoned prefix for no new information. Runs
-    # regardless of TOU window (a dead seat is dead at any hour) and never
-    # turns OFF the TOU-peak routing above — strict addition only.
-    if agent_type == "reviewer_fresh":
-        _prior_state = _reviewer_attempt_state(target_id, pr_number, cycle)
-        if _prior_state["last_infra_reason"] == "seat_no_tool_calls":
-            agent_type = "reviewer_fresh_contractor"
-            _gap_spanner_reroute = True
-        else:
-            _gap_spanner_reroute = False
-    else:
-        _gap_spanner_reroute = False
 
     # Build prior_review context for same-reviewer mode
     prior_review_text = _build_prior_review_text(target_id, pr_number, cycle) if mode == "same" else ""
@@ -5928,11 +5897,15 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     res = _SHAPER.dispatch(agent_type, target_id, user_prompt, vars_=vars_)
 
     # D2/D5 provenance: a verdict whose record does not say which model
-    # produced it is not auditable, and this route makes verdicts come from
-    # two different models on the same PR. Look up the registry-declared
-    # model/seat for this agent_type (never hardcode — the registry is the
-    # single source of truth for both reviewer_fresh and its contractor
-    # counterpart, which share a template but not a model).
+    # produced it is not auditable. Look up the registry-declared model/seat
+    # for this agent_type (never hardcode — the registry is the single
+    # source of truth). Post-lapis-pm-phala-test-key, every
+    # fresh-review verdict comes from the single local reviewer_fresh seat —
+    # there is no longer a contractor counterpart to distinguish. NOTE:
+    # "reviewer_fresh_contractor" still appears in _REVIEWER_AGENT_TYPES and
+    # the family mapping above (D4) as a read-only parsing artifact for
+    # historical dispatch records; no live code path in this function (or
+    # anywhere else) produces that agent_type anymore.
     try:
         shaped_agent = _SHAPER.get_agent(agent_type)
     except Exception:
@@ -5952,32 +5925,29 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "model": shaped_agent.model if shaped_agent else None,
         "review_gate_ts": review_gate_ts,
     }
-    if agent_type == "reviewer_fresh_contractor":
-        if _gap_spanner_reroute:
-            # Tag the route so the locality ledger can distinguish a
-            # dead-seat gap-spanner reroute (this unit) from the TOU-peak
-            # scheduled contractor call above — do not conflate the two
-            # counters.
-            record["route"] = "gap-spanner-dead-seat-reroute"
-        else:
-            # Tag the route so the locality ledger can distinguish a scheduled
-            # daytime contractor call (POLICY) from a fallback event, per
-            # decision/gw-daytime-no-flips-judge-via-deepseek-v4-flash-2026-07-30:
-            # "instrumentation should distinguish the two or the ledger will read
-            # every daytime judge call as an independence failure."
-            record["route"] = "peak-window-policy"
     append_dispatched(target_id, record)
 
-    _gap_spanner_log = (
-        f"Gap-spanner reroute: prior seat_no_tool_calls on PR #{pr_number} "
-        f"cycle {cycle} → routed to reviewer_fresh_contractor "
-        f"(decision/gw-daytime-no-flips-2026-07-30-temporary-carveout-"
-        f"reviewer-seat-health-2026-08-07).\n"
-        if _gap_spanner_reroute else ""
-    )
+    # Dead-seat visibility (lapis-pm-phala-test-key, D3.4):
+    # the removed gap-spanner used to silently reroute a dead
+    # reviewer_fresh seat to the contractor seat. There is no alternate
+    # seat anymore, so a prior seat_no_tool_calls failure on this exact
+    # PR/cycle must be surfaced here instead of hidden — this dispatch is
+    # about to retry the same dead seat, and an operator directive (wait
+    # for seat recovery, or move the PR) is the only remedy.
+    _dead_seat_note = ""
+    if agent_type == "reviewer_fresh":
+        _prior_state = _reviewer_attempt_state(target_id, pr_number, cycle)
+        if _prior_state["last_infra_reason"] == "seat_no_tool_calls":
+            _dead_seat_note = (
+                f"Reviewer seat dead: prior attempt on PR #{pr_number} cycle "
+                f"{cycle} failed with seat_no_tool_calls. No alternate seat "
+                f"is configured — this dispatch retries the same seat. "
+                f"Remedy is an operator directive (re-dispatch after seat "
+                f"recovery, or a directive to move the PR).\n"
+            )
     episodic.write_dispatch(
         target_id,
-        f"{_gap_spanner_log}"
+        f"{_dead_seat_note}"
         f"Reviewer dispatched (cycle {cycle}, mode={mode}): {agent_type} → {res.task_id}\n"
         f"PR #{pr_number}: {pr.get('title', '')}",
         extra_tags=[

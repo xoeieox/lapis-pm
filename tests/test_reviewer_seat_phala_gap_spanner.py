@@ -1,15 +1,17 @@
-"""Tests for lapis-pm-reviewer-seat-phala-test-key: routing a
-definitively-dead local reviewer seat to the Phala contractor instead of
-letting it burn the rest of the infra budget toward a pause.
+"""Tests for lapis-pm-phala-test-key D3.4/D5.2: the dead-seat
+gap-spanner reroute is removed. A prior seat_no_tool_calls failure on this
+exact PR/cycle no longer redirects the next dispatch to a contractor seat —
+there is no alternate seat anymore. Instead the dispatch log entry
+(episodic.write_dispatch) must make the dead seat visible: state that the
+seat is dead, that no alternate seat is configured, and that an operator
+directive is the remedy.
 
-Invariants under test (spec Deliverable 4):
-  - prior infra reason == "seat_no_tool_calls" and mode == "fresh" reroutes
-    to reviewer_fresh_contractor, outside the TOU window.
-  - prior infra reason == "gw_not_serving" (not seat_no_tool_calls) does NOT
-    reroute — falls through to the existing ceiling/pause path unchanged.
-  - mode == "same" never reroutes, regardless of prior reason.
-  - the TOU-window branch still fires when neither gap-spanner condition
-    applies (regression guard on the existing D2 carve-out).
+Formerly (lapis-pm-reviewer-seat-phala-test-key) this file asserted
+the opposite: that seat_no_tool_calls rerouted to reviewer_fresh_contractor.
+That route, and the seat backing it, are gone (Erah, 2026-08-19: "Drop
+Phala as contractor, the rotating setup breaks whatever we have often
+enough that it shouldn't be relied upon for Machinery."). Rewritten, not
+deleted, per spec D5.6.
 """
 
 from __future__ import annotations
@@ -44,8 +46,8 @@ CLS = authority.PRClassification(
     diff="",
 )
 
-OFFPEAK_TIME = datetime(2026, 8, 4, 10, 0, tzinfo=PACIFIC)  # 10:00 PT — outside TOU peak
-PEAK_TIME = datetime(2026, 8, 4, 18, 0, tzinfo=PACIFIC)     # 18:00 PT — inside 16:00-21:00
+OFFPEAK_TIME = datetime(2026, 8, 4, 10, 0, tzinfo=PACIFIC)  # 10:00 PT
+PEAK_TIME = datetime(2026, 8, 4, 18, 0, tzinfo=PACIFIC)     # 18:00 PT — formerly 16:00-21:00 peak
 
 
 def _make_dispatch_result():
@@ -101,35 +103,45 @@ def _state(last_infra_reason=None):
     }
 
 
-class TestGapSpannerReroute:
+class TestDeadSeatVisibleNoReroute:
 
-    def test_prior_seat_no_tool_calls_fresh_mode_offpeak_reroutes_to_contractor(self):
+    def test_prior_seat_no_tool_calls_fresh_mode_dispatches_local_seat(self):
         agent_type, records, texts = _call_reviewer(
             "fresh", OFFPEAK_TIME, _state("seat_no_tool_calls")
         )
-        assert agent_type == "reviewer_fresh_contractor"
-        assert records[0]["route"] == "gap-spanner-dead-seat-reroute"
-        assert any("Gap-spanner reroute" in t and "seat_no_tool_calls" in t for t in texts)
-        # Log the symptom only — never a diagnosed cause.
-        assert not any("prefix-cache" in t.lower() or "poisoning" in t.lower() for t in texts)
+        assert agent_type == "reviewer_fresh"
+        assert "route" not in records[0]
+        assert records[0]["agent_type"] == "reviewer_fresh"
 
-    def test_prior_gw_not_serving_fresh_mode_does_not_reroute(self):
-        agent_type, records, _ = _call_reviewer(
+    def test_prior_seat_no_tool_calls_dispatch_log_carries_no_alternate_seat_note(self):
+        _, _, texts = _call_reviewer(
+            "fresh", OFFPEAK_TIME, _state("seat_no_tool_calls")
+        )
+        assert any("seat_no_tool_calls" in t for t in texts)
+        assert any("dead" in t.lower() for t in texts)
+        assert any("no alternate seat" in t.lower() for t in texts)
+
+    def test_prior_gw_not_serving_fresh_mode_no_note(self):
+        agent_type, records, texts = _call_reviewer(
             "fresh", OFFPEAK_TIME, _state("gw_not_serving")
         )
         assert agent_type == "reviewer_fresh"
         assert "route" not in records[0]
+        assert not any("seat_no_tool_calls" in t for t in texts)
 
-    def test_prior_seat_no_tool_calls_same_mode_does_not_reroute(self):
-        agent_type, records, _ = _call_reviewer(
+    def test_prior_seat_no_tool_calls_same_mode_no_note(self):
+        """same mode is never routed through the reviewer_fresh dead-seat
+        check at all — the note is scoped to reviewer_fresh dispatches."""
+        agent_type, records, texts = _call_reviewer(
             "same", OFFPEAK_TIME, _state("seat_no_tool_calls")
         )
         assert agent_type == "reviewer"
         assert "route" not in records[0]
+        assert not any("seat_no_tool_calls" in t for t in texts)
 
-    def test_tou_peak_branch_still_fires_when_no_gap_spanner_condition(self):
-        agent_type, records, _ = _call_reviewer(
+    def test_former_peak_window_no_longer_affects_routing(self):
+        agent_type, records, texts = _call_reviewer(
             "fresh", PEAK_TIME, _state(None)
         )
-        assert agent_type == "reviewer_fresh_contractor"
-        assert records[0]["route"] == "peak-window-policy"
+        assert agent_type == "reviewer_fresh"
+        assert "route" not in records[0]

@@ -144,6 +144,8 @@ def test_target_sha_routes_run_eval_to_single_fixture(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bfe, "LAPIS_PM_REPO", toy_repo)
     monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus")
+    # AC4: repo_only now resolves through discover_repos(), not the LAPIS_PM_REPO const.
+    monkeypatch.setattr(bfe, "discover_repos", lambda root=None: [(toy_repo, "lapis-pm")])
 
     result = bfe.run_eval(
         phase="build-corpus", mock_mode=True,
@@ -169,6 +171,8 @@ def test_cli_invalid_target_sha_exits_2_no_save(tmp_path, monkeypatch, capsys):
     _make_harvest_toy_repo(toy_repo)
 
     monkeypatch.setattr(bfe, "LAPIS_PM_REPO", toy_repo)
+    # AC4: repo_only now resolves through discover_repos(), not the LAPIS_PM_REPO const.
+    monkeypatch.setattr(bfe, "discover_repos", lambda root=None: [(toy_repo, "lapis-pm")])
 
     saved = []
     monkeypatch.setattr(bfe, "save_corpus", lambda c: saved.extend(c))
@@ -230,6 +234,8 @@ def test_cli_mock_mode_non_discriminates_guard_exempt(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bfe, "LAPIS_PM_REPO", toy_repo)
     monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus")
+    # AC4: repo_only now resolves through discover_repos(), not the LAPIS_PM_REPO const.
+    monkeypatch.setattr(bfe, "discover_repos", lambda root=None: [(toy_repo, "lapis-pm")])
 
     args = argparse.Namespace(
         phase="build-corpus", run_id=None, mock=True,

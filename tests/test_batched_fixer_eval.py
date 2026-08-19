@@ -9,6 +9,7 @@ All tests run against mocked swarm / synthetic fixtures — zero GW, zero paid s
 import json
 import os
 import subprocess
+import sys
 import pytest
 from dataclasses import asdict
 from pathlib import Path
@@ -972,7 +973,12 @@ def test_ac13_parse_pytest_failures():
 
 
 def test_ach1_startup_probe_blocks_real_build_when_gw_down(tmp_path, monkeypatch):
-    """AC-H1: non-mock build-corpus raises when GW probe returns fallback status."""
+    """AC-H1: non-mock build-corpus raises when GW probe returns fallback status.
+
+    AC6: the message asserts what launder_intent actually checks (exception vs no
+    exception) — no specific-model claim ('big-122B'), since the code never checks
+    which model answered.
+    """
     import lapis_pm.batched_fixer_eval as bfe
 
     # Simulate GW unavailable: call_operator raises on any call
@@ -984,13 +990,18 @@ def test_ach1_startup_probe_blocks_real_build_when_gw_down(tmp_path, monkeypatch
 
     monkeypatch.setattr(bfe, "launder_intent", _mock_launder_fails)
 
-    with pytest.raises(RuntimeError, match="GW not serving big-122B"):
+    with pytest.raises(RuntimeError, match="GW not serving"):
         bfe.run_eval(phase="build-corpus", mock_mode=False)
 
 
 def test_ach1_mock_mode_skips_probe(tmp_path, monkeypatch):
     """AC-H1: mock-mode build-corpus skips the GW probe and builds GW-free."""
     import lapis_pm.batched_fixer_eval as bfe
+
+    # AC1: isolate the corpus generation lifecycle off the real staging root.
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
 
     probe_called = []
 
@@ -1055,10 +1066,6 @@ def test_ach2_launder_status_fallback_counted(monkeypatch, tmp_path):
             cwd=fake_repo, check=True, capture_output=True,
         )
 
-    # Redirect repos: only fake_repo (conductor path nonexistent → skipped).
-    monkeypatch.setattr(bfe, "LAPIS_PM_REPO", fake_repo)
-    monkeypatch.setattr(bfe, "CONDUCTOR_REPO", tmp_path / "nonexistent")
-
     call_count = [0]
 
     def _mixed_launder(raw, mock_mode=False):
@@ -1070,7 +1077,9 @@ def test_ach2_launder_status_fallback_counted(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bfe, "launder_intent", _mixed_launder)
 
-    _, meta = bfe.build_corpus(skip_base_runs=True)
+    # AC4: build_corpus's default is now discover_repos() (the full /srv/git/*-working
+    # set) — pass an explicit repos= override so this test stays isolated to fake_repo.
+    _, meta = bfe.build_corpus(skip_base_runs=True, repos=[(fake_repo, "test-repo")])
 
     # All 5 fix commits must reach the laundering step.
     assert meta["laundering_total"] == n_fix_commits, (
@@ -1087,6 +1096,11 @@ def test_ach2_launder_status_fallback_counted(monkeypatch, tmp_path):
 def test_ach2_fallback_warning_printed_to_stderr(monkeypatch, capsys, tmp_path):
     """AC-H2: run_eval build-corpus prints contamination WARNING to stderr when fallback > 0."""
     import lapis_pm.batched_fixer_eval as bfe
+
+    # AC1: isolate the corpus generation lifecycle off the real staging root.
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
 
     dummy_corpus = [
         FixtureRecord(
@@ -1113,9 +1127,14 @@ def test_ach2_fallback_warning_printed_to_stderr(monkeypatch, capsys, tmp_path):
     assert "2/5" in captured.err
 
 
-def test_ach2_no_warning_when_no_fallbacks(monkeypatch, capsys):
+def test_ach2_no_warning_when_no_fallbacks(monkeypatch, capsys, tmp_path):
     """AC-H2: run_eval build-corpus prints NO contamination warning when fallback count is 0."""
     import lapis_pm.batched_fixer_eval as bfe
+
+    # AC1: isolate the corpus generation lifecycle off the real staging root.
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
 
     dummy_corpus = [
         FixtureRecord(
@@ -1228,6 +1247,11 @@ def test_ach3_sub_floor_raises():
 def test_ach3_shape_captured_in_run_eval_metadata(monkeypatch, tmp_path):
     """AC-H3: run_eval build-corpus captures corpus_shape from validate_corpus_power_floor."""
     import lapis_pm.batched_fixer_eval as bfe
+
+    # AC1: isolate the corpus generation lifecycle off the real staging root.
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
 
     captured_metadata = {}
 
@@ -1820,6 +1844,11 @@ def test_aco5_manifest_has_discriminates_fields(monkeypatch, tmp_path):
     per_bucket_holdout_discriminates (with 'small'/'larger' keys) when called from run_eval."""
     import lapis_pm.batched_fixer_eval as bfe
 
+    # AC1: isolate the corpus generation lifecycle off the real staging root.
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
+
     captured = {}
 
     def _capture_manifest(meta):
@@ -1862,9 +1891,16 @@ def test_aco5_manifest_has_discriminates_fields(monkeypatch, tmp_path):
     assert captured["per_bucket_holdout_discriminates"]["larger"] == 8
 
 
-def test_aco5_build_fails_loud_when_discriminates_below_floor(monkeypatch, capsys):
-    """AC-O5: run_eval build-corpus fails loud (logs error) when DISCRIMINATES floor unmet."""
+def test_aco5_build_fails_loud_when_discriminates_below_floor(monkeypatch, capsys, tmp_path):
+    """AC5: run_eval build-corpus writes the manifest FIRST (achieved counts survive the
+    shortfall), THEN raises the reserved CorpusPowerFloorUnmetError — never a silent
+    return-None / exit-0 when the floor is unmet."""
     import lapis_pm.batched_fixer_eval as bfe
+
+    # AC1: isolate the corpus generation lifecycle off the real staging root.
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
 
     thin_corpus = [
         FixtureRecord(
@@ -1878,12 +1914,19 @@ def test_aco5_build_fails_loud_when_discriminates_below_floor(monkeypatch, capsy
     monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {
         "_shape": "coarse-binary",
     })
+    manifest_calls = []
     monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
-    monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: None)
+    monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: manifest_calls.append(m))
 
-    # run_eval catches ValueError and logs it; the build does NOT complete
-    result = bfe.run_eval(phase="build-corpus", mock_mode=True)
-    assert result is None  # build did not succeed
+    with pytest.raises(bfe.CorpusPowerFloorUnmetError):
+        bfe.run_eval(phase="build-corpus", mock_mode=True)
+
+    # The manifest must have been written BEFORE the raise, with the achieved (sub-floor)
+    # counts and complete=True — evidence survives the shortfall.
+    assert len(manifest_calls) == 1
+    written = manifest_calls[0]
+    assert written["complete"] is True
+    assert written["per_bucket_holdout_discriminates"] == {"small": 0, "larger": 0}
 
 
 # AC-O3 classify_candidate_outcome_golden unit tests
@@ -2003,6 +2046,718 @@ def test_acw3_build_corpus_real_git_extraction(tmp_path):
     assert so.checker_class == "UNTESTED", (
         f"Source-only commit must be UNTESTED; got {so.checker_class!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-batched-fixer-corpus-staged-and-buildable-v0: AC1-AC6
+# ---------------------------------------------------------------------------
+
+
+def _make_generation(corpus_root, run_id, complete, mtime=None):
+    """Test helper: create a generation dir with a minimal manifest."""
+    gen_dir = corpus_root / run_id
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {"complete": complete, "artifact_class": "derived-cache"}
+    (gen_dir / "_manifest.json").write_text(json.dumps(manifest))
+    if mtime is not None:
+        os.utime(gen_dir, (mtime, mtime))
+    return gen_dir
+
+
+# --- AC1: segregated staging root + generation lifecycle -------------------
+
+
+def test_ac1_corpus_dir_not_under_repo_root():
+    """AC1: CORPUS_DIR resolves under the staging root, never under the repo root."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    repo_root = Path(__file__).resolve().parent.parent
+    assert repo_root not in bfe.CORPUS_DIR.resolve().parents or not str(
+        bfe.CORPUS_DIR
+    ).startswith(str(repo_root)), "CORPUS_DIR must not live under the repo root"
+    assert str(bfe.CORPUS_DIR).startswith(str(bfe.STAGING_ROOT))
+    assert str(bfe.RUNS_DIR).startswith(str(bfe.STAGING_ROOT))
+
+
+def test_ac1_staging_dir_env_override():
+    """AC1: BFE_STAGING_DIR env var overrides the default staging root.
+
+    Checked in a subprocess (not importlib.reload) — reloading batched_fixer_eval
+    in-process would mint a second FixtureRunResult/etc. class object, breaking every
+    other test's isinstance() checks against the module imported at test-file load time.
+    """
+    # This worktree's conftest.py points PYTHONUSERBASE at a throwaway .pyuserbase so
+    # normal `site` startup can't find the agents_core editable-install .pth files —
+    # drop it for the child so real user-site processing (as any production
+    # invocation would see) resolves agents_core normally.
+    child_env = {**os.environ, "BFE_STAGING_DIR": "/tmp/custom-bfe-staging"}
+    child_env.pop("PYTHONUSERBASE", None)
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import lapis_pm.batched_fixer_eval as bfe; print(bfe.STAGING_ROOT)",
+        ],
+        env=child_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/tmp/custom-bfe-staging"
+
+
+def test_ac1_start_corpus_generation_creates_dir(tmp_path, monkeypatch):
+    """AC1: start_corpus_generation creates CORPUS_ROOT/<run_id> before repo iteration."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+
+    gen_dir = bfe.start_corpus_generation("20260819-000000-corpus")
+    assert gen_dir == tmp_path / "corpus" / "20260819-000000-corpus"
+    assert gen_dir.is_dir()
+
+
+def test_ac1_start_corpus_generation_aborts_below_free_space_margin(tmp_path, monkeypatch):
+    """AC1: the single pre-harvest free-space check aborts loudly below the margin,
+    BEFORE any repo is touched."""
+    import lapis_pm.batched_fixer_eval as bfe
+    from collections import namedtuple
+
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+
+    _Usage = namedtuple("_Usage", ["total", "used", "free"])
+    monkeypatch.setattr(
+        bfe.shutil, "disk_usage", lambda path: _Usage(100 * 1024 ** 3, 99 * 1024 ** 3, 1 * 1024 ** 3)
+    )
+
+    with pytest.raises(RuntimeError, match="safety margin"):
+        bfe.start_corpus_generation("20260819-000001-corpus")
+
+
+def test_ac1_promote_corpus_generation_repoints_symlink(tmp_path, monkeypatch):
+    """AC1: 'current' is repointed atomically after a build completes."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    (tmp_path / "corpus").mkdir()
+
+    gen1 = _make_generation(tmp_path / "corpus", "gen1", complete=True)
+    bfe.promote_corpus_generation(gen1)
+    current = bfe._corpus_current_symlink()
+    assert current.is_symlink()
+    assert current.resolve() == gen1.resolve()
+
+    gen2 = _make_generation(tmp_path / "corpus", "gen2", complete=True)
+    bfe.promote_corpus_generation(gen2)
+    assert current.resolve() == gen2.resolve(), "current must move to the new generation"
+
+
+def test_ac1_promote_corpus_generation_handles_legacy_plain_dir(tmp_path, monkeypatch):
+    """AC1: a pre-existing plain 'current' directory (e.g. harvest_one-only usage before
+    any real build) is replaced by a symlink, not left blocking promotion."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    current = tmp_path / "corpus" / "current"
+    current.mkdir(parents=True)
+    (current / "some-fixture.json").write_text("{}")
+
+    gen1 = _make_generation(tmp_path / "corpus", "gen1", complete=True)
+    bfe.promote_corpus_generation(gen1)
+    assert current.is_symlink()
+    assert current.resolve() == gen1.resolve()
+
+
+def test_ac1_prune_retains_last_n_complete_generations(tmp_path, monkeypatch):
+    """AC1: only the last CORPUS_GENERATIONS_RETAIN complete generations survive."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    (tmp_path / "corpus").mkdir()
+
+    gens = [
+        _make_generation(tmp_path / "corpus", f"gen{i}", complete=True, mtime=1000 + i)
+        for i in range(5)
+    ]
+    bfe.promote_corpus_generation(gens[-1])  # current -> newest
+
+    pruned = bfe.prune_old_corpus_generations(retain=3)
+    remaining = {p.name for p in (tmp_path / "corpus").iterdir() if p.is_dir() and not p.is_symlink()}
+    assert set(pruned) == {"gen0", "gen1"}, f"expected gen0/gen1 pruned, got {pruned}"
+    assert remaining == {"gen2", "gen3", "gen4"}
+
+
+def test_ac1_prune_never_touches_incomplete_generations(tmp_path, monkeypatch):
+    """AC1: an incomplete generation (crashed build) is never counted toward the
+    retention window and never deleted, even with retain=0."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    (tmp_path / "corpus").mkdir()
+
+    complete_gen = _make_generation(tmp_path / "corpus", "good", complete=True, mtime=1000)
+    incomplete_gen = _make_generation(tmp_path / "corpus", "crashed", complete=False, mtime=2000)
+    bfe.promote_corpus_generation(complete_gen)
+
+    pruned = bfe.prune_old_corpus_generations(retain=0)
+    assert "crashed" not in pruned
+    assert incomplete_gen.exists(), "an incomplete generation must never be deleted"
+
+
+def test_ac1_prune_never_deletes_generation_current_points_at(tmp_path, monkeypatch):
+    """AC1: the generation 'current' resolves to is never pruned, even past the
+    retention window (a run that crashes repeatedly must never evict the last good corpus)."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    (tmp_path / "corpus").mkdir()
+
+    gen = _make_generation(tmp_path / "corpus", "only-good", complete=True, mtime=1000)
+    bfe.promote_corpus_generation(gen)
+
+    pruned = bfe.prune_old_corpus_generations(retain=0)
+    assert "only-good" not in pruned
+    assert gen.exists()
+
+
+def test_ac1_load_corpus_empty_when_missing(tmp_path, monkeypatch):
+    """AC1: no build has ever run -> load_corpus returns [] without error."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
+    assert bfe.load_corpus() == []
+
+
+def test_ac1_load_corpus_refuses_incomplete_generation(tmp_path, monkeypatch):
+    """AC1: a manifest without 'complete': true marks a partial crash — load_corpus
+    must refuse it loudly rather than silently loading a short corpus."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    corpus_dir = tmp_path / "corpus" / "current"
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "_manifest.json").write_text(json.dumps({"complete": False}))
+    (corpus_dir / "some-fixture.json").write_text(json.dumps(asdict(FixtureRecord(
+        repo="lapis-pm", sha="x", parent_sha="y", pr_number=None, path="x.py",
+        file_loc="unknown", changed_lines=5, tier="T1",
+    ))))
+    monkeypatch.setattr(bfe, "CORPUS_DIR", corpus_dir)
+
+    with pytest.raises(bfe.CorpusGenerationIncompleteError):
+        bfe.load_corpus()
+
+
+def test_ac1_load_corpus_accepts_complete_generation(tmp_path, monkeypatch):
+    """AC1: a manifest with 'complete': true loads normally."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    corpus_dir = tmp_path / "corpus" / "current"
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "_manifest.json").write_text(json.dumps({"complete": True}))
+    (corpus_dir / "lapis-pm-aabbccdd.json").write_text(json.dumps(asdict(FixtureRecord(
+        repo="lapis-pm", sha="aabbccdd", parent_sha="y", pr_number=None, path="x.py",
+        file_loc="unknown", changed_lines=5, tier="T1",
+    ))))
+    monkeypatch.setattr(bfe, "CORPUS_DIR", corpus_dir)
+
+    loaded = bfe.load_corpus()
+    assert len(loaded) == 1
+    assert loaded[0].sha == "aabbccdd"
+
+
+# --- AC2: holdout assignment moves onto the bucket axis ---------------------
+
+
+def test_ac2_assign_bucket_holdout_only_discriminates_and_bucket_axis():
+    """AC2: _assign_bucket_holdout assigns ONLY among DISCRIMINATES fixtures, on the
+    small/larger bucket axis, not the T1/T2/T3 tier axis."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    small_diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    larger_diff = "--- a/y.py\n+++ b/y.py\n@@ -1 +1,35 @@\n" + "".join(f"+l{j}\n" for j in range(35))
+
+    corpus = []
+    # 3 DISCRIMINATES small, all tier T2 (co-committed fix+test)
+    for i in range(3):
+        corpus.append(FixtureRecord(
+            repo="lapis-pm", sha=f"sd{i}", parent_sha=f"p{i}", pr_number=None,
+            path="x.py", file_loc="unknown", changed_lines=5, tier="T2",
+            checker_class="DISCRIMINATES", golden_source_diff=small_diff,
+        ))
+    # 3 DISCRIMINATES larger, all tier T2
+    for i in range(3):
+        corpus.append(FixtureRecord(
+            repo="lapis-pm", sha=f"ld{i}", parent_sha=f"p{i}", pr_number=None,
+            path="y.py", file_loc="unknown", changed_lines=35, tier="T2",
+            checker_class="DISCRIMINATES", golden_source_diff=larger_diff,
+        ))
+    # BLIND and UNTESTED fixtures — must NEVER receive holdout, even though they'd
+    # otherwise be the first ones walked in tier order under the old per-tier loop.
+    corpus.insert(0, FixtureRecord(
+        repo="lapis-pm", sha="blind0", parent_sha="p", pr_number=None,
+        path="z.py", file_loc="unknown", changed_lines=5, tier="T1",
+        checker_class="BLIND", golden_source_diff=small_diff,
+    ))
+    corpus.insert(0, FixtureRecord(
+        repo="lapis-pm", sha="untested0", parent_sha="p", pr_number=None,
+        path="w.py", file_loc="unknown", changed_lines=5, tier="T1",
+        checker_class="UNTESTED",
+    ))
+
+    counts = bfe._assign_bucket_holdout(corpus, holdout_floor=3)
+
+    assert counts == {"small": 3, "larger": 3}
+    for f in corpus:
+        if f.checker_class == "DISCRIMINATES":
+            assert f.blind_holdout is True
+        else:
+            assert f.blind_holdout is False, "BLIND/UNTESTED must never receive holdout"
+
+
+def test_ac2_holdout_synthetic_corpus_8_and_8_passes_7_raises():
+    """AC2 regression test: a synthetic corpus with >= 8 DISCRIMINATES holdout in each
+    bucket passes validate_discriminates_power_floor after _assign_bucket_holdout; one
+    with only 7 in either bucket still raises."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    small_diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    larger_diff = "--- a/y.py\n+++ b/y.py\n@@ -1 +1,35 @@\n" + "".join(f"+l{j}\n" for j in range(35))
+
+    def _make(n_small, n_larger):
+        corpus = []
+        for i in range(n_small):
+            corpus.append(FixtureRecord(
+                repo="lapis-pm", sha=f"s{i}", parent_sha=f"p{i}", pr_number=None,
+                path="x.py", file_loc="unknown", changed_lines=5, tier="T2",
+                checker_class="DISCRIMINATES", golden_source_diff=small_diff,
+            ))
+        for i in range(n_larger):
+            corpus.append(FixtureRecord(
+                repo="lapis-pm", sha=f"l{i}", parent_sha=f"p{i}", pr_number=None,
+                path="y.py", file_loc="unknown", changed_lines=35, tier="T2",
+                checker_class="DISCRIMINATES", golden_source_diff=larger_diff,
+            ))
+        return corpus
+
+    passing = _make(8, 8)
+    bfe._assign_bucket_holdout(passing, holdout_floor=8)
+    result = bfe.validate_discriminates_power_floor(passing, floor=8)
+    assert result["per_bucket_holdout_discriminates"] == {"small": 8, "larger": 8}
+
+    failing = _make(7, 8)
+    bfe._assign_bucket_holdout(failing, holdout_floor=8)
+    with pytest.raises(ValueError, match="DISCRIMINATES holdout floor not met"):
+        bfe.validate_discriminates_power_floor(failing, floor=8)
+
+
+# --- AC3: widened structural caps -------------------------------------------
+
+
+def test_ac3_structural_filter_boundary_matrix():
+    """AC3: _structural_filter_reject_reason boundary matrix — 0/1/2/3 files, 2 files
+    no test, test-only, at/either-side of the (widened, 200) line cap, <=2 trivial."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    assert bfe.HARVEST_MAX_CHANGED_LINES == 200
+    assert bfe.HARVEST_MAX_CHANGED_FILES == 2
+
+    cases = [
+        ("zero_files", [], 0, False),
+        ("one_file", [("src.py", 10)], 10, True),
+        ("two_files_with_test", [("src.py", 5), ("test_src.py", 5)], 10, True),
+        ("three_files", [("a.py", 5), ("b.py", 5), ("c.py", 5)], 15, False),
+        ("two_files_no_test", [("a.py", 5), ("b.py", 5)], 10, False),
+        ("test_only", [("test_a.py", 5)], 5, False),
+        ("at_cap", [("src.py", 200)], 200, True),
+        ("just_below_cap", [("src.py", 199)], 199, True),
+        ("just_above_cap", [("src.py", 201)], 201, False),
+        ("trivial_two_lines", [("src.py", 2)], 2, False),
+    ]
+    for name, changed_files, total_changed, expect_accept in cases:
+        reason = bfe._structural_filter_reject_reason(changed_files, total_changed)
+        accepted = reason is None
+        assert accepted == expect_accept, (
+            f"case {name!r}: expected accept={expect_accept}, got reason={reason!r}"
+        )
+
+
+def test_ac3_build_corpus_and_harvest_one_agree_on_structural_filters(tmp_path):
+    """AC3: behavioural equivalence, not textual identity — feed build_corpus (batch) and
+    harvest_one (single-commit) the SAME real git commits at every filter boundary and
+    assert the accept/reject decision matches for every case."""
+    import subprocess as sp
+    import lapis_pm.batched_fixer_eval as bfe
+
+    repo = tmp_path / "repo_ac3"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "seed.py").write_text("x = 1\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(name, files):
+        for fname, n_lines in files:
+            content = "".join(f"line_{name}_{i}\n" for i in range(n_lines))
+            (repo / fname).write_text(content)
+        sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        sp.run(["git", "commit", "-m", f"fix: {name}"], cwd=repo, check=True, capture_output=True)
+        rev = sp.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True)
+        return rev.stdout.strip()
+
+    cases = {
+        "one_file": [("one_file.py", 10)],
+        "two_files_with_test": [("two_a.py", 5), ("test_two_a.py", 5)],
+        "three_files": [("three_a.py", 5), ("three_b.py", 5), ("three_c.py", 5)],
+        "two_files_no_test": [("nt_a.py", 5), ("nt_b.py", 5)],
+        "test_only": [("test_only_case.py", 5)],
+        "at_cap": [("at_cap.py", 200)],
+        "just_above_cap": [("over_cap.py", 201)],
+        "trivial": [("trivial.py", 2)],
+    }
+    shas = {name: _commit(name, files) for name, files in cases.items()}
+
+    corpus, _meta = bfe.build_corpus(
+        repos=[(repo, "ac3-repo")], launder_mock_mode=True, skip_base_runs=True,
+        target_size=100,
+    )
+    batch_shas = {f.sha for f in corpus}
+
+    for name, sha in shas.items():
+        single = bfe.harvest_one(sha, repo, "ac3-repo", skip_base_runs=True, mock_launder=True)
+        batch_included = sha in batch_shas
+        single_included = single is not None
+        assert batch_included == single_included, (
+            f"case {name!r}: build_corpus included={batch_included}, "
+            f"harvest_one included={single_included} — must agree"
+        )
+
+
+# --- AC4: full repo set discovery + hard-exclude broken suites --------------
+
+
+def test_ac4_discover_repos_labels_and_ordering(tmp_path):
+    """AC4: discover_repos finds *-working dirs with a .git, strips the suffix for the
+    label, and orders deterministically by directory name."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    for name in ["zeta-working", "alpha-working", "beta-working"]:
+        d = tmp_path / name
+        (d / ".git").mkdir(parents=True)
+    # Not '-working' suffixed — must be excluded.
+    (tmp_path / "conductor" / ".git").mkdir(parents=True)
+    # '-working' suffixed but no .git — must be excluded.
+    (tmp_path / "no-git-working").mkdir()
+
+    result = bfe.discover_repos(root=tmp_path)
+    assert [label for _p, label in result] == ["alpha", "beta", "zeta"]
+    assert all(p.name.endswith("-working") for p, _label in result)
+
+
+def test_ac4_discover_repos_missing_root_returns_empty(tmp_path):
+    """AC4: a nonexistent root returns [] rather than raising."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    assert bfe.discover_repos(root=tmp_path / "does-not-exist") == []
+
+
+def test_ac4_label_collision_raises():
+    """AC4: two candidates deriving the same label is a fatal configuration error —
+    both paths are named, never silently resolved to one."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    candidates = [Path("/a/foo-working"), Path("/b/foo-working")]
+    with pytest.raises(ValueError, match="label collision"):
+        bfe._label_candidates(candidates)
+
+
+def test_ac4_repo_only_resolves_via_discovery(monkeypatch, tmp_path):
+    """AC4: run_eval's target-sha dispatch resolves repo_only through the SAME
+    discover_repos() used by batch harvest, not a hardcoded lapis-pm/conductor map."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    fake_repo = tmp_path / "other-repo-working"
+    fake_repo.mkdir()
+    (fake_repo / ".git").mkdir()
+
+    monkeypatch.setattr(bfe, "discover_repos", lambda root=None: [(fake_repo, "other-repo")])
+
+    captured = {}
+
+    def _fake_harvest_one(sha, repo_path, repo_label, **kw):
+        captured["repo_path"] = repo_path
+        captured["repo_label"] = repo_label
+        return FixtureRecord(
+            repo=repo_label, sha=sha, parent_sha="p", pr_number=None, path="x.py",
+            file_loc="unknown", changed_lines=5, tier="T1", checker_class="DISCRIMINATES",
+        )
+
+    monkeypatch.setattr(bfe, "harvest_one", _fake_harvest_one)
+    monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
+
+    bfe.run_eval(phase="build-corpus", mock_mode=True, target_sha="deadbeef", repo_only="other-repo")
+
+    assert captured["repo_path"] == fake_repo
+    assert captured["repo_label"] == "other-repo"
+
+
+def test_ac4_repo_only_unknown_label_raises(monkeypatch, tmp_path, caplog):
+    """AC4: an --repo-only label not present in discover_repos() raises ValueError
+    (logged by run_eval's generic exception handler, same as the pre-existing
+    'not recognized' behaviour), rather than silently falling back to a hardcoded path."""
+    import logging
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "discover_repos", lambda root=None: [])
+
+    with caplog.at_level(logging.ERROR, logger="lapis_pm.batched_fixer_eval"):
+        result = bfe.run_eval(
+            phase="build-corpus", mock_mode=True, target_sha="deadbeef", repo_only="nonexistent-repo",
+        )
+    assert result is None
+    assert any("not a discovered repo" in rec.message for rec in caplog.records)
+
+
+def test_ac4_probe_repo_suite_at_head_no_test_suite(tmp_path):
+    """AC4: a repo with no tests/ dir is skipped with reason 'no_test_suite', not
+    treated as a broken suite."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    repo = tmp_path / "no_tests_repo"
+    repo.mkdir()
+    passed, reason = bfe.probe_repo_suite_at_head(repo)
+    assert passed is False
+    assert reason == "no_test_suite"
+
+
+def test_ac4_probe_repo_suite_at_head_broken_suite(tmp_path):
+    """AC4: a repo whose suite fails at HEAD is skipped with reason 'suite_broken_at_head'."""
+    import subprocess as sp
+    import lapis_pm.batched_fixer_eval as bfe
+
+    repo = tmp_path / "broken_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_broken.py").write_text("def test_fails():\n    assert False\n")
+
+    passed, reason = bfe.probe_repo_suite_at_head(repo)
+    assert passed is False
+    assert reason == "suite_broken_at_head"
+
+
+def test_ac4_probe_repo_suite_at_head_passing_suite(tmp_path):
+    """AC4: a repo whose suite passes at HEAD is not excluded."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    repo = tmp_path / "healthy_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+
+    passed, reason = bfe.probe_repo_suite_at_head(repo)
+    assert passed is True
+    assert reason == ""
+
+
+def test_ac4_build_corpus_skips_broken_suite_repo_and_records_manifest_row(tmp_path):
+    """AC4: build_corpus hard-excludes a repo whose suite is broken at HEAD, and records
+    a {repo, reason, eligible_commits_seen} skip row + repos_skipped count."""
+    import subprocess as sp
+    import lapis_pm.batched_fixer_eval as bfe
+
+    repo = tmp_path / "broken_history_repo"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "module.py").write_text("x = 1\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    (repo / "module.py").write_text("x = 2\nx = 3\nx = 4\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "fix: bump x"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_broken.py").write_text("def test_fails():\n    assert False\n")
+
+    corpus, meta = bfe.build_corpus(
+        repos=[(repo, "broken-repo")], launder_mock_mode=True, skip_base_runs=False,
+    )
+
+    assert corpus == []
+    assert meta["repos_skipped"] == 1
+    assert meta["repos_harvested"] == 0
+    assert len(meta["repo_skips"]) == 1
+    skip_row = meta["repo_skips"][0]
+    assert skip_row["repo"] == "broken-repo"
+    assert skip_row["reason"] == "suite_broken_at_head"
+    assert skip_row["eligible_commits_seen"] == 1
+
+
+# --- AC5: manifest ordering + distribution metrics --------------------------
+
+
+def test_ac5_bucket_distribution_metrics_no_editorial():
+    """AC5: _compute_bucket_distribution reports count/median/max/repo_spread per
+    bucket — numbers only, no coherence/quality verdict string."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    small_diff_5 = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,5 @@\n" + "".join(f"+s{j}\n" for j in range(5))
+    small_diff_9 = "--- a/x.py\n+++ b/x.py\n@@ -1 +1,9 @@\n" + "".join(f"+s{j}\n" for j in range(9))
+    corpus = [
+        FixtureRecord(
+            repo="lapis-pm", sha="a", parent_sha="p", pr_number=None, path="x.py",
+            file_loc="unknown", changed_lines=5, tier="T2", checker_class="DISCRIMINATES",
+            golden_source_diff=small_diff_5,
+        ),
+        FixtureRecord(
+            repo="conductor", sha="b", parent_sha="p", pr_number=None, path="x.py",
+            file_loc="unknown", changed_lines=9, tier="T2", checker_class="DISCRIMINATES",
+            golden_source_diff=small_diff_9,
+        ),
+    ]
+    dist = bfe._compute_bucket_distribution(corpus)
+    assert dist["small"]["count"] == 2
+    assert dist["small"]["median_changed_lines"] == 7  # median of 5, 9
+    assert dist["small"]["max_changed_lines"] == 9
+    assert dist["small"]["repo_spread"] == {"lapis-pm": 1, "conductor": 1}
+    assert dist["larger"]["count"] == 0
+    # No editorial verdict keys anywhere in the output.
+    for bucket_stats in dist.values():
+        assert "coherent" not in bucket_stats
+        assert "quality" not in bucket_stats
+        assert "verdict" not in bucket_stats
+
+
+def test_ac1_ac5_full_build_corpus_mock_mode_end_to_end(tmp_path, monkeypatch):
+    """Verification item 2: run_eval(phase='build-corpus', mock_mode=True) completes
+    end-to-end through the REAL (unmocked) orchestration, writes to the staging root
+    with the AC1 generation lifecycle, and touches no *-working tree — asserted by
+    'git status --short' staying clean in the synthetic source repo used as the
+    discovered repo set."""
+    import subprocess as sp
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path / "staging")
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "staging" / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "staging" / "corpus" / "current")
+
+    repo = tmp_path / "src_repo-working"
+    repo.mkdir()
+    sp.run(["git", "init", str(repo)], check=True, capture_output=True)
+    sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "module.py").write_text("def foo():\n    return 'old'\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_module.py").write_text(
+        "from module import foo\ndef test_foo():\n    assert foo() == 'new'\n"
+    )
+    (repo / "module.py").write_text("def foo():\n    return 'new'\n")
+    sp.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "fix: correct foo() return value"], cwd=repo, check=True, capture_output=True)
+
+    monkeypatch.setattr(bfe, "discover_repos", lambda root=None: [(repo, "src-repo")])
+    monkeypatch.setattr(bfe, "launder_intent", lambda raw, mock_mode=False, **kw: (
+        f"[Symptom] {raw[:50]}", "mock"
+    ))
+
+    before_status = sp.run(
+        ["git", "status", "--short"], cwd=repo, capture_output=True, text=True
+    ).stdout
+
+    try:
+        bfe.run_eval(phase="build-corpus", mock_mode=True)
+    except bfe.CorpusPowerFloorUnmetError:
+        pass  # a single-fixture corpus is expected to be under floor — that's fine here
+
+    after_status = sp.run(
+        ["git", "status", "--short"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert before_status == after_status == "", "the source repo must stay clean"
+
+    # The staging root now has a promoted generation with a complete manifest.
+    current = bfe._corpus_current_symlink()
+    assert current.is_symlink()
+    manifest = json.loads((current / "_manifest.json").read_text())
+    assert manifest["complete"] is True
+    assert manifest["artifact_class"] == "derived-cache"
+    assert manifest["laundering_fallback_count"] == 0
+    fixture_files = [p for p in current.glob("*.json") if p.name != "_manifest.json"]
+    assert len(fixture_files) == 1
+
+
+def test_ac5_cli_exit_code_2_on_floor_unmet(monkeypatch, tmp_path):
+    """AC5: cmd_batched_fixer_eval returns the reserved exit code 2 (not the generic 1)
+    when run_eval raises CorpusPowerFloorUnmetError."""
+    import argparse
+    import lapis_pm.batched_fixer_eval as bfe
+    from lapis_pm.cli import cmd_batched_fixer_eval
+
+    def _raise(*a, **kw):
+        raise bfe.CorpusPowerFloorUnmetError("small=0, larger=0, floor=8", {"complete": True})
+
+    monkeypatch.setattr(bfe, "run_eval", _raise)
+    # cmd_batched_fixer_eval does `from . import batched_fixer_eval as bfe` internally,
+    # which re-imports the same module object — the monkeypatch above is visible there.
+
+    args = argparse.Namespace(
+        phase="build-corpus", run_id=None, mock=True, json=False,
+        target_sha=None, repo_only=None,
+    )
+    rc = cmd_batched_fixer_eval(args)
+    assert rc == 2
+
+
+# --- AC6: corrected GW precondition -----------------------------------------
+
+
+def test_ac6_gw_precondition_message_names_no_specific_model(monkeypatch):
+    """AC6: the remedy message says 'confirm an operator model is serving', never names
+    big-122B or any specific model — launder_intent doesn't check which model answered,
+    only whether the call raised."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "launder_intent", lambda raw, mock_mode=False: (raw, "fallback"))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bfe.run_eval(phase="build-corpus", mock_mode=False)
+
+    message = str(excinfo.value)
+    assert "122B" not in message
+    assert "big-122B" not in message
+    assert "operator model is serving" in message
+
+
+def test_ac6_gw_precondition_passes_when_launder_status_is_gw(monkeypatch, tmp_path):
+    """AC6: the precondition only checks launder_intent's returned status, not which
+    model served it — a 'gw' status (any operator model) must pass the probe."""
+    import lapis_pm.batched_fixer_eval as bfe
+
+    monkeypatch.setattr(bfe, "STAGING_ROOT", tmp_path)
+    monkeypatch.setattr(bfe, "CORPUS_ROOT", tmp_path / "corpus")
+    monkeypatch.setattr(bfe, "CORPUS_DIR", tmp_path / "corpus" / "current")
+
+    probe_calls = []
+
+    def _tracking_launder(raw, mock_mode=False):
+        probe_calls.append((raw, mock_mode))
+        return raw, "gw"  # any operator model answering — not specifically big-122B
+
+    monkeypatch.setattr(bfe, "launder_intent", _tracking_launder)
+    monkeypatch.setattr(bfe, "build_corpus", lambda **kw: ([], {
+        "laundering_total": 0, "laundering_fallback_count": 0,
+    }))
+    monkeypatch.setattr(bfe, "validate_corpus_power_floor", lambda c, **kw: {"_shape": "coarse-binary"})
+    monkeypatch.setattr(bfe, "save_corpus", lambda c: None)
+    monkeypatch.setattr(bfe, "_write_corpus_manifest", lambda m: None)
+
+    # Must not raise — floor will be unmet (empty corpus) so we expect
+    # CorpusPowerFloorUnmetError, NOT the GW precondition RuntimeError.
+    with pytest.raises(bfe.CorpusPowerFloorUnmetError):
+        bfe.run_eval(phase="build-corpus", mock_mode=False)
+
+    assert probe_calls and probe_calls[0][0] == "probe"
 
 
 # ---------------------------------------------------------------------------

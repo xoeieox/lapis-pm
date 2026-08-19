@@ -1878,6 +1878,11 @@ def cmd_batched_fixer_eval(args) -> int:
     except bfe.TargetShaNotResolvedError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    except bfe.CorpusPowerFloorUnmetError as e:
+        # AC5: manifest is already written with the achieved counts — this reserved exit
+        # code means "built, but under floor", never shared with any other failure.
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     except bfe.NonDiscriminatesHarvestError as e:
         print(f"warning: {e}", file=sys.stderr)
         return 1
@@ -2755,9 +2760,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bfe.add_argument(
         "--repo-only",
-        choices=["lapis-pm", "conductor"],
         default="lapis-pm",
-        help="Repo to harvest --target-sha from (default: lapis-pm).",
+        help="Repo label to harvest --target-sha from (default: lapis-pm). Must be a "
+             "label discover_repos() resolves (any /srv/git/*-working repo, e.g. "
+             "'conductor') — run_eval validates it against that same discovery, so "
+             "single-commit and batch harvest can't disagree about which repos exist.",
     )
     bfe.set_defaults(func=cmd_batched_fixer_eval)
 

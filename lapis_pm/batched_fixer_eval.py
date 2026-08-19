@@ -40,14 +40,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Filesystem layout
 # ---------------------------------------------------------------------------
+#
+# Staging root (lapis-pm-batched-fixer-corpus-staged-and-buildable-v0, AC1): corpus +
+# run artifacts are segregated off any production repo, under a dedicated staging root
+# (default /srv/fast/batched-fixer-eval, ratified home for new bulk data on BRIX).
+# REPORTS_DIR stays put — reports are small human-readable docs, already published there.
 
-EVAL_BASE = Path("/tmp/batched-fixer-eval")
-CORPUS_DIR = Path(__file__).parent / "fixtures/batched_fixer_corpus"
+STAGING_ROOT = Path(os.environ.get("BFE_STAGING_DIR", "/srv/fast/batched-fixer-eval"))
+CORPUS_ROOT = STAGING_ROOT / "corpus"
+CORPUS_DIR = CORPUS_ROOT / "current"  # symlink to the active generation dir (AC1)
+EVAL_BASE = STAGING_ROOT
 RUNS_DIR = EVAL_BASE / "runs"
 REPORTS_DIR = room_path('planning.evals')
 
 LAPIS_PM_REPO = Path("/srv/lapis/lapis-pm")
 CONDUCTOR_REPO = Path("/srv/git/conductor-working")
+GIT_REPOS_ROOT = Path("/srv/git")
 
 CLONE_PREFIX = "/tmp/bfe"
 
@@ -60,6 +68,7 @@ SWARM_PROBE_TIMEOUT_S = 4
 SWARM_RECHECK_TIMEOUT_S = 10
 SWARM_HEALTH_RETRIES = 2
 TEARDOWN_WAIT_S = 5.0
+REPO_SUITE_PROBE_TIMEOUT_S = 300  # bounded HEAD probe (AC4) — one hanging repo can't stall the build
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -71,6 +80,20 @@ CORPUS_MIN_SIZE = 40
 CORPUS_MAX_SIZE = 60
 CORPUS_HOLDOUT_PER_TIER = 8
 FLAKE_RUN_COUNT = 3
+
+# Harvest structural caps (AC3) — module constants so build_corpus's inline filter and
+# harvest_one's single-commit filter can never silently drift apart.
+HARVEST_MAX_CHANGED_FILES = 2
+HARVEST_MAX_CHANGED_LINES = 200  # widened from 80 (Erah's ruling 2026-08-19) — feeds the "larger" bucket
+
+# DISCRIMINATES holdout bucket axis (AC2) — source-diff changed-line count, promoted to a
+# module constant so holdout assignment and validate_discriminates_power_floor share one
+# symbol instead of drifting apart the way tier-axis assignment vs bucket-axis validation did.
+_SOURCE_SIZE_THRESHOLD = 30
+
+# Corpus generation lifecycle (AC1)
+CORPUS_GENERATIONS_RETAIN = 3
+CORPUS_MIN_FREE_BYTES = 5 * 1024 ** 3  # 5 GiB pre-harvest safety margin
 
 N_CANDIDATES_RANGE = [1, 2, 3, 4]
 
@@ -383,14 +406,150 @@ def detached_worktree(clone_path: Path, sha: str, wt_name: str = "eval_wt"):
 
 
 # ---------------------------------------------------------------------------
+# Corpus generation lifecycle (AC1) — staging root is persistent, not /tmp, so it needs
+# its own lifecycle: each build writes a fresh generation dir, `current` is repointed
+# only after the build completes, and old complete generations are pruned.
+# ---------------------------------------------------------------------------
+
+
+class CorpusGenerationIncompleteError(RuntimeError):
+    """A corpus generation's manifest is missing or lacks 'complete': true (AC1).
+
+    Raised by load_corpus() to refuse silently loading a short/partial-crash corpus.
+    """
+
+
+def _corpus_generation_dir(run_id: str) -> Path:
+    return CORPUS_ROOT / run_id
+
+
+def _corpus_current_symlink() -> Path:
+    return CORPUS_ROOT / "current"
+
+
+def start_corpus_generation(run_id: str) -> Path:
+    """Create a new corpus generation dir + do the ONE pre-harvest free-space check (AC1).
+
+    Strict ordering, once per build: create the generation directory, then this single
+    free-space check on the staging filesystem, before any repo is touched. Never a
+    per-repo or mid-iteration check — that would let a build exhaust disk partway through
+    and leave a half-harvested generation behind.
+    """
+    gen_dir = _corpus_generation_dir(run_id)
+    gen_dir.mkdir(parents=True, exist_ok=True)
+
+    usage = shutil.disk_usage(STAGING_ROOT)
+    if usage.free < CORPUS_MIN_FREE_BYTES:
+        raise RuntimeError(
+            f"Staging filesystem {STAGING_ROOT} has {usage.free / (1024 ** 3):.1f} GiB "
+            f"free, below the {CORPUS_MIN_FREE_BYTES / (1024 ** 3):.0f} GiB safety margin. "
+            f"Aborting before touching any repo."
+        )
+    return gen_dir
+
+
+def promote_corpus_generation(generation_dir: Path) -> None:
+    """Atomically repoint the 'current' symlink at generation_dir (AC1).
+
+    Only called after a build's manifest has already been written with 'complete': true.
+    Uses a temp-symlink + rename so 'current' is never observed half-written — it either
+    points at the prior generation or the new one, never a partial state. A crashed build
+    therefore leaves an orphan generation, never a half-written 'current'.
+    """
+    symlink_path = _corpus_current_symlink()
+    tmp_link = CORPUS_ROOT / f".current-tmp-{os.getpid()}"
+    if tmp_link.is_symlink() or tmp_link.is_file():
+        tmp_link.unlink()
+    elif tmp_link.exists():
+        shutil.rmtree(tmp_link)
+    tmp_link.symlink_to(generation_dir.name)
+    # A pre-existing 'current' that is a plain directory (never through this lifecycle,
+    # e.g. legacy/harvest_one-only usage) can't be swapped for a symlink via rename —
+    # clear it first. The only non-atomic edge case, hit only on first-ever migration.
+    if symlink_path.exists() and not symlink_path.is_symlink():
+        shutil.rmtree(symlink_path)
+    tmp_link.replace(symlink_path)
+
+
+def prune_old_corpus_generations(retain: int = CORPUS_GENERATIONS_RETAIN) -> list[str]:
+    """Retain the last `retain` COMPLETE generations, prune older complete ones (AC1).
+
+    Incomplete generations (manifest missing or 'complete' != true) are never counted
+    toward the retention window and never deleted — a run that crashes repeatedly must
+    never evict the last known-good corpus. Returns the pruned generation dir names.
+    """
+    if not CORPUS_ROOT.exists():
+        return []
+
+    current_target = None
+    symlink_path = _corpus_current_symlink()
+    if symlink_path.is_symlink():
+        try:
+            current_target = symlink_path.resolve().name
+        except OSError:
+            current_target = None
+
+    complete_gens: list[tuple[float, Path]] = []
+    for entry in CORPUS_ROOT.iterdir():
+        if entry.is_symlink() or not entry.is_dir() or entry.name.startswith("."):
+            continue
+        manifest_path = entry / "_manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+        if not manifest.get("complete", False):
+            continue
+        complete_gens.append((entry.stat().st_mtime, entry))
+
+    complete_gens.sort(key=lambda t: t[0], reverse=True)
+    pruned = []
+    for _mtime, gen_dir in complete_gens[retain:]:
+        if gen_dir.name == current_target:
+            continue  # never prune the generation 'current' points at
+        logger.info("Pruning old corpus generation: %s", gen_dir)
+        shutil.rmtree(gen_dir, ignore_errors=True)
+        pruned.append(gen_dir.name)
+    return pruned
+
+
+# ---------------------------------------------------------------------------
 # Corpus loading / saving
 # ---------------------------------------------------------------------------
 
 
 def load_corpus() -> list[FixtureRecord]:
-    CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+    """Load the corpus at CORPUS_DIR ('current' generation).
+
+    A missing CORPUS_DIR (no build has ever run) returns []. A present generation whose
+    manifest lacks 'complete': true is a partial/crashed build (AC1) — refused loudly
+    rather than silently loading a short corpus.
+    """
+    if not CORPUS_DIR.exists():
+        return []
+
+    manifest_path = CORPUS_DIR / "_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception as exc:
+            raise CorpusGenerationIncompleteError(
+                f"Corpus manifest at {manifest_path} is unreadable ({exc}); refusing to "
+                f"load a corpus generation whose completeness cannot be verified."
+            ) from exc
+        if not manifest.get("complete", False):
+            raise CorpusGenerationIncompleteError(
+                f"Corpus generation at {CORPUS_DIR} has no manifest 'complete: true' — "
+                f"this marks a partial/crashed build. Refusing to silently load a short "
+                f"corpus; re-run build-corpus."
+            )
+
     corpus = []
     for json_file in sorted(CORPUS_DIR.glob("*.json")):
+        if json_file.name == "_manifest.json":
+            continue
         try:
             with open(json_file) as f:
                 data = json.load(f)
@@ -726,6 +885,40 @@ def _source_diff_changed_lines(diff: str) -> int:
     )
 
 
+def _source_diff_bucket(golden_source_diff: str) -> Literal["small", "larger"]:
+    """Bucket a DISCRIMINATES fixture by source-diff changed-line count (AC2).
+
+    ≤ _SOURCE_SIZE_THRESHOLD = 'small', > _SOURCE_SIZE_THRESHOLD = 'larger'. The single
+    axis shared by holdout assignment (build_corpus) and validate_discriminates_power_floor
+    — one symbol, never two copies of the threshold.
+    """
+    return "small" if _source_diff_changed_lines(golden_source_diff) <= _SOURCE_SIZE_THRESHOLD else "larger"
+
+
+def _discriminates_bucket_counts(corpus: list[FixtureRecord]) -> dict[str, Any]:
+    """Non-raising DISCRIMINATES bucket/holdout counter, shared by
+    validate_discriminates_power_floor and run_eval's AC5 manifest-first ordering
+    (the manifest must be writable with the achieved counts even when the floor is unmet).
+    """
+    per_bucket: dict[str, int] = defaultdict(int)
+    per_bucket_holdout: dict[str, int] = defaultdict(int)
+
+    for f in corpus:
+        if f.checker_class == "DISCRIMINATES":
+            bucket = _source_diff_bucket(f.golden_source_diff)
+            per_bucket[bucket] += 1
+            if f.blind_holdout:
+                per_bucket_holdout[bucket] += 1
+
+    small_holdout = per_bucket_holdout.get("small", 0)
+    larger_holdout = per_bucket_holdout.get("larger", 0)
+
+    return {
+        "per_tier_discriminates_counts": dict(per_bucket),
+        "per_bucket_holdout_discriminates": {"small": small_holdout, "larger": larger_holdout},
+    }
+
+
 def validate_discriminates_power_floor(
     corpus: list[FixtureRecord],
     floor: int = CORPUS_HOLDOUT_PER_TIER,
@@ -743,20 +936,9 @@ def validate_discriminates_power_floor(
 
     Returns per_tier_discriminates_counts and per_bucket_holdout_discriminates.
     """
-    _SOURCE_SIZE_THRESHOLD = 30
-
-    per_bucket: dict[str, int] = defaultdict(int)
-    per_bucket_holdout: dict[str, int] = defaultdict(int)
-
-    for f in corpus:
-        if f.checker_class == "DISCRIMINATES":
-            bucket = "small" if _source_diff_changed_lines(f.golden_source_diff) <= _SOURCE_SIZE_THRESHOLD else "larger"
-            per_bucket[bucket] += 1
-            if f.blind_holdout:
-                per_bucket_holdout[bucket] += 1
-
-    small_holdout = per_bucket_holdout.get("small", 0)
-    larger_holdout = per_bucket_holdout.get("larger", 0)
+    counts = _discriminates_bucket_counts(corpus)
+    small_holdout = counts["per_bucket_holdout_discriminates"]["small"]
+    larger_holdout = counts["per_bucket_holdout_discriminates"]["larger"]
 
     if small_holdout < floor or larger_holdout < floor:
         raise ValueError(
@@ -768,10 +950,7 @@ def validate_discriminates_power_floor(
             f"(c) accept DIRECTIONAL-ONLY DISCRIMINATES set — never silent."
         )
 
-    return {
-        "per_tier_discriminates_counts": dict(per_bucket),
-        "per_bucket_holdout_discriminates": {"small": small_holdout, "larger": larger_holdout},
-    }
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -1169,13 +1348,192 @@ def _compute_difficulty_signals(diff: str, pre_state: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Repo discovery (AC4) — full /srv/git/*-working set, replacing the hardcoded pair
+# ---------------------------------------------------------------------------
+
+
+def _label_candidates(candidates: list[Path]) -> list[tuple[Path, str]]:
+    """Derive (path, label) pairs from candidate repo dirs (AC4).
+
+    Label = directory name minus the '-working' suffix ('lapis-pm-working' ->
+    'lapis-pm'), reproducing today's two hardcoded labels exactly. Two candidates
+    deriving the same label is a fatal configuration error — both paths are named in
+    the raised error, never silently resolved to one. Pure and root-independent so the
+    collision guard is directly testable without needing two real filesystem entries
+    with the same basename (impossible within a single directory listing).
+    """
+    labels: dict[str, Path] = {}
+    result: list[tuple[Path, str]] = []
+    for p in candidates:
+        label = p.name[: -len("-working")]
+        if label in labels:
+            raise ValueError(
+                f"discover_repos: label collision — both {labels[label]} and {p} derive "
+                f"label {label!r}; refusing to silently pick one"
+            )
+        labels[label] = p
+        result.append((p, label))
+    return result
+
+
+def discover_repos(root: Path = GIT_REPOS_ROOT) -> list[tuple[Path, str]]:
+    """Discover /srv/git/*-working repos with a .git directory (AC4).
+
+    Ordered deterministically (sorted by directory name) so corpus builds are
+    reproducible.
+    """
+    if not root.exists():
+        return []
+    candidates = sorted(
+        (p for p in root.iterdir() if p.name.endswith("-working") and (p / ".git").exists()),
+        key=lambda p: p.name,
+    )
+    return _label_candidates(candidates)
+
+
+def probe_repo_suite_at_head(
+    repo_path: Path, timeout: int = REPO_SUITE_PROBE_TIMEOUT_S
+) -> tuple[bool, str]:
+    """Run a repo's full pytest suite once at HEAD (AC4 hard-exclude gate).
+
+    Fail-first verification is the corpus's entire integrity claim — a fixture is valid
+    only because its test provably failed before the fix and passed after. When a repo's
+    suite is already unreliable at HEAD, that signal stops carrying its meaning, so the
+    whole repo is excluded rather than admitting a degraded fixture.
+
+    Returns (passed, reason). reason is "" when passed, else "no_test_suite" (nothing to
+    collect) or "suite_broken_at_head" (failures, error, or timeout). Bounded by `timeout`
+    so one hanging repo cannot stall the build.
+    """
+    if not (repo_path / "tests").exists() and not list(repo_path.glob("test_*.py")):
+        return False, "no_test_suite"
+    try:
+        # PYTHONDONTWRITEBYTECODE: this probe runs directly against repo_path (there is
+        # nothing to isolate before we know the suite is healthy) — never leave even a
+        # __pycache__ write in a shared *-working tree.
+        probe_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        result = subprocess.run(
+            ["python3", "-B", "-m", "pytest", "-q", "--tb=no", "--no-header", "-p", "no:cacheprovider"],
+            cwd=repo_path, capture_output=True, text=True, timeout=timeout, env=probe_env,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Suite HEAD probe timed out for %s", repo_path)
+        return False, "suite_broken_at_head"
+    except Exception as exc:
+        logger.warning("Suite HEAD probe errored for %s: %s", repo_path, exc)
+        return False, "suite_broken_at_head"
+
+    if result.returncode == 5:
+        # pytest: no tests collected — a real repo with no runnable suite, not "broken".
+        return False, "no_test_suite"
+    if result.returncode != 0:
+        return False, "suite_broken_at_head"
+    return True, ""
+
+
+def _count_eligible_commits(repo_path: Path) -> int:
+    """Read-only count of commits that would pass the fix-pattern + structural filters
+    (AC4 manifest skip-row 'eligible_commits_seen'). No test execution — git log only,
+    so a repo's true would-have-contributed count is visible even when it gets excluded
+    by probe_repo_suite_at_head before any commit is touched."""
+    fix_pattern = re.compile(r"^fix[\(\:\s]", re.IGNORECASE)
+    try:
+        result = subprocess.run(
+            ["git", "log", "--no-merges", "--format=%H %s"],
+            cwd=repo_path, capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return 0
+
+    count = 0
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        sha, subject = parts
+        if not fix_pattern.match(subject):
+            continue
+        try:
+            ns_result = subprocess.run(
+                ["git", "show", "--numstat", "--format=", sha],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            continue
+        changed_files: list[tuple[str, int]] = []
+        total_changed = 0
+        for fline in ns_result.stdout.strip().split("\n"):
+            if not fline.strip():
+                continue
+            fp = fline.split()
+            if len(fp) >= 3:
+                try:
+                    chg = int(fp[0]) + int(fp[1])
+                    changed_files.append((fp[2], chg))
+                    total_changed += chg
+                except ValueError:
+                    pass
+        if _structural_filter_reject_reason(changed_files, total_changed) is None:
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Build corpus (AC1, AC1b, AC2, AC4b) — CORE
 # ---------------------------------------------------------------------------
 
 
+def _structural_filter_reject_reason(
+    changed_files: list[tuple[str, int]], total_changed: int,
+) -> Optional[str]:
+    """Structural harvest filter shared by build_corpus and harvest_one (AC3).
+
+    Single source of truth for HARVEST_MAX_CHANGED_FILES / HARVEST_MAX_CHANGED_LINES and
+    the co-committed-file / test-only / trivial-size rules, so single-commit harvest
+    (harvest_one) and batch harvest (build_corpus) can never silently disagree about which
+    commits are eligible. Returns None when the commit passes every filter, else a short
+    reason string identifying which rule rejected it.
+    """
+    if not changed_files:
+        return "no-changed-files"
+    if len(changed_files) > HARVEST_MAX_CHANGED_FILES:
+        return "too-many-files"
+    if len(changed_files) == HARVEST_MAX_CHANGED_FILES and not any("test" in f[0] for f in changed_files):
+        return "two-files-no-test"
+    if total_changed > HARVEST_MAX_CHANGED_LINES:
+        return "too-many-changed-lines"
+    if all("test" in f[0] or f[0].endswith("_test.py") for f in changed_files):
+        return "test-only"
+    if total_changed <= 2:
+        return "trivial"
+    return None
+
+
+def _assign_bucket_holdout(corpus: list[FixtureRecord], holdout_floor: int) -> dict[str, int]:
+    """Assign blind_holdout on the bucket axis (AC2), not the tier axis: first
+    holdout_floor per {small, larger} bucket, and ONLY among fixtures classified
+    DISCRIMINATES — a fixture can only be a usable A/B discriminator when it is one.
+    This is the axis validate_discriminates_power_floor actually checks; assigning by
+    tier (the prior behaviour) capped the DISCRIMINATES-holdout pool at ~holdout_floor
+    total, since co-committed fix+test commits are always tier T2. Mutates corpus
+    in-place (sets .blind_holdout) and returns the per-bucket holdout counts assigned.
+    """
+    holdout_counts: dict[str, int] = {}
+    for f in corpus:
+        if f.checker_class != "DISCRIMINATES":
+            continue
+        bucket = _source_diff_bucket(f.golden_source_diff)
+        if holdout_counts.get(bucket, 0) < holdout_floor:
+            f.blind_holdout = True
+            holdout_counts[bucket] = holdout_counts.get(bucket, 0) + 1
+    return holdout_counts
+
+
 def build_corpus(
     target_size: int = 50,
-    tier_floor: int = CORPUS_HOLDOUT_PER_TIER,
+    holdout_floor: int = CORPUS_HOLDOUT_PER_TIER,
     mock_corpus: Optional[list[FixtureRecord]] = None,
     launder_mock_mode: bool = False,
     skip_base_runs: bool = False,
@@ -1183,40 +1541,42 @@ def build_corpus(
 ) -> tuple[list[FixtureRecord], dict[str, Any]]:
     """Build the frozen fixture corpus from git history.
 
-    Real mode: extracts commits from lapis-pm + conductor, computes scoped tests,
-    runs N≥3 base runs for flakiness fingerprint, classifies checker_class, launders intent.
+    Real mode: extracts commits from the discovered repo set (AC4), computes scoped
+    tests, runs N≥3 base runs for flakiness fingerprint, classifies checker_class,
+    launders intent.
 
     Args:
         mock_corpus: If provided, skip git extraction (for unit testing AC13).
         launder_mock_mode: Use mock laundering (no GW call) — for testing AC2 code-path.
         skip_base_runs: Skip N≥3 base test runs (faster corpus build without fingerprint).
+            Also skips the AC4 suite-HEAD-probe hard-exclude gate, which is itself a real
+            test run.
+        repos: Explicit (path, label) override — default is discover_repos() (AC4).
     """
     if mock_corpus is not None:
         logger.info("Using mock corpus (%d fixtures)", len(mock_corpus))
         return mock_corpus, {"source": "mock", "fixtures_count": len(mock_corpus)}
 
-    logger.info("Building corpus from git history (lapis-pm + conductor)")
+    if repos is None:
+        repos = discover_repos()
+
+    logger.info("Building corpus from git history (%d discovered repos)", len(repos))
 
     corpus: list[FixtureRecord] = []
     metadata: dict[str, Any] = {
-        "lapis_pm_count": 0,
-        "conductor_count": 0,
+        "per_repo_counts": {},
+        "per_repo_flaky_excluded_count": {},
         "quarantine_count": 0,
         "total_extracted": 0,
         "deduped_dropped": 0,
         "trivial_dropped": 0,
         "flaky_target_quarantine_count": 0,
-        "flaky_excluded_count_lapis_pm": 0,
-        "flaky_excluded_count_conductor": 0,
         "laundering_total": 0,
         "laundering_fallback_count": 0,
+        "repos_harvested": 0,
+        "repos_skipped": 0,
+        "repo_skips": [],
     }
-
-    if repos is None:
-        repos = [
-            (LAPIS_PM_REPO, "lapis-pm"),
-            (CONDUCTOR_REPO, "conductor"),
-        ]
 
     seen_diffs: set[str] = set()
     fix_pattern = re.compile(r"^fix[\(\:\s]", re.IGNORECASE)
@@ -1227,6 +1587,28 @@ def build_corpus(
         if not repo_path.exists():
             logger.warning("Repo not found: %s", repo_path)
             continue
+
+        # AC4 hard-exclude: a broken suite means fail-first verification can't be trusted
+        # for this whole repo — skip it rather than admit a degraded fixture.
+        if not skip_base_runs:
+            probe_ok, probe_reason = probe_repo_suite_at_head(repo_path)
+            if not probe_ok:
+                eligible_seen = _count_eligible_commits(repo_path)
+                logger.warning(
+                    "Skipping repo %s: %s (eligible_commits_seen=%d)",
+                    repo_name, probe_reason, eligible_seen,
+                )
+                metadata["repos_skipped"] += 1
+                metadata["repo_skips"].append({
+                    "repo": repo_name,
+                    "reason": probe_reason,
+                    "eligible_commits_seen": eligible_seen,
+                })
+                continue
+
+        metadata["repos_harvested"] += 1
+        metadata["per_repo_counts"].setdefault(repo_name, 0)
+        metadata["per_repo_flaky_excluded_count"].setdefault(repo_name, 0)
 
         logger.info("Extracting from %s...", repo_name)
 
@@ -1290,27 +1672,14 @@ def build_corpus(
                             except ValueError:
                                 pass
 
-                    if not changed_files:
-                        continue
-                    if len(changed_files) > 2:
-                        continue
-                    if len(changed_files) == 2 and not any("test" in f[0] for f in changed_files):
-                        continue
-                    if total_changed > 80:
-                        continue
-
-                    # Quarantine test-only commits
-                    is_test_only = all(
-                        "test" in f[0] or f[0].endswith("_test.py")
-                        for f in changed_files
-                    )
-                    if is_test_only:
+                    reject_reason = _structural_filter_reject_reason(changed_files, total_changed)
+                    if reject_reason == "test-only":
                         metadata["quarantine_count"] += 1
                         continue
-
-                    # Exclude trivial 1-line value swaps (pure +1/-1 docstring/URL fixes)
-                    if total_changed <= 2:
+                    if reject_reason == "trivial":
                         metadata["trivial_dropped"] += 1
+                        continue
+                    if reject_reason is not None:
                         continue
 
                     # Dedup by diff hash
@@ -1445,10 +1814,9 @@ def build_corpus(
                         except Exception as exc:
                             logger.warning("Fail-first verification failed for %s: %s", sha[:8], exc)
 
-                    if repo_name == "lapis-pm":
-                        metadata["flaky_excluded_count_lapis_pm"] += flaky_excluded
-                    else:
-                        metadata["flaky_excluded_count_conductor"] += flaky_excluded
+                    metadata["per_repo_flaky_excluded_count"][repo_name] = (
+                        metadata["per_repo_flaky_excluded_count"].get(repo_name, 0) + flaky_excluded
+                    )
 
                     # Classify checker_class using co-committed test oracle (AC-O2)
                     checker_class = classify_checker_class_cocommitted(
@@ -1489,10 +1857,9 @@ def build_corpus(
 
                     corpus.append(fixture)
                     metadata["total_extracted"] += 1
-                    if repo_name == "lapis-pm":
-                        metadata["lapis_pm_count"] += 1
-                    else:
-                        metadata["conductor_count"] += 1
+                    metadata["per_repo_counts"][repo_name] = (
+                        metadata["per_repo_counts"].get(repo_name, 0) + 1
+                    )
 
                 except Exception as exc:
                     logger.warning("Error processing commit %s: %s", sha, exc)
@@ -1503,16 +1870,11 @@ def build_corpus(
         else:
             _run_extraction(None)
 
-    # Assign holdout flags (first tier_floor per tier)
-    holdout_counts: dict[str, int] = {}
-    for f in corpus:
-        if holdout_counts.get(f.tier, 0) < tier_floor:
-            f.blind_holdout = True
-            holdout_counts[f.tier] = holdout_counts.get(f.tier, 0) + 1
+    holdout_counts = _assign_bucket_holdout(corpus, holdout_floor)
 
     tier_counts = {t: sum(1 for f in corpus if f.tier == t) for t in ("T1", "T2", "T3")}
-    metadata["per_tier_counts"] = tier_counts
-    metadata["per_tier_holdout_counts"] = dict(holdout_counts)
+    metadata["per_tier_counts"] = tier_counts  # descriptive only (AC2) — tiers are file-count metadata
+    metadata["per_bucket_holdout_counts"] = dict(holdout_counts)
     metadata["deduped_seen"] = len(seen_diffs)
 
     logger.info(
@@ -1639,24 +2001,9 @@ def harvest_one(
             except ValueError:
                 pass
 
-    # Structural filters - byte-identical to build_corpus's inline checks (:1272-1289).
-    if not changed_files:
-        return None
-    if len(changed_files) > 2:
-        return None
-    if len(changed_files) == 2 and not any("test" in f[0] for f in changed_files):
-        return None
-    if total_changed > 80:
-        return None
-
-    is_test_only = all(
-        "test" in f[0] or f[0].endswith("_test.py")
-        for f in changed_files
-    )
-    if is_test_only:
-        return None
-
-    if total_changed <= 2:
+    # Structural filters - the SAME shared helper build_corpus's inline checks call
+    # (AC3), so single-commit harvest and batch harvest can never silently disagree.
+    if _structural_filter_reject_reason(changed_files, total_changed) is not None:
         return None
 
     pr_number: Optional[int] = None
@@ -2398,6 +2745,54 @@ def _write_corpus_manifest(metadata: dict[str, Any]) -> None:
     logger.info("Corpus manifest written: %s", manifest_path)
 
 
+def _compute_bucket_distribution(corpus: list[FixtureRecord]) -> dict[str, Any]:
+    """Per-bucket distribution metrics for the AC5 manifest: count, median/max source-diff
+    changed lines, and repo spread. Numbers only, no editorial verdict — whether a bucket
+    reads as coherent or messy is the reader's judgement, not a value invented here."""
+    buckets: dict[str, list[FixtureRecord]] = {"small": [], "larger": []}
+    for f in corpus:
+        if f.checker_class == "DISCRIMINATES":
+            buckets[_source_diff_bucket(f.golden_source_diff)].append(f)
+
+    result: dict[str, Any] = {}
+    for bucket, fixtures in buckets.items():
+        sizes = sorted(_source_diff_changed_lines(f.golden_source_diff) for f in fixtures)
+        n = len(sizes)
+        if n:
+            mid = n // 2
+            median = sizes[mid] if n % 2 else (sizes[mid - 1] + sizes[mid]) / 2
+        else:
+            median = 0
+        repo_spread: dict[str, int] = defaultdict(int)
+        for f in fixtures:
+            repo_spread[f.repo] += 1
+        result[bucket] = {
+            "count": n,
+            "median_changed_lines": median,
+            "max_changed_lines": sizes[-1] if sizes else 0,
+            "repo_spread": dict(repo_spread),
+        }
+    return result
+
+
+class CorpusPowerFloorUnmetError(RuntimeError):
+    """AC5: a completed, manifest-recorded build did not meet the DISCRIMINATES holdout
+    floor. Distinct from every other failure mode so the __main__ / CLI call site can
+    signal it with its own reserved exit code (2) rather than folding into a generic
+    failure. By the time this is raised, the manifest already carries the achieved
+    counts — the shortfall is actionable, not silent. Whether to proceed directional-only
+    is Erah's call, not the worker's.
+    """
+
+    def __init__(self, floor_detail: str, achieved: dict[str, Any]):
+        self.achieved = achieved
+        super().__init__(
+            f"Corpus built and manifest written, but the DISCRIMINATES holdout floor was "
+            f"not met: {floor_detail}. Resolution (Erah's decision, not the worker's): "
+            f"proceed directional-only, or extend the corpus further."
+        )
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -2419,6 +2814,7 @@ def run_eval(
     instead of the full build_corpus sweep, and save_corpus just that one fixture.
     repo_only selects which repo to harvest it from (default "lapis-pm").
     """
+    global CORPUS_DIR
     if run_id is None:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
@@ -2429,26 +2825,29 @@ def run_eval(
         if phase == "build-corpus":
             # Startup probe: verify GW laundering is live before building anything (real mode only).
             # A down or wrong-mode GW causes every fixture to silently use raw-body intent
-            # (contaminated). Fail loud before building, not after.
+            # (contaminated). Fail loud before building, not after. launder_intent only ever
+            # checks whether the call raised, never which model answered (AC6) — the message
+            # below must not assert a requirement the code doesn't enforce.
             if not mock_mode:
                 _, probe_status = launder_intent("probe", mock_mode=False)
                 if probe_status == "fallback":
                     raise RuntimeError(
-                        "GW not serving big-122B — intent-laundering would silently degrade to "
-                        "raw-body (contaminated) intent. Wake GW and run `gw-serve big`, confirm "
-                        "doorman /status serving:true, then re-run build-corpus."
+                        "GW not serving — intent-laundering would silently degrade to "
+                        "raw-body (contaminated) intent. Wake GW and confirm an operator "
+                        "model is serving, then re-run build-corpus."
                     )
 
             if target_sha is not None:
+                # AC4: resolve repo_label through the SAME discovery build_corpus uses, so
+                # single-commit and batch harvest can never disagree about which repos exist.
                 repo_label = repo_only or "lapis-pm"
-                if repo_label == "lapis-pm":
-                    repo_path = LAPIS_PM_REPO
-                elif repo_label == "conductor":
-                    repo_path = CONDUCTOR_REPO
-                else:
+                discovered = {label: path for path, label in discover_repos()}
+                if repo_label not in discovered:
                     raise ValueError(
-                        f"--repo-only {repo_label!r} is not recognized; expected 'lapis-pm' or 'conductor'"
+                        f"--repo-only {repo_label!r} is not a discovered repo; available: "
+                        f"{sorted(discovered)}"
                     )
+                repo_path = discovered[repo_label]
 
                 fixture = harvest_one(
                     target_sha, repo_path, repo_label,
@@ -2469,33 +2868,84 @@ def run_eval(
                 )
                 return None
 
-            corpus, metadata = build_corpus(launder_mock_mode=mock_mode)
+            # AC1: generation lifecycle. Strict ordering, once per build: create the
+            # generation dir, then the single pre-harvest free-space check, THEN begin
+            # repo iteration — never per-repo or mid-iteration.
+            generation_dir = start_corpus_generation(run_id)
+            CORPUS_DIR = generation_dir
+            floor_met = True
+            floor_detail = ""
+            try:
+                corpus, metadata = build_corpus(launder_mock_mode=mock_mode)
 
-            floor_result = validate_corpus_power_floor(corpus)
-            corpus_shape = floor_result.pop("_shape", "unknown")
-            metadata["corpus_shape"] = corpus_shape
+                # Tiers remain descriptive-only metadata (AC2) — holdout no longer lives on
+                # this axis, so a tier-floor shortfall must not block the build.
+                try:
+                    floor_result = validate_corpus_power_floor(corpus)
+                    corpus_shape = floor_result.pop("_shape", "unknown")
+                except ValueError as exc:
+                    logger.info(
+                        "Tier-axis power floor not met (descriptive only, non-blocking — "
+                        "AC2 moved the holdout gate onto the bucket axis): %s", exc,
+                    )
+                    corpus_shape = "tier-floor-not-met"
+                metadata["corpus_shape"] = corpus_shape
 
-            # Surface contamination loudly before any floor checks.
-            fallback_count = metadata.get("laundering_fallback_count", 0)
-            if fallback_count > 0:
-                total = metadata.get("laundering_total", 0)
-                print(
-                    f"\n⚠ CONTAMINATED CORPUS: {fallback_count}/{total} fixtures used "
-                    f"raw-body intent (laundering fallback). The PM checkpoint must require "
-                    f"this be 0; re-run with GW serving big.",
-                    file=sys.stderr,
+                # Surface contamination loudly before any floor checks.
+                fallback_count = metadata.get("laundering_fallback_count", 0)
+                if fallback_count > 0:
+                    total = metadata.get("laundering_total", 0)
+                    print(
+                        f"\n⚠ CONTAMINATED CORPUS: {fallback_count}/{total} fixtures used "
+                        f"raw-body intent (laundering fallback). The PM checkpoint must require "
+                        f"this be 0; re-run with GW serving.",
+                        file=sys.stderr,
+                    )
+
+                # AC5: compute the achieved DISCRIMINATES counts WITHOUT letting an unmet
+                # floor block the manifest write — a shortfall is only actionable if the
+                # evidence (achieved counts) survives it. validate_discriminates_power_floor
+                # is still the gate function (raises ValueError below floor); we only fall
+                # back to the non-raising counter to recover the achieved numbers.
+                try:
+                    disc_counts = validate_discriminates_power_floor(corpus)
+                except ValueError as exc:
+                    floor_met = False
+                    floor_detail = str(exc)
+                    disc_counts = _discriminates_bucket_counts(corpus)
+                metadata["per_tier_discriminates_counts"] = disc_counts["per_tier_discriminates_counts"]
+                metadata["per_bucket_holdout_discriminates"] = disc_counts["per_bucket_holdout_discriminates"]
+                metadata["bucket_distribution"] = _compute_bucket_distribution(corpus)
+
+                metadata["artifact_class"] = "derived-cache"
+                metadata["artifact_class_note"] = (
+                    "This corpus is rebuildable from git history and is not a source of "
+                    "truth."
                 )
+                metadata["complete"] = True  # final write
 
-            # DISCRIMINATES power floor check (AC-O5): fails loud if <8 per coarse bucket.
-            # ValueError propagates as a logged failure; the shortfall message is the directive
-            # to the PM/Erah — resolution is their call (see spec §AC-O5).
-            disc_floor = validate_discriminates_power_floor(corpus)
-            metadata["per_tier_discriminates_counts"] = disc_floor["per_tier_discriminates_counts"]
-            metadata["per_bucket_holdout_discriminates"] = disc_floor["per_bucket_holdout_discriminates"]
+                _write_corpus_manifest(metadata)
+                save_corpus(corpus)
+            finally:
+                CORPUS_DIR = _corpus_current_symlink()
 
-            _write_corpus_manifest(metadata)
-            save_corpus(corpus)
+            # Only reached once the manifest has been written with 'complete': true —
+            # a crashed build above leaves an orphan generation, never a half-written
+            # 'current' (AC1).
+            promote_corpus_generation(generation_dir)
+            pruned = prune_old_corpus_generations()
+            if pruned:
+                logger.info("Pruned corpus generations: %s", pruned)
+
             logger.info("Corpus built: %d fixtures, metadata: %s", len(corpus), metadata)
+
+            if not floor_met:
+                # AC5: manifest is already written and 'current' already promoted — the
+                # evidence survives this. Raise AFTER, with a reserved, distinct exit path
+                # (CorpusPowerFloorUnmetError -> sys.exit(2) at the CLI call sites) so a
+                # barren corpus can never read as exit 0.
+                raise CorpusPowerFloorUnmetError(floor_detail, metadata)
+
             return None
 
         if phase == "run":
@@ -2542,6 +2992,12 @@ def run_eval(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    result = run_eval(mock_mode=True)
+    try:
+        result = run_eval(mock_mode=True)
+    except CorpusPowerFloorUnmetError as exc:
+        # AC5: reserved, distinct exit code for "built, but under floor" — never shared
+        # with any other failure, so a barren corpus can never read as exit 0.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
     if result:
         print(f"Result: {result}")

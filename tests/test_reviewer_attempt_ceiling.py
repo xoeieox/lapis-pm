@@ -423,6 +423,14 @@ class TestIncidentReconstruction:
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
             patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
+            # lapis-pm-reviewer-defer-backoff-v0: this replay drives ticks
+            # back-to-back with no simulated wall-clock advance, which is
+            # exactly what the backoff feature now paces against by design
+            # (see test_reviewer_infra_backoff.py for that coverage). Disable
+            # it here so this test keeps asserting its own, orthogonal
+            # concern — the infra budget still bounds gw_not_serving without
+            # wedging behind the reviewer-attempt ceiling.
+            patch("lapis_pm.pm_core._reviewer_infra_backoff_check", return_value=None),
         ):
             # The observed #834 sequence was six dispatches; drive one tick
             # further so the ceiling-check after the sixth failure gets a

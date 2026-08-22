@@ -538,6 +538,7 @@ agents:
   # ratified durable answer and lands via the separate keeper concept spec.
   # Any future tier push must not re-capture one half of this pair without
   # touching the other; see test_registry_agent_tiers.py.
+  # First live local-fixer dispatch completed 2026-08-22 (post-merge verification).
   fixer_retry:
     chub_bundles: []
     engine: local-fixer      # was: claude

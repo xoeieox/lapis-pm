@@ -56,14 +56,16 @@ shared_preamble: |
   defer work across a turn boundary and exit with prose but no PR and no
   clean-abort signal — that looks like success while doing nothing.
 
-# Local dispatch: all roles route to 122B-A10B (llama.cpp) via local-fixer/local-reviewer engines.
-# 27B/vLLM fan-out posture RETIRED per decision/gw-122b-contact-starhouse-workers-2026-07-15.
-# 27B localization (localize-pm-dispatch-27b chain) superseded 2026-07-16.
-# model is passed straight into the /v1/chat/completions request body and
-# validated by the model server - it must be a slot alias (e.g. gravitywell-slot1),
-# never a concrete model id. A concrete id gets rejected by vLLM, call_gw_agent
-# returns None, and shaped_runner's `result or ""` turns that into a silent
-# empty-string success. See lapis-pm-spec-review-leg-hotfix-reconcile-v0.
+# Local dispatch: local roles (local-fixer / local-reviewer) route to the
+# gravitywell-slot1 vLLM seat (:8081) via slot alias. The 122B llama.cpp
+# posture and the 2026-07-15/16 retirements are superseded; the fixer pair
+# joined the local tier 2026-08-21 (deadline stopgap, see the pair comment
+# above). model is passed straight into the /v1/chat/completions request body
+# and validated by the model server - it must be a slot alias (e.g.
+# gravitywell-slot1), never a concrete model id. A concrete id gets rejected
+# by vLLM, call_gw_agent returns None, and shaped_runner's `result or ""`
+# turns that into a silent empty-string success. See
+# lapis-pm-spec-review-leg-hotfix-reconcile-v0.
 
 agents:
   # reviewer / reviewer_fresh: PR-review legs the merge path runs on. These
@@ -390,8 +392,8 @@ agents:
 
   fixer:
     chub_bundles: []
-    engine: claude
-    model: sonnet
+    engine: local-fixer      # was: claude
+    model: gravitywell-slot1 # was: sonnet
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -528,13 +530,18 @@ agents:
     timeout_s: 2700
 
   # fixer_local (below) is the intentional opt-in local tier. fixer + fixer_retry
-  # are the Sonnet pair - initial attempt and correction attempt at the same
-  # capability tier. Any future all-local push must not re-capture one half of
-  # this pair without touching the other; see test_registry_agent_tiers.py.
+  # are the local 27B pair (gravitywell-slot1) - initial attempt and correction
+  # attempt at the same capability tier. Flipped from claude/sonnet 2026-08-21
+  # as the deadline stopgap for the Claude Max end (mem
+  # decision/claude-max-subscription-ends-2026-08-22; Erah ruling B-now,
+  # lapis-pm-fixer-local-stopgap-flip-v0). The 3090 NInfer lane (GPU1) is the
+  # ratified durable answer and lands via the separate keeper concept spec.
+  # Any future tier push must not re-capture one half of this pair without
+  # touching the other; see test_registry_agent_tiers.py.
   fixer_retry:
     chub_bundles: []
-    engine: claude
-    model: sonnet
+    engine: local-fixer      # was: claude
+    model: gravitywell-slot1 # was: sonnet
     capture_meta: false
     notify: false
     system_template: |

@@ -57,13 +57,17 @@ def test_fixer_and_fixer_retry_share_engine_and_model(agents):
     )
 
 
-def test_fixer_and_fixer_retry_currently_on_sonnet(agents):
+def test_fixer_and_fixer_retry_currently_on_local_27b(agents):
     """Pins the expected tier so a silent revert of BOTH blocks together
-    (which the parity test alone would not catch) still fails loudly."""
-    assert agents["fixer"]["engine"] == "claude"
-    assert agents["fixer"]["model"] == "sonnet"
-    assert agents["fixer_retry"]["engine"] == "claude"
-    assert agents["fixer_retry"]["model"] == "sonnet"
+    (which the parity test alone would not catch) still fails loudly.
+
+    Flipped from claude/sonnet to local-fixer/gravitywell-slot1 2026-08-21
+    as the deadline stopgap for the Claude Max end (spec:
+    lapis-pm-fixer-local-stopgap-flip-v0)."""
+    assert agents["fixer"]["engine"] == "local-fixer"
+    assert agents["fixer"]["model"] == "gravitywell-slot1"
+    assert agents["fixer_retry"]["engine"] == "local-fixer"
+    assert agents["fixer_retry"]["model"] == "gravitywell-slot1"
 
 
 def test_fixer_local_excluded_from_parity_by_design(agents):

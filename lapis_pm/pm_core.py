@@ -595,6 +595,7 @@ _CONDUCTOR_GW_HOST_SCRIPTS: tuple[_GwHostScript, ...] = (
     _GwHostScript("gw-topology", "/usr/local/sbin/gw-topology", 0o755, "root:root", True, True),
     _GwHostScript("gw-idle-suspend.sh", "/usr/local/sbin/gw-idle-suspend.sh", 0o755, "root:root", False, True),
     _GwHostScript("gw_resume_grace.py", "/usr/local/sbin/gw_resume_grace.py", 0o755, "root:root", False, False),
+    _GwHostScript("gw-gpu1-lease.sh", "/usr/local/sbin/gw-gpu1-lease.sh", 0o755, "root:root", False, False),
 )
 
 

@@ -19,6 +19,17 @@ unfixed by lapis-pm-spec-review-leg-hotfix-reconcile-v0 (neither was on
 the spec-review or merge path at the time). lapis-pm-stale-122b-model-pins-v0
 repinned both to `gravitywell-slot1`, so every local-reviewer / local-fixer
 entry now passes this assertion outright - no xfail marks remain.
+
+One deliberate exemption: the GPU1 berth pair (fixer + fixer_retry,
+gpu1-berth-reflip-v0 / gw-gpu1-berth-standing-seat-v0 leg 3) is a
+GravityWell backend, but on the NInfer engine at host port :8082 - not a
+vLLM slot. The slot-alias defect this file guards is vLLM slot-alias drift;
+the berth is a non-vLLM GravityWell engine whose model id is engine-defined
+(the NInfer --model-id `ninfer-27b`, served verbatim by its /v1/models per
+the leg-1 DoD capture), so no slot alias exists to pin to and the
+slot-alias invariant does not apply. Its berth SHAPE (model + backend_url +
+swarm_payload) is pinned by tests/test_registry_berth_shape.py; the
+NINFER_BERTH_AGENTS set below exempts ONLY the alias check.
 """
 from __future__ import annotations
 
@@ -43,6 +54,15 @@ VALID_SLOT_ALIASES = {"gravitywell-slot1", "gravitywell-slot2"}
 # entry, reviewer_fresh_contractor, routed to the BRIX phala-test-key seat.
 NON_GRAVITYWELL_CONTRACTOR_AGENTS = {"reviewer_fresh_contractor"}
 
+# The GPU1 berth pair (gpu1-berth-reflip-v0 / gw-gpu1-berth-standing-seat-v0
+# leg 3): a GravityWell backend, but the NInfer engine at host port :8082 -
+# not a vLLM slot. Its model is the NInfer --model-id (ninfer-27b) because
+# the NInfer engine's /v1/models serves that exact id (leg-1 DoD capture);
+# no slot alias exists to pin to, so the slot-alias invariant does not
+# apply. The berth SHAPE (model + backend_url + swarm_payload) is pinned by
+# tests/test_registry_berth_shape.py; this set only exempts the alias check.
+NINFER_BERTH_AGENTS = {"fixer", "fixer_retry"}
+
 _REGISTRY = yaml.safe_load(REGISTRY_PATH.read_text())
 _AGENTS = _REGISTRY["agents"]
 
@@ -53,7 +73,9 @@ LOCAL_AGENT_NAMES = sorted(
 )
 
 GRAVITYWELL_AGENT_NAMES = sorted(
-    name for name in LOCAL_AGENT_NAMES if name not in NON_GRAVITYWELL_CONTRACTOR_AGENTS
+    name
+    for name in LOCAL_AGENT_NAMES
+    if name not in NON_GRAVITYWELL_CONTRACTOR_AGENTS and name not in NINFER_BERTH_AGENTS
 )
 
 

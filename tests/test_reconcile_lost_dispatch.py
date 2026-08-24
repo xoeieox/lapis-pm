@@ -359,11 +359,15 @@ class TestActLostFixerRetry:
         assert vars_["existing_branch"] == f"lapis/{target_id}/forced"
 
     def test_fixer_retry_raises_not_implemented(self):
-        """_act_lost_fixer_retry raises NotImplementedError for fixer_retry agent type."""
+        """_act_lost_fixer_retry loud-skips (does not raise) for fixer_retry (Part B)."""
         orig = _fixer_record(gpu_id="gpu-orig-001", status="failed", agent_type="fixer_retry")
 
-        with pytest.raises(NotImplementedError, match="fixer_retry"):
-            pm_core._act_lost_fixer_retry("my-target", orig)
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            result = pm_core._act_lost_fixer_retry("my-target", orig)
+        assert "skip:lost_fixer_retry_undispatchable" in result
 
 
 # ---------------------------------------------------------------------------

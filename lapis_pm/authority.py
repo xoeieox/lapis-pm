@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from agents_core.llm import call_claude_cli
 from agents_core.forgejo import get_pr, get_pr_diff
 
 logger = logging.getLogger(__name__)
@@ -188,7 +187,7 @@ Be terse. Only return the JSON object.
 
 
 def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict:
-    """Inline structured screen via Sonnet.
+    """Inline structured screen via the local seat (call_gw_agent).
 
     Used only for auto-merge authority targets and as the kill-switch fallback.
     Returns parsed JSON or fallback dict.
@@ -200,10 +199,22 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
         f"Spec context:\n{spec_summary}\n\n"
         f"Diff:\n```diff\n{diff_text}\n```"
     )
-    raw = call_claude_cli(
-        prompt=user, system=SCREEN_SYSTEM,
-        model="sonnet", timeout=300, json_mode=True, log=logger.warning,
-    )
+    served_model_out: list = []
+    try:
+        from agents_core.gw_agent import call_gw_agent
+        raw = call_gw_agent(
+            prompt=user,
+            system=SCREEN_SYSTEM,
+            writeable=False,
+            json_mode=True,
+            max_steps=1,
+            timeout=300,
+            on_wake_fail="skip",
+            served_model_out=served_model_out,
+        )
+    except Exception as exc:
+        logger.warning("authority.screen: call_gw_agent error: %s", exc)
+        raw = None
     if not raw:
         return {"verdict": "needs-human", "issues": [], "confidence": 0.0,
                 "reason": "screen call returned empty"}

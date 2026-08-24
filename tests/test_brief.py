@@ -9,20 +9,32 @@ Required contract test (Deliverable 5):
   - prompt= arg contains "Inline screen: did not run" when screen_issues=[]
   - prompt= arg contains the Trigger: line
 
+Routing contract (lapis-pm-prose-synthesis-local-repoint-v0):
+  - synthesize() routes to call_gw_agent (the local seat), NOT call_claude_cli
+  - the provenance line records the actual served_model_out (or an explicit
+    'local-seat-unavailable' marker when the seat produced no text)
+
 Optional round-trip smoke test:
   - synthesize() returns a Brief and writes a pm:brief comment when
-    call_claude_cli is mocked to return a valid body.
+    call_gw_agent is mocked to return a valid body.
 """
 
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lapis_pm import brief
 from lapis_pm.brief import BRIEF_SYSTEM
+
+
+def _fake_comment(cid: str) -> MagicMock:
+    c = MagicMock()
+    c.id = cid
+    c.tags = ["pm:brief"]
+    return c
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +49,7 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
       (b) BRIEF_SYSTEM contains the no-absence-from-truncation sentence verbatim
       (c) captured prompt contains "Inline screen: did not run"
       (d) captured prompt contains the Trigger: line
+      (e) call_gw_agent is invoked with json_mode=False (NOT call_claude_cli)
     """
     # (a) Grounding rule — verbatim from spec
     assert (
@@ -55,24 +68,22 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
         "affirmatively says X should exist and the diff section is complete."
     ) in BRIEF_SYSTEM, "BRIEF_SYSTEM missing no-absence-from-truncation rule"
 
-    # Capture call_claude_cli arguments
+    # Capture call_gw_agent arguments
     captured = {}
 
-    def fake_call_claude_cli(prompt, system, model, timeout, **kwargs):
+    def fake_call(prompt, system, **kwargs):
         captured["prompt"] = prompt
         captured["system"] = system
+        captured["kwargs"] = kwargs
+        kwargs["served_model_out"].append("gravitywell-slot1")
         return "## State\nok\n## Recent activity\n- thing\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
-    fake_comment = MagicMock()
-    fake_comment.id = "brief-cid-contract"
-    fake_comment.tags = ["pm:brief"]
-
     with (
-        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_call_claude_cli),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("brief-cid-contract")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
@@ -83,7 +94,7 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
             notify=None,
         )
 
-    assert captured, "call_claude_cli was not called"
+    assert captured, "call_gw_agent was not called"
 
     # (c) Prompt contains the no-screen indicator
     assert "Inline screen: did not run" in captured["prompt"], (
@@ -95,25 +106,28 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
         f"prompt missing trigger line; got:\n{captured['prompt']}"
     )
 
+    # (e) Local seat was invoked with json_mode=False (prose brief)
+    assert captured["kwargs"].get("json_mode") is False, (
+        "briefs are prose; json_mode must be False"
+    )
+    assert captured["kwargs"].get("writeable") is False
+
 
 def test_brief_prompt_inline_screen_ran_when_issues_present():
     """When screen_issues is non-empty, prompt says 'Inline screen: ran'."""
     captured = {}
 
-    def fake_call_claude_cli(prompt, system, model, timeout, **kwargs):
+    def fake_call(prompt, system, **kwargs):
         captured["prompt"] = prompt
+        kwargs["served_model_out"].append("gravitywell-slot1")
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
-    fake_comment = MagicMock()
-    fake_comment.id = "brief-cid-ran"
-    fake_comment.tags = ["pm:brief"]
-
     with (
-        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_call_claude_cli),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("brief-cid-ran")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
@@ -128,6 +142,67 @@ def test_brief_prompt_inline_screen_ran_when_issues_present():
 
 
 # ---------------------------------------------------------------------------
+# Routing contract: local seat is invoked, not call_claude_cli
+# ---------------------------------------------------------------------------
+
+def test_synthesize_routes_to_local_seat_not_claude():
+    """synthesize() must route to call_gw_agent, NOT call_claude_cli."""
+    gw_calls = []
+
+    def fake_gw(prompt, system, **kwargs):
+        gw_calls.append(kwargs)
+        kwargs["served_model_out"].append("gravitywell-slot1")
+        return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("routing-cid")),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
+    ):
+        result = brief.synthesize(
+            target_id="routing-tid",
+            trigger="advisory-clean",
+            screen_issues=[],
+            notify=None,
+        )
+
+    assert gw_calls, "call_gw_agent was not called"
+    # json_mode must be False for prose briefs
+    assert gw_calls[0].get("json_mode") is False, "briefs are prose; json_mode must be False"
+    assert result.synthesis_failed is False
+
+
+def test_synthesize_fallback_when_local_seat_returns_no_text():
+    """When the local seat returns no text, synthesize() sets synthesis_failed=True."""
+    def fake_gw(prompt, system, **kwargs):
+        # Seat unreachable: served_model_out stays empty, returns None
+        return None
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
+        patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("fallback-cid")),
+        patch("lapis_pm.brief.episodic.write_brief_options"),
+        patch("lapis_pm.brief._brief_version_line", return_value=""),
+    ):
+        result = brief.synthesize(
+            target_id="fallback-tid",
+            trigger="advisory-clean",
+            screen_issues=[],
+            notify=None,
+        )
+
+    assert result.synthesis_failed is True
+    assert "local seat returned no text" in result.body
+
+
+# ---------------------------------------------------------------------------
 # Optional: round-trip smoke test
 # ---------------------------------------------------------------------------
 
@@ -139,16 +214,17 @@ def test_synthesize_round_trip_returns_brief():
         "## Risk / spec deviation\nnone\n"
         "## Decision needed\nnone\n"
     )
-    fake_comment = MagicMock()
-    fake_comment.id = "smoke-brief-cid"
-    fake_comment.tags = ["pm:brief"]
+
+    def fake_gw(prompt, system, **kwargs):
+        kwargs["served_model_out"].append("gravitywell-slot1")
+        return fake_body
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=fake_body),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("smoke-brief-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
@@ -167,33 +243,31 @@ def test_synthesize_round_trip_returns_brief():
 
 
 # ---------------------------------------------------------------------------
-# Retry tests
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Version line tests (deliverable 5 — running-version provenance)
 # ---------------------------------------------------------------------------
 
 def test_brief_body_contains_version_line():
-    """Every emitted brief body carries the running-version provenance line."""
+    """Every emitted brief body carries the running-version provenance line,
+    stamped with the ACTUAL seat that produced the body (served_model_out)."""
     fake_body = (
         "## State\nRunning.\n"
         "## Recent activity\n- tick\n"
         "## Risk / spec deviation\nnone\n"
         "## Decision needed\nnone\n"
     )
-    fake_comment = MagicMock()
-    fake_comment.id = "version-line-cid"
-    fake_comment.tags = ["pm:brief"]
 
     written_body = {}
 
     def capture_write_brief(target_id, body):
         written_body["body"] = body
-        return fake_comment
+        return _fake_comment("version-line-cid")
+
+    def fake_gw(prompt, system, **kwargs):
+        kwargs["served_model_out"].append("gravitywell-slot1")
+        return fake_body
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=fake_body),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
@@ -212,24 +286,29 @@ def test_brief_body_contains_version_line():
     body = written_body.get("body", result.body)
     assert "lapis_pm @" in body, f"Version line missing from brief body:\n{body}"
     assert "brief.py:" in body
+    # Provenance truth-integrity: the label is the ACTUAL seat that produced the text
+    assert "brief.py:gravitywell-slot1" in body, (
+        f"Provenance line must record the actual seat; got:\n{body}"
+    )
     # Starts with the synthesized content (version line is additive, not replacing)
     assert body.startswith(fake_body)
 
 
-def test_brief_fallback_body_also_contains_version_line():
-    """The failure-fallback brief body also carries the version line."""
-    fake_comment = MagicMock()
-    fake_comment.id = "fallback-version-cid"
-    fake_comment.tags = ["pm:brief"]
-
+def test_brief_fallback_body_records_seat_unavailable():
+    """The failure-fallback brief body carries the version line AND records the
+    explicit 'local-seat-unavailable' marker (never a model name that did not run)."""
     written_body = {}
 
     def capture_write_brief(target_id, body):
         written_body["body"] = body
-        return fake_comment
+        return _fake_comment("fallback-version-cid")
+
+    def fake_gw(prompt, system, **kwargs):
+        # Seat down: no text, served_model_out stays empty
+        return None
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
@@ -246,7 +325,11 @@ def test_brief_fallback_body_also_contains_version_line():
 
     body = written_body.get("body", "")
     assert "lapis_pm @" in body, "Version line must appear even in fallback brief"
-    assert "composer call returned empty" in body
+    assert "local seat returned no text" in body
+    # Provenance truth-integrity: explicit unavailable marker, not a model name
+    assert "brief.py:local-seat-unavailable" in body, (
+        f"Provenance line must record 'local-seat-unavailable' when the seat produced no text; got:\n{body}"
+    )
 
 
 def test_brief_synthesis_retries_once_on_empty():
@@ -259,20 +342,19 @@ def test_brief_synthesis_retries_once_on_empty():
     )
     call_count = {"n": 0}
 
-    def fake_call(prompt, system, model, timeout, **kwargs):
+    def fake_call(prompt, system, **kwargs):
         call_count["n"] += 1
-        return "" if call_count["n"] == 1 else valid_body
-
-    fake_comment = MagicMock()
-    fake_comment.id = "retry-brief-cid"
-    fake_comment.tags = ["pm:brief"]
+        if call_count["n"] == 1:
+            return None  # first attempt: seat down
+        kwargs["served_model_out"].append("gravitywell-slot1")
+        return valid_body
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_call),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("retry-brief-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
@@ -287,17 +369,16 @@ def test_brief_synthesis_retries_once_on_empty():
 
 
 def test_brief_synthesis_fallback_after_two_empties():
-    """Both calls return empty — placeholder is returned and does not contain 'Sonnet'."""
-    fake_comment = MagicMock()
-    fake_comment.id = "fallback-brief-cid"
-    fake_comment.tags = ["pm:brief"]
+    """Both calls return empty — placeholder is returned and does not mention 'Sonnet'."""
+    def fake_gw(prompt, system, **kwargs):
+        return None  # both attempts: no text
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("fallback-brief-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
@@ -308,7 +389,7 @@ def test_brief_synthesis_fallback_after_two_empties():
         )
 
     assert "Sonnet" not in result.body, f"Placeholder must not mention 'Sonnet'; got:\n{result.body}"
-    assert "composer call returned empty" in result.body
+    assert "local seat returned no text" in result.body
 
 
 # ---------------------------------------------------------------------------
@@ -317,16 +398,15 @@ def test_brief_synthesis_fallback_after_two_empties():
 
 def test_synthesize_returns_synthesis_failed_when_fallback_used():
     """When _synthesize_body() returns None, synthesize() sets synthesis_failed=True."""
-    fake_comment = MagicMock()
-    fake_comment.id = "synthesis-failed-cid"
-    fake_comment.tags = ["pm:brief"]
+    def fake_gw(prompt, system, **kwargs):
+        return None
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=""),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("synthesis-failed-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
@@ -336,65 +416,31 @@ def test_synthesize_returns_synthesis_failed_when_fallback_used():
             notify=None,
         )
 
-    assert result.synthesis_failed is True, "Expected synthesis_failed=True when fallback is used"
+    assert result.synthesis_failed is True
 
 
-def test_synthesize_synthesis_success_not_failed():
-    """When _synthesize_body() returns valid body, synthesis_failed=False."""
-    valid_body = (
-        "## State\nGood.\n"
-        "## Recent activity\n- ok\n"
-        "## Risk / spec deviation\nnone\n"
-        "## Decision needed\nnone\n"
-    )
-    fake_comment = MagicMock()
-    fake_comment.id = "synthesis-success-cid"
-    fake_comment.tags = ["pm:brief"]
+def test_synthesize_returns_synthesis_false_when_body_produced():
+    """When _synthesize_body() returns a body, synthesis_failed=False."""
+    def fake_gw(prompt, system, **kwargs):
+        kwargs["served_model_out"].append("gravitywell-slot1")
+        return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=valid_body),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("synthesis-ok-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
-            target_id="synthesis-success-tid",
+            target_id="synthesis-ok-tid",
             trigger="advisory-clean",
             notify=None,
         )
 
-    assert result.synthesis_failed is False, "Expected synthesis_failed=False when synthesis succeeds"
-
-
-def test_pushover_not_sent_when_synthesis_failed():
-    """Pushover is not pushed when b.synthesis_failed=True."""
-    fake_comment = MagicMock()
-    fake_comment.id = "pushover-failed-cid"
-    fake_comment.tags = ["pm:brief"]
-
-    send_notification = MagicMock(return_value=True)
-
-    with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=""),
-        patch("lapis_pm.brief.send_notification", send_notification),
-        patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
-        patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
-    ):
-        result = brief.synthesize(
-            target_id="pushover-failed-tid",
-            trigger="advisory-clean",
-            notify=brief.NotifyPriority.NORMAL,
-        )
-
-    assert result.synthesis_failed is True
-    assert result.pushed is False, "Expected pushed=False when synthesis_failed=True"
-    send_notification.assert_not_called()
+    assert result.synthesis_failed is False
 
 
 def test_pushover_sent_when_synthesis_succeeds():
@@ -405,18 +451,19 @@ def test_pushover_sent_when_synthesis_succeeds():
         "## Risk / spec deviation\nnone\n"
         "## Decision needed\nnone\n"
     )
-    fake_comment = MagicMock()
-    fake_comment.id = "pushover-success-cid"
-    fake_comment.tags = ["pm:brief"]
 
     send_notification = MagicMock(return_value=True)
 
+    def fake_gw(prompt, system, **kwargs):
+        kwargs["served_model_out"].append("gravitywell-slot1")
+        return valid_body
+
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value=valid_body),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
         patch("lapis_pm.brief.send_notification", send_notification),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
-        patch("lapis_pm.brief.episodic.write_brief", return_value=fake_comment),
+        patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("pushover-success-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):

@@ -643,25 +643,37 @@ class TestFindLostFixerRetryDispatches:
 class TestActLostFixerRetryForRetryAgent:
 
     def test_fixer_retry_redispatch_includes_pr_number(self):
-        """Lost fixer_retry re-dispatch is not yet supported — raises NotImplementedError."""
+        """Lost fixer_retry: loud skip carries the pr number (Part B, deferred follow-up)."""
         orig = _fixer_retry_record(gpu_id="gpu-retry-lost", status="failed", pr_number=106)
 
-        with pytest.raises(NotImplementedError, match="fixer_retry"):
-            pm_core._act_lost_fixer_retry("my-target", orig)
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            result = pm_core._act_lost_fixer_retry("my-target", orig)
+        assert result.startswith("skip:lost_fixer_retry_undispatchable:pr=106")
 
     def test_fixer_retry_redispatch_includes_intent_note(self):
-        """Lost fixer_retry dispatch is not yet supported — raises NotImplementedError."""
+        """Lost fixer_retry: loud skip, no re-dispatch (Part B, deferred follow-up)."""
         orig = _fixer_retry_record(gpu_id="gpu-noop", status="failed", pr_number=106)
 
-        with pytest.raises(NotImplementedError, match="fixer_retry"):
-            pm_core._act_lost_fixer_retry("my-target", orig)
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            result = pm_core._act_lost_fixer_retry("my-target", orig)
+        assert result.startswith("skip:lost_fixer_retry_undispatchable:pr=106")
 
     def test_fixer_retry_redispatch_carries_pr_number_in_record(self):
-        """Lost fixer_retry re-dispatch is not yet supported — raises NotImplementedError."""
+        """Lost fixer_retry: loud skip carries the pr number (Part B, deferred follow-up)."""
         orig = _fixer_retry_record(gpu_id="gpu-carry-orig", status="failed", pr_number=106)
 
-        with pytest.raises(NotImplementedError, match="fixer_retry"):
-            pm_core._act_lost_fixer_retry("my-target", orig)
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            result = pm_core._act_lost_fixer_retry("my-target", orig)
+        assert result.startswith("skip:lost_fixer_retry_undispatchable:pr=106")
 
 
 # ---------------------------------------------------------------------------
@@ -716,11 +728,15 @@ class TestDepositInvariants:
         mock_deposit.assert_called_once_with(rec, "my-target")
 
     def test_close_slot_not_called_on_first_retry_path(self):
-        """D5: first retry (_act_lost_fixer_retry) with fixer_retry is not yet supported."""
+        """D5: lost fixer_retry is a loud skip, no re-dispatch (Part B, deferred follow-up)."""
         orig = _fixer_retry_record(gpu_id="gpu-first-retry", status="failed", pr_number=106)
 
-        with pytest.raises(NotImplementedError, match="fixer_retry"):
-            pm_core._act_lost_fixer_retry("my-target", orig)
+        with (
+            patch("lapis_pm.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            result = pm_core._act_lost_fixer_retry("my-target", orig)
+        assert result.startswith("skip:lost_fixer_retry_undispatchable:pr=106")
 
     def test_close_slot_called_on_terminal_brief(self):
         """D5: brief-raised (terminal) path calls _close_slot_and_deposit on original_rec."""
@@ -853,7 +869,7 @@ class TestTickBodyAdvanceScenario:
         assert "reviewer_dispatched" in result.decision
 
     def test_tick_retries_lost_fixer_retry_on_first_loss(self):
-        """Tick: no-op fixer_retry lost dispatch is not yet supported."""
+        """Tick: lost fixer_retry is a loud skip, not a retry (Part B, deferred follow-up)."""
         rec = _fixer_retry_record(
             status="failed",
             ts="2026-06-01T09:00:00Z",
@@ -861,8 +877,8 @@ class TestTickBodyAdvanceScenario:
 
         extra = [("lapis_pm.pm_core._SHAPER", {})]
         with _tick_ctx([rec], perceive_result=([], True), extra_patches=extra) as mocks:
-            with pytest.raises(NotImplementedError, match="fixer_retry"):
-                pm_core.tick("my-target")
+            result = pm_core.tick("my-target")
+        assert result.decision.startswith("skip:lost_fixer_retry_undispatchable:pr=")
 
     def test_tick_briefs_on_second_loss(self):
         """Tick: no-op fixer_retry + lost_retry_count=1 + terminal child → brief."""

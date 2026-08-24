@@ -3909,6 +3909,29 @@ def _reconcile_surviving_head_branch(target_id: str, repo: str) -> None:
         )
 
 
+def _is_pr_merged(target_id: str, pr_num: int) -> bool:
+    """Part C net (2026-08-24): the single merged-state predicate.
+
+    A PR counts as merged when the daemon recorded a merged observation for
+    it (the same observation set _is_auto_land_eligible is built from) OR a
+    live Forgejo state check says merged. Fail-conservative: any exception,
+    404, or not-found returns False (not merged) - never raises.
+    """
+    if pr_num in _merged_pr_numbers_observed(target_id):
+        return True
+    if _forgejo_get_pr is None:
+        return False
+    target = TargetStore().get(target_id)
+    if target is None or not target.pm_repo:
+        return False
+    try:
+        repo_name, owner = _repo_owner(target.pm_repo)
+        pr_data = _forgejo_get_pr(repo_name, pr_num, owner=owner)
+        return (pr_data.get("state") or "") == "merged"
+    except Exception:
+        return False
+
+
 def _is_auto_land_eligible(target_id: str) -> bool:
     """Return True if this target meets all auto-land conditions.
 
@@ -3962,7 +3985,11 @@ def _is_auto_land_eligible(target_id: str) -> bool:
                         pass  # 404 or network error → treat as deleted
             except Exception:
                 pass  # Forgejo unavailable → fall through to merge-status proxy
-    return True
+    # Part C net (2026-08-24): the merged state is now expressed through the
+    # single _is_pr_merged predicate. Behavior-neutral: max(merged) is in the
+    # observed-merged set by construction, so the predicate's observation
+    # short-circuit returns True exactly as the old literal True did.
+    return _is_pr_merged(target_id, max(merged))
 
 
 def _spec_bound_ts(target_id: str) -> str:
@@ -8028,11 +8055,31 @@ def _collect_merged_pr_created_ats(target_id: str) -> list[str]:
     return result
 
 
+def _earliest_fixer_retry_dispatch_ts(records: list[dict], pr_num: int) -> str:
+    """Part A net (2026-08-24): the retry-chain start for a PR.
+
+    Chain start = the earliest dispatch ts among records with
+    agent_type == "fixer_retry" for this pr_number. Initial-fixer and
+    reviewer records are excluded - that exclusion is the strict chain
+    isolation that keeps unrelated prior advances (original fixer, other
+    retry chains) from masking a genuinely lost retry. Returns "" when
+    there is no matching record.
+    """
+    ts_list = [
+        r.get("ts", "")
+        for r in records
+        if r.get("agent_type") == "fixer_retry" and r.get("pr_number") == pr_num
+    ]
+    ts_list = [t for t in ts_list if t]
+    return min(ts_list) if ts_list else ""
+
+
 def _find_lost_fixer_dispatches(
     target_id: str,
     records: list[dict],
     open_prs: list[dict],
     forgejo_ok: bool,
+    merged_pr_nums: set[int] | None = None,
 ) -> tuple[list[dict], list[tuple[dict, dict | None]]]:
     """Classify terminal fixer dispatches with no corresponding PR as lost.
 
@@ -8081,6 +8128,15 @@ def _find_lost_fixer_dispatches(
                 continue  # No PR to check — skip
             if _fixer_completion_ts(target_id, pr_num, dispatch_ts):
                 continue  # Advance observed — normal completion, not lost
+            # Part A net (2026-08-24): a sibling in the SAME retry chain advanced
+            # the PR after the chain started - the no-op retry's work was not lost.
+            chain_start = _earliest_fixer_retry_dispatch_ts(records, pr_num)
+            if chain_start and _pr_advanced_since(target_id, pr_num, chain_start):
+                continue  # Sibling-in-chain advance - normal completion, not lost
+            # Part C net (2026-08-24): the PR is live-merged - the retry's work
+            # demonstrably landed even though no advance observation was recorded.
+            if merged_pr_nums is not None and pr_num in merged_pr_nums:
+                continue  # Merged PR - normal completion, not lost
 
             orig_gpu_id = rec.get("gpu_id", "")
             retry_child: dict | None = next(
@@ -8174,10 +8230,30 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
     """
     agent_type = rec.get("agent_type", "fixer")
     if agent_type == "fixer_retry":
-        raise NotImplementedError(
-            "_act_lost_fixer_retry does not yet support fixer_retry — "
-            "branch derivation from PR head ref is deferred"
+        # Part B (2026-08-24): a genuinely lost fixer_retry no longer aborts the
+        # tick (the raise used to propagate to tick_all and loop on
+        # skipped=exception). Full fixer_retry re-dispatch (branch derivation
+        # from the PR head ref) remains a deferred follow-up; this is a loud,
+        # visible, one-shot skip so the tick completes and the case stays seen.
+        pr_num = rec.get("pr_number")
+        dispatch_id = rec.get("gpu_id", "?")
+        print(
+            f"WARN: _act_lost_fixer_retry: lost fixer_retry target={target_id} "
+            f"pr={pr_num} dispatch={dispatch_id} - no fixer_retry re-dispatch "
+            "(deferred follow-up); loud skip, tick continues.",
+            file=sys.stderr,
         )
+        skip_tag = f"pm:lost:fixer_retry:skipped:pr={pr_num}"
+        if not any(skip_tag in (c.tags or []) for c in episodic.all_comments(target_id)):
+            episodic.write_observation(
+                target_id,
+                f"lost fixer_retry: pr={pr_num} dispatch={dispatch_id} - "
+                "fixer_retry re-dispatch is a deferred follow-up; loud skip "
+                "(tick no longer aborts). The retry chain needs a manual "
+                "force-dispatch or review.",
+                extra_tags=["pm:error", skip_tag],
+            )
+        return f"skip:lost_fixer_retry_undispatchable:pr={pr_num}"
     intent = rec.get("intent", "(no intent)")
     spec_summary = episodic.spec_summary(target_id)
     # For fixer_retry, carry pr_number and note that prior attempt was a no-op
@@ -8671,8 +8747,23 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # Classify lost fixer dispatches (terminal job, no PR produced).
     # Must run after encode so freshly-flipped records are visible.
     _lost_all_records = load_dispatched(target_id)
+    # Part C net (2026-08-24): live-merged PR numbers unblock the lost-classifier.
+    # One Forgejo call per distinct PR number; catch-all per PR (an exception
+    # leaves the PR out of the set - it must never re-enter skipped=exception).
+    _merged_pr_nums: set[int] = set()
+    _retry_pr_nums = sorted({
+        r.get("pr_number") for r in _lost_all_records
+        if r.get("agent_type") == "fixer_retry" and r.get("pr_number") is not None
+    })
+    for _pn in _retry_pr_nums:
+        try:
+            if _is_pr_merged(target_id, _pn):
+                _merged_pr_nums.add(_pn)
+        except Exception:
+            pass
     _lost_needs_retry, _lost_needs_brief = _find_lost_fixer_dispatches(
-        target_id, _lost_all_records, open_prs, forgejo_ok
+        target_id, _lost_all_records, open_prs, forgejo_ok,
+        merged_pr_nums=_merged_pr_nums,
     )
 
     # 4. Decide (priority order, single action)

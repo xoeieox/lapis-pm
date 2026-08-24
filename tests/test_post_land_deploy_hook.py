@@ -3913,6 +3913,8 @@ class TestGwHostScriptDeploy:
         assert "/usr/local/sbin/gw-topology" in by_dest
         assert "/usr/local/sbin/gw-idle-suspend.sh" in by_dest
         assert "/usr/local/sbin/gw_resume_grace.py" in by_dest
+        assert "/usr/local/sbin/gw-gpu1-lease.sh" in by_dest
+        assert "/usr/local/bin/gw-serve" in by_dest
 
         topology = by_dest["/usr/local/sbin/gw-topology"]
         assert topology.src_name == "gw-topology"
@@ -3937,10 +3939,35 @@ class TestGwHostScriptDeploy:
         assert grace.self_attesting is False
         assert grace.execution_sensitive is False
 
-    def test_gw_serve_and_gw_dual_not_manifested(self):
-        """Out-of-scope: no repo source, so no manifest entry (spec Out-of-scope)."""
+        # gw-gpu1-lease.sh (gpu1-multi-tenant-lease arbitration landing
+        # 2026-08-22/23): the tenancy fast-follow debt — hand-installed on GW
+        # with the manifest entry never landed; manifested here to make
+        # subsequent conductor deploys deliver it durably.
+        lease = by_dest["/usr/local/sbin/gw-gpu1-lease.sh"]
+        assert lease.src_name == "gw-gpu1-lease.sh"
+        assert lease.mode == 0o755
+        assert lease.owner == "root:root"
+        assert lease.self_attesting is False
+        assert lease.execution_sensitive is False
+
+        # gw-serve (gw-gpu1-berth-standing-seat-v0 leg 3): gained a repo
+        # source (conductor scripts/gw-serve, bootstrapped + GPU 1 stop-path
+        # extension) via leg 1 (conductor PR #896). Dest is /usr/local/bin
+        # (arbitrary per entry); execution_sensitive=True — it flips serving
+        # state, so the D5 in-flight-flip skip applies.
+        serve = by_dest["/usr/local/bin/gw-serve"]
+        assert serve.src_name == "gw-serve"
+        assert serve.mode == 0o755
+        assert serve.owner == "root:root"
+        assert serve.self_attesting is False
+        assert serve.execution_sensitive is True
+
+    def test_gw_dual_not_manifested(self):
+        """Out-of-scope: gw-dual has no repo source, so no manifest entry
+        (spec Out-of-scope). gw-serve DID gain a repo source via
+        gw-gpu1-berth-standing-seat-v0 leg 1 and is asserted in
+        test_manifest_has_both_scripts_correctly_shaped above."""
         dests = {e.dest for e in pm_core._CONDUCTOR_GW_HOST_SCRIPTS}
-        assert "/usr/local/bin/gw-serve" not in dests
         assert "/usr/local/sbin/gw-dual" not in dests
 
     # --- D2: gate sharing ---

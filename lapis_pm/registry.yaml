@@ -60,22 +60,22 @@ shared_preamble: |
 # gravitywell-slot1 vLLM seat (:8081) via slot alias. The 122B llama.cpp
 # posture and the 2026-07-15/16 retirements are superseded; the fixer pair
 # joined the local tier 2026-08-21 (deadline stopgap, see the pair comment
-# below). The berth flip (the standing NInfer 27B fixer seat on GPU 1 /
-# 3090 Ti, host port :8082; spec gw-gpu1-berth-standing-seat-v0, leg 3)
-# merged 2026-08-24 (PR #302) and was REVERTED the same day: the first real
-# berth dispatch failed - agents_core/shaper.py never carries swarm_payload
-# registry->spec (the keep-both shape collapses to the full payload and
-# NInfer 400s it) and the job's per-run deferrable lease was starved in the
-# doorman wait-list (mem finding/
-# gpu1-berth-first-berth-dispatch-failed-2026-08-24). The pair runs the
-# stopgap again until both defects close. model is passed straight into the
-# /v1/chat/completions request body and validated by the model server. On
-# the vLLM seats it must be a slot alias (e.g. gravitywell-slot1), never a
-# concrete model id: a concrete id gets rejected by vLLM, call_gw_agent
-# returns None, and shaped_runner's `result or ""` turns that into a silent
-# empty-string success. The berth re-flip is the one exception: its model
-# will be the NInfer --model-id (ninfer-27b) because the NInfer engine's
-# /v1/models serves that exact id (leg-1 DoD capture). See
+# below) and moved to the berth (the standing NInfer 27B fixer seat on
+# GPU 1 / 3090 Ti, host port :8082) 2026-08-24 - the durable answer to that
+# stopgap (spec gw-gpu1-berth-standing-seat-v0, leg 3). The first flip
+# (PR #302) merged but was REVERTED the same day (PR #304): the agents-core
+# shaper never carried swarm_payload registry->spec, so the first berth
+# dispatch 400'd (admissions were NOT a cause - mem
+# correction/gpu1-berth-defect2-misattributed-2026-08-24). The shaper fix
+# (agents-core PR #256, merge commit 5dc2216) deployed 2026-08-24 and this
+# re-flip lands the flip with the encode link proven. model is passed
+# straight into the /v1/chat/completions request body and validated by the
+# model server. On the vLLM seats it must be a slot alias (e.g.
+# gravitywell-slot1), never a concrete model id: a concrete id gets rejected
+# by vLLM, call_gw_agent returns None, and shaped_runner's `result or ""`
+# turns that into a silent empty-string success. The berth seat is the one
+# exception: its model is the NInfer --model-id (ninfer-27b) because the
+# NInfer engine's /v1/models serves that exact id (leg-1 DoD capture). See
 # lapis-pm-spec-review-leg-hotfix-reconcile-v0.
 
 agents:
@@ -401,28 +401,27 @@ agents:
       No prose outside the JSON.
     timeout_s: 1800
 
-  # BERTH HELD (2026-08-24): the leg-3 flip (PR #302) was reverted the same
-  # day - first-berth-dispatch failure, two defects (mem finding/
-  # gpu1-berth-first-berth-dispatch-failed-2026-08-24):
-  #   (1) agents_core/shaper.py never carries swarm_payload registry->spec,
-  #       so the encoded spec lacks the key and _is_swarm computes False ->
-  #       full payload -> NInfer 400 chat_template_option_not_supported
-  #       (proven by direct POST to :8082);
-  #   (2) the job's per-run deferrable lease was starved in the doorman
-  #       wait-list for the full retry budget on both runs (admission defer;
-  #       root cause open).
-  # The pair runs the STOPGAP: model gravitywell-slot1, no backend_url, no
-  # swarm_payload (the fully-proven full-payload path on the vLLM seat).
-  # Re-flip ONLY after the shaper fix (agents-core) deploys AND the
-  # admission root cause closes: restore on BOTH entries model: ninfer-27b
-  # + backend_url: http://203.0.113.11:8082 + swarm_payload: true
-  # (keep-both: acquire_lease stays at the default true). The stopgap shape
-  # is pinned by tests/test_registry_berth_shape.py; a premature re-flip
-  # fails loudly there.
+  # Berth re-flip (gw-gpu1-berth-standing-seat-v0, leg 3 + agents-core
+  # shaper fix): fixer + fixer_retry route to the standing NInfer 27B seat
+  # on GPU 1 (3090 Ti) at host port :8082. backend_url + swarm_payload:
+  # true force the swarm payload shape (the NInfer engine rejects the full
+  # payload with HTTP 400 chat_template_option_not_supported - G2 gate
+  # record 2026-08-19) while acquire_lease stays at the default true:
+  # keep-both (the job holds the per-run job lease AND the supervisor
+  # lease; spec Design / keep-both). The first flip (PR #302) was reverted
+  # by PR #304 pending the agents-core shaper fix (merged PR #256 /
+  # 5dc2216); the encode link is proven end-to-end (swarm payload ->
+  # NInfer 200, stopgap shape byte-identical). Stopgap fallback: re-point
+  # BOTH entries back to model: gravitywell-slot1 and drop
+  # backend_url/swarm_payload (tests/test_registry_berth_shape.py re-pins
+  # the stopgap); the flip activates ONLY at merge (deploy hook ships
+  # registry.yaml), so a held merge = zero behavioral change.
   fixer:
     chub_bundles: []
     engine: local-fixer      # was: claude
-    model: gravitywell-slot1 # stopgap (berth ninfer-27b held - see block above)
+    model: ninfer-27b        # was: gravitywell-slot1 (stopgap), sonnet (pre-stopgap)
+    backend_url: http://203.0.113.11:8082
+    swarm_payload: true
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -559,26 +558,25 @@ agents:
     timeout_s: 2700
 
   # fixer_local (below) is the intentional opt-in local tier. fixer + fixer_retry
-  # are the stopgap pair (gravitywell-slot1) - initial attempt and correction
-  # attempt at the same capability tier. Flipped from claude/sonnet
+  # are the berth pair (ninfer-27b on :8082, GPU 1 / 3090 Ti) - initial attempt
+  # and correction attempt at the same capability tier. Flipped from claude/sonnet
   # 2026-08-21 as the deadline stopgap for the Claude Max end (mem
   # decision/claude-max-subscription-ends-2026-08-22; Erah ruling B-now,
-  # lapis-pm-fixer-local-stopgap-flip-v0). The berth flip 2026-08-24 (PR
-  # #302, spec gw-gpu1-berth-standing-seat-v0, leg 3) was REVERTED the same
-  # day (first-berth-dispatch failure - see the BERTH HELD block above the
-  # fixer entry): the pair runs the stopgap again until the shaper encode
-  # fix deploys and the admission root cause closes.
-  # The stopgap shape is pinned by tests/test_registry_berth_shape.py (held
-  # re-flip: it pins the stopgap shape and fails loudly on a premature berth
-  # re-point); engine+model parity between the pair is
-  # test_registry_agent_tiers.py's job.
+  # lapis-pm-fixer-local-stopgap-flip-v0), then to the berth 2026-08-24 - the
+  # ratified durable answer (spec gw-gpu1-berth-standing-seat-v0, leg 3).
+  # The berth shape (backend_url + swarm_payload, acquire_lease default true)
+  # is pinned by the comment block above the fixer entry and by
+  # tests/test_registry_berth_shape.py; the stopgap fallback is re-pointing
+  # BOTH entries back to gravitywell-slot1 (see that block).
   # Any future tier push must not re-capture one half of this pair without
   # touching the other; see test_registry_agent_tiers.py.
   # First live local-fixer dispatch completed 2026-08-22 (post-merge verification).
   fixer_retry:
     chub_bundles: []
     engine: local-fixer      # was: claude
-    model: gravitywell-slot1 # stopgap (berth ninfer-27b held - see fixer block above)
+    model: ninfer-27b        # was: gravitywell-slot1 (stopgap), sonnet (pre-stopgap)
+    backend_url: http://203.0.113.11:8082
+    swarm_payload: true
     capture_meta: false
     notify: false
     system_template: |

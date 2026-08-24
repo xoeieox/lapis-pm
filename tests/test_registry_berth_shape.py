@@ -1,37 +1,25 @@
-"""Registry-shape pin: the berth flip (gw-gpu1-berth-standing-seat-v0, leg 3)
-is HELD - the pair runs the stopgap.
+"""Registry-shape pin: the berth flip (gw-gpu1-berth-standing-seat-v0, leg 3).
 
-The flip (PR #302, merged 2026-08-24) was reverted the same day: the first
-real berth dispatch failed, exposing two defects (mem finding/
-gpu1-berth-first-berth-dispatch-failed-2026-08-24):
-
-  1. SHAPER ENCODE GAP (proven): agents_core/shaper.py never carries the
-     swarm_payload registry key into the encoded job spec, so the keep-both
-     berth shape collapses at runtime - _is_swarm computes False -> full
-     payload -> NInfer 400 chat_template_option_not_supported (reproduced
-     by direct POST to :8082).
-  2. ADMISSION DEFER (root cause open): the job's per-run deferrable lease
-     was starved in the doorman wait-list for the full ~58s retry budget on
-     both runs.
-
-Until the shaper fix (agents-core) deploys AND the admission root cause
-closes, fixer + fixer_retry run the STOPGAP shape - the fully-proven
-full-payload path on the vLLM seat:
+fixer + fixer_retry carry the berth shape - the standing NInfer 27B seat on
+GPU 1 (3090 Ti) at host port :8082:
 
   engine: local-fixer
-  model: gravitywell-slot1   (the :8081 seat)
-  NO backend_url             (routes via the seat alias)
-  NO swarm_payload           (the full payload is the proven shape here)
+  model: ninfer-27b            (the NInfer --model-id; leg-1 DoD confirms
+                                 /v1/models serves it)
+  backend_url: http://203.0.113.11:8082
+  swarm_payload: true          (the NInfer engine rejects the full payload
+                                 with HTTP 400 chat_template_option_not_
+                                 supported - G2 gate record 2026-08-19 - so
+                                 the berth seat MUST run the swarm shape)
+  acquire_lease: default true  (keep-both: the job holds the per-run job
+                                 lease AND the supervisor lease; the spec
+                                 Design / keep-both section)
 
-This file pins the stopgap shape so a premature re-flip (re-pointing either
-entry to the berth before the encode link is fixed) fails loudly here. The
-re-flip PR restores the berth assertions on this same file: model ninfer-27b
-+ backend_url http://203.0.113.11:8082 + swarm_payload: true
-(keep-both: acquire_lease stays at the default true - no explicit key).
+The flip is test-pinned, not comment-pinned: a silent re-point of either
+entry back to the stopgap seat (gravitywell-slot1) fails loudly here.
 The engine+model parity between the pair is test_registry_agent_tiers.py's
-job; this file pins the shape keys on each entry individually so a
-half-revert (one entry re-pointed to the berth, the other not) is caught by
-BOTH tests.
+job; this file pins the berth shape keys on each entry individually so a
+half-flip (one entry re-pointed, the other not) is caught by BOTH tests.
 """
 
 from __future__ import annotations
@@ -41,7 +29,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-_STOPGAP_MODEL = "gravitywell-slot1"
+_BERTH_BACKEND_URL = "http://203.0.113.11:8082"
+_BERTH_MODEL = "ninfer-27b"
 
 
 @pytest.fixture(scope="module")
@@ -52,30 +41,38 @@ def agents():
 
 
 @pytest.mark.parametrize("name", ["fixer", "fixer_retry"])
-def test_stopgap_shape_held_pending_shaper_fix(name, agents):
-    """The pair is on the stopgap: gravitywell-slot1, no berth keys.
-
-    Re-pointing either entry to the berth (ninfer-27b / :8082 /
-    swarm_payload) before the agents-core shaper fix deploys re-introduces
-    the proven 400 on every dispatch - see the module docstring. The
-    re-flip PR updates this test to the berth shape."""
+def test_berth_shape_keys(name, agents):
     entry = agents[name]
     assert entry["engine"] == "local-fixer", (
-        f"{name}.engine={entry.get('engine')!r} - the pair is the "
+        f"{name}.engine={entry.get('engine')!r} - the berth pair is the "
         "local-fixer engine"
     )
-    assert entry["model"] == _STOPGAP_MODEL, (
-        f"{name}.model={entry.get('model')!r} - the berth is HELD (shaper "
-        "encode gap + admission defer open); the pair must stay on the "
-        f"stopgap seat {_STOPGAP_MODEL!r} until the re-flip PR lands"
+    assert entry["model"] == _BERTH_MODEL, (
+        f"{name}.model={entry.get('model')!r} - the berth seat serves "
+        f"{_BERTH_MODEL!r} (NInfer --model-id); a re-point back to the "
+        "stopgap seat (gravitywell-slot1) must be a deliberate, reviewed "
+        "change (spec stopgap fallback)"
     )
-    assert entry.get("backend_url") is None, (
-        f"{name}.backend_url={entry.get('backend_url')!r} - the stopgap "
-        "lane routes via the seat alias; a berth backend_url is only "
-        "correct once the shaper carries swarm_payload (held re-flip)"
+    assert entry.get("backend_url") == _BERTH_BACKEND_URL, (
+        f"{name}.backend_url={entry.get('backend_url')!r} - the berth seat "
+        "is at host port :8082 (Erah port settlement 2026-08-21)"
     )
-    assert entry.get("swarm_payload") is None, (
-        f"{name}.swarm_payload={entry.get('swarm_payload')!r} - the "
-        "stopgap lane runs the full payload; swarm_payload is only correct "
-        "on the berth (held re-flip)"
+    assert entry.get("swarm_payload") is True, (
+        f"{name}.swarm_payload={entry.get('swarm_payload')!r} - the NInfer "
+        "engine rejects the full payload (HTTP 400 "
+        "chat_template_option_not_supported); the berth seat MUST run the "
+        "swarm shape"
+    )
+
+
+@pytest.mark.parametrize("name", ["fixer", "fixer_retry"])
+def test_acquire_lease_stays_default_true(name, agents):
+    """keep-both: the berth entry must NOT set acquire_lease explicitly -
+    the default (true) means the job holds the per-run job lease AND the
+    supervisor lease. An explicit acquire_lease (true or false) changes the
+    lease topology and must be a deliberate, reviewed change."""
+    entry = agents[name]
+    assert "acquire_lease" not in entry, (
+        f"{name} must not set acquire_lease explicitly - the default (true) "
+        "is the keep-both posture (spec Design / keep-both)"
     )

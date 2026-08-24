@@ -60,11 +60,16 @@ shared_preamble: |
 # gravitywell-slot1 vLLM seat (:8081) via slot alias. The 122B llama.cpp
 # posture and the 2026-07-15/16 retirements are superseded; the fixer pair
 # joined the local tier 2026-08-21 (deadline stopgap, see the pair comment
-# above). model is passed straight into the /v1/chat/completions request body
-# and validated by the model server - it must be a slot alias (e.g.
-# gravitywell-slot1), never a concrete model id. A concrete id gets rejected
+# below) and moved to the berth (the standing NInfer 27B fixer seat on
+# GPU 1 / 3090 Ti, host port :8082) 2026-08-24 - the durable answer to that
+# stopgap (spec gw-gpu1-berth-standing-seat-v0, leg 3). model is passed
+# straight into the /v1/chat/completions request body and validated by the
+# model server. On the vLLM seats it must be a slot alias (e.g.
+# gravitywell-slot1), never a concrete model id: a concrete id gets rejected
 # by vLLM, call_gw_agent returns None, and shaped_runner's `result or ""`
-# turns that into a silent empty-string success. See
+# turns that into a silent empty-string success. The berth seat is the one
+# exception: its model is the NInfer --model-id (ninfer-27b) because the
+# NInfer engine's /v1/models serves that exact id (leg-1 DoD capture). See
 # lapis-pm-spec-review-leg-hotfix-reconcile-v0.
 
 agents:
@@ -390,10 +395,23 @@ agents:
       No prose outside the JSON.
     timeout_s: 1800
 
+  # Berth flip (gw-gpu1-berth-standing-seat-v0, leg 3): fixer + fixer_retry
+  # route to the standing NInfer 27B seat on GPU 1 (3090 Ti) at host port
+  # :8082. backend_url + swarm_payload: true force the swarm payload shape
+  # (the NInfer engine rejects the full payload with HTTP 400
+  # chat_template_option_not_supported - G2 gate record 2026-08-19) while
+  # acquire_lease stays at the default true: keep-both (the job holds the
+  # per-run job lease AND the supervisor lease; spec Design / keep-both).
+  # Stopgap fallback: re-point both entries back to model: gravitywell-slot1
+  # and drop backend_url/swarm_payload; the flip activates ONLY at merge
+  # (deploy hook ships registry.yaml), so a held merge = zero behavioral
+  # change.
   fixer:
     chub_bundles: []
     engine: local-fixer      # was: claude
-    model: gravitywell-slot1 # was: sonnet
+    model: ninfer-27b        # was: gravitywell-slot1 (stopgap), sonnet (pre-stopgap)
+    backend_url: http://203.0.113.11:8082
+    swarm_payload: true
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -530,19 +548,25 @@ agents:
     timeout_s: 2700
 
   # fixer_local (below) is the intentional opt-in local tier. fixer + fixer_retry
-  # are the local 27B pair (gravitywell-slot1) - initial attempt and correction
-  # attempt at the same capability tier. Flipped from claude/sonnet 2026-08-21
-  # as the deadline stopgap for the Claude Max end (mem
+  # are the berth pair (ninfer-27b on :8082, GPU 1 / 3090 Ti) - initial attempt
+  # and correction attempt at the same capability tier. Flipped from claude/sonnet
+  # 2026-08-21 as the deadline stopgap for the Claude Max end (mem
   # decision/claude-max-subscription-ends-2026-08-22; Erah ruling B-now,
-  # lapis-pm-fixer-local-stopgap-flip-v0). The 3090 NInfer lane (GPU1) is the
-  # ratified durable answer and lands via the separate keeper concept spec.
+  # lapis-pm-fixer-local-stopgap-flip-v0), then to the berth 2026-08-24 - the
+  # ratified durable answer (spec gw-gpu1-berth-standing-seat-v0, leg 3).
+  # The berth shape (backend_url + swarm_payload, acquire_lease default true)
+  # is pinned by the comment block above the fixer entry and by
+  # tests/test_registry_berth_shape.py; the stopgap fallback is re-pointing
+  # BOTH entries back to gravitywell-slot1 (see that block).
   # Any future tier push must not re-capture one half of this pair without
   # touching the other; see test_registry_agent_tiers.py.
   # First live local-fixer dispatch completed 2026-08-22 (post-merge verification).
   fixer_retry:
     chub_bundles: []
     engine: local-fixer      # was: claude
-    model: gravitywell-slot1 # was: sonnet
+    model: ninfer-27b        # was: gravitywell-slot1 (stopgap), sonnet (pre-stopgap)
+    backend_url: http://203.0.113.11:8082
+    swarm_payload: true
     capture_meta: false
     notify: false
     system_template: |

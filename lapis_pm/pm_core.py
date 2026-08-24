@@ -586,16 +586,25 @@ class _GwHostScript(NamedTuple):
 
 # GROWTH OBLIGATION (mirrors the _CONDUCTOR_NIGHT_SCRIPTS growth-obligation
 # comment above): any new conductor script whose runtime home is
-# gravitywell:/usr/local/sbin/ MUST be added here, or it gets no delivery
-# (D1) and no drift report (D7 only covers manifested files).
-# gw-serve (/usr/local/bin) and gw-dual (/usr/local/sbin) are deliberately
-# NOT here — they have no repo source, so a manifest entry naming them would
-# be a no-op at best (spec Out-of-scope).
+# gravitywell:/usr/local/sbin/ (or, per-entry, another remote path — the dest
+# is arbitrary per entry) MUST be added here, or it gets no delivery (D1)
+# and no drift report (D7 only covers manifested files).
+# gw-dual (/usr/local/sbin) is deliberately NOT here — it has no repo source,
+# so a manifest entry naming it would be a no-op at best (spec Out-of-scope).
+# gw-serve (/usr/local/bin) gained a repo source (scripts/gw-serve,
+# bootstrapped + GPU 1 stop-path extension) via gw-gpu1-berth-standing-seat-v0
+# leg 1 (conductor PR #896), so it is manifested here: execution_sensitive=True
+# because it flips serving state (the in-flight-flip skip, D5, applies).
+# gw-gpu1-lease.sh is the tenancy fast-follow debt (gpu1-multi-tenant-lease
+# arbitration landing 2026-08-22/23): it was hand-installed on GW and the
+# manifest entry never landed; this entry makes subsequent conductor deploys
+# deliver it durably.
 _CONDUCTOR_GW_HOST_SCRIPTS: tuple[_GwHostScript, ...] = (
     _GwHostScript("gw-topology", "/usr/local/sbin/gw-topology", 0o755, "root:root", True, True),
     _GwHostScript("gw-idle-suspend.sh", "/usr/local/sbin/gw-idle-suspend.sh", 0o755, "root:root", False, True),
     _GwHostScript("gw_resume_grace.py", "/usr/local/sbin/gw_resume_grace.py", 0o755, "root:root", False, False),
     _GwHostScript("gw-gpu1-lease.sh", "/usr/local/sbin/gw-gpu1-lease.sh", 0o755, "root:root", False, False),
+    _GwHostScript("gw-serve", "/usr/local/bin/gw-serve", 0o755, "root:root", False, True),
 )
 
 

@@ -176,6 +176,11 @@ def test_run_thursday_summary_reads_jsonl_files(monkeypatch, tmp_path):
 
 def test_run_thursday_summary_fail_soft_on_network_error(monkeypatch, tmp_path):
     monkeypatch.setenv("ROOM_ROOT", str(tmp_path))
+    # Patch the ladder constants down so the always-failing fake does not
+    # add ~60s of real sleeps to the suite (lapis-pm-hold-shadow-summary-
+    # retry-v0).
+    monkeypatch.setattr(summary, "MAX_DEPOSIT_ATTEMPTS", 3)
+    monkeypatch.setattr(summary, "RETRY_DELAY_SEC", 0.001)
 
     class _FakeClient:
         def __init__(self, *a, **kw):
@@ -194,6 +199,82 @@ def test_run_thursday_summary_fail_soft_on_network_error(monkeypatch, tmp_path):
     monkeypatch.setattr(httpx, "Client", _FakeClient)
 
     assert summary.run_thursday_summary() is None
+
+
+def test_run_thursday_summary_retries_then_succeeds(monkeypatch, tmp_path):
+    """The boot-race retry ladder: failed attempts are retried, and a later
+    success returns its gem_id immediately (one gem per successful run)."""
+    monkeypatch.setenv("ROOM_ROOT", str(tmp_path))
+    monkeypatch.setattr(summary, "MAX_DEPOSIT_ATTEMPTS", 3)
+    monkeypatch.setattr(summary, "RETRY_DELAY_SEC", 0.001)
+
+    state = {"posts": 0}
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"gem_id": "gem-retry"}
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, *a, **kw):
+            state["posts"] += 1
+            if state["posts"] <= 2:
+                raise ConnectionError("weaver not listening yet")
+            return _FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+
+    gem_id = summary.run_thursday_summary()
+
+    assert gem_id == "gem-retry"
+    assert state["posts"] == 3  # two failures + one success, no further retries
+
+
+def test_run_thursday_summary_exhausts_retries_fail_soft(monkeypatch, tmp_path, capsys):
+    """Exhausting the ladder returns None (never raises) and prints the full
+    stderr ladder: per-attempt retry lines plus the final failure line."""
+    monkeypatch.setenv("ROOM_ROOT", str(tmp_path))
+    monkeypatch.setattr(summary, "MAX_DEPOSIT_ATTEMPTS", 3)
+    monkeypatch.setattr(summary, "RETRY_DELAY_SEC", 0.001)
+
+    state = {"posts": 0}
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, *a, **kw):
+            state["posts"] += 1
+            raise ConnectionError("weaver unreachable")
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+
+    assert summary.run_thursday_summary() is None
+    assert state["posts"] == 3  # exactly MAX_DEPOSIT_ATTEMPTS attempts
+
+    err = capsys.readouterr().err
+    assert "deposit attempt 1/3 failed (ConnectionError); retrying in" in err
+    assert "deposit attempt 2/3 failed (ConnectionError); retrying in" in err
+    assert "deposit failed after 3 attempts (ConnectionError)" in err
 
 
 def test_summary_module_never_writes_brief_gem_map_key():

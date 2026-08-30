@@ -1,13 +1,16 @@
 """Parity guardrail: fixer and fixer_retry must share one capability tier.
 
 Coverage (spec: restore-fixer-retry-sonnet-registry-v0; berth flip
-gw-gpu1-berth-standing-seat-v0 leg 3):
+gw-gpu1-berth-standing-seat-v0 leg 3, reversed 2026-08-29):
 
   fixer and fixer_retry are a pair by design - initial attempt and correction
-  attempt at the same capability tier. The pair is now the local pair
-  (ninfer-27b, the standing NInfer 27B berth seat on GPU 1 / 3090 Ti at host
-  port :8082; the stopgap gravitywell-slot1 seat remains the fallback -
-  re-point both entries back to it to revert). The 2026-07-17 migration
+  attempt at the same capability tier. The pair is the local stopgap pair
+  (gravitywell-slot1 on :8081). The 2026-08-24 berth flip (ninfer-27b on
+  :8082, GPU 1 / 3090 Ti; spec gw-gpu1-berth-standing-seat-v0, leg 3) was
+  reversed 2026-08-29 as a deliberate operational pause - the berth seat is
+  down for the night and GPU 1 may be repurposed to ComfyUI (Erah-directed;
+  NOT a defect hold). The re-flip re-points both entries to the berth and
+  updates this pin to ninfer-27b with it. The 2026-07-17 migration
   (restore-fixer-sonnet-default-registry-v0) moved `fixer` to claude/sonnet on
   a stated premise that fixer_retry was "already sonnet" - a premise that was
   never checked and turned out to be false, leaving fixer_retry on
@@ -61,23 +64,23 @@ def test_fixer_and_fixer_retry_share_engine_and_model(agents):
     )
 
 
-def test_fixer_and_fixer_retry_currently_on_berth_27b(agents):
-    """Pins the expected tier so a silent revert of BOTH blocks together
+def test_fixer_and_fixer_retry_currently_on_local_27b(agents):
+    """Pins the expected tier so a silent change of BOTH blocks together
     (which the parity test alone would not catch) still fails loudly.
 
     Flipped from claude/sonnet to local-fixer/gravitywell-slot1 2026-08-21
     as the deadline stopgap for the Claude Max end (spec:
-    lapis-pm-fixer-local-stopgap-flip-v0), then to the berth - the standing
-    NInfer 27B seat (ninfer-27b) on GPU 1 / 3090 Ti at host port :8082 -
-    2026-08-24, the ratified durable answer (spec:
-    gw-gpu1-berth-standing-seat-v0, leg 3). The berth shape keys
-    (backend_url + swarm_payload) are pinned by
-    tests/test_registry_berth_shape.py; this test pins engine + model only,
-    same as before the flip."""
+    lapis-pm-fixer-local-stopgap-flip-v0). The 2026-08-24 berth flip (spec:
+    gw-gpu1-berth-standing-seat-v0, leg 3) was reversed 2026-08-29 (Erah-
+    directed operational pause - berth down for the night, GPU 1 may become
+    ComfyUI) - so the pair is back on the stopgap until the re-flip PR lands,
+    which updates this pin to ninfer-27b with it. The stopgap/berth shape
+    keys are pinned by tests/test_registry_berth_shape.py; this test pins
+    engine + model only."""
     assert agents["fixer"]["engine"] == "local-fixer"
-    assert agents["fixer"]["model"] == "ninfer-27b"
+    assert agents["fixer"]["model"] == "gravitywell-slot1"
     assert agents["fixer_retry"]["engine"] == "local-fixer"
-    assert agents["fixer_retry"]["model"] == "ninfer-27b"
+    assert agents["fixer_retry"]["model"] == "gravitywell-slot1"
 
 
 def test_fixer_local_excluded_from_parity_by_design(agents):

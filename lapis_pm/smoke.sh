@@ -2212,7 +2212,7 @@ def _fake_write_brief(target_id, body):
 _common_patches = [
     patch('agents_core.notify.send_notification', side_effect=_fake_send_notification),
     patch('lapis_pm.brief.send_notification', side_effect=_fake_send_notification),
-    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nsmoke body\n## Decision needed\nnone'),
+    patch('agents_core.gw_agent.call_gw_agent', return_value='## State\nsmoke body\n## Decision needed\nnone'),
     patch('lapis_pm.brief.episodic.write_brief', side_effect=_fake_write_brief),
     patch('lapis_pm.brief.episodic.recall', return_value=[]),
     patch('lapis_pm.brief.episodic.spec_summary', return_value='smoke spec'),
@@ -2338,7 +2338,7 @@ def _chain_fake_notify(message, title, priority, url=None, url_title=None):
 chain_patches = [
     patch('agents_core.notify.send_notification', side_effect=_chain_fake_notify),
     patch('lapis_pm.brief.send_notification', side_effect=_chain_fake_notify),
-    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nsmoke\n## Decision needed\nnone'),
+    patch('agents_core.gw_agent.call_gw_agent', return_value='## State\nsmoke\n## Decision needed\nnone'),
     patch('lapis_pm.brief.episodic.write_brief', side_effect=_fake_write_brief),
     patch('lapis_pm.brief.episodic.recall', return_value=[]),
     patch('lapis_pm.brief.episodic.spec_summary', return_value='spec'),
@@ -2390,7 +2390,7 @@ def _recording_write_brief(target_id, body):
 
 common = [
     patch('lapis_pm.brief.send_notification'),  # should NOT be called; no side_effect
-    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nsmoke\n## Decision needed\nnone'),
+    patch('agents_core.gw_agent.call_gw_agent', return_value='## State\nsmoke\n## Decision needed\nnone'),
     patch('lapis_pm.brief.episodic.write_brief', side_effect=_recording_write_brief),
     patch('lapis_pm.brief.episodic.recall', return_value=[]),
     patch('lapis_pm.brief.episodic.spec_summary', return_value='spec'),
@@ -2666,7 +2666,7 @@ def fake_write_brief_options(tid, content, **kwargs):
     return c
 
 patches = [
-    patch('lapis_pm.brief.call_claude_cli', return_value='## State\nok\n## Decision needed\nnone'),
+    patch('agents_core.gw_agent.call_gw_agent', return_value='## State\nok\n## Decision needed\nnone'),
     patch('lapis_pm.brief.send_notification', return_value=False),
     patch('lapis_pm.brief.episodic.recall', return_value=[]),
     patch('lapis_pm.brief.episodic.spec_summary', return_value='spec'),
@@ -2806,7 +2806,7 @@ def fake_call_claude(*a, **kw):
 
 # Stub Pushover (no token in smoke)
 with (
-    patch('lapis_pm.land.call_claude_cli', side_effect=fake_call_claude),
+    patch('agents_core.gw_agent.call_gw_agent', side_effect=fake_call_claude),
     patch('lapis_pm.pm_core._SHAPER'),
 ):
     from lapis_pm.cli import main as cli_main
@@ -3580,7 +3580,7 @@ print(f"advisory-clean anchor: reviewer_verdict_text={rvt!r} ok")
 # Verify the Reviewer verdict: block appears in the synthesize prompt
 captured_prompt = {}
 
-def fake_llm(prompt, system, model, timeout):
+def fake_llm(prompt, system, **kwargs):
     captured_prompt["prompt"] = prompt
     return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
@@ -3589,7 +3589,7 @@ fake_comment.id = "smoke-anchor-prompt-cid"
 fake_comment.tags = ["pm:brief"]
 
 with (
-    patch("lapis_pm.brief.call_claude_cli", side_effect=fake_llm),
+    patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
     patch("lapis_pm.brief.send_notification", return_value=False),
     patch("lapis_pm.brief.episodic.recall", return_value=[]),
     patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),

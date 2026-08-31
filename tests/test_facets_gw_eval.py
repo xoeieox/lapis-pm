@@ -434,10 +434,10 @@ class TestQualityCrossJudge:
         )
         spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(3)]
 
-        # Mock call_claude_cli to return "equivalent" verdict for all fixtures
+        # Mock call_gw_agent to return "equivalent" verdict for all fixtures
         mock_verdict = json.dumps({"judgment": "equivalent", "reasoning": "both make same recommendation"})
 
-        with patch('lapis_pm.facets_gw_eval.call_claude_cli', return_value=mock_verdict):
+        with patch('lapis_pm.facets_gw_eval.call_gw_agent', return_value=mock_verdict):
             result = run_quality_cross_judge(clean, spec_paths)
 
         assert result == 100.0
@@ -462,7 +462,7 @@ class TestQualityCrossJudge:
             json.dumps({"judgment": "weaker", "reasoning": "less confident"}),
         ]
 
-        with patch('lapis_pm.facets_gw_eval.call_claude_cli', side_effect=verdicts):
+        with patch('lapis_pm.facets_gw_eval.call_gw_agent', side_effect=verdicts):
             result = run_quality_cross_judge(clean, spec_paths)
 
         # 2 out of 3 are equivalent-or-stronger = 66.7%
@@ -483,7 +483,7 @@ class TestQualityCrossJudge:
         assert result is None
 
     def test_cross_judge_unavailable(self):
-        """Cross-judge returns None if call_claude_cli is unavailable."""
+        """Cross-judge returns None if the local client is unavailable."""
         clean = EvalPass(
             pass_name="clean",
             pass_at="2026-06-17T00:00:00Z",
@@ -492,7 +492,7 @@ class TestQualityCrossJudge:
         )
         spec_paths = [Path(f"/tmp/fixture{i}.md") for i in range(1)]
 
-        with patch('lapis_pm.facets_gw_eval.call_claude_cli', None):
+        with patch('lapis_pm.facets_gw_eval.call_gw_agent', None):
             result = run_quality_cross_judge(clean, spec_paths)
 
         assert result is None
@@ -513,7 +513,7 @@ class TestQualityCrossJudge:
             json.dumps({"judgment": "equivalent", "reasoning": "ok"}),
         ]
 
-        with patch('lapis_pm.facets_gw_eval.call_claude_cli', side_effect=responses):
+        with patch('lapis_pm.facets_gw_eval.call_gw_agent', side_effect=responses):
             result = run_quality_cross_judge(clean, spec_paths)
 
         # Only 1 out of 2 parsed correctly and is equivalent = 50%

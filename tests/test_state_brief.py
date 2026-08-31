@@ -518,7 +518,7 @@ class TestWeeklyDryRunAndDegraded:
         assert "weekly pattern item" in result
 
     def test_weekly_degraded_fallback_includes_gardener_data_block_not_bucket_header(self):
-        """Weekly call_claude_cli failure degrades to a placeholder that still
+        """Weekly local-seat call failure degrades to a placeholder that still
         omits the Gardener bucket header but includes the raw data block."""
         buckets = {
             "Built": [],
@@ -528,7 +528,7 @@ class TestWeeklyDryRunAndDegraded:
             "Awaiting your call": [],
             "Gardener Cross-Cutting Observations": ["[Warning] weekly pattern item"],
         }
-        with patch("agents_core.llm.call_claude_cli", return_value=None):
+        with patch("agents_core.gw_agent.call_gw_agent", return_value=None):
             result = state_brief._generate_prose(
                 period="weekly",
                 buckets=buckets,

@@ -21,9 +21,9 @@ from typing import Literal
 from agents_core.room_paths import room_path, room_str
 
 try:
-    from agents_core.llm import call_claude_cli
+    from agents_core.gw_agent import call_gw_agent
 except ImportError:
-    call_claude_cli = None  # type: ignore
+    call_gw_agent = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -321,15 +321,16 @@ Be conservative: only rate "equivalent" if you are confident both would lead to 
 
 
 def run_quality_cross_judge(clean_pass: EvalPass, fixture_specs: list[Path]) -> float | None:
-    """Run Sonnet quality cross-judge on Arm A vs Arm B outputs.
+    """Run quality cross-judge on Arm A vs Arm B outputs via the local seat.
 
     For each fixture, judges whether Arm-B outputs are decision-equivalent to Arm-A.
-    Returns: percentage of fixtures judged equivalent-or-stronger, or None if judge unavailable.
+    Returns: percentage of fixtures judged equivalent-or-stronger, or None if the
+    local client is unavailable.
 
     This is a PM-optional action; unit tests mock it.
     """
-    if not call_claude_cli:
-        logger.warning("facets_gw_eval: call_claude_cli not available; quality cross-judge skipped")
+    if not call_gw_agent:
+        logger.warning("facets_gw_eval: call_gw_agent not available; quality cross-judge skipped")
         return None
 
     if clean_pass.arm_a.run_count == 0 or clean_pass.arm_b.run_count == 0:
@@ -350,9 +351,10 @@ def run_quality_cross_judge(clean_pass: EvalPass, fixture_specs: list[Path]) -> 
         )
 
         try:
-            verdict_json = call_claude_cli(
+            verdict_json = call_gw_agent(
                 prompt=prompt, system=QUALITY_JUDGE_SYSTEM,
-                model="sonnet", timeout=60, log=logger.warning,
+                writeable=False, json_mode=True, max_steps=1,
+                timeout=60, on_wake_fail="skip",
             )
             if verdict_json:
                 verdict = json.loads(verdict_json)

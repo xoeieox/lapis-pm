@@ -66,12 +66,12 @@ def test_synthesize_includes_verdict_block_when_provided():
     """
     captured = {}
 
-    def fake_llm(prompt, system, model, timeout, **kwargs):
+    def fake_llm(prompt, system, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_llm),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
@@ -85,7 +85,7 @@ def test_synthesize_includes_verdict_block_when_provided():
             notify=None,
         )
 
-    assert captured, "call_claude_cli was not called"
+    assert captured, "call_gw_agent was not called"
     assert "Reviewer verdict:\nverdict=clean; confidence=0.93\n" in captured["prompt"], (
         f"Expected 'Reviewer verdict:' block in prompt; got:\n{captured['prompt']}"
     )
@@ -99,12 +99,12 @@ def test_synthesize_omits_verdict_block_when_none():
     """synthesize() with reviewer_verdict_text=None produces no 'Reviewer verdict:' block."""
     captured = {}
 
-    def fake_llm(prompt, system, model, timeout, **kwargs):
+    def fake_llm(prompt, system, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_llm),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
@@ -118,7 +118,7 @@ def test_synthesize_omits_verdict_block_when_none():
             notify=None,
         )
 
-    assert captured, "call_claude_cli was not called"
+    assert captured, "call_gw_agent was not called"
     assert "Reviewer verdict:" not in captured["prompt"], (
         f"Unexpected 'Reviewer verdict:' block in prompt when kwarg is None; got:\n{captured['prompt']}"
     )
@@ -132,12 +132,12 @@ def test_synthesize_omits_verdict_block_when_empty_string():
     """synthesize() with reviewer_verdict_text='' produces no 'Reviewer verdict:' block."""
     captured = {}
 
-    def fake_llm(prompt, system, model, timeout, **kwargs):
+    def fake_llm(prompt, system, **kwargs):
         captured["prompt"] = prompt
         return "## State\nok\n## Recent activity\n- x\n## Risk / spec deviation\nnone\n## Decision needed\nnone\n"
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", side_effect=fake_llm),
+        patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
@@ -151,7 +151,7 @@ def test_synthesize_omits_verdict_block_when_empty_string():
             notify=None,
         )
 
-    assert captured, "call_claude_cli was not called"
+    assert captured, "call_gw_agent was not called"
     assert "Reviewer verdict:" not in captured["prompt"], (
         f"Unexpected 'Reviewer verdict:' block in prompt when kwarg is empty string; got:\n{captured['prompt']}"
     )

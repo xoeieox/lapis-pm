@@ -60,7 +60,7 @@ def _fake_write_brief_options_factory(captured: list):
 # ---------------------------------------------------------------------------
 
 _COMMON_SYNTH_PATCHES = [
-    ("lapis_pm.brief.call_claude_cli", "## State\nok\n## Decision needed\nnone"),
+    ("agents_core.gw_agent.call_gw_agent", "## State\nok\n## Decision needed\nnone"),
     ("lapis_pm.brief.send_notification", None),
     ("lapis_pm.brief.episodic.recall", []),
     ("lapis_pm.brief.episodic.spec_summary", "spec"),
@@ -112,7 +112,7 @@ def test_synthesize_emits_sibling_for_closed_form_triggers(
     captured_options: list = []
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value="## State\nok\n## Decision needed\nnone"),
+        patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
@@ -142,7 +142,7 @@ def test_synthesize_emits_sibling_with_pr_number():
     captured_options: list = []
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value="## State\nok\n## Decision needed\nnone"),
+        patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
@@ -172,7 +172,7 @@ def test_synthesize_no_sibling_for_amendment_triggers(trigger):
     captured_options: list = []
 
     with (
-        patch("lapis_pm.brief.call_claude_cli", return_value="## State\nok\n## Decision needed\nnone"),
+        patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
         patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
         patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),

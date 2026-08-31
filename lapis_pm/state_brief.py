@@ -52,7 +52,7 @@ Temporal compression hierarchy (Gardener observations only):
 
 Models:
   morning / afternoon / live → call_llm (qwen3.6-35b-a3b, local GPU)
-  weekly                     → call_claude_cli(model="sonnet") via Max sub
+  weekly                     → call_gw_agent (local seat, gravitywell-slot1)
 
 Dry-run gate:
   LAPIS_BRIEF_DRY_RUN=1 skips the LLM call and writes a placeholder.
@@ -1220,13 +1220,20 @@ def _generate_prose(period: str, buckets: dict[str, list[str]], start_label: str
 
     if period == "weekly":
         prompt = build_weekly_prompt(buckets, start_label)
-        from agents_core.llm import call_claude_cli
-        result = call_claude_cli(
-            prompt=prompt,
-            system=WEEKLY_SYSTEM,
-            model="sonnet",
-            timeout=300,
-        )
+        try:
+            from agents_core.gw_agent import call_gw_agent
+            result = call_gw_agent(
+                prompt=prompt,
+                system=WEEKLY_SYSTEM,
+                writeable=False,
+                json_mode=False,
+                max_steps=1,
+                timeout=300,
+                on_wake_fail="skip",
+            )
+        except Exception as exc:
+            logger.warning("state_brief: call_gw_agent error: %s", exc)
+            result = None
     else:
         prompt = build_daily_prompt(buckets, start_label)
         from agents_core.llm import call_llm

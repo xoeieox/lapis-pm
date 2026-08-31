@@ -9,9 +9,10 @@ Output tree under /srv/lapis/trajectory/:
 Storage invariant: /srv/lapis/trajectory/ NOT /srv/lapis/lapis-state/.
 Qwen-narrated derivative content stays out of the RoomRAG-indexed corpus.
 
-LLM calls go through agents_core.llm:
+LLM calls go through agents_core.llm / agents_core.gw_agent:
   call_llm()        — Qwen 3.6 (default)
-  call_claude_cli() — Haiku (only when LAPIS_TRAJECTORY_MONTHLY_MODEL=haiku)
+  call_gw_agent()   — local seat (when LAPIS_TRAJECTORY_MONTHLY_MODEL=haiku;
+                      the local route takes precedence per the re-point spec)
 
 Dry-run gate: LAPIS_TRAJECTORY_DRY_RUN=1 skips LLM calls and writes placeholder
 one_liner: "(dry run)". Read inside this module at LLM call site.
@@ -87,11 +88,27 @@ def _call_qwen(prompt: str, system: str) -> str | None:
 
 
 def _call_haiku(prompt: str, system: str = "") -> str | None:
-    """Call Haiku via agents_core.llm.call_claude_cli. Returns text or None."""
+    """Call the local seat via call_gw_agent. Returns text or None.
+
+    Legacy name kept for the LAPIS_TRAJECTORY_MONTHLY_MODEL=haiku gate; the
+    local route takes precedence per lapis-pm-prose-synthesis-local-repoint-v0.
+    """
     if _dry_run():
         return "(dry run)"
-    from agents_core.llm import call_claude_cli
-    return call_claude_cli(prompt, system=system, model="haiku", timeout=300)
+    try:
+        from agents_core.gw_agent import call_gw_agent
+        return call_gw_agent(
+            prompt=prompt,
+            system=system,
+            writeable=False,
+            json_mode=False,
+            max_steps=1,
+            timeout=300,
+            on_wake_fail="skip",
+        )
+    except Exception as exc:
+        logger.warning("trajectory: call_gw_agent error: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

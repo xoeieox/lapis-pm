@@ -17,7 +17,6 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from agents_core.llm import call_claude_cli
 from agents_core.room_paths import room_path, room_str
 
 logger = logging.getLogger(__name__)
@@ -133,14 +132,26 @@ def generate_arc_doc(target_id: str, extra_origin_note: str | None = None) -> Ar
         f"Full thread chronology (oldest first):\n{episodes_block}\n"
     )
 
-    body = call_claude_cli(
-        prompt=user, system=ARC_DOC_SYSTEM,
-        model="haiku", timeout=180, log=logger.warning,
-    )
+    served_model_out: list = []
+    try:
+        from agents_core.gw_agent import call_gw_agent
+        body = call_gw_agent(
+            prompt=user,
+            system=ARC_DOC_SYSTEM,
+            writeable=False,
+            json_mode=False,
+            max_steps=1,
+            timeout=180,
+            on_wake_fail="skip",
+            served_model_out=served_model_out,
+        )
+    except Exception as exc:
+        logger.warning("land: call_gw_agent error: %s", exc)
+        body = None
     if not body:
         body = (
             f"# {target_id} — Arc Doc\n\n"
-            "## Origin\nArc doc synthesis failed — Haiku call returned empty.\n\n"
+            "## Origin\nArc doc synthesis failed — local seat returned no text.\n\n"
             f"## Landing summary\nFallback dump of thread chronology:\n\n{episodes_block}\n"
         )
 
@@ -148,11 +159,19 @@ def generate_arc_doc(target_id: str, extra_origin_note: str | None = None) -> Ar
         body = _append_origin_note(body, extra_origin_note)
 
     # Prepend a tiny YAML frontmatter so RoomRAG / Kami can tag arc docs cleanly.
+    # Provenance truth-integrity: record the ACTUAL seat that produced the body
+    # (from call_gw_agent's served_model_out), or an explicit 'local-seat-
+    # unavailable' marker when the seat produced no text. Never a model name
+    # that did not actually run.
+    prov_label = (
+        str(served_model_out[-1]) if served_model_out else "local-seat-unavailable"
+    )
     frontmatter = (
         "---\n"
         f"target_id: {target_id}\n"
         f"generated: {now}\n"
         f"comment_count: {len(comments)}\n"
+        f"model: {prov_label}\n"
         "kind: arc-doc\n"
         "---\n\n"
     )

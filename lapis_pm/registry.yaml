@@ -61,20 +61,24 @@ shared_preamble: |
 # posture and the 2026-07-15/16 retirements are superseded; the fixer pair
 # joined the local tier 2026-08-21 (deadline stopgap, see the pair comment
 # below) and moved to the berth (the standing NInfer 27B fixer seat on
-# GPU 1 / 3090 Ti, host port :8082) 2026-08-24 - the durable answer to that
-# stopgap (spec gw-gpu1-berth-standing-seat-v0, leg 3). The first flip
-# (PR #302) merged but was REVERTED the same day (PR #304): the agents-core
-# shaper never carried swarm_payload registry->spec, so the first berth
-# dispatch 400'd (admissions were NOT a cause - mem
+# GPU 1 / 3090 Ti, host port :8082) 2026-08-24 (spec
+# gw-gpu1-berth-standing-seat-v0, leg 3). The first flip (PR #302) merged
+# but was REVERTED the same day (PR #304): the agents-core shaper never
+# carried swarm_payload registry->spec, so the first berth dispatch 400'd
+# (admissions were NOT a cause - mem
 # correction/gpu1-berth-defect2-misattributed-2026-08-24). The shaper fix
-# (agents-core PR #256, merge commit 5dc2216) deployed 2026-08-24 and this
-# re-flip lands the flip with the encode link proven. model is passed
+# (agents-core PR #256, merge commit 5dc2216) deployed 2026-08-24 and the
+# re-flip (PR #305) landed with the encode link proven. The berth flip was
+# reversed 2026-08-29 (PR #308 stopgap pause) and ratified 2026-08-31 as
+# the durable GPU0 default - the berth is dormant until on-demand overflow
+# (see the block above the fixer entry). model is passed
 # straight into the /v1/chat/completions request body and validated by the
 # model server. On the vLLM seats it must be a slot alias (e.g.
 # gravitywell-slot1), never a concrete model id: a concrete id gets rejected
 # by vLLM, call_gw_agent returns None, and shaped_runner's `result or ""`
-# turns that into a silent empty-string success. The berth seat is the one
-# exception: its model is the NInfer --model-id (ninfer-27b) because the
+# turns that into a silent empty-string success. The berth seat (on-demand
+# overflow only) is the one exception: its model is the NInfer --model-id
+# (ninfer-27b) because the
 # NInfer engine's /v1/models serves that exact id (leg-1 DoD capture). See
 # lapis-pm-spec-review-leg-hotfix-reconcile-v0.
 
@@ -401,29 +405,47 @@ agents:
       No prose outside the JSON.
     timeout_s: 1800
 
-  # Stopgap pause (2026-08-29, Erah-directed): fixer + fixer_retry run the
-  # STOPGAP shape - the fully-proven full-payload path on the vLLM seat at
-  # :8081 (model gravitywell-slot1, NO backend_url, NO swarm_payload). The
-  # berth (the standing NInfer 27B seat on GPU 1 / 3090 Ti at host port
-  # :8082; spec gw-gpu1-berth-standing-seat-v0, leg 3) is DOWN for the
-  # 2026-08-29 night: Erah will leave it down and may repurpose GPU 1 for
-  # ComfyUI. GPU 0 / :8081 is NOT the new default - this is a deliberate
-  # operational pause for the current dispatches, not a redefinition of the
-  # durable seat. Re-flip ONLY when the berth is back up: restore on BOTH
-  # entries model: ninfer-27b + backend_url: http://203.0.113.11:8082 +
-  # swarm_payload: true (keep-both: acquire_lease stays at the default
-  # true). The stopgap shape is pinned by
-  # tests/test_registry_berth_shape.py; a premature re-flip fails loudly
-  # there. The flip activates ONLY at merge (deploy hook ships registry.
-  # yaml), so a held merge = zero behavioral change. Provenance: first flip
-  # PR #302, reverted PR #304 pending the agents-core shaper fix (merged PR
-  # #256 / 5dc2216), re-flipped PR #305 (ff23355) after the encode link was
-  # proven end-to-end; this stopgap pause is the 2026-08-29 operational
-  # reversal of PR #305.
+  # GPU0 default (durable, ratified 2026-08-31): fixer + fixer_retry run
+  # the fully-proven full-payload path on the vLLM seat at :8081 (model
+  # gravitywell-slot1, NO backend_url, NO swarm_payload). This is the
+  # durable default, not a pause: the big-model-on-GPU0 premise that drove
+  # the 2026-08-24 berth flip is dead (27B is the daily driver), and the
+  # 2026-08-29 stopgap pause (PR #308) made this shape the standing one.
+  # The berth (the NInfer 27B seat on GPU 1 / 3090 Ti at host port :8082;
+  # spec gw-gpu1-berth-standing-seat-v0) is DORMANT BY DEFAULT: the
+  # ninfer-fixer unit is disabled (no auto-start) and GPU 1 may be
+  # repurposed (ComfyUI). The berth is the ON-DEMAND OVERFLOW seat,
+  # activated only when GPU 0 / :8081 is loaded:
+  #   activate: ssh gravitywell sudo systemctl start ninfer-fixer; wait for
+  #     :8082/health 200; then in the DEPLOY CLONE registry
+  #     (/srv/git/lapis-pm/lapis_pm/registry.yaml - the ticks read the
+  #     deploy clone; a fresh Type=oneshot process per fire re-imports it,
+  #     so no restart) re-point BOTH fixer + fixer_retry to the berth
+  #     block: model: ninfer-27b + backend_url: http://203.0.113.11:8082
+  #     + swarm_payload: true (acquire_lease stays at the default true -
+  #     keep-both). The next timer fire or a force-dispatch picks up the
+  #     re-pointed seat.
+  #   revert: restore the GPU0 lines on BOTH entries + ssh gravitywell
+  #     sudo systemctl stop ninfer-fixer.
+  # WARNING (clobber): a merge while the overflow is active ships the
+  # committed GPU0 default and silently reverts the live seat (the repo
+  # default wins on deploy) - the PM host-activation step verifies the
+  # deploy clone still holds the intended seat and re-applies the berth
+  # block post-deploy if the overflow is still active. The GPU0-default
+  # shape is pinned by tests/test_registry_fixer_seat.py; a re-point to
+  # the berth (ninfer-27b / :8082 / swarm_payload) is only correct as a
+  # deliberate, reviewed on-demand overflow edit of the DEPLOY CLONE -
+  # never as a repo commit. Provenance: local-tier stopgap 2026-08-21
+  # (spec lapis-pm-fixer-local-stopgap-flip-v0), berth flip PR #302
+  # reverted PR #304 pending the agents-core shaper fix (merged PR #256 /
+  # 5dc2216), re-flipped PR #305 (ff23355) after the encode link was
+  # proven end-to-end, stopgap pause PR #308 (2026-08-29 Erah-directed),
+  # durable GPU0 default ratified 2026-08-31 (berth dormant until
+  # on-demand - Erah decision).
   fixer:
     chub_bundles: []
     engine: local-fixer      # was: claude
-    model: gravitywell-slot1 # stopgap (berth ninfer-27b down for the 2026-08-29 night - see block above)
+    model: gravitywell-slot1 # GPU0 durable default (berth is on-demand overflow - see block above)
     capture_meta: true
     notify: true
     notify_policy: infra-only
@@ -560,21 +582,23 @@ agents:
     timeout_s: 2700
 
   # fixer_local (below) is the intentional opt-in local tier. fixer + fixer_retry
-  # are the STOPGAP pair (gravitywell-slot1 on :8081) - initial attempt and
-  # correction attempt at the same capability tier. The berth flip 2026-08-24
+  # are the GPU0-DEFAULT pair (gravitywell-slot1 on :8081) - initial attempt and
+  # correction attempt at the same capability tier. Durable default ratified
+  # 2026-08-31 (berth dormant until on-demand): the 2026-08-24 berth flip
   # (PR #305, spec gw-gpu1-berth-standing-seat-v0, leg 3) was reversed
-  # 2026-08-29 (Erah-directed operational pause): the berth seat (GPU 1 /
-  # 3090 Ti, :8082) is down for the night and GPU 1 may be repurposed to
-  # ComfyUI. The stopgap shape (no backend_url / swarm_payload) is pinned by
-  # tests/test_registry_berth_shape.py; the re-flip re-points BOTH entries
-  # back to the berth (see the block above the fixer entry).
+  # 2026-08-29 by the stopgap pause (PR #308) and the stopgap shape became
+  # the durable shape. The GPU0-default shape (no backend_url /
+  # swarm_payload) is pinned by tests/test_registry_fixer_seat.py; the
+  # on-demand berth overflow re-points BOTH entries in the DEPLOY CLONE
+  # only (see the block above the fixer entry) - a repo re-point to the
+  # berth is a deliberate, reviewed overflow change, not a default.
   # Any future tier push must not re-capture one half of this pair without
   # touching the other; see test_registry_agent_tiers.py.
   # First live local-fixer dispatch completed 2026-08-22 (post-merge verification).
   fixer_retry:
     chub_bundles: []
     engine: local-fixer      # was: claude
-    model: gravitywell-slot1 # stopgap (berth ninfer-27b down for the 2026-08-29 night - see fixer block above)
+    model: gravitywell-slot1 # GPU0 durable default (berth is on-demand overflow - see fixer block above)
     capture_meta: false
     notify: false
     system_template: |

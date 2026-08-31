@@ -64,19 +64,20 @@ def test_fixer_and_fixer_retry_share_engine_and_model(agents):
     )
 
 
-def test_fixer_and_fixer_retry_currently_on_local_27b(agents):
+def test_fixer_and_fixer_retry_currently_on_gpu0_slot1(agents):
     """Pins the expected tier so a silent change of BOTH blocks together
     (which the parity test alone would not catch) still fails loudly.
 
-    Flipped from claude/sonnet to local-fixer/gravitywell-slot1 2026-08-21
-    as the deadline stopgap for the Claude Max end (spec:
-    lapis-pm-fixer-local-stopgap-flip-v0). The 2026-08-24 berth flip (spec:
-    gw-gpu1-berth-standing-seat-v0, leg 3) was reversed 2026-08-29 (Erah-
-    directed operational pause - berth down for the night, GPU 1 may become
-    ComfyUI) - so the pair is back on the stopgap until the re-flip PR lands,
-    which updates this pin to ninfer-27b with it. The stopgap/berth shape
-    keys are pinned by tests/test_registry_berth_shape.py; this test pins
-    engine + model only."""
+    The GPU0 durable default (ratified 2026-08-31, berth dormant until
+    on-demand): the pair is on local-fixer/gravitywell-slot1 (the
+    2026-08-21 stopgap shape became the durable default after the
+    2026-08-24 berth flip - PR #305, spec
+    gw-gpu1-berth-standing-seat-v0, leg 3 - was reversed 2026-08-29 by PR
+    #308; the berth is the on-demand overflow seat only). A repo re-point
+    of BOTH entries to ninfer-27b would be a reviewed overflow change, not
+    a default - on-demand overflow re-points the DEPLOY CLONE only. The
+    shape keys are pinned by tests/test_registry_fixer_seat.py; this test
+    pins engine + model only."""
     assert agents["fixer"]["engine"] == "local-fixer"
     assert agents["fixer"]["model"] == "gravitywell-slot1"
     assert agents["fixer_retry"]["engine"] == "local-fixer"

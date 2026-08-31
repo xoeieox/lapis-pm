@@ -97,7 +97,6 @@ def _call_haiku(prompt: str, system: str = "") -> str | None:
         return "(dry run)"
     try:
         from agents_core.gw_agent import call_gw_agent
-        served_model_out: list = []
         return call_gw_agent(
             prompt=prompt,
             system=system,
@@ -106,7 +105,6 @@ def _call_haiku(prompt: str, system: str = "") -> str | None:
             max_steps=1,
             timeout=300,
             on_wake_fail="skip",
-            served_model_out=served_model_out,
         )
     except Exception as exc:
         logger.warning("trajectory: call_gw_agent error: %s", exc)

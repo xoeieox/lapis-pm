@@ -9,6 +9,22 @@ seam directive: "present the shadow log grouped by proposed
 classification"), and deposits exactly ONE Desk gem via weaver's
 decision-gems endpoint, deposited_by="hold-shadow-observer-v0".
 
+Deposit reliability (lapis-pm-hold-shadow-summary-retry-v0): the deposit
+POST is wrapped in a bounded retry ladder. Rationale: the Persistent timer
+re-fires a missed elapse at boot, and on 2026-08-20 that catch-up fired
+~1s after BRIX woke from suspend, before user-scope weaver-server was
+listening - one silent failure line, no retry, a whole week without the
+desk card. The ladder makes up to MAX_DEPOSIT_ATTEMPTS network calls, all
+to the same single /v0/decision-gems endpoint; success is defined as the
+attempt completing without exception (its return value, which may be None
+for a 2xx body lacking gem_id, is returned immediately - a completed
+response is never retried), so a healthy run still deposits exactly once.
+Known-deferred LOW: if an attempt times out AFTER weaver committed the row
+(response lost), the next attempt deposits a duplicate gem with the same
+title - visible on the desk, not silent corruption. This deferral is valid
+ONLY while the weaver endpoint lacks an idempotency key; revisit if weaver
+dedup lands.
+
 Isolation (same invariants as hold_shadow.py — see that module's
 docstring): reads only its own JSONL files under /srv/lapis/hold-shadow/, writes
 nothing to mem, and critically never writes a pm/brief-gem/map/<gem_id> key
@@ -22,11 +38,25 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 DEPOSITED_BY = "hold-shadow-observer-v0"
 _BRIX_DEFAULT = "http://203.0.113.10:8403"  # prod-only fallback, same default as brief_gem.py
+
+# Retry ladder (lapis-pm-hold-shadow-summary-retry-v0). Module globals (not
+# hard-coded) so tests can monkeypatch them down to zero-delay / few-attempt
+# values. RETRY_DELAY_SEC rationale: the observed boot-race window was ~6s
+# (BRIX wake 07:28:10, weaver-server listening by 07:28:16-17 on 2026-08-20);
+# 15s leaves margin for variable boot load. Worst-case wall time is
+# MAX_DEPOSIT_ATTEMPTS x 10s per-attempt timeout + (MAX-1) x 15s sleeps =
+# 110s, comfortably inside the unit's TimeoutStartSec=300; connection-refused
+# (the actual boot-race mode) fails instantly, so the realistic ladder is
+# ~60s of sleeps.
+MAX_DEPOSIT_ATTEMPTS = 5
+RETRY_DELAY_SEC = 15.0
 
 
 def _room_root() -> Path:
@@ -165,19 +195,43 @@ def run_thursday_summary() -> str | None:
     """Deposit exactly one Desk gem for this morning's read. Returns the
     gem_id on success, or None on any failure (fail-soft: never raises out
     of this function; the caller's exit code carries the failure signal
-    instead — see cli.py's hold-shadow-summary subcommand)."""
+    instead — see cli.py's hold-shadow-summary subcommand).
+
+    The deposit POST runs as a bounded retry ladder (lapis-pm-hold-shadow-
+    summary-retry-v0): up to MAX_DEPOSIT_ATTEMPTS attempts against the same
+    single endpoint, RETRY_DELAY_SEC apart, with one stderr line per failed
+    attempt (exception class name only - no message content) so the systemd
+    journal shows a visible ladder instead of one silent line. Success is
+    defined as an attempt completing without exception; its return value
+    (which may be None for a 2xx body lacking gem_id) is returned
+    immediately and never retried."""
     gate_outcomes = _read_jsonl(hold_shadow_dir() / "gate-outcomes.jsonl")
     hold_facts = _read_jsonl(hold_shadow_dir() / "hold-facts.jsonl")
     enforce_outcomes = _read_jsonl(hold_shadow_dir() / "enforce-outcomes.jsonl")
     summary = build_summary(gate_outcomes, hold_facts, enforce_outcomes)
     payload = _render_gem_payload(summary)
 
-    try:
-        import httpx
-        base = _weaver_base_url()
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.post(f"{base}/v0/decision-gems", json=payload)
-            resp.raise_for_status()
-            return resp.json().get("gem_id")
-    except Exception:
-        return None
+    import httpx
+
+    for attempt in range(1, MAX_DEPOSIT_ATTEMPTS + 1):
+        try:
+            base = _weaver_base_url()
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(f"{base}/v0/decision-gems", json=payload)
+                resp.raise_for_status()
+                return resp.json().get("gem_id")
+        except Exception as exc:
+            if attempt < MAX_DEPOSIT_ATTEMPTS:
+                print(
+                    f"hold-shadow-summary: deposit attempt {attempt}/{MAX_DEPOSIT_ATTEMPTS} "
+                    f"failed ({type(exc).__name__}); retrying in {RETRY_DELAY_SEC:g}s",
+                    file=sys.stderr,
+                )
+                time.sleep(RETRY_DELAY_SEC)
+            else:
+                print(
+                    f"hold-shadow-summary: deposit failed after {MAX_DEPOSIT_ATTEMPTS} "
+                    f"attempts ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+                return None

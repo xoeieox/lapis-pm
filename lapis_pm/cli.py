@@ -770,6 +770,16 @@ def _print_target_status(t, explain: bool = False):
                 print(f"  last-verdict:  {verdict}"
                       + (f", {issues} issue(s)" if verdict == "fixable" else ""))
 
+            # Panel-health line (lapis-pm-panel-leg-survival-v0, Change 4):
+            # starved count over the last 5 reviewer verdicts for the active
+            # PR, with the union of legs_down. Renders only when the
+            # active-review block renders (no open PR / Forgejo down -> no
+            # line); a PR with no completed verdicts -> no line.
+            panel = _pm._panel_health_summary(t.id, review_state["pr_number"])
+            if panel:
+                legs_text = ", ".join(panel["legs"]) or "-"
+                print(f"  panel:         {panel['starved']}/{panel['total']} starved (legs: {legs_text})")
+
         # R3 (lapis-pm-reviewer-defer-backoff-v0): rendered independently of
         # review_state above — during an active backoff the failed attempt
         # has no pending reviewer and no verdict yet, exactly the shape

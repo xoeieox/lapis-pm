@@ -301,6 +301,16 @@ def run_local_reviewer_witness(
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": 4096,
+            # Thinking-disable (lapis-pm-panel-leg-survival-v0, D1): the local
+            # seat serves a thinking model behind a vLLM reasoning parser.
+            # Without this field the model spends its entire 4096-token output
+            # budget in the reasoning channel and is cut off (finish_reason=
+            # length) before emitting a single content token — the reproduced
+            # production failure (measurement arm A, 2026-09-01). Arm B proves
+            # the fix on the same seat: 7.9s, 591 tokens, reasoning_tokens=0,
+            # valid complete verdict JSON. max_tokens stays 4096 — it is a
+            # runaway guard, not a size estimate (Erah, 2026-08-12).
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if model is not None:
             body["model"] = model

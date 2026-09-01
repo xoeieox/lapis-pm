@@ -249,12 +249,41 @@ _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _L
 # same day, measured to parse cleanly at this budget.
 _MAX_TOKENS = 4096
 
-# Node 2 — MacBook Pro M4 Max / Gemma-3-27b (MLX, port 8080)
-# Architecturally distinct from GravityWell Qwen (formerly StarHouse Qwen, repointed
-# 2026-08-05 after StarHouse's 2026-08-03 kernel panic); used for parallel corroboration.
-_NODE2_URL = "http://100.124.203.15:8080/v1/chat/completions"
-_NODE2_MODEL = "/Users/user/Tools/mlx-models/gemma-3-27b-it-4bit"
-_NODE2_TIMEOUT = 120  # MLX on M4 Max is slower than StarHouse llama.cpp; large prompts approach 60s
+# Node 2 — Phala TEE (unguarded direct path), deepseek/deepseek-v4-flash-0731.
+# Re-pointed 2026-09-01 (lapis-pm-panel-leg-survival-v0, D3; tenancy ratified by
+# Erah 2026-09-01): the previous substrate — a MacBook Pro (MLX, 100.124.203.15:8080,
+# the May 2026 mesh-milestone witness) — sleeps and drops off the tailnet when
+# asleep, so the panel's only independent substrate was the least reliable machine
+# in the fleet. Phala is a different host, model family and engine, always-on.
+# Tenancy basis (code review only): the node2 prompt is CODE-ONLY — the diff
+# excerpt + repo grep hits, never vault content (`include_vault=False`, pinned
+# by test); one outside caller is acceptable; local-first is preserved (two of
+# three legs stay local). The unguarded direct path is the operator's choice:
+# the sealed :8413 proxy is one-mode-at-a-time and carries interactive-session
+# failure modes. Known-degradation cause: transient upstream 502 bursts — the
+# leg then fails closed (substrate_unavailable), which is the safe direction.
+# The API key comes from the PHALA_API_KEY environment variable (read at call
+# time, node2 path only — see _phala_api_key); its value lives only in
+# /data/agents/config/phala.env and must never appear in any notes/error/claim.
+_NODE2_URL = "https://inference.phala.com/v1/chat/completions"
+_NODE2_MODEL = "deepseek/deepseek-v4-flash-0731"
+# 120s stays a runaway guard, not a size estimate: arm E measured 15.3s on a
+# 1,838-char prompt (7.8x margin); the production node2 prompt is code-bounded
+# (~15-16k chars worst case: diff[:2500] + 10 identifiers x 3 repo hits, 200
+# chars each, vault excluded) — >=4x margin at worst case.
+_NODE2_TIMEOUT = 120
+
+
+def _phala_api_key() -> str | None:
+    """Read the Phala API key at call time (node2 path only).
+
+    Same call-time-vs-import-time discipline as _llm_url/LOCAL_LLM_URL. The
+    value lives only in /data/agents/config/phala.env (600, daemon user); this
+    function references the env var name, never a key value. Returns None when
+    unset — the caller fails the node2 leg closed (substrate_unavailable with
+    a note naming PHALA_API_KEY) without touching the local legs.
+    """
+    return os.environ.get("PHALA_API_KEY")
 
 # Grammar constraint, copied from local_reviewer_witness.py's REVIEWER_JSON_SCHEMA
 # shape — proven on this exact GravityWell seat 2026-08-12 (measured FASTER than no
@@ -332,10 +361,18 @@ class LapisPMReviewerAdapter:
         node_url: str | None = None,
         node_model: str | None = None,
         node_timeout: int | None = None,
+        include_vault: bool = True,
     ) -> CorroborationResult:
         """Single LLM call to check identifier claims against substrate.
 
         Returns uncertain if no identifiers or LLM unavailable.
+
+        include_vault=False omits vault grep hits from the prompt (the node2
+        tenancy constraint — code-only content, never vault docs). This is a
+        build-time guard in the prompt loop below: the passed `substrates` list
+        is NEVER mutated (it is built once and read by both concurrent scoring
+        threads — a mutation would non-deterministically strip vault lines from
+        node1's prompt).
         """
         scope_id = f"repo:{repo}"
         now = datetime.now(timezone.utc).isoformat()
@@ -363,7 +400,7 @@ class LapisPMReviewerAdapter:
                     )
             else:
                 substrate_lines.append("  (not found in repo)")
-            if s.vault_hits:
+            if include_vault and s.vault_hits:
                 for h in s.vault_hits[:2]:
                     substrate_lines.append(
                         f"  vault:{h['file']}:{h['line']}: {h['text']}"
@@ -396,6 +433,17 @@ class LapisPMReviewerAdapter:
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": _MAX_TOKENS,
+                # Thinking-disable (lapis-pm-panel-leg-survival-v0, D2): the
+                # node1 seat is the same local thinking-model substrate as the
+                # witness; without this field it burns 84% of its tokens in
+                # reasoning on small prompts and the tail exceeds the 45s
+                # guard under seat load (measurement arms C/D, 2026-09-01).
+                # The field rides this shared body to node2/Phala as well —
+                # verified accepted there (arm E2: HTTP 200, 2026-09-01); it is
+                # a no-op on the non-thinking node2 substrate. Any future
+                # node2 re-point must re-verify field acceptance: the one-retry
+                # 4xx degrade drops the grammar, not this field.
+                "chat_template_kwargs": {"enable_thinking": False},
             }
             if node_model:
                 body["model"] = node_model
@@ -415,6 +463,34 @@ class LapisPMReviewerAdapter:
             _url = node_url or _llm_url()
             _timeout = node_timeout or _LLM_TIMEOUT
 
+            # Phala key gate (lapis-pm-panel-leg-survival-v0, Change 2): the
+            # PHALA_API_KEY read and the Authorization header live on the
+            # node2 path only (gated on the Phala origin). Node1 and the
+            # witness never read the key, so a daemon env missing it takes
+            # down node2 only, never the local legs. Absent key fails closed
+            # with a greppable note naming the env var — never the value.
+            _headers: dict[str, str] = {}
+            if _url.startswith("https://inference.phala.com"):
+                _phala_key = _phala_api_key()
+                if not _phala_key:
+                    self._last_model = None
+                    self._last_prompt_hash = None
+                    return CorroborationResult(
+                        verdict="uncertain",
+                        claim="(substrate unavailable)",
+                        citations=[],
+                        freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                        scope_id=scope_id,
+                        drift_class=None,
+                        notes=(
+                            f"PHALA_API_KEY not set in daemon env — node2 "
+                            f"({_url}) failed closed without a call; local "
+                            f"legs unaffected"
+                        ),
+                        leg_status="substrate_unavailable",
+                    )
+                _headers["Authorization"] = f"Bearer {_phala_key}"
+
             if not node_reachable(_url, timeout=_PROBE_TIMEOUT):
                 self._last_model = None
                 self._last_prompt_hash = None
@@ -429,14 +505,14 @@ class LapisPMReviewerAdapter:
                     leg_status="substrate_unavailable",
                 )
 
-            resp = httpx.post(_url, json=_build_body(True), timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
+            resp = httpx.post(_url, json=_build_body(True), headers=_headers, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
             if resp.status_code in (400, 422):
                 # Grammar-not-supported vs validation-failed, per the precedent at
                 # local_reviewer_witness.py:330-345: an HTTP 4xx on the first
                 # (grammar-carrying) attempt means the endpoint rejects json_schema —
                 # degrade to a plain call rather than hard-failing a seat that can't
-                # take the grammar (e.g. node2/MLX). One retry, never a hard fail.
-                resp = httpx.post(_url, json=_build_body(False), timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
+                # take the grammar. One retry, never a hard fail.
+                resp = httpx.post(_url, json=_build_body(False), headers=_headers, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
             resp.raise_for_status()
             resp_json = resp.json()
 
@@ -622,13 +698,14 @@ def run_corroboration_pass(
 ) -> dict:
     """Run the corroboration follow-up pass on a PR diff.
 
-    Dispatches to StarHouse (primary) and MacBook/Node2 (witness) in parallel.
+    Dispatches to the local GW seat (primary) and the Phala TEE (node2,
+    re-pointed 2026-09-01 — see the _NODE2_URL block) in parallel.
     Returns a dict suitable for attaching as `corroboration_result` to the
     reviewer verdict JSON. Never raises — returns uncertain-shaped dict on any
     error (Compost invariant: all outputs are nutrients).
 
     Added fields beyond v0 shape:
-      node2_corroboration: CorroborationResult dict from MacBook/Gemma, or None
+      node2_corroboration: CorroborationResult dict from the Phala TEE, or None
       cross_node_divergence: "agree" | "diverge" | "node2_unavailable"
     """
     import concurrent.futures
@@ -655,6 +732,10 @@ def run_corroboration_pass(
                 node_url=_NODE2_URL,
                 node_model=_NODE2_MODEL,
                 node_timeout=_NODE2_TIMEOUT,
+                # Code-only tenancy constraint (Erah, 2026-09-01): the outside
+                # caller never sees vault content — diff excerpt + repo grep
+                # hits only. Build-time guard; `substrates` is not mutated.
+                include_vault=False,
             )
         except Exception as exc:
             return _make_uncertain(repo, f"Node2 error: {type(exc).__name__}: {exc}")

@@ -8,6 +8,10 @@ User=user
 WorkingDirectory=/srv/git/lapis-pm
 ExecStart=/usr/bin/python3 -m lapis_pm.cli tick --all
 EnvironmentFile=-/data/agents/config/conductor.env
+# Phala TEE key for the node2 corroboration leg (lapis-pm-panel-leg-survival-v0,
+# Change 2). The `-` prefix makes a missing file non-fatal at unit start — node2
+# then fails closed per leg; the local legs never read this key.
+EnvironmentFile=-/data/agents/config/phala.env
 # /data/agents/scripts on PYTHONPATH is legacy — only needed for chub_broker until
 # it migrates out of conductor. shaper.py also adds this to sys.path defensively.
 Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages

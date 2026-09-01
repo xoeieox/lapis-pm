@@ -4925,6 +4925,46 @@ def _active_review_state(target_id: str, open_prs: list[dict]) -> dict | None:
     return None
 
 
+def _panel_health_summary(target_id: str, pr_number: int) -> dict | None:
+    """Panel-health line for `lapis-pm status` (lapis-pm-panel-leg-survival-v0,
+    Change 4): starved count over the last 5 reviewer verdicts for the active
+    PR, plus the union of legs_down across the starved ones.
+
+    Same episodic source and parsing rules as _last_review_verdict (tag
+    `pm:reviewer:pr={N}:cycle=*:verdict=`, JSON body after the first newline,
+    tag-fallback path included — the fallback verdict counts as starved via
+    the missing-blocks rule, gate-consistent). Returns None when the PR has no
+    completed reviewer verdicts (the line must not render then).
+    """
+    from . import panel_starvation as _panel_starvation
+
+    prefix = f"pm:reviewer:pr={pr_number}:cycle="
+    verdicts: list[dict] = []
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                verdict_val = t.split(":verdict=")[-1]
+                if verdict_val == "pending":
+                    continue
+                try:
+                    json_part = c.content.split("\n", 1)[-1].strip()
+                    verdicts.append(json.loads(json_part))
+                except (json.JSONDecodeError, IndexError):
+                    verdicts.append(
+                        {"verdict": verdict_val, "issues": [], "confidence": 0.0}
+                    )
+                break
+    if not verdicts:
+        return None
+    # The starved count and the legs union are over the full stored verdict
+    # list (all cycles for the PR); `total` is the display window size (last 5).
+    starved = [v for v in verdicts if _panel_starvation.verdict_is_starved(v)]
+    legs = sorted({
+        leg for v in starved for leg in _verdict_legs_down(v)
+    })
+    return {"starved": len(starved), "total": min(5, len(verdicts)), "legs": legs}
+
+
 def _active_reviewer_backoff(target_id: str, open_prs: list[dict]) -> dict | None:
     """Return the currently-active reviewer-infra-backoff state for status
     display (R3, lapis-pm-reviewer-defer-backoff-v0), or None.
@@ -6314,27 +6354,141 @@ def _noop_retry_escalation_marker_key(target_id: str, pr_number: int, cycle: int
     return f"pm/noop-retry-escalation/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
 
 
+# Simultaneous-blip window (lapis-pm-panel-leg-survival-v0, Change 3; Council
+# 2026-09-01-110546-fdaec4, Marcus's suggestion): two starved verdicts with
+# DISJOINT legs_down closer than this apart are labelled "transient panel
+# degradation (simultaneous blip)" — a common transient cause is the working
+# hypothesis and a simple retry is the suggested action. Farther apart (the
+# common case — review cycles are separated by a fixer round-trip, minutes+)
+# they are labelled "intermittent panel instability". 60s = one tick.
+PANEL_BLIP_WINDOW_SECONDS = 60
+
+# Cross-cycle window for the degraded predicate: the last min(3, available)
+# reviewer verdicts for the PR, including the current cycle.
+_PANEL_DEGRADED_WINDOW = 3
+
+
+def _reviewer_verdicts_by_cycle(target_id: str, pr_number: int) -> dict[int, dict]:
+    """Map reviewer cycle -> verdict dict for this PR, in `all_comments` order.
+
+    Same episodic source and parsing rules as _review_verdict_for_cycle (tag
+    prefix `pm:reviewer:pr={N}:cycle={C}:verdict=`, JSON body after the first
+    newline, tag-fallback path included). The tag-fallback verdict has no
+    `panel_starvation` block, so `verdict_is_starved` counts it as starved via
+    the missing-blocks rule — gate-consistent.
+    """
+    out: dict[int, dict] = {}
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            m = re.match(
+                r"^pm:reviewer:pr=%d:cycle=(\d+):verdict=(.+)$" % pr_number, t
+            )
+            if not m:
+                continue
+            cyc, verdict_val = int(m.group(1)), m.group(2)
+            if verdict_val == "pending":
+                continue
+            try:
+                json_part = c.content.split("\n", 1)[-1].strip()
+                out[cyc] = json.loads(json_part)
+            except (json.JSONDecodeError, IndexError):
+                out[cyc] = {"verdict": verdict_val, "issues": [], "confidence": 0.0}
+    return out
+
+
+def _verdict_legs_down(verdict: dict) -> list[str]:
+    """A verdict's `legs_down`: the stored `panel_starvation` annotation when
+    present, else recomputed via panel_starvation.starved_legs() (pre-annotation
+    verdicts)."""
+    from . import panel_starvation as _panel_starvation
+    pstarv = verdict.get("panel_starvation")
+    if pstarv is not None:
+        legs = pstarv.get("legs_down") or []
+        if legs:
+            return list(legs)
+    return _panel_starvation.starved_legs(verdict)
+
+
+def _panel_blip_window_seconds() -> float:
+    """Call-time read so tests can monkeypatch the value (same discipline as
+    the LOCAL_LLM_URL/PHALA_API_KEY env reads)."""
+    return float(os.environ.get("PANEL_BLIP_WINDOW_SECONDS", PANEL_BLIP_WINDOW_SECONDS))
+
+
+def _parse_comment_ts(c) -> datetime | None:
+    """Best-effort parse of a comment's `ts` field (ISO 8601, naive assumed
+    UTC). Returns None when unparseable — the caller treats that as
+    temporally-separated (the conservative label)."""
+    try:
+        return datetime.fromisoformat(str(c.ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _panel_degradation_label(
+    starved: list[dict],
+    cycle_by_verdict: dict[int, int],
+    comment_ts_by_cycle: dict[int, datetime | None],
+) -> str:
+    """Diagnostic label for a degraded panel (Council reclassification,
+    lapis-pm-panel-leg-survival-v0 Change 3):
+
+    - persistent: the same leg appears in the legs_down of >= 2 starved
+      verdicts — "persistent panel degradation", inspect that leg.
+    - intermittent: disjoint legs, temporally separated (beyond the blip
+      window) — "intermittent panel instability", inspect legs individually.
+    - simultaneous blip: disjoint legs, starved verdicts within
+      PANEL_BLIP_WINDOW_SECONDS of each other — "transient panel degradation
+      (simultaneous blip)", a simple retry is the suggested action.
+    """
+    leg_counts: dict[str, int] = {}
+    for v in starved:
+        for leg in set(_verdict_legs_down(v)):
+            leg_counts[leg] = leg_counts.get(leg, 0) + 1
+    if any(n >= 2 for n in leg_counts.values()):
+        return "persistent panel degradation"
+
+    # Disjoint legs across the starved verdicts: are they temporally separated?
+    timestamps = [
+        comment_ts_by_cycle.get(cycle_by_verdict.get(id(v), -1))
+        for v in starved
+    ]
+    known = [t for t in timestamps if t is not None]
+    if len(known) >= 2 and min(known) and max(known):
+        span = (max(known) - min(known)).total_seconds()
+        if span <= _panel_blip_window_seconds():
+            return "transient panel degradation (simultaneous blip)"
+    return "intermittent panel instability"
+
+
 def _escalate_noop_retry_if_degraded(target_id: str, rec: dict, pr_num) -> str | None:
     """Leg 3: escalate a no-op fixer_retry when the verdict that drove it was
-    degraded (starved panel, Leg 1) or carried a refuted absence claim (Leg 2).
+    starved (Leg 1) or carried a refuted absence claim (Leg 2).
 
-    That combination is strong evidence the verdict was false — the PR #220
-    incident is the worked example
-    (finding/reviewer-seat-false-high-finding-absence-from-diff-third-occurrence-2026-08-08):
-    the retry correctly found nothing to change and logged exactly this noop,
-    then the target sat at "reviewing cycle N/budget" with nothing scheduled
-    to advance it — indistinguishable from a stalled worker
-    (pattern-fixer-background-wait-stall) while having the opposite remedy: a
-    real stall has unaddressed valid issues and wants redispatch; this has
-    valid-looking invalid ones and wants a human overriding the verdict.
+    Ontology (Council reclassification, run 2026-09-01-110546-fdaec4): a
+    starved verdict is a VOID — the panel could not corroborate — not a
+    FALSEHOOD. No brief in any case may conclude "the verdict was false"; the
+    correct claim is about the process (corroboration failed), never about the
+    content (the verdict is wrong). The PR #220 incident remains the worked
+    example for the refuted-absence-claim branch (Leg 2); the starved branch
+    now reads cross-cycle context before drawing a conclusion.
+
+    Degraded predicate (broadened, Council): the panel is degraded and the
+    verdict unreliable iff at least two of the last min(3, available)
+    reviewer verdicts for this PR (including the current cycle) are starved —
+    same-leg or disjoint alike. The brief directs the operator to suspend
+    trust in the verdict and not gate on it (panel repair / PM second
+    opinion); it carries its own premise (starved count, cycle numbers, union
+    of legs_down) and a diagnostic label (persistent / intermittent /
+    simultaneous blip). R1 is untouched: this conclusion never gates or
+    auto-dispatches.
 
     Reuses the existing outstanding-brief mechanism (R3) rather than
     inventing a new state or surface — same shape as the
-    reviewer_infra_budget_exhausted worked example (pm_core.py :4395-area
-    decision, :7688-area action dispatch): a distinct named condition, an
-    idempotent marker so it fires exactly once per pr+cycle, and a
-    human-reachable escalation via brief.synthesize + _set_brief_outstanding
-    (the same call pm-pr-review already walks).
+    reviewer_infra_budget_exhausted worked example: a distinct named
+    condition, an idempotent marker so it fires exactly once per pr+cycle,
+    and a human-reachable escalation via brief.synthesize +
+    _set_brief_outstanding.
 
     Returns the action string if an escalation fired, else None (nothing to
     escalate — verdict was healthy and unrefuted — or already recorded).
@@ -6361,30 +6515,122 @@ def _escalate_noop_retry_if_degraded(target_id: str, rec: dict, pr_num) -> str |
     if _mem().get(marker_key):
         return None
 
+    # Cross-cycle window (Change 3): the last min(3, available) reviewer
+    # verdicts for this PR, including the current cycle, in all_comments
+    # order. The current cycle's verdict is the one just read.
+    by_cycle = _reviewer_verdicts_by_cycle(target_id, pr_number)
+    window_verdicts = list(by_cycle.values())[-_PANEL_DEGRADED_WINDOW:]
+    current_cycle = cycle
+    # The current cycle's verdict (just read) is always in the window — the
+    # window is the last min(3, available) verdicts INCLUDING this cycle.
+    if verdict_info not in window_verdicts:
+        window_verdicts = window_verdicts + [verdict_info]
+    window_verdicts = window_verdicts[-_PANEL_DEGRADED_WINDOW:]
+    starved_in_window = [
+        v for v in window_verdicts if _panel_starvation.verdict_is_starved(v)
+    ]
+
+    # Cycle number per verdict in the window (for the brief's premise).
+    cycle_by_verdict: dict[int, int] = {}
+    for c, v in by_cycle.items():
+        cycle_by_verdict.setdefault(id(v), c)
+    if id(verdict_info) not in cycle_by_verdict:
+        cycle_by_verdict[id(verdict_info)] = current_cycle
+
+    # Comment timestamps per cycle (for the blip-window label).
+    comment_ts_by_cycle: dict[int, datetime | None] = {}
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            m = re.match(r"^pm:reviewer:pr=%d:cycle=(\d+):verdict=" % pr_number, t)
+            if m:
+                comment_ts_by_cycle.setdefault(int(m.group(1)), _parse_comment_ts(c))
+
+    label: str | None = None
+    if starved and len(starved_in_window) >= 2:
+        # Degraded: >= 2 of the window starved, same-leg or disjoint alike.
+        label = _panel_degradation_label(starved_in_window, cycle_by_verdict, comment_ts_by_cycle)
+
     reasons = []
     if starved:
-        legs = ", ".join((verdict_info.get("panel_starvation") or {}).get("legs_down") or [])
-        reasons.append(f"panel starved (legs down: {legs or 'unknown'})")
+        legs = ", ".join(_verdict_legs_down(verdict_info)) or "unknown"
+        reasons.append(f"panel starved on this cycle (legs down: {legs})")
     if refuted:
         reasons.append(f"{len(refuted)} absence claim(s) refuted against the PR-head file")
     reason_text = "; ".join(reasons)
 
+    if starved and label:
+        starved_cycles = sorted(
+            cycle_by_verdict.get(id(v), -1) for v in starved_in_window
+        )
+        cycle_range = (
+            f"{starved_cycles[0]}" if len(starved_cycles) == 1
+            else f"{starved_cycles[0]}-{starved_cycles[-1]}"
+        )
+        legs_union = sorted({
+            leg for v in starved_in_window for leg in _verdict_legs_down(v)
+        })
+        legs_union_text = ", ".join(legs_union) or "unknown"
+        premise = (
+            f"panel starved on {len(starved_in_window)} of last {len(window_verdicts)} "
+            f"verdicts, PR #{pr_number} (cycles {cycle_range}), legs down: "
+            f"{legs_union_text}"
+        )
+        if label == "persistent panel degradation":
+            diagnosis = (
+                "persistent panel degradation — a leg is down across multiple "
+                "cycles; inspect that leg and repair the panel"
+            )
+        elif label == "transient panel degradation (simultaneous blip)":
+            diagnosis = (
+                "transient panel degradation (simultaneous blip) — a common "
+                "transient cause is the working hypothesis; a simple retry is "
+                "the suggested action"
+            )
+        else:
+            diagnosis = (
+                "intermittent panel instability — disjoint legs across cycles; "
+                "inspect legs individually"
+            )
+        hold_text = (
+            f"PR #{pr_number} fixer retry (cycle {cycle}) made no code or "
+            f"description change, against a verdict that was starved. "
+            f"{premise}. {diagnosis}. Suspend trust in the verdict and do not "
+            f"gate on it — it is uncorroborated, not proven wrong; panel "
+            f"repair or PM second opinion, not an override of a false verdict."
+        )
+    elif starved:
+        # Single-cycle starved: the void framing without the degraded label.
+        legs = ", ".join(_verdict_legs_down(verdict_info)) or "unknown"
+        hold_text = (
+            f"PR #{pr_number} fixer retry (cycle {cycle}) made no code or "
+            f"description change, against a verdict that was starved. Panel "
+            f"starved on this cycle (legs down: {legs}); this verdict is "
+            f"uncorroborated — do not gate on it; it stands as advisory."
+        )
+    else:
+        hold_text = (
+            f"PR #{pr_number} fixer retry (cycle {cycle}) made no code or "
+            f"description change, against a verdict that was {reason_text}. "
+            f"The retry found nothing to change; a real stall has unaddressed "
+            f"valid issues, this has valid-looking invalid ones. Needs human "
+            f"judgment on the refuted finding(s)."
+        )
+
     episodic.write_hold(
         target_id,
-        f"PR #{pr_number} fixer retry (cycle {cycle}) made no code or description "
-        f"change, against a verdict that was {reason_text}. This is strong evidence "
-        f"the verdict was false, not that nothing is left to fix — a real stall has "
-        f"unaddressed valid issues, this has valid-looking invalid ones. Needs a "
-        f"human overriding the verdict, not a redispatch.",
+        content=hold_text,
         extra_tags=[f"pm:pr={pr_number}", "pm:noop-retry-degraded-verdict"],
     )
     b = brief.synthesize(
         target_id,
         trigger=(
-            f"No-op fixer retry against a degraded verdict on PR #{pr_number} "
-            f"cycle {cycle} ({reason_text}) — human judgment needed"
+            f"No-op fixer retry against a starved or refuted verdict on PR "
+            f"#{pr_number} cycle {cycle} ({reason_text}) — human judgment needed"
         ),
-        query=f"PR #{pr_number} no-op retry: verdict likely false ({reason_text})",
+        query=(
+            f"PR #{pr_number} no-op retry: verdict uncorroborated or refuted "
+            f"({reason_text})"
+        ),
         pr_number=pr_number,
         notify=NotifyPriority.HIGH,
     )
@@ -6396,6 +6642,7 @@ def _escalate_noop_retry_if_degraded(target_id: str, rec: dict, pr_num) -> str |
             "pr_number": pr_number,
             "cycle": cycle,
             "reasons": reasons,
+            "degraded_label": label,
             "comment_id": b.comment_id,
         }),
         tags=["lapis-pm", "noop-retry-escalation"],

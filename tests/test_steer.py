@@ -310,6 +310,30 @@ class TestInjectOverlay:
         assert "reprioritize: focus on X" in vars_["steer_directive_block"]
         mem.delete.assert_called_once()
 
+    def test_fixer_staged_with_overlay_sets_block_and_consumes(self):
+        """lapis-pm-fixers-harness-registry-v0 Leg 2: the fixer_staged agent_type
+        consumes the single-shot directive overlay (the mission fence rides the
+        steer channel into {steer_directive_block})."""
+        mem = self._mem_mock("```mission\npre_aimed: true\n```")
+        with patch("lapis_pm.steer._mem", return_value=mem), \
+             patch("lapis_pm.episodic.write_observation"):
+            from lapis_pm import steer
+            vars_ = {}
+            steer.inject_overlay("tid", vars_, "fixer_staged")
+        assert "pre_aimed: true" in vars_["steer_directive_block"]
+        assert "Active PM directive" in vars_["steer_directive_block"]
+        mem.delete.assert_called_once()
+
+    def test_fixer_staged_without_overlay_sets_empty_string(self):
+        mem = self._mem_mock(None)
+        with patch("lapis_pm.steer._mem", return_value=mem), \
+             patch("lapis_pm.episodic.write_observation"):
+            from lapis_pm import steer
+            vars_ = {}
+            steer.inject_overlay("tid", vars_, "fixer_staged")
+        assert vars_["steer_directive_block"] == ""
+        mem.delete.assert_not_called()
+
     def test_fixer_without_overlay_sets_empty_string(self):
         mem = self._mem_mock(None)
         with patch("lapis_pm.steer._mem", return_value=mem), \
@@ -425,6 +449,25 @@ class TestTemplateRenderGuard:
             tpl.format(**vars_)
         except KeyError as e:
             pytest.fail(f"fixer_retry template raised KeyError: {e}")
+
+    def test_fixer_staged_template_renders_with_overlay(self):
+        """lapis-pm-fixers-harness-registry-v0 Leg 2: the fixer_staged
+        system_template carries {steer_directive_block} and renders the
+        mission fence without KeyError."""
+        tpl = _load_template("fixer_staged")
+        assert "{steer_directive_block}" in tpl
+        vars_ = self._base_vars("```mission\npre_aimed: true\n```")
+        rendered = tpl.format(**vars_)
+        assert "pre_aimed: true" in rendered
+        assert "test-target-v0" in rendered
+
+    def test_fixer_staged_template_no_key_error_missing_overlay(self):
+        tpl = _load_template("fixer_staged")
+        vars_ = self._base_vars(None)
+        try:
+            tpl.format(**vars_)
+        except KeyError as e:
+            pytest.fail(f"fixer_staged template raised KeyError: {e}")
 
 
 # ---------------------------------------------------------------------------

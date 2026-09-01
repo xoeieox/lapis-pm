@@ -3175,7 +3175,12 @@ def force_dispatch(
     # Also resolve pr_number here for reviewer/reviewer_fresh/fixer_retry so cycle accounting
     # (_fixer_retry_count / _reviewer_cycle_count) can attribute force-dispatched records
     # to the correct PR, same as the daemon's own _act_dispatch_fixer_retry/_act_dispatch_reviewer.
-    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry",) + _REVIEWER_AGENT_TYPES and target.pm_repo:
+    # fixer_staged (lapis-pm-fixers-harness-registry-v0, Leg 2): a BARE entry here — it must
+    # resolve the parked PR's ref via this scan so the staged engine checks out the PR head,
+    # but it must NOT be added to _INITIAL_FIXER_TYPES (that constant also gates the
+    # open-PR ValueError guard above; extending it would block the staged dispatch against a
+    # parked PR).
+    if agent_type in _INITIAL_FIXER_TYPES + ("fixer_retry", "fixer_staged") + _REVIEWER_AGENT_TYPES and target.pm_repo:
         try:
             from agents_core.forgejo import get_open_prs as _get_open_prs
             repo_name, owner = _repo_owner(target.pm_repo)

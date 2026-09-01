@@ -207,13 +207,14 @@ def inject_overlay(target_id: str, vars_: dict, agent_type: str) -> None:
     """The ONE place that touches vars_['steer_directive_block'].
 
     ALWAYS sets the key so str.format(**vars_) never KeyErrors.
-    - For fixer / fixer_retry: consume the overlay (if any) and build the
-      directive block; write pm:steer:directive:consumed observation.
+    - For fixer / fixer_retry / fixer_staged: consume the overlay (if any)
+      and build the directive block; write pm:steer:directive:consumed
+      observation.
     - For all other agent types: set "" without consuming — the directive
       persists until a fixer dispatch picks it up.
     """
     from . import episodic
-    if agent_type in ("fixer", "fixer_retry"):
+    if agent_type in ("fixer", "fixer_retry", "fixer_staged"):
         overlay = consume_directive_overlay(target_id)
     else:
         overlay = None

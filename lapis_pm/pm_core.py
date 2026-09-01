@@ -4956,12 +4956,13 @@ def _panel_health_summary(target_id: str, pr_number: int) -> dict | None:
                 break
     if not verdicts:
         return None
-    window = verdicts[-5:]
-    starved = [v for v in window if _panel_starvation.verdict_is_starved(v)]
+    # The starved count and the legs union are over the full stored verdict
+    # list (all cycles for the PR); `total` is the display window size (last 5).
+    starved = [v for v in verdicts if _panel_starvation.verdict_is_starved(v)]
     legs = sorted({
         leg for v in starved for leg in _verdict_legs_down(v)
     })
-    return {"starved": len(starved), "total": len(window), "legs": legs}
+    return {"starved": len(starved), "total": min(5, len(verdicts)), "legs": legs}
 
 
 def _active_reviewer_backoff(target_id: str, open_prs: list[dict]) -> dict | None:
@@ -6617,7 +6618,7 @@ def _escalate_noop_retry_if_degraded(target_id: str, rec: dict, pr_num) -> str |
 
     episodic.write_hold(
         target_id,
-        hold_text,
+        content=hold_text,
         extra_tags=[f"pm:pr={pr_number}", "pm:noop-retry-degraded-verdict"],
     )
     b = brief.synthesize(

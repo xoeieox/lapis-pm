@@ -25,7 +25,12 @@ from lapis_pm.completion_text import ExtractedText, extract_completion_text
 from lapis_pm.node_probe import node_reachable
 
 _PROBE_TIMEOUT = 3    # seconds for connect probe before POST
-_CONNECT_TIMEOUT = 5  # seconds connect cap on POST (120s read budget preserved)
+# 300s read budget (lapis-pm-panel-leg-survival-v0 rev 4): sized by measurement,
+# not precaution — arm F1 measured 137.7s on the identical production shape
+# (35.5k-char witness prompt, thinking ON, 16,384 budget) on a loaded seat, so
+# 300s carries 2.2x at the measured point; the runaway-guard principle
+# (Erah, 2026-08-12) is preserved, applied to the new measurement.
+_CONNECT_TIMEOUT = 5  # seconds connect cap on POST (300s read budget preserved)
 
 
 def _default_endpoint() -> str:
@@ -240,7 +245,7 @@ def run_local_reviewer_witness(
     *,
     model: str | None = None,
     endpoint: str | None = None,
-    timeout: int = 120,
+    timeout: int = 300,
     max_diff_chars: int = 30000,
     max_spec_chars: int = 5000,
     _use_grammar: bool = True,      # internal; set False only in tests exercising parse-failure path
@@ -300,17 +305,15 @@ def run_local_reviewer_witness(
         body: dict = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 4096,
-            # Thinking-disable (lapis-pm-panel-leg-survival-v0, D1): the local
-            # seat serves a thinking model behind a vLLM reasoning parser.
-            # Without this field the model spends its entire 4096-token output
-            # budget in the reasoning channel and is cut off (finish_reason=
-            # length) before emitting a single content token — the reproduced
-            # production failure (measurement arm A, 2026-09-01). Arm B proves
-            # the fix on the same seat: 7.9s, 591 tokens, reasoning_tokens=0,
-            # valid complete verdict JSON. max_tokens stays 4096 — it is a
-            # runaway guard, not a size estimate (Erah, 2026-08-12).
-            "chat_template_kwargs": {"enable_thinking": False},
+            # 16,384 (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling
+            # 2026-09-01): thinking stays ON — the deliberation is the function
+            # the reviewer legs exist for. The 4096 budget starved the
+            # reasoning channel before the JSON ever started (arm A,
+            # 2026-09-01); arm F1 measured 12,847 reasoning tokens on the
+            # identical production shape at a 16,384 budget, finishing with
+            # finish_reason=stop and valid verdict JSON. Still a runaway guard
+            # (1/16 of the seat's 262k context), now correctly sized.
+            "max_tokens": 16384,
         }
         if model is not None:
             body["model"] = model

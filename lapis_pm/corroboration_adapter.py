@@ -232,22 +232,28 @@ def _llm_url() -> str:
     return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
 
 
-# _LLM_TIMEOUT stays at 45s deliberately — measured live on the GravityWell seat
-# 2026-08-12 (corroboration-shaped prompt, max_tokens=4096, grammar on and off):
-# both arms finished in 11-16s, well under this budget. A token cap is a runaway
-# guard, not a size estimate (Erah, 2026-08-12) — raising the timeout here would be
-# sizing by precaution rather than measurement. See lapis-pm-corroboration-thinking-
-# parse-and-truncation-loudness-v0 Scope 5.
-_LLM_TIMEOUT = 45  # seconds; measured 11-16s live, unchanged from pre-fix value
+# _LLM_TIMEOUT 120s (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling
+# 2026-09-01): sized by measurement, not precaution — the runaway-guard
+# principle (Erah, 2026-08-12) applied to the new measurement. Arm C measured
+# 9.5s thinking ON on a 3.7k-char corroboration-shaped prompt (84% of tokens in
+# the reasoning channel); 120s carries >=10x even at ~10x the prompt scale.
+# The old 45s guard was sized from a no-thinking arm and tripped under seat
+# load on production-sized prompts (the ReadTimeout lines in the verdict
+# JSONLs).
+_LLM_TIMEOUT = 120  # seconds; measured 9.5s live thinking ON, 120s guard
 _PROBE_TIMEOUT = 3   # seconds for connect probe before POST
 _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _LLM_TIMEOUT)
 
 # A runaway guard, not a size estimate: too-small silently corrupts every call by
 # starving a thinking model's reasoning channel before it reaches an answer (the
 # root cause this unit repairs), too-large only costs when a model actually reaches
-# it. Raised from 512 toward local_reviewer_witness.py's proven 4096 — same seat,
-# same day, measured to parse cleanly at this budget.
-_MAX_TOKENS = 4096
+# it. 16,384 (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling 2026-09-01):
+# thinking stays ON; arm F1 measured 12,847 reasoning tokens on the worst-case
+# production shape at this budget, finishing with finish_reason=stop and valid
+# JSON. 1/16 of the seat's 262k context — still a guard, now correctly sized.
+# Shared body: node1 rides it and node2/Phala rides it too (16k is within that
+# substrate's capacity — arm E completed at 125 tokens).
+_MAX_TOKENS = 16384
 
 # Node 2 — Phala TEE (unguarded direct path), deepseek/deepseek-v4-flash-0731.
 # Re-pointed 2026-09-01 (lapis-pm-panel-leg-survival-v0, D3; tenancy ratified by
@@ -432,18 +438,12 @@ class LapisPMReviewerAdapter:
             body: dict = {
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
+                # max_tokens 16384 (lapis-pm-panel-leg-survival-v0 rev 4):
+                # thinking stays ON — the deliberation is the function the
+                # reviewer legs exist for (Erah ruling 2026-09-01). No
+                # chat_template_kwargs field: the rev-3 thinking-disable design
+                # is void; no leg sends it.
                 "max_tokens": _MAX_TOKENS,
-                # Thinking-disable (lapis-pm-panel-leg-survival-v0, D2): the
-                # node1 seat is the same local thinking-model substrate as the
-                # witness; without this field it burns 84% of its tokens in
-                # reasoning on small prompts and the tail exceeds the 45s
-                # guard under seat load (measurement arms C/D, 2026-09-01).
-                # The field rides this shared body to node2/Phala as well —
-                # verified accepted there (arm E2: HTTP 200, 2026-09-01); it is
-                # a no-op on the non-thinking node2 substrate. Any future
-                # node2 re-point must re-verify field acceptance: the one-retry
-                # 4xx degrade drops the grammar, not this field.
-                "chat_template_kwargs": {"enable_thinking": False},
             }
             if node_model:
                 body["model"] = node_model
@@ -572,6 +572,20 @@ class LapisPMReviewerAdapter:
             # a stale model from a prior call should not claim credit.
             self._last_model = None
             self._last_prompt_hash = None
+            # The exception message is echoed for legibility, EXCEPT on the
+            # Phala path where a key-bearing error string must never reach a
+            # notes/error/claim field (lapis-pm-panel-leg-survival-v0 DoD #3
+            # sentinel: the env var name may be named, the value never).
+            _phala_path = _url.startswith("https://inference.phala.com")
+            if _phala_path:
+                _note = (
+                    f"LLM unavailable: {type(exc).__name__} on node2 ({_url}); "
+                    f"see daemon log for details"
+                )
+            else:
+                # Message included, not just the exception class name — a bare
+                # class name is what hid this defect for over a week.
+                _note = f"LLM unavailable: {type(exc).__name__}: {exc}"
             return CorroborationResult(
                 verdict="uncertain",
                 claim="(substrate unavailable)",
@@ -579,9 +593,7 @@ class LapisPMReviewerAdapter:
                 freshness_stamp=datetime.now(timezone.utc).isoformat(),
                 scope_id=scope_id,
                 drift_class=None,
-                # Message included, not just the exception class name — a bare
-                # class name is what hid this defect for over a week.
-                notes=f"LLM unavailable: {type(exc).__name__}: {exc}",
+                notes=_note,
                 leg_status="substrate_unavailable",
             )
 

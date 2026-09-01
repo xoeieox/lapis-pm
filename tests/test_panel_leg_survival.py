@@ -1,9 +1,11 @@
-"""Tests for lapis-pm-panel-leg-survival-v0 (the five changes).
+"""Tests for lapis-pm-panel-leg-survival-v0 (the five changes, rev 4).
 
-Coverage (spec DoD #1-#6, #8):
-  #1 payload shape pinned: witness + node1 bodies carry
-     chat_template_kwargs {"enable_thinking": False}; max_tokens/timeouts/
-     temperature unchanged from baseline.
+Coverage (spec DoD #1-#6, #8; rev 4 amendment supersedes the rev-3
+thinking-disable pins):
+  #1 payload shape pinned (rev 4): witness + node1 bodies carry
+     max_tokens=16384 and carry NO chat_template_kwargs (thinking stays
+     ON); the timeout constants are 300s (witness), 120s (node1),
+     120s (node2).
   #2 node2 re-point pinned: new _NODE2_URL/_NODE2_MODEL constants; node2
      prompt carries no vault: lines while node1's does; score() leaves the
      passed substrates list unmutated.
@@ -66,15 +68,15 @@ VALID_WITNESS_RESP = {
 
 
 # ---------------------------------------------------------------------------
-# DoD #1: payload shape pinned — thinking-disable on the local legs
+# DoD #1 (rev 4): payload shape pinned — thinking ON, budget raised
 # ---------------------------------------------------------------------------
 
-class TestThinkingDisablePayload:
+class TestThinkingOnPayload:
 
-    def test_witness_body_carries_enable_thinking_false_and_unchanged_baseline(self):
-        """The witness request body carries chat_template_kwargs
-        {"enable_thinking": False} and keeps the baseline max_tokens/
-        temperature exactly (runaway guards, not size estimates)."""
+    def test_witness_body_carries_16384_and_no_thinking_field(self):
+        """The witness request body carries max_tokens=16384 and NO
+        chat_template_kwargs (rev 4: thinking stays ON), with temperature
+        unchanged from baseline."""
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = VALID_WITNESS_RESP
@@ -98,14 +100,14 @@ class TestThinkingDisablePayload:
         assert result.agreement != "local_failed"
         assert captured, "no POST captured"
         body = captured[0]
-        assert body["chat_template_kwargs"] == {"enable_thinking": False}
-        # Baseline invariants — unchanged by this spec:
-        assert body["max_tokens"] == 4096
+        assert body["max_tokens"] == 16384
+        assert "chat_template_kwargs" not in body
         assert body["temperature"] == 0.1
 
-    def test_node1_body_carries_enable_thinking_false_and_unchanged_baseline(self):
-        """The node1 corroboration body (shared _build_body) carries the
-        field and keeps max_tokens/temperature baseline."""
+    def test_node1_body_carries_16384_and_no_thinking_field(self):
+        """The node1 corroboration body (shared _build_body) carries
+        max_tokens=16384 and NO chat_template_kwargs (rev 4: thinking stays
+        ON), with temperature unchanged."""
         adapter = LapisPMReviewerAdapter()
         substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
 
@@ -124,16 +126,21 @@ class TestThinkingDisablePayload:
         assert result.leg_status == "ok"
         assert captured, "no POST captured"
         body = captured[0]
-        assert body["chat_template_kwargs"] == {"enable_thinking": False}
-        assert body["max_tokens"] == _MAX_TOKENS == 4096
+        assert body["max_tokens"] == _MAX_TOKENS == 16384
+        assert "chat_template_kwargs" not in body
         assert body["temperature"] == 0.1
 
-    def test_timeouts_unchanged_from_baseline(self):
-        """45s node1 / 120s node2 guards stay exactly as-is."""
-        assert _LLM_TIMEOUT == 45
+    def test_timeouts_sized_by_measurement(self):
+        """Rev 4: witness read timeout 300s (arm F1 = 137.7s measured),
+        node1 _LLM_TIMEOUT 120s (arm C = 9.5s measured), _NODE2_TIMEOUT
+        stays 120s (arm E = 15.3s measured)."""
+        assert _LLM_TIMEOUT == 120
         assert _NODE2_TIMEOUT == 120
         from lapis_pm.local_reviewer_witness import _PROBE_TIMEOUT as _w_probe
         assert _w_probe == 3
+        import inspect
+        sig = inspect.signature(run_local_reviewer_witness)
+        assert sig.parameters["timeout"].default == 300
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +181,13 @@ class TestNode2Repoint:
         assert r1.leg_status == "ok"
         assert any("vault:" in p for p in n1_prompts), "node1 prompt must carry vault lines"
 
-        # node2 (include_vault=False) — no vault lines
+        # node2 (include_vault=False) — no vault lines. The Phala key gate
+        # reads the env var at call time, so the test supplies one.
         n2_prompts: list[str] = []
         with (
             patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
             patch("httpx.post", side_effect=capture_posts(n2_prompts)),
+            patch.dict("os.environ", {"PHALA_API_KEY": "phala-test-key"}),
         ):
             r2 = adapter.score(
                 FAKE_DIFF, substrates, "lapis-pm",
@@ -536,6 +545,60 @@ class TestLeg3DegradedPredicate:
 
 
 # ---------------------------------------------------------------------------
+# DoD #5 (Leg 2 branch): refuted-only verdicts still escalate, void-framed
+# ---------------------------------------------------------------------------
+
+class TestVoidFraming:
+
+    def test_refuted_only_branch_still_escalates_without_falsehood(self):
+        """A refuted-only verdict (not starved) still escalates a no-op
+        retry, worded VOID not 'verdict was false' — no falsehood phrasing
+        anywhere (Council reclassification: the claim is about the process,
+        never 'the verdict is wrong')."""
+        refuted = {
+            "verdict": "fixable",
+            "issues": [{"severity": "high", "path": "foo.py", "note": "x"}],
+            "confidence": 0.9,
+            "refuted_absence_findings": ["_check_equal is not defined anywhere"],
+            "panel_starvation": {"legs_down": [], "starved": False, "confidence_raw": 0.9},
+        }
+        comments = [
+            _verdict_comment("2026-09-01T12:00:00+00:00", 7, 3, refuted),
+        ]
+
+        def fake_for_cycle(target_id, pr_number, cyc):
+            for c in comments:
+                for t in c.tags:
+                    if t == f"pm:reviewer:pr={pr_number}:cycle={cyc}:verdict=fixable":
+                        return json.loads(c.content.split("\n", 1)[-1].strip())
+            return None
+
+        with (
+            patch("lapis_pm.pm_core._review_verdict_for_cycle", side_effect=fake_for_cycle),
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments),
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core.episodic.write_hold") as mock_hold,
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_outstanding,
+        ):
+            mock_mem.return_value.get.return_value = None
+            mock_brief = MagicMock()
+            mock_brief.comment_id = "cid-test"
+            mock_synth.return_value = mock_brief
+            action = pm_core._escalate_noop_retry_if_degraded("tid", {
+                "gpu_id": "task-1", "agent_type": "fixer_retry", "pr_number": 7, "cycle": 3,
+            }, 7)
+
+        assert action is not None and "noop_retry_degraded_verdict_brief" in action
+        hold_text = mock_hold.call_args.kwargs["content"] if mock_hold.call_args else ""
+        assert hold_text, "the refuted-only branch must still write a hold"
+        assert "verdict was false" not in hold_text
+        assert "verdict was false" not in mock_synth.call_args[1]["trigger"]
+        assert "verdict was false" not in mock_synth.call_args[1]["query"]
+        mock_set_outstanding.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # DoD #6: status panel-health line
 # ---------------------------------------------------------------------------
 
@@ -552,8 +615,9 @@ class TestPanelHealthLine:
         assert s == {"starved": 2, "total": 3, "legs": ["local_witness", "second_node"]}
 
     def test_summary_window_is_last_five(self):
-        # 6 verdicts: 3 starved in the first three (truncated out of the
-        # window), 2 starved in the last 5.
+        # 6 verdicts: the display window is the last 5 (total==5, the first
+        # verdict truncated out), while the starved count and legs union cover
+        # the full stored history — 4 of 6 are starved, 2 healthy.
         comments = []
         for i, legs in enumerate([("local_witness",), None, ("second_node",), None, ("corroboration",), ("local_witness",)], start=1):
             v = _starved_verdict(legs) if legs else _healthy_verdict()
@@ -561,8 +625,8 @@ class TestPanelHealthLine:
         with patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments):
             s = pm_core._panel_health_summary("tid", 7)
         assert s["total"] == 5
-        assert s["starved"] == 2
-        assert s["legs"] == ["corroboration", "local_witness"]
+        assert s["starved"] == 4
+        assert s["legs"] == ["corroboration", "local_witness", "second_node"]
 
     def test_summary_none_when_no_verdicts(self):
         with patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]):
@@ -668,69 +732,3 @@ class TestPanelHealthLine:
         out = capsys.readouterr().out
         assert rc == 0
         assert "panel:" not in out
-
-
-# ---------------------------------------------------------------------------
-# DoD #7/#8 fence: no "verdict was false" phrasing anywhere in the Leg 3
-# escalation surface (void framing, not falsehood).
-# ---------------------------------------------------------------------------
-
-class TestVoidFraming:
-
-    def test_no_falsehood_phrasing_in_escalation_source(self):
-        import inspect
-        src = inspect.getsource(pm_core._escalate_noop_retry_if_degraded)
-        # The docstring may mention the banned phrase only to forbid it.
-        # The executable text must not emit it.
-        for line in src.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(("#", '"""', "'''", "def ", "if ", "elif ", "else:", "return", "label", "diagnosis", "hold_text", "reasons", "reason_text", "premise")):
-                continue
-            if "=" in stripped or stripped.startswith(("f\"", 'f"')):
-                assert "verdict was false" not in stripped, (
-                    f"falsehood phrasing in executable Leg 3 text: {stripped}"
-                )
-
-    def test_refuted_only_branch_still_escalates_without_falsehood(self):
-        """A refuted-absence-claim verdict (not starved) still escalates, and
-        its brief carries no 'verdict was false' conclusion."""
-        refuted = {
-            "verdict": "fixable",
-            "issues": [],
-            "confidence": 0.9,
-            "panel_starvation": {"legs_down": [], "starved": False, "confidence_raw": 0.9},
-            "refuted_absence_findings": [
-                {"severity": "high", "path": "foo.py", "note": "...",
-                 "absence_check": "refuted", "refuted_location": "foo.py@deadbeef"},
-            ],
-        }
-        comments = [
-            _verdict_comment("2026-09-01T12:00:00+00:00", 7, 3, refuted),
-        ]
-
-        def fake_for_cycle(target_id, pr_number, cyc):
-            for c in comments:
-                for t in c.tags:
-                    if t == f"pm:reviewer:pr={pr_number}:cycle={cyc}:verdict=fixable":
-                        return json.loads(c.content.split("\n", 1)[-1].strip())
-            return None
-
-        with (
-            patch("lapis_pm.pm_core._review_verdict_for_cycle", side_effect=fake_for_cycle),
-            patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments),
-            patch("lapis_pm.pm_core._mem") as mock_mem,
-            patch("lapis_pm.pm_core.episodic.write_hold") as mock_hold,
-            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
-            patch("lapis_pm.pm_core._set_brief_outstanding"),
-        ):
-            mock_mem.return_value.get.return_value = None
-            mock_brief = MagicMock()
-            mock_brief.comment_id = "cid-refuted"
-            mock_synth.return_value = mock_brief
-            action = pm_core._escalate_noop_retry_if_degraded(
-                "tid", {"gpu_id": "t", "agent_type": "fixer_retry", "pr_number": 7, "cycle": 3}, 7
-            )
-        assert action is not None
-        hold_text = mock_hold.call_args.kwargs["content"]
-        assert "verdict was false" not in hold_text
-        assert "refuted" in hold_text.lower()

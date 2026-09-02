@@ -1003,6 +1003,11 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
             continue
 
         pre_head = ""
+        # deploy-pull-selfheal-core-v0 (Slice 1): whether this path's pull
+        # failure was recorded by the machine (gem/ledger, no self-repair).
+        # Initialized per-path so every failure branch (incl. the dirty-tree
+        # skip that never reaches the selfheal block) has it defined.
+        machine_recorded = False
         try:
             pre_result = subprocess.run(
                 ["git", "-C", path, "rev-parse", "HEAD"],
@@ -1120,6 +1125,48 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                                 _finish_success(pre_head)
                                 continue
                             result = retry  # fall through with the retry's failure below
+                    # deploy-pull-selfheal-core-v0 (Slice 1): classify the failure and let
+                    # the machine act on its lane (safe-zone self-repair, ledger +
+                    # gem) BEFORE the legacy divergence-lockout / generic alert.
+                    # A genuine divergence classifies `diverged` (NOT a safe-zone
+                    # repair - the classifier returns it and the machine records a
+                    # gem but does NOT repair it); the legacy lockout below still
+                    # handles the actual lock. A self-REPAIR success (head
+                    # advanced) is fully owned by the machine and skips the rest;
+                    # a RECORDED-only failure (gem/ledger, no head advance - e.g.
+                    # a divergence) suppresses the generic notify but still falls
+                    # through to the divergence lockout. D4/D5/D6/D7 surfaces are
+                    # removed in this slice.
+                    selfheal_handled = False
+                    if is_critical_repo:
+                        try:
+                            from . import deploy_pull_selfheal as _dps
+                            selfheal_handled = _dps.pass_handled_failure(
+                                repo, path, trigger, pull_rc=result.returncode,
+                                pull_stderr=result.stderr or "",
+                            )
+                        except Exception as _dps_exc:
+                            print(
+                                f"[post-land-pull] selfheal pass errored for {path}: "
+                                f"{_dps_exc}",
+                                file=sys.stderr,
+                            )
+                    # Critical fix #4 (rev-2): a self-repair success MUST fire
+                    # _finish_success(pre_head) so the restart gate (re-import into
+                    # running services) + the canonical deploy-log line run - the
+                    # head's block never made this call, so any_advanced stayed
+                    # False and the self-repaired head was never re-imported
+                    # (the stale-runtime class this slice closes).
+                    if selfheal_handled:
+                        _finish_success(pre_head)
+                    # A self-REPAIR (head advanced) is fully owned - skip the
+                    # divergence lockout AND the generic notify.
+                    if selfheal_handled and any_advanced:
+                        continue
+                    # A RECORDED-only failure (gem/ledger, no head advance):
+                    # suppress the generic notify below (the machine owns it)
+                    # but STILL fall through to the divergence lockout.
+                    machine_recorded = selfheal_handled and not any_advanced
                     if "Not possible to fast-forward" in result.stderr:
                         distance = _commit_distance(path)
                         print(
@@ -1146,7 +1193,11 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                         except Exception:
                             pass
                         continue
-                if is_critical_repo:
+                # The machine recorded this failure (gem/ledger) but did not
+                # self-repair it - suppress the generic notify (the machine owns
+                # it; the divergence lockout above, if any, already handled the
+                # physical lock).
+                if is_critical_repo and not machine_recorded:
                     try:
                         from agents_core.notify import send_notification, Priority as _P
                         send_notification(

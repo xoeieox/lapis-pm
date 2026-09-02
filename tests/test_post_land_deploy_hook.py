@@ -495,6 +495,9 @@ class TestPostLandGitPull:
         with (
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
+            # Slice 1: the selfheal pass owns critical-repo failures; mock it
+            # False so this test exercises the legacy notify FALLBACK.
+            patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
         ):
             pm_core._post_land_git_pull("lapis-pm")
 
@@ -524,6 +527,9 @@ class TestPostLandGitPull:
         with (
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
+            # Slice 1: mock the selfheal pass False to exercise the legacy notify
+            # fallback (the machine did not own this failure).
+            patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
         ):
             pm_core._post_land_git_pull("agents-core")
 
@@ -1643,6 +1649,7 @@ class TestSynapseDeploy:
         with (
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
+            patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
         ):
             pm_core._post_land_git_pull("synapse")
 
@@ -1666,6 +1673,7 @@ class TestSynapseDeploy:
         with (
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
+            patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
         ):
             pm_core._post_land_git_pull("synapse")
 
@@ -1748,6 +1756,7 @@ class TestSynapseDeploy:
         with (
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
+            patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
         ):
             pm_core._post_land_git_pull("lapis-pm")
 

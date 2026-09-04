@@ -745,6 +745,15 @@ def _ensure_head_branch_deleted(repo: str, pr_number: int, *, owner: str | None 
     honored or stale state persists, an explicit DELETE is issued. Either way,
     the branch ends deleted. If both probes fail, log and continue — do not
     raise. This guard is a safety backstop, not a critical operation.
+
+    One exception: a branch still held by an open PR is NEVER deleted
+    (2026-08-31 incident - every fixer for a target pushes to the SAME
+    lapis/<target_id>/local branch, so deleting a merged PR's surviving
+    branch auto-closed the in-flight PR on that branch and destroyed the
+    work). The explicit DELETE is skipped with a warning naming the holding
+    PR number(s). The open-PR probe is itself best-effort: a probe failure
+    logs a warning and falls through to the DELETE, preserving today's
+    behavior on a partial Forgejo outage.
     """
     if not _forgejo_get_pr or not _forgejo_get_branch:
         return  # forgejo not available
@@ -763,6 +772,34 @@ def _ensure_head_branch_deleted(repo: str, pr_number: int, *, owner: str | None 
             logger.warning("_ensure_head_branch_deleted: get_branch failed: %s", e)
             # fall through to explicit DELETE attempt
         # branch still exists — issue explicit DELETE
+        # Open-PR clobber guard (2026-08-31 incident): the branch may still
+        # hold an in-flight PR - the daemon reuses lapis/<target_id>/local
+        # across every fixer dispatch for a target. Deleting it would make
+        # Forgejo auto-close that PR. Refuse the delete while any open PR's
+        # head ref matches. A probe failure is non-fatal: log and fall
+        # through to the DELETE, exactly as today on a partial Forgejo
+        # outage. (Protects both call sites: the post-merge merge_and_deploy
+        # step and the per-tick _reconcile_surviving_head_branch.)
+        if get_open_prs is not None:
+            holding_prs = None
+            try:
+                holding_prs = [
+                    pr_dict.get("number")
+                    for pr_dict in get_open_prs(repo, owner=owner)
+                    if (pr_dict.get("head") or {}).get("ref") == ref
+                ]
+            except Exception as e:
+                logger.warning(
+                    "_ensure_head_branch_deleted: open-PR probe failed (non-fatal): %s",
+                    e,
+                )
+            if holding_prs:
+                logger.warning(
+                    "_ensure_head_branch_deleted: NOT deleting branch %s - open PR(s) %s still hold it",
+                    ref,
+                    holding_prs,
+                )
+                return
         try:
             import httpx
             default_owner = owner or (repo.split("/", 1)[0] if "/" in repo else "Erah")

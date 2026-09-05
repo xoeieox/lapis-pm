@@ -1176,6 +1176,89 @@ def _run_pass_locked(repo: str, path: str, cls: str, evidence: dict,
     return actions
 
 
+def close_ledger_entries_for_path(path: str, *, reason: str = "") -> None:
+    """lapis-pm-daemon-silent-gaps-v0 B4b ledger closure: mark every open
+    ledger entry for `path` as `closed` (NOT deleted) so a subsequent
+    re-lock of the same path is a fresh state transition that pages,
+    instead of being suppressed by the "already-paged" dedup (the silent
+    re-lock trap). Called on a B4b self-clear; the manual escape hatch
+    (_clear_deploy_pull_lock) stays as-is per the spec. Best-effort:
+    never raises."""
+    now = _now_iso()
+    try:
+        with file_lock(_LEDGER_LOCK_FILE, _LEDGER_LOCK_TIMEOUT_S):
+            ledger = read_ledger()
+            changed = False
+            for entry in ledger.values():
+                if entry.get("path") != path:
+                    continue
+                if entry.get("status") != "open":
+                    continue
+                entry["status"] = "closed"
+                entry["closed_at"] = now
+                if reason:
+                    entry["closed_reason"] = reason
+                changed = True
+            if changed:
+                write_ledger(ledger)
+    except Exception as exc:  # noqa: BLE001 - best-effort, never raises
+        logger.warning("[deploy-pull-selfheal] close_ledger_entries_for_path "
+                       "failed for %s: %s", path, exc)
+
+
+def notify_locked_clone_stuck(repo: str, path: str, cls: str,
+                              trigger: str) -> None:
+    """lapis-pm-daemon-silent-gaps-v0 B4b still-stuck page: exactly one
+    NORMAL page per (path, class) state transition, deduped on the D3
+    ledger signature (compute_signature = sha256(path|class)). A stable
+    class stuck for days pages exactly once (subsequent cycles are silent
+    `bump:open` - the 2026-09-02 370-page storm must not recur). Best-
+    effort: never raises."""
+    try:
+        with file_lock(_LEDGER_LOCK_FILE, _LEDGER_LOCK_TIMEOUT_S):
+            ledger = read_ledger()
+            signature = compute_signature(path, cls)
+            entry = ledger.get(signature)
+            if entry is not None and entry.get("status") == "open":
+                # Stable class: bump only - no page (I2 - only state
+                # transitions page).
+                entry["last_seen"] = _now_iso()
+                entry["times_seen"] = entry.get("times_seen", 1) + 1
+                write_ledger(ledger)
+                return
+            # First detection (or a class transition, or a RE-LOCK after a
+            # B4b self-clear closed the entry) - page once: a closed entry
+            # re-opening is a fresh state transition, not suppressed by
+            # dedup (the silent re-lock trap).
+            now = _now_iso()
+            base = entry if entry is not None else _new_entry(
+                path, repo, cls, {}, now,
+            )
+            base["status"] = "open"
+            base["last_seen"] = now
+            base["times_seen"] = 1
+            ledger[signature] = base
+            write_ledger(ledger)
+        _send_page(
+            message=(
+                f"{repo}: deploy clone {path} is LOCKED and still stuck "
+                f"(class={cls}); the lock is kept and the pull is skipped. "
+                f"Manual intervention required (clear the lock once the "
+                f"divergence is resolved)."
+            ),
+            title=f"{repo}: deploy pull lock still stuck ({cls})",
+            priority=_normal_priority(),
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort, never raises
+        logger.warning("[deploy-pull-selfheal] notify_locked_clone_stuck "
+                       "failed for %s: %s", path, exc)
+
+
+def _normal_priority():
+    from agents_core.notify import Priority
+    return Priority.NORMAL
+
+
 def _salvage_entry(ledger: dict, entry: dict, repo: str, path: str,
                    evidence: dict, trigger: str) -> list[str]:
     """D4.1-D4.4 for one open entry meeting the window condition."""

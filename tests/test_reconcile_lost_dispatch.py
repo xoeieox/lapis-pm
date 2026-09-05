@@ -34,6 +34,7 @@ def _fixer_record(
     parent_gpu_id: str | None = None,
     agent_type: str = "fixer",
     error: str | None = None,
+    pr_number: int | None = 1,
 ) -> dict:
     rec = {
         "gpu_id": gpu_id,
@@ -45,6 +46,7 @@ def _fixer_record(
         "status": status,
         "retry_count": 0,
         "lost_retry_count": lost_retry_count,
+        "pr_number": pr_number,
     }
     if parent_gpu_id is not None:
         rec["parent_gpu_id"] = parent_gpu_id
@@ -122,7 +124,7 @@ class TestClassifyLostFixer:
 
     def test_non_fixer_not_classified(self):
         """reviewer and brief agent types are NOT classified as lost."""
-        for atype in ("reviewer", "reviewer_fresh", "brief", "fixer_retry"):
+        for atype in ("reviewer", "reviewer_fresh", "brief"):
             rec = _fixer_record(status="failed", agent_type=atype)
             with patch("lapis_pm.episodic.all_comments", return_value=[]):
                 retry, brief = pm_core._find_lost_fixer_dispatches(
@@ -130,6 +132,72 @@ class TestClassifyLostFixer:
                 )
             assert retry == [], f"agent_type={atype} should not be in needs_retry"
             assert brief == [], f"agent_type={atype} should not be in needs_brief"
+
+    def test_fixer_retry_pr_none_terminal_no_pr_is_lost(self):
+        """B2: a terminal fixer_retry with pr_number None, no advance after
+        dispatch_ts, no PR opened after dispatch_ts, and no pending child is
+        classified lost (routed through the _act_lost_fixer_retry path)."""
+        rec = _fixer_record(status="failed", agent_type="fixer_retry",
+                            pr_number=None)
+        with patch("lapis_pm.episodic.all_comments", return_value=[]):
+            retry, brief = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+        assert len(retry) == 1
+        assert retry[0]["gpu_id"] == rec["gpu_id"]
+        assert brief == []
+
+    def test_fixer_retry_pr_none_with_pr_after_dispatch_not_lost(self):
+        """B2 (DoD 2b): a pr=None fixer_retry is NOT lost when a PR opened
+        at/after dispatch_ts (guards against a PR that opened but failed to
+        stamp the record)."""
+        rec = _fixer_record(status="failed", agent_type="fixer_retry",
+                            pr_number=None)
+        pr = _open_pr(created_at="2026-05-01T11:00:00-07:00")
+        with patch("lapis_pm.episodic.all_comments", return_value=[]):
+            retry, brief = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[pr], forgejo_ok=True
+            )
+        assert retry == []
+        assert brief == []
+
+    def test_fixer_retry_pr_none_non_terminal_not_lost(self):
+        """B2 (DoD 2c): a non-terminal (pending) pr=None fixer_retry is NOT
+        lost - the status gate excludes in-flight records."""
+        rec = _fixer_record(status="pending", agent_type="fixer_retry",
+                            pr_number=None)
+        with patch("lapis_pm.episodic.all_comments", return_value=[]):
+            retry, brief = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+        assert retry == []
+        assert brief == []
+
+    def test_fixer_retry_pr_present_behavior_unchanged(self):
+        """B2 (DoD 2d): a pr_number-present fixer_retry follows the existing
+        criterion - a terminal record with no advance and no merged PR is
+        lost."""
+        rec = _fixer_record(status="failed", agent_type="fixer_retry",
+                            pr_number=7)
+        with patch("lapis_pm.episodic.all_comments", return_value=[]):
+            retry, brief = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+        assert len(retry) == 1
+        assert retry[0]["gpu_id"] == rec["gpu_id"]
+
+    def test_fixer_staged_pr_none_keeps_skip(self):
+        """B2 scope (rev 3, DoD 7): a fixer_staged record with pr_number None
+        does NOT enter the lost path - the existing skip is retained (only
+        fixer_retry records get the pr=None lost criterion)."""
+        rec = _fixer_record(status="failed", agent_type="fixer_staged",
+                            pr_number=None)
+        with patch("lapis_pm.episodic.all_comments", return_value=[]):
+            retry, brief = pm_core._find_lost_fixer_dispatches(
+                "my-target", [rec], open_prs=[], forgejo_ok=True
+            )
+        assert retry == []
+        assert brief == []
 
     def test_retry_child_not_classified_directly(self):
         """Dispatch with parent_gpu_id (retry child) is skipped; only originals."""
@@ -472,7 +540,12 @@ class TestSecondLossBrief:
             pm_core._act_lost_brief("my-target", original, None)
 
         assert captured_queries, "synthesize not called"
-        assert "/srv/lapis/planning/specs/my-target.md" in captured_queries[0], (
+        # The spec path is resolved through room_str('planning.specs', ...)
+        # which honours ROOM_ROOT; the suite's session-wide ROOM_ROOT pin
+        # (conftest._pin_room_root_to_tmp) redirects it to a tmp dir, so
+        # assert on the target-specific suffix rather than a hardcoded
+        # /room literal (the pre-pin assertion broke when the pin landed).
+        assert "planning/specs/my-target.md" in captured_queries[0], (
             f"spec path not in brief query: {captured_queries[0]!r}"
         )
 

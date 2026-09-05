@@ -106,6 +106,127 @@ def _isolate_ledger(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# B4b (lapis-pm-daemon-silent-gaps-v0) - locked-clone re-evaluation helpers
+# ---------------------------------------------------------------------------
+
+class TestB4bLockedCloneHelpers:
+    """close_ledger_entries_for_path (ledger closure on clear) +
+    notify_locked_clone_stuck (the still-stuck NORMAL page, deduped on the
+    D3 ledger signature)."""
+
+    def test_close_marks_open_entries_closed_not_deleted(self, monkeypatch):
+        """After a B4b self-clear the D3 ledger entry for the path is
+        `closed` (never deleted) - so a re-lock of the same path is a fresh
+        state transition that pages instead of being dedup-suppressed."""
+        from lapis_pm import deploy_pull_selfheal as _dps
+        ledger = {
+            "sig-open": {
+                "signature": "sig-open", "path": "/srv/git/agents-core",
+                "repo": "agents-core", "class": "diverged",
+                "first_seen": "2026-09-02T16:04:00+00:00",
+                "last_seen": "2026-09-02T16:04:00+00:00",
+                "times_seen": 3, "status": "open",
+            },
+            "sig-resolved": {
+                "signature": "sig-resolved", "path": "/srv/git/agents-core",
+                "repo": "agents-core", "class": "safe_dead_branch",
+                "status": "resolved",
+            },
+            "sig-other": {
+                "signature": "sig-other", "path": "/srv/git/other",
+                "repo": "other", "class": "diverged", "status": "open",
+            },
+        }
+        monkeypatch.setattr(_dps, "read_ledger", lambda path=None: dict(ledger))
+        written = []
+        monkeypatch.setattr(_dps, "write_ledger",
+                            lambda ledger, path=None: written.append(dict(ledger)))
+        _dps.close_ledger_entries_for_path("/srv/git/agents-core",
+                                           reason="b4b-self-clear")
+        assert written, "ledger must be re-written"
+        out = written[-1]
+        assert "sig-open" in out, "entry must NOT be deleted"
+        assert out["sig-open"]["status"] == "closed"
+        assert out["sig-open"]["closed_reason"] == "b4b-self-clear"
+        assert out["sig-open"].get("closed_at"), "closed_at must be set"
+        # non-open and other-path entries are untouched
+        assert out["sig-resolved"]["status"] == "resolved"
+        assert out["sig-other"]["status"] == "open"
+
+    def test_close_noop_when_no_open_entries(self, monkeypatch):
+        from lapis_pm import deploy_pull_selfheal as _dps
+        monkeypatch.setattr(_dps, "read_ledger", lambda path=None: {})
+        written = []
+        monkeypatch.setattr(_dps, "write_ledger",
+                            lambda ledger, path=None: written.append(ledger))
+        _dps.close_ledger_entries_for_path("/srv/git/agents-core")
+        assert written == [], "no write when nothing to close"
+
+    def test_still_stuck_pages_once_then_silent(self, monkeypatch):
+        """A locked clone in `diverged` state: exactly one NORMAL page on
+        first detection; a second backstop cycle in the same state emits no
+        additional page (the 2026-09-02 370-page storm must not recur)."""
+        from agents_core.notify import Priority
+        pages = []
+
+        def fake_send(message, title, priority, **kwargs):
+            pages.append((title, priority))
+            return True
+
+        monkeypatch.setattr("agents_core.notify.send_notification", fake_send)
+        monkeypatch.setattr(dps, "_send_page",
+                            lambda message, title, priority: pages.append((title, priority)))
+
+        dps.notify_locked_clone_stuck("agents-core", "/srv/git/agents-core",
+                                      dps.CLASS_DIVERGED, "backstop-timer")
+        assert len(pages) == 1
+        assert pages[0][1] == Priority.NORMAL
+
+        # Second cycle, same (path, class): silent bump, no page.
+        dps.notify_locked_clone_stuck("agents-core", "/srv/git/agents-core",
+                                      dps.CLASS_DIVERGED, "backstop-timer")
+        assert len(pages) == 1
+
+        ledger = dps.read_ledger()
+        sig = dps.compute_signature("/srv/git/agents-core", dps.CLASS_DIVERGED)
+        assert sig in ledger
+        assert ledger[sig]["status"] == "open"
+        assert ledger[sig]["times_seen"] == 2
+
+    def test_class_transition_pages_again(self, monkeypatch):
+        """A class change for the same path is a fresh state transition:
+        the new (path, class) signature pages once."""
+        pages = []
+        monkeypatch.setattr(dps, "_send_page",
+                            lambda message, title, priority: pages.append(title))
+        dps.notify_locked_clone_stuck("agents-core", "/srv/git/agents-core",
+                                      dps.CLASS_DIVERGED, "backstop-timer")
+        dps.notify_locked_clone_stuck("agents-core", "/srv/git/agents-core",
+                                      dps.CLASS_FETCH_FAILED, "backstop-timer")
+        assert len(pages) == 2
+
+    def test_relock_after_closed_entry_pages_fresh(self, monkeypatch):
+        """DoD 9: after a B4b self-clear (entry `closed`), a re-lock of the
+        same path emits a fresh page (the re-lock is a new state
+        transition, not suppressed by dedup)."""
+        pages = []
+        monkeypatch.setattr(dps, "_send_page",
+                            lambda message, title, priority: pages.append(title))
+        dps.notify_locked_clone_stuck("agents-core", "/srv/git/agents-core",
+                                      dps.CLASS_DIVERGED, "backstop-timer")
+        assert len(pages) == 1
+        dps.close_ledger_entries_for_path("/srv/git/agents-core",
+                                          reason="b4b-self-clear")
+        # Re-lock: the closed entry is re-opened as a fresh transition.
+        dps.notify_locked_clone_stuck("agents-core", "/srv/git/agents-core",
+                                      dps.CLASS_DIVERGED, "backstop-timer")
+        assert len(pages) == 2
+        ledger = dps.read_ledger()
+        sig = dps.compute_signature("/srv/git/agents-core", dps.CLASS_DIVERGED)
+        assert ledger[sig]["status"] == "open"
+
+
+# ---------------------------------------------------------------------------
 # D1 - classifier
 # ---------------------------------------------------------------------------
 

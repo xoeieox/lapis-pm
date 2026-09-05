@@ -1032,12 +1032,67 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
         # re-attempted pull, no repeated quarantine dance. A human clears the
         # lock (_clear_deploy_pull_lock) once the divergence is resolved.
         if is_critical_repo and _deploy_pull_locked(path):
-            print(
-                f"[post-land-pull] {path} is locked (genuine divergence, manual "
-                f"intervention required) — skipping pull",
-                file=sys.stderr,
-            )
-            continue
+            # lapis-pm-daemon-silent-gaps-v0 B4b: a locked clone is re-evaluated,
+            # not skipped forever. The D1 classifier's EVIDENCE (fetch_rc /
+            # porcelain / ahead) is consulted - never the class label's safe
+            # set (the clean-ff-able state is `unknown`, which the module's I1
+            # declares "never a safe class" for the module's own self-repair
+            # actions; this is a different, explicitly-guarded decision path,
+            # and the ff-only pull is the self-verification). Any None/empty
+            # evidence field is still-stuck (never clear, never an error).
+            # The clear decision does NOT re-implement classification logic.
+            locked_reclear = False
+            try:
+                from . import deploy_pull_selfheal as _dps
+                _cls, _ev = _dps.classify_pull_failure(path, trigger)
+                _fetch_ok = _ev.get("fetch_rc") == 0
+                _clean = not any(
+                    line and not line.startswith("??")
+                    for line in (_ev.get("porcelain") or [])
+                )
+                _ahead_zero = _ev.get("ahead") == 0
+                if _fetch_ok and _clean and _ahead_zero:
+                    # The ONLY clearable state (D1's clean:unknown arm).
+                    # Clear the lock + proceed with the existing ff-only pull
+                    # below; the ff-only guard self-verifies (a failed pull
+                    # re-locks with fresh measurement + the existing HIGH
+                    # page). Ledger entry marked `closed` (never deleted) so a
+                    # re-lock pages as a fresh state transition.
+                    _dps.close_ledger_entries_for_path(path, reason="b4b-self-clear")
+                    _clear_deploy_pull_lock(path)
+                    locked_reclear = True
+                    print(
+                        f"[post-land-pull] {path} lock self-cleared (clean-ff-able "
+                        f"state: fetch ok, clean tree, ahead==0) — proceeding with "
+                        f"ff-only pull",
+                        file=sys.stderr,
+                    )
+                else:
+                    # still-stuck: keep the lock, emit exactly one NORMAL page
+                    # per (path, class) state transition via a NEW page site in
+                    # the locked-clone path, deduped on the D3 ledger
+                    # signature (compute_signature = sha256(path|class)); a
+                    # stable class stuck for days pages exactly once
+                    # (subsequent cycles are silent `bump:open`).
+                    _dps.notify_locked_clone_stuck(repo, path, _cls, trigger)
+                    print(
+                        f"[post-land-pull] {path} is locked (genuine divergence, "
+                        f"manual intervention required; re-evaluated class="
+                        f"{_cls}) — skipping pull",
+                        file=sys.stderr,
+                    )
+                    continue
+            except Exception as _lock_exc:
+                # Never an unhandled error: a classification failure keeps the
+                # lock and degrades to the original skip (logged).
+                print(
+                    f"[post-land-pull] {path} locked-clone re-evaluation errored "
+                    f"({type(_lock_exc).__name__}: {_lock_exc}) — skipping pull",
+                    file=sys.stderr,
+                )
+                continue
+            if not locked_reclear:
+                continue
 
         pre_head = ""
         # deploy-pull-selfheal-core-v0 (Slice 1): whether this path's pull
@@ -1213,6 +1268,21 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                             file=sys.stderr,
                         )
                         _write_deploy_pull_lock(path, "genuine_divergence", distance)
+                        # lapis-pm-daemon-silent-gaps-v0 B4a: the EXISTING HIGH
+                        # page is extended - not supplemented - with the
+                        # commits_behind == 0 anomaly flag. Exactly one page
+                        # per lock acquisition (this one). The bare
+                        # try/except: pass is a named silent delivery path:
+                        # send_notification writes the notify audit line either
+                        # way (delivered=true/false is the verification
+                        # surface - a swallowed send must be visible in the
+                        # audit log).
+                        _suspect_flag = ""
+                        if distance == 0:
+                            _suspect_flag = (
+                                " suspect: divergence with zero commits behind "
+                                "(classification anomaly)"
+                            )
                         try:
                             from agents_core.notify import send_notification, Priority as _P
                             send_notification(
@@ -1220,9 +1290,9 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                                     f"post-land pull for {path} hit genuine lineage "
                                     f"divergence (not an untracked collision) — "
                                     f"{distance if distance is not None else '?'} commits "
-                                    f"behind origin/main. Locked; will NOT retry or "
-                                    f"reset --hard. Needs manual intervention, then "
-                                    f"clear the lock."
+                                    f"behind origin/main.{_suspect_flag} Locked; will "
+                                    f"NOT retry or reset --hard. Needs manual "
+                                    f"intervention, then clear the lock."
                                 ),
                                 title=f"{repo}: deploy pull diverged (locked)",
                                 priority=_P.HIGH,
@@ -8474,18 +8544,43 @@ def _find_lost_fixer_dispatches(
             dispatch_ts = rec.get("ts", "")
             pr_num = rec.get("pr_number")
             if pr_num is None:
-                continue  # No PR to check — skip
-            if _fixer_completion_ts(target_id, pr_num, dispatch_ts):
-                continue  # Advance observed — normal completion, not lost
-            # Part A net (2026-08-24): a sibling in the SAME retry chain advanced
-            # the PR after the chain started - the no-op retry's work was not lost.
-            chain_start = _earliest_fixer_retry_dispatch_ts(records, pr_num)
-            if chain_start and _pr_advanced_since(target_id, pr_num, chain_start):
-                continue  # Sibling-in-chain advance - normal completion, not lost
-            # Part C net (2026-08-24): the PR is live-merged - the retry's work
-            # demonstrably landed even though no advance observation was recorded.
-            if merged_pr_nums is not None and pr_num in merged_pr_nums:
-                continue  # Merged PR - normal completion, not lost
+                # lapis-pm-daemon-silent-gaps-v0 B2 (rev 3): a pr_number-None
+                # fixer_retry that died before a PR number was recorded is no
+                # longer invisible to lost-detection. The sibling criterion
+                # (the pr_number-present path above) applies with the
+                # pr_number-keyed nets reduced: terminal (the status gate above
+                # already excludes in-flight records), no advance observed for
+                # the target after dispatch_ts (a pr=None record has no
+                # per-PR completion observation to check - the has_pr checks
+                # below are the advance net), no PR opened/merged for the
+                # target at/after dispatch_ts (guards against a PR that opened
+                # but failed to stamp the record), and no pending retry child
+                # (checked below). No new time gate - the sibling path has
+                # none. fixer_staged records keep the rev-2 skip behavior
+                # (this branch only runs for agent_type == "fixer_retry").
+                has_pr = any(
+                    pr.get("created_at", "") >= dispatch_ts for pr in open_prs
+                )
+                if not has_pr:
+                    if merged_pr_created_ats is None:
+                        merged_pr_created_ats = _collect_merged_pr_created_ats(target_id)
+                    has_pr = any(ts >= dispatch_ts for ts in merged_pr_created_ats)
+                if has_pr:
+                    continue  # PR exists — not lost
+            else:
+                if _fixer_completion_ts(target_id, pr_num, dispatch_ts):
+                    continue  # Advance observed — normal completion, not lost
+                # Part A net (2026-08-24): a sibling in the SAME retry chain
+                # advanced the PR after the chain started - the no-op retry's
+                # work was not lost.
+                chain_start = _earliest_fixer_retry_dispatch_ts(records, pr_num)
+                if chain_start and _pr_advanced_since(target_id, pr_num, chain_start):
+                    continue  # Sibling-in-chain advance - normal completion, not lost
+                # Part C net (2026-08-24): the PR is live-merged - the retry's
+                # work demonstrably landed even though no advance observation
+                # was recorded.
+                if merged_pr_nums is not None and pr_num in merged_pr_nums:
+                    continue  # Merged PR - normal completion, not lost
 
             orig_gpu_id = rec.get("gpu_id", "")
             retry_child: dict | None = next(
@@ -8586,22 +8681,62 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
         # visible, one-shot skip so the tick completes and the case stays seen.
         pr_num = rec.get("pr_number")
         dispatch_id = rec.get("gpu_id", "?")
+        # lapis-pm-daemon-silent-gaps-v0 B3: the skip_tag degenerates to
+        # per-target when pr_number is None (a second stuck pr=None chain on
+        # the same target would page nothing) - carry the dispatch gpu_id in
+        # the tag for the pr=None class so each chain is one-page-per-chain.
+        if pr_num is None:
+            skip_tag = f"pm:lost:fixer_retry:skipped:pr=None:gpu={dispatch_id}"
+        else:
+            skip_tag = f"pm:lost:fixer_retry:skipped:pr={pr_num}"
         print(
             f"WARN: _act_lost_fixer_retry: lost fixer_retry target={target_id} "
             f"pr={pr_num} dispatch={dispatch_id} - no fixer_retry re-dispatch "
             "(deferred follow-up); loud skip, tick continues.",
             file=sys.stderr,
         )
-        skip_tag = f"pm:lost:fixer_retry:skipped:pr={pr_num}"
         if not any(skip_tag in (c.tags or []) for c in episodic.all_comments(target_id)):
-            episodic.write_observation(
-                target_id,
+            # B3: the page body (and the upgraded observation) must carry the
+            # exact recovery command template + the record's original intent -
+            # the operator/LLM first-responder must be able to act from the
+            # page alone. The HIGH page for the underlying death itself comes
+            # from the queue layer (B1 + sibling A1); this NORMAL page is the
+            # daemon-side signal that the retry chain is stuck and needs a
+            # human. Deduped by the SAME skip_tag that gates the observation.
+            intent = rec.get("intent", "(no intent)")
+            recovery_cmd = (
+                f"lapis-pm tick --target {target_id} --force-dispatch "
+                f"fixer:\"{intent}\""
+            )
+            observation_text = (
                 f"lost fixer_retry: pr={pr_num} dispatch={dispatch_id} - "
                 "fixer_retry re-dispatch is a deferred follow-up; loud skip "
                 "(tick no longer aborts). The retry chain needs a manual "
-                "force-dispatch or review.",
+                "force-dispatch or review.\n"
+                f"Recovery: {recovery_cmd}\n"
+                f"Original intent: {intent}"
+            )
+            episodic.write_observation(
+                target_id,
+                observation_text,
                 extra_tags=["pm:error", skip_tag],
             )
+            try:
+                from agents_core.notify import send_notification, Priority as _P
+                send_notification(
+                    message=(
+                        f"lost fixer_retry: target={target_id} pr={pr_num} "
+                        f"dispatch={dispatch_id} - fixer_retry re-dispatch is "
+                        "a deferred follow-up; the retry chain is stuck and "
+                        "needs a human.\n"
+                        f"Recovery: {recovery_cmd}\n"
+                        f"Original intent: {intent}"
+                    ),
+                    title=f"{target_id}: lost fixer_retry stuck (manual force-dispatch needed)",
+                    priority=_P.NORMAL,
+                )
+            except Exception:
+                pass
         return f"skip:lost_fixer_retry_undispatchable:pr={pr_num}"
     intent = rec.get("intent", "(no intent)")
     spec_summary = episodic.spec_summary(target_id)

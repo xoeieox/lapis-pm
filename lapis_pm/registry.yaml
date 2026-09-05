@@ -600,7 +600,8 @@ agents:
     engine: local-fixer      # was: claude
     model: gravitywell-slot1 # GPU0 durable default (berth is on-demand overflow - see fixer block above)
     capture_meta: false
-    notify: false
+    notify: true
+    notify_policy: infra-only
     system_template: |
       You are a fix agent for repo {repo}, working on target {target_id}.
       This is a RETRY to fix reviewer-flagged issues on an existing PR.
@@ -666,7 +667,8 @@ agents:
     engine: local-fixer-staged
     model: gravitywell-slot1
     capture_meta: false
-    notify: false
+    notify: true
+    notify_policy: infra-only
     system_template: |
       You are a staged fix agent for repo {repo}, working on target {target_id}.
       This dispatch runs the STAGED fixer harness (engine local-fixer-staged):

@@ -52,6 +52,29 @@ LINEAGE_WINDOW_H = 24
 SHADOW_DIR = Path("/srv/lapis/autonomy-shadow")
 SHADOW_PRECEDENT_CALLS = SHADOW_DIR / "precedent-calls.jsonl"
 
+# Lazy mem accessor (same pattern as router_portfolio._mem): resolved on first
+# use so the leaf module imports cleanly off the mem master and in tests.
+_mem_store = None
+
+
+def _mem():
+    """Return the shared module-level mem accessor (lazy init).
+
+    On the mem master (BRIX) this is a direct MemoryStore (local = master). Off
+    master it is the pm_core shared store (node-identity-checked), so precedent
+    writes never diverge into a local sqlite that reverse-replication would
+    clobber. Import is best-effort — a missing pm_core (test isolation) falls
+    back to a fresh MemoryStore."""
+    global _mem_store
+    if _mem_store is None:
+        try:
+            from . import pm_core as _pm_core
+            _mem_store = _pm_core._mem()
+        except Exception:
+            from agents_core.mem import MemoryStore
+            _mem_store = MemoryStore()
+    return _mem_store
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -290,6 +313,7 @@ def write_adjudication(mem, *, target_id: str, pr_number, outcome: str,
         "schema": "adjudication/v1",
         "ts": _now_iso(),
         "repo": repo,
+        "target_id": target_id,
         "fork": fork,
         "chosen": outcome,
         "intent": intent or "",

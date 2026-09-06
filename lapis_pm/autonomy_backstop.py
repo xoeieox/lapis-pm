@@ -28,6 +28,30 @@ from . import precedent as _precedent
 
 logger = logging.getLogger(__name__)
 
+# Lazy mem accessor (same pattern as router_portfolio._mem): resolved on first
+# use so the leaf module imports cleanly off the mem master and in tests.
+_mem_store = None
+
+
+def _mem():
+    """Return the shared module-level mem accessor (lazy init).
+
+    On the mem master (BRIX) this is a direct MemoryStore (local = master). Off
+    master it is the pm_core shared store (node-identity-checked), so backstop
+    writes never diverge into a local sqlite that reverse-replication would
+    clobber. Import is best-effort — a missing pm_core (test isolation) falls
+    back to a fresh MemoryStore."""
+    global _mem_store
+    if _mem_store is None:
+        try:
+            from . import pm_core as _pm_core
+            _mem_store = _pm_core._mem()
+        except Exception:
+            from agents_core.mem import MemoryStore
+            _mem_store = MemoryStore()
+    return _mem_store
+
+
 # 14-day lookback for resolved merges (U3.2).
 REGRESSION_WINDOW_DAYS = 14
 
@@ -279,9 +303,19 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
     except Exception:
         pass
 
-    # Update last_sweep_ts on every class record for this repo.
+    # Update last_sweep_ts on every class record for this repo. Re-read the
+    # current data (a demotion above may have updated it) so the sweep stamp
+    # does not clobber the demotion.
     for rec in recs:
-        data = dict(rec["data"])
+        raw = mem.get(rec["key"])
+        data = {}
+        if raw:
+            try:
+                data = json.loads(raw.get("content", ""))
+            except (ValueError, TypeError):
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
         data["last_sweep_ts"] = now
         mem.set(rec["key"], json.dumps(data, ensure_ascii=False, sort_keys=True),
                 tags=["lapis-pm", "pm:autonomy-class"])

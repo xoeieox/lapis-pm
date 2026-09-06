@@ -38,6 +38,30 @@ logger = logging.getLogger(__name__)
 # Wall budget per head (Design 2). Exceeded = inconclusive = fail-safe.
 ATTESTATION_WALL_BUDGET_S = 900
 
+# Lazy mem accessor (same pattern as router_portfolio._mem): resolved on first
+# use so the leaf module imports cleanly off the mem master and in tests.
+_mem_store = None
+
+
+def _mem():
+    """Return the shared module-level mem accessor (lazy init).
+
+    On the mem master (BRIX) this is a direct MemoryStore (local = master). Off
+    master it is the pm_core shared store (node-identity-checked), so
+    attestation writes never diverge into a local sqlite that
+    reverse-replication would clobber. Import is best-effort — a missing
+    pm_core (test isolation) falls back to a fresh MemoryStore."""
+    global _mem_store
+    if _mem_store is None:
+        try:
+            from . import pm_core as _pm_core
+            _mem_store = _pm_core._mem()
+        except Exception:
+            from agents_core.mem import MemoryStore
+            _mem_store = MemoryStore()
+    return _mem_store
+
+
 # Test-runner control set (Design 2 / B1): a PR touching any of these
 # attests `inconclusive` — it may not rewrite the instrument that measures
 # it. Root-level filenames plus conftest.py / tests/*.cfg|ini at any depth.

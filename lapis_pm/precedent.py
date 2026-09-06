@@ -203,12 +203,26 @@ def _matches(repo: str, fork: dict, rec: dict) -> bool:
     return True
 
 
+def _parse_timestamp(value) -> datetime | None:
+    """Parse an ISO-8601 string (with or without offset / trailing Z) or a
+    numeric epoch value to a (UTC-normalized) datetime. Returns None when
+    nothing parses — callers treat that as no-match (fail-safe)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    return _parse_iso(value)
+
+
 def _lineage_ok(mem, rec: dict) -> bool:
     """Design 5 (iii)+(iv): verify the cited ratify outcome live at match time."""
     citations = rec.get("citations") or []
     if not isinstance(citations, list):
         return False
-    rec_ts = _parse_iso(rec.get("ts"))
+    rec_ts = _parse_timestamp(rec.get("ts"))
     if rec_ts is None:
         return False
     for cit in citations:
@@ -231,7 +245,18 @@ def _lineage_ok(mem, rec: dict) -> bool:
             return False
         if odata.get("target_id") != rec.get("target_id"):
             return False
-        created = _parse_iso(outcome.get("created") or odata.get("created"))
+        # The ratification-outcome entry (RouterPortfolioEntry) stores its
+        # ISO-8601 timestamp in `freshness_stamp` — it has NO `created`
+        # field. Look for `freshness_stamp` FIRST (the field the writer
+        # always sets), then `created` (mem-store-attached or legacy).
+        # Accept ISO-8601 (offset or trailing Z) or numeric epoch. No
+        # timestamp found / nothing parses = no match (fail-safe — never
+        # widen the window, never fall back to matching).
+        created = (
+            _parse_timestamp(odata.get("freshness_stamp"))
+            or _parse_timestamp(outcome.get("created"))
+            or _parse_timestamp(odata.get("created"))
+        )
         if created is None:
             return False
         if abs((rec_ts - created).total_seconds()) > LINEAGE_WINDOW_H * 3600:
@@ -283,15 +308,32 @@ def find_precedent(mem, repo: str, fork: dict) -> dict | None:
 def _fork_from_options_sibling(mem, target_id: str) -> dict | None:
     """Copy the fork block from the `pm:brief-options` sibling (Design 5).
 
+    The sibling is a per-target COMMENT (written by
+    `episodic.write_brief_options`, tag `episodic.TAG_BRIEF_OPTIONS`), NOT a
+    mem key — read it from the comment store the same way `brief.read_options`
+    does: iterate `episodic.all_comments(target_id)`, keep the
+    TAG_BRIEF_OPTIONS-tagged comments, and use the LATEST such comment
+    (most recently appended).
+
     Returns None when the sibling is missing/unparseable (briefs predating
     this spec, non-PR briefs) — the record is still written with `fork: null`.
+    Never raises.
     """
     try:
-        raw = mem.get(f"pm:brief-options:{target_id}")
-        if not raw:
+        from . import episodic
+        latest_data = None
+        for c in episodic.all_comments(target_id):
+            if episodic.TAG_BRIEF_OPTIONS not in (c.tags or []):
+                continue
+            try:
+                data = json.loads(c.content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict):
+                latest_data = data
+        if not isinstance(latest_data, dict):
             return None
-        data = json.loads(raw.get("content", ""))
-        fork = data.get("fork_class") if isinstance(data, dict) else None
+        fork = latest_data.get("fork_class")
         return fork if isinstance(fork, dict) else None
     except Exception:
         return None

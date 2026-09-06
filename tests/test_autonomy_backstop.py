@@ -79,7 +79,7 @@ class TestSweepOneRepoPerCall:
                 tags=["lapis-pm", "pm:autonomy-class"])
 
         with (
-            patch.object(va, "attest",
+            patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
         ):
@@ -105,7 +105,7 @@ class TestSweepOneRepoPerCall:
                 tags=["lapis-pm", "pm:auto-resolved"])
 
         with (
-            patch.object(va, "attest",
+            patch.object(va, "attest_main_baseline",
                          return_value=_att("unattested",
                                            pr_failures=["lapis_pm/foo.py::test_x"])),
             patch("lapis_pm.episodic.write_observation"),
@@ -133,7 +133,7 @@ class TestSweepOneRepoPerCall:
                 tags=["lapis-pm", "pm:auto-resolved"])
 
         with (
-            patch.object(va, "attest",
+            patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
         ):
@@ -162,14 +162,14 @@ class TestSweepIdempotency:
                 tags=["lapis-pm", "pm:autonomy-class"])
 
         with (
-            patch.object(va, "attest") as mock_attest,
+            patch.object(va, "attest_main_baseline") as mock_baseline,
             patch("lapis_pm.episodic.write_observation"),
         ):
             out = ab.sweep(mem, now="2026-09-06T12:00:00Z")
 
         # The repo was already swept today -> skipped, no suite run.
         assert out["status"] == "skipped_already_swept_today"
-        assert not mock_attest.called
+        assert not mock_baseline.called
 
     def test_cursor_advances_across_repos(self):
         # AC6: cursor advances - a second tick processes the next repo.
@@ -181,7 +181,7 @@ class TestSweepIdempotency:
                     tags=["lapis-pm", "pm:autonomy-class"])
 
         with (
-            patch.object(va, "attest",
+            patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
         ):
@@ -190,13 +190,42 @@ class TestSweepIdempotency:
         # After the first sweep, lapis-pm's last_sweep_ts is set. The next
         # sweep (next day) should pick the repo with the oldest (empty) stamp.
         with (
-            patch.object(va, "attest",
+            patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
         ):
             out2 = ab.sweep(mem, now="2026-09-07T00:00:00Z")
         second_repo = out2["repo"]
         assert first_repo != second_repo
+
+    def test_sweep_uses_main_baseline_not_attest(self):
+        # The sweep must run the dedicated main-baseline path (one detached
+        # worktree at origin/main), NOT attest() with a fake target_id
+        # (attest(target_id="__backstop__") would build a nonexistent branch
+        # "lapis/__backstop__/main" and always return inconclusive).
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                "sweep must not call va.attest (it was called with "
+                f"args={args}, kwargs={kwargs})"
+            )
+
+        with (
+            patch.object(va, "attest", side_effect=_boom),
+            patch.object(va, "attest_main_baseline",
+                         return_value=_att("attested", pr_failures=[])),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
+
+        # The sweep completed with the stubbed main-baseline result.
+        assert out["repo"] == "lapis-pm"
+        assert out["status"] == "green"
 
 
 # ---------------------------------------------------------------------------

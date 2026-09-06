@@ -119,17 +119,30 @@ def _adjudication_body(target_id: str = "my-target", pr: int = 42,
 
 
 def _outcome_body(target_id: str = "my-target", outcome: str = "confirm",
-                  created: str = "2026-09-06T00:00:00Z") -> dict:
-    return {
+                  created: str = "2026-09-06T00:00:00Z",
+                  freshness_stamp: str | None = None,
+                  omit_timestamp: bool = False) -> dict:
+    """A ratification-outcome entry. The real writer (RouterPortfolioEntry)
+    stores its ISO-8601 timestamp in `freshness_stamp` — it has NO `created`
+    field. `created` is kept for legacy/mem-attached timestamps;
+    `freshness_stamp` (when given) wins; `omit_timestamp` drops both."""
+    body = {
         "ratification_outcome": outcome,
         "target_id": target_id,
-        "created": created,
     }
+    if not omit_timestamp:
+        if freshness_stamp is not None:
+            body["freshness_stamp"] = freshness_stamp
+        else:
+            body["created"] = created
+    return body
 
 
 def _seed_precedent(mem, target_id: str = "my-target", pr: int = 42,
                     chosen: str = "confirm", ts: str = "2026-09-06T00:00:00Z",
                     created: str = "2026-09-06T00:00:00Z",
+                    freshness_stamp: str | None = None,
+                    omit_timestamp: bool = False,
                     outcome_target: str = "my-target",
                     outcome: str = "confirm",
                     source: str = "human") -> str:
@@ -144,8 +157,9 @@ def _seed_precedent(mem, target_id: str = "my-target", pr: int = 42,
     mem.set(key, content, tags=["lapis-pm", "adjudication", f"target:{target_id}"])
     # Cited outcome.
     okey = body["citations"][0]
-    mem.set(okey, json.dumps(_outcome_body(target_id=outcome_target,
-                                            outcome=outcome, created=created)),
+    mem.set(okey, json.dumps(_outcome_body(
+        target_id=outcome_target, outcome=outcome, created=created,
+        freshness_stamp=freshness_stamp, omit_timestamp=omit_timestamp)),
             tags=["lapis-pm", "router-portfolio"])
     return key
 
@@ -519,3 +533,139 @@ class TestRatifyAdjudication:
             mem._data[key]["content"].split("```json\n", 1)[1].rsplit("\n```", 1)[0]
         )
         assert body["fork"] is None  # auditable but never matches
+
+
+# ---------------------------------------------------------------------------
+# _fork_from_options_sibling: the sibling is a per-target COMMENT (tag
+# episodic.TAG_BRIEF_OPTIONS), not a mem key — read it from the comment
+# store like brief.read_options does (latest such comment wins).
+# ---------------------------------------------------------------------------
+
+class TestForkFromOptionsSibling:
+
+    def _comment(self, content: str, tags: list[str]):
+        c = MagicMock()
+        c.tags = tags
+        c.content = content
+        return c
+
+    def test_returns_fork_dict_from_comment_store(self):
+        # A comment-store sibling carrying the TAG_BRIEF_OPTIONS tag and a
+        # fork_class dict -> the dict comes back.
+        from lapis_pm import episodic
+        fork = {"repo": "lapis-pm", "verdict_class": "clean",
+                "change_classes": ["code"], "loc_bucket": "lt100",
+                "held_paths_class": "none"}
+        payload = {"brief_id": "b1", "trigger": "advisory-clean",
+                   "options": [], "fork_class": fork}
+        with patch.object(episodic, "all_comments", return_value=[
+            self._comment("not a sibling", ["pm:observation"]),
+            self._comment(json.dumps(payload), [episodic.TAG_BRIEF_OPTIONS]),
+        ]):
+            got = pc._fork_from_options_sibling(_make_mem(), "my-target")
+        assert got == fork
+
+    def test_latest_sibling_wins(self):
+        # Multiple TAG_BRIEF_OPTIONS comments -> the LATEST (most recently
+        # appended) wins.
+        from lapis_pm import episodic
+        fork_old = {"repo": "lapis-pm", "verdict_class": "clean",
+                    "change_classes": ["code"], "loc_bucket": "lt100",
+                    "held_paths_class": "none"}
+        fork_new = dict(fork_old, loc_bucket="100_400")
+        with patch.object(episodic, "all_comments", return_value=[
+            self._comment(json.dumps({"fork_class": fork_old}),
+                          [episodic.TAG_BRIEF_OPTIONS]),
+            self._comment(json.dumps({"fork_class": fork_new}),
+                          [episodic.TAG_BRIEF_OPTIONS]),
+        ]):
+            got = pc._fork_from_options_sibling(_make_mem(), "my-target")
+        assert got == fork_new
+
+    def test_no_sibling_returns_none(self):
+        # No TAG_BRIEF_OPTIONS comment -> None (the record is written with
+        # fork: null).
+        from lapis_pm import episodic
+        with patch.object(episodic, "all_comments", return_value=[
+            self._comment("some observation", ["pm:observation"]),
+        ]):
+            assert pc._fork_from_options_sibling(_make_mem(), "my-target") is None
+        with patch.object(episodic, "all_comments", return_value=[]):
+            assert pc._fork_from_options_sibling(_make_mem(), "my-target") is None
+
+    def test_unparseable_content_returns_none(self):
+        # A sibling comment with unparseable JSON -> None (never raises).
+        from lapis_pm import episodic
+        with patch.object(episodic, "all_comments", return_value=[
+            self._comment("{not valid json", [episodic.TAG_BRIEF_OPTIONS]),
+        ]):
+            assert pc._fork_from_options_sibling(_make_mem(), "my-target") is None
+
+    def test_missing_or_non_dict_fork_class_returns_none(self):
+        from lapis_pm import episodic
+        with patch.object(episodic, "all_comments", return_value=[
+            self._comment(json.dumps({"brief_id": "b1", "options": []}),
+                          [episodic.TAG_BRIEF_OPTIONS]),
+        ]):
+            assert pc._fork_from_options_sibling(_make_mem(), "my-target") is None
+        with patch.object(episodic, "all_comments", return_value=[
+            self._comment(json.dumps({"fork_class": "not-a-dict"}),
+                          [episodic.TAG_BRIEF_OPTIONS]),
+        ]):
+            assert pc._fork_from_options_sibling(_make_mem(), "my-target") is None
+
+    def test_store_exception_returns_none(self):
+        # A comment-store failure -> None (never raises).
+        from lapis_pm import episodic
+        with patch.object(episodic, "all_comments",
+                          side_effect=RuntimeError("store down")):
+            assert pc._fork_from_options_sibling(_make_mem(), "my-target") is None
+
+
+# ---------------------------------------------------------------------------
+# _lineage_ok: the ratification-outcome entry stores its timestamp in
+# `freshness_stamp` (RouterPortfolioEntry has NO `created` field). The 24h
+# window must be derived from freshness_stamp first, then `created`.
+# ---------------------------------------------------------------------------
+
+class TestLineageFreshnessStamp:
+
+    def test_freshness_stamp_within_24h_matches(self):
+        # An outcome entry carrying freshness_stamp (no created) within 24h
+        # of the record's ts matches.
+        mem = _make_mem()
+        _seed_precedent(mem, ts="2026-09-06T00:00:00Z",
+                        freshness_stamp="2026-09-05T23:00:00Z")
+        fork = pc.derive_fork_class(_make_cls(), "clean", repo="lapis-pm")
+        rec = pc.find_precedent(mem, "lapis-pm", fork)
+        assert rec is not None
+
+    def test_stale_freshness_stamp_no_match(self):
+        # A stale freshness_stamp (older than 24h) does not match.
+        mem = _make_mem()
+        _seed_precedent(mem, ts="2026-09-06T00:00:00Z",
+                        freshness_stamp="2026-08-01T00:00:00Z")
+        fork = pc.derive_fork_class(_make_cls(), "clean", repo="lapis-pm")
+        rec = pc.find_precedent(mem, "lapis-pm", fork)
+        assert rec is None
+
+    def test_no_timestamp_at_all_no_match(self):
+        # An entry with no timestamp at all does not match (fail-safe —
+        # never widen the window, never fall back to matching).
+        mem = _make_mem()
+        _seed_precedent(mem, ts="2026-09-06T00:00:00Z", omit_timestamp=True)
+        fork = pc.derive_fork_class(_make_cls(), "clean", repo="lapis-pm")
+        rec = pc.find_precedent(mem, "lapis-pm", fork)
+        assert rec is None
+
+    def test_freshness_stamp_wins_over_created(self):
+        # freshness_stamp is consulted FIRST: a fresh freshness_stamp with a
+        # stale `created` still matches (and vice versa would not — the
+        # fresh field wins).
+        mem = _make_mem()
+        _seed_precedent(mem, ts="2026-09-06T00:00:00Z",
+                        created="2026-08-01T00:00:00Z",
+                        freshness_stamp="2026-09-06T00:00:00Z")
+        fork = pc.derive_fork_class(_make_cls(), "clean", repo="lapis-pm")
+        rec = pc.find_precedent(mem, "lapis-pm", fork)
+        assert rec is not None

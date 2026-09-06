@@ -2881,6 +2881,22 @@ def _attestation_hook(target_id: str, cls: authority.PRClassification,
         if not repo:
             return
 
+        # Derive the PR head branch slug from the payload's PR head ref
+        # (e.g. "lapis/<tid>/local" -> slug "local"). attest() builds the
+        # head branch as "lapis/<tid>/<slug>"; the default slug ("forced")
+        # does not exist for real PR branches, so without the correct slug
+        # worktree creation would always fail -> always inconclusive.
+        # If the ref is missing or does not match the expected prefix, do
+        # NOT call attest() at all — inconclusive by omission is fail-safe;
+        # never call attest with a wrong slug.
+        head_ref = (pr.get("head") or {}).get("ref", "")
+        prefix = f"lapis/{target_id}/"
+        if not head_ref or not head_ref.startswith(prefix):
+            return
+        slug = head_ref[len(prefix):]
+        if not slug:
+            return
+
         # One run per head SHA: reuse the cached result while the head is
         # unchanged (a force-push re-runs it).
         mem = _mem()
@@ -2894,6 +2910,7 @@ def _attestation_hook(target_id: str, cls: authority.PRClassification,
                     repo, pr_number, head_sha,
                     changed_paths=list(getattr(cls, "changed_paths", None) or []),
                     target_id=target_id,
+                    slug=slug,
                 )
             finally:
                 _autonomy_set_inflight(False)

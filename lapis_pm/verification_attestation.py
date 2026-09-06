@@ -98,9 +98,12 @@ def _base_ref(base_branch: str) -> str:
 def _pr_failures_from_output(output: str) -> list[str]:
     """Extract failing test ids from pytest -q output (or smoke.sh output).
 
-    pytest -q emits `FAILED path::test_name` lines. Best-effort: any line
-    starting with FAILED is a failure; the set is what matters (the diff is
-    on sets, not ordering)."""
+    Recognizes BOTH pytest -q failure shapes:
+      - short-summary lines: `FAILED path::test_name` (optionally with a
+        ` - reason` suffix);
+      - the `= N failed ...` summary line (pytest short test summary).
+    Best-effort: the set is what matters (the diff is on sets, not
+    ordering)."""
     out = set()
     for line in (output or "").splitlines():
         line = line.strip()
@@ -109,18 +112,28 @@ def _pr_failures_from_output(output: str) -> list[str]:
             ident = line[len("FAILED "):].split(" - ")[0].strip()
             if ident:
                 out.add(ident)
+        elif line.startswith("= ") and " failed" in line:
+            # "= 3 failed, 1 passed in 1.23s" — pytest summary line.
+            # The summary line does not name the failing tests, so it only
+            # serves as failure EVIDENCE (a non-empty marker) — the hard
+            # invariant (a red suite never yields `attested`) is enforced on
+            # the exit code, not by synthesizing fake test ids.
+            out.add("_FAILED_SUMMARY")
     return sorted(out)
 
 
-def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str]]:
-    """Run the repo's suite in `worktree`. Returns (suite, failures).
+def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str], int]:
+    """Run the repo's suite in `worktree`. Returns (suite, failures, exit_code).
 
     Suite selection (Design 2): `bash smoke.sh` if the file exists in the
     repo root, else `python3 -m pytest -q` — exactly the `pm-pr-review`
     skill's repo-entry-point rule.
 
-    Raises on any runner failure (timeout, missing binary, non-zero rc is
-    NOT an error — red suites are data, not failures).
+    Raises on any runner failure (timeout, missing binary). A non-zero exit
+    code is NOT an error — red suites are data, not failures — but the exit
+    code is returned so the caller can enforce the hard invariant: a suite
+    that exits non-zero must NEVER yield an `attested` result (a red suite
+    with no parseable FAILED lines is `inconclusive`, fail-safe).
     """
     if (worktree / "smoke.sh").exists():
         suite = "bash smoke.sh"
@@ -135,10 +148,8 @@ def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str]]:
         text=True,
         timeout=ATTESTATION_WALL_BUDGET_S,
     )
-    # A red suite is DATA (its failures feed the diff), not an error. Only
-    # timeouts / missing binaries raise (caught upstream -> inconclusive).
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    return suite, _pr_failures_from_output(output)
+    return suite, _pr_failures_from_output(output), int(proc.returncode or 0)
 
 
 def _create_worktree(clone: str, ref: str, dest: Path) -> None:
@@ -227,8 +238,8 @@ def attest(
         try:
             _create_worktree(clone, head_ref, pr_wt)
             _create_worktree(clone, base_ref, main_wt)
-            suite, pr_failures = _run_suite_in_worktree(pr_wt)
-            _main_suite, main_failures = _run_suite_in_worktree(main_wt)
+            suite, pr_failures, pr_rc = _run_suite_in_worktree(pr_wt)
+            _main_suite, main_failures, _main_rc = _run_suite_in_worktree(main_wt)
         except subprocess.TimeoutExpired:
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
                     "suite": "", "ts": ts, "reason": "wall_budget_exceeded"}
@@ -240,6 +251,22 @@ def attest(
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
                     "suite": "", "ts": ts,
                     "reason": f"runner_error:{type(e).__name__}"}
+
+        # Hard invariant (fail-safe): a suite that exits non-zero (red) must
+        # NEVER yield `attested`. For repos whose suite entry point is
+        # `bash smoke.sh` a red suite may produce no parseable FAILED lines
+        # at all — in that case the failure set is empty but the run was
+        # red, so the result is `inconclusive` (brief as today), never
+        # `attested`.
+        if pr_rc != 0 and not pr_failures:
+            return {
+                "result": "inconclusive",
+                "pr_failures": [],
+                "preexisting": [],
+                "suite": suite,
+                "ts": ts,
+                "reason": "red_suite_unparseable_failures",
+            }
 
         pr_set = set(pr_failures)
         main_set = set(main_failures)
@@ -303,6 +330,84 @@ def write_cache(mem, target_id: str, pr_number: int, head_sha: str,
     key = cache_key(target_id, pr_number)
     mem.set(key, json.dumps(payload, ensure_ascii=False), tags=tags)
     return key
+
+
+def attest_main_baseline(
+    repo: str,
+    base_branch: str = "main",
+    *,
+    target_id: str | None = None,
+) -> dict:
+    """Run the repo's suite ONCE on `origin/<base_branch>` (U3 backstop).
+
+    A dedicated main-baseline run: ONE throwaway worktree, detached at
+    `origin/<base_branch>` directly — `_head_branch_for` is NOT involved
+    (there is no PR head to build a branch name from). Reuses attest()'s
+    internal machinery (worktree create/cleanup, suite run, failure
+    parsing, wall budget). Single run, no cache.
+
+    Returns the same result shape as attest():
+        {result: "attested" | "unattested" | "inconclusive",
+         pr_failures: [str], preexisting: [str],
+         suite: str, ts: iso}
+
+    For the backstop, `pr_failures` carries main's failure set and `result`
+    is `attested` (green) or `unattested` (red, failures parsed). A red
+    suite with no parseable failures is `inconclusive` (hard invariant,
+    same as attest()). Worktree cleanup happens on ALL exit paths
+    (success, timeout, worktree failure, exception) — removed `--force`,
+    exactly like attest().
+    """
+    ts = _now_iso()
+    clone = _repo_clone_path(repo)
+    if not Path(clone).is_dir():
+        return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
+                "suite": "", "ts": ts, "reason": f"clone_missing:{clone}"}
+
+    base_ref = _base_ref(base_branch)
+    root = Path(tempfile.mkdtemp(prefix="lapis-attest-"))
+    main_wt = root / "main"
+    try:
+        os.chmod(str(root), 0o700)
+        try:
+            _create_worktree(clone, base_ref, main_wt)
+            suite, main_failures, main_rc = _run_suite_in_worktree(main_wt)
+        except subprocess.TimeoutExpired:
+            return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
+                    "suite": "", "ts": ts, "reason": "wall_budget_exceeded"}
+        except subprocess.CalledProcessError as e:
+            return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
+                    "suite": "", "ts": ts,
+                    "reason": f"worktree_failure:{type(e).__name__}"}
+        except Exception as e:
+            return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
+                    "suite": "", "ts": ts,
+                    "reason": f"runner_error:{type(e).__name__}"}
+
+        # Hard invariant: a red suite with no parseable failures is
+        # inconclusive (fail-safe), never attested.
+        if main_rc != 0 and not main_failures:
+            return {
+                "result": "inconclusive",
+                "pr_failures": [],
+                "preexisting": [],
+                "suite": suite,
+                "ts": ts,
+                "reason": "red_suite_unparseable_failures",
+            }
+
+        result = "unattested" if main_failures else "attested"
+        return {
+            "result": result,
+            "pr_failures": main_failures,
+            "preexisting": [],
+            "suite": suite,
+            "ts": ts,
+        }
+    finally:
+        # ALL exit paths (success, timeout, worktree failure, exception).
+        _remove_worktree(clone, main_wt)
+        shutil.rmtree(str(root), ignore_errors=True)
 
 
 def record_preexisting(mem, repo: str, preexisting: list[str], now: str | None = None) -> None:

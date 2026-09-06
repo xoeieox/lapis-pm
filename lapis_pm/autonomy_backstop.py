@@ -255,16 +255,10 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
                 "ts": now}
 
     # Re-run the suite on origin/main in a throwaway worktree (same budget /
-    # cache discipline as U1).
-    att = _va.attest(
-        repo, pr_number=0, head_sha="origin/main", base_branch="main",
-        target_id="__backstop__", slug="main",
-    )
-    # attest() runs the PR-head vs main diff; for the backstop we only need
-    # main's failure set. Reuse the main worktree run result: when head_sha is
-    # origin/main the PR worktree == main worktree, so pr_failures == main's
-    # failures. (See verification_attestation: both worktrees are created;
-    # with head==main the diff is empty and pr_failures carries main's set.)
+    # cleanup discipline as U1). Dedicated main-baseline run: ONE detached
+    # worktree at origin/main — no PR head, no _head_branch_for.
+    att = _va.attest_main_baseline(repo, base_branch="main",
+                                   target_id="__backstop__")
     main_failures = att.get("pr_failures", [])
     result = att.get("result", "inconclusive")
 

@@ -129,8 +129,8 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_a"]),
-                                       ("python3 -m pytest -q", ["tests/test_x.py::test_a"]),
+                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_a"], 0),
+                                       ("python3 -m pytest -q", ["tests/test_x.py::test_a"], 0),
                          ]),
         ):
             res = va.attest("lapis-pm", 42, "abc123",
@@ -147,8 +147,8 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_new"]),
-                                       ("python3 -m pytest -q", []),
+                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_new"], 1),
+                                       ("python3 -m pytest -q", [], 0),
                          ]),
         ):
             res = va.attest("lapis-pm", 42, "abc123",
@@ -170,6 +170,173 @@ class TestAttestResults:
                             changed_paths=["lapis_pm/foo.py"])
         assert res["result"] == "inconclusive"
         assert res["reason"] == "wall_budget_exceeded"
+
+    def test_red_suite_no_parseable_failures_inconclusive(self):
+        # Hard invariant (fail-safe): a suite that exits non-zero (red) with
+        # NO parseable FAILED lines must yield inconclusive, NOT attested —
+        # e.g. a repo whose entry point is `bash smoke.sh` and whose red run
+        # prints no FAILED lines at all.
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         side_effect=[("bash smoke.sh", [], 1),
+                                       ("bash smoke.sh", [], 0),
+                         ]),
+        ):
+            res = va.attest("lapis-pm", 42, "abc123",
+                            changed_paths=["lapis_pm/foo.py"])
+        assert res["result"] == "inconclusive"
+        assert res["reason"] == "red_suite_unparseable_failures"
+
+    def test_green_suite_no_failures_attested(self):
+        # Zero exit, no failures on either head -> attested.
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         side_effect=[("bash smoke.sh", [], 0),
+                                       ("bash smoke.sh", [], 0),
+                         ]),
+        ):
+            res = va.attest("lapis-pm", 42, "abc123",
+                            changed_paths=["lapis_pm/foo.py"])
+        assert res["result"] == "attested"
+        assert res["pr_failures"] == []
+        assert res["preexisting"] == []
+
+    def test_parser_recognizes_failed_lines_and_summary(self):
+        # The parser recognizes BOTH pytest -q failure shapes: short-summary
+        # "FAILED path::test" lines and the "= N failed" summary line.
+        out = "FAILED tests/test_x.py::test_a - AssertionError\n"
+        failures = va._pr_failures_from_output(out)
+        assert "tests/test_x.py::test_a" in failures
+
+        summary = "= 3 failed, 1 passed in 1.23s =\n"
+        failures = va._pr_failures_from_output(summary)
+        assert failures  # failure evidence present (the summary marker)
+
+        # No failures at all -> empty set.
+        assert va._pr_failures_from_output("4 passed in 0.1s\n") == []
+
+    def test_attest_main_baseline_green(self):
+        # Dedicated main-baseline run: one detached worktree at origin/main,
+        # green suite -> attested with an empty failure set.
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree") as mock_create,
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         return_value=("bash smoke.sh", [], 0)),
+        ):
+            res = va.attest_main_baseline("lapis-pm", base_branch="main")
+        assert res["result"] == "attested"
+        assert res["pr_failures"] == []
+        assert res["suite"] == "bash smoke.sh"
+        # ONE worktree, detached at origin/main (no _head_branch_for).
+        assert mock_create.call_count == 1
+        assert mock_create.call_args.args[1] == "origin/main"
+
+    def test_attest_main_baseline_red_with_failures(self):
+        # Red main baseline with parseable failures -> unattested, failures
+        # carried in pr_failures (the backstop reads them as main_failures).
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         return_value=("python3 -m pytest -q",
+                                       ["tests/test_x.py::test_a"], 1)),
+        ):
+            res = va.attest_main_baseline("lapis-pm")
+        assert res["result"] == "unattested"
+        assert res["pr_failures"] == ["tests/test_x.py::test_a"]
+
+    def test_attest_main_baseline_red_no_failures_inconclusive(self):
+        # Hard invariant: red main baseline with no parseable failures is
+        # inconclusive (fail-safe), never attested.
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         return_value=("bash smoke.sh", [], 1)),
+        ):
+            res = va.attest_main_baseline("lapis-pm")
+        assert res["result"] == "inconclusive"
+        assert res["reason"] == "red_suite_unparseable_failures"
+
+    def test_attest_main_baseline_timeout_inconclusive(self):
+        # Timeout in the main-baseline run -> inconclusive (wall budget).
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         side_effect=subprocess.TimeoutExpired(cmd="pytest", timeout=900)),
+        ):
+            res = va.attest_main_baseline("lapis-pm")
+        assert res["result"] == "inconclusive"
+        assert res["reason"] == "wall_budget_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# U1.2 hook slug fix: the attestation hook derives the PR head slug from the
+# payload's pr.head.ref and passes it to attest(); a missing/mismatched ref
+# skips the attestation entirely (never call attest with a wrong slug).
+# ---------------------------------------------------------------------------
+
+class TestHookSlug:
+
+    def _run_hook(self, payload: dict, att: dict):
+        from lapis_pm import pm_core
+        cls = _make_cls()
+        target = _make_target(pm_verification="pm-live-test")
+        with (
+            patch.object(pm_core, "TargetStore") as mock_store,
+            patch.object(pm_core, "_mem", return_value=_make_mem()),
+            patch.object(va, "attest", return_value=att) as mock_attest,
+            patch.object(va, "read_cache", return_value=None),
+            patch.object(va, "write_cache"),
+            patch("lapis_pm.episodic.write_observation"),
+            patch.dict("os.environ", {"PM_AUTONOMY_ACTUATOR": "shadow"}),
+        ):
+            mock_store.return_value.get.return_value = target
+            pm_core._attestation_hook("my-target", cls, payload)
+        return mock_attest
+
+    def test_hook_passes_slug_from_head_ref(self):
+        # pr.head.ref "lapis/my-target/local" -> attest receives slug="local".
+        payload = {"pr": {"head": {"sha": "abc123",
+                                   "ref": "lapis/my-target/local"}},
+                   "classification": None}
+        mock_attest = self._run_hook(payload, _att("attested"))
+        assert mock_attest.called
+        assert mock_attest.call_args.kwargs.get("slug") == "local"
+
+    def test_hook_not_called_when_ref_absent(self):
+        # No pr.head.ref -> attest is NOT called (skip; inconclusive by
+        # omission is fail-safe).
+        payload = {"pr": {"head": {"sha": "abc123"}}, "classification": None}
+        mock_attest = self._run_hook(payload, _att("attested"))
+        assert not mock_attest.called
+
+    def test_hook_not_called_when_ref_prefix_mismatch(self):
+        # A ref that does not start with "lapis/<target_id>/" -> attest is
+        # NOT called (never call attest with a wrong slug).
+        payload = {"pr": {"head": {"sha": "abc123",
+                                   "ref": "lapis/other-target/local"}},
+                   "classification": None}
+        mock_attest = self._run_hook(payload, _att("attested"))
+        assert not mock_attest.called
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +382,13 @@ class TestContainmentInvariant:
         Returns (target, mock_attest)."""
         from lapis_pm import pm_core
         cls = _make_cls()
-        payload = {"pr": {"head": {"sha": "abc123"}}, "classification": cls}
+        # The payload carries the PR head ref (the hook derives the branch
+        # slug from it); without a matching "lapis/<tid>/<slug>" ref the hook
+        # skips the attestation entirely (never call attest with a wrong
+        # slug).
+        payload = {"pr": {"head": {"sha": "abc123",
+                                   "ref": "lapis/my-target/local"}},
+                   "classification": cls}
         target = _make_target(pm_verification="pm-live-test")
         with (
             patch.object(pm_core, "TargetStore") as mock_store,

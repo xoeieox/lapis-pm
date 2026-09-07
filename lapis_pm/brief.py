@@ -272,6 +272,7 @@ def synthesize(
     options_extra_tags: list[str] | None = None,
     reviewer_verdict_text: str | None = None,
     functional_critic_text: str | None = None,
+    fork_class: dict | None = None,
 ) -> Brief:
     """Produce a brief, write it as a comment, optionally push to Pushover.
 
@@ -354,7 +355,8 @@ def synthesize(
     # The brief body is unchanged; this is purely additive.
     if trigger in _CLOSED_FORM_TRIGGERS:
         _write_options_sibling(target_id, comment.id, trigger, pr_number,
-                               extra_tags=options_extra_tags)
+                               extra_tags=options_extra_tags,
+                               fork_class=fork_class)
 
     deep_link = f"{DASHBOARD_BASE}/thread/{target_id}"
     pushed = False
@@ -376,8 +378,16 @@ def _write_options_sibling(
     trigger: str,
     pr_number: int | None,
     extra_tags: list[str] | None = None,
+    fork_class: dict | None = None,
 ) -> None:
-    """Write the pm:brief-options sibling comment for a closed-form trigger."""
+    """Write the pm:brief-options sibling comment for a closed-form trigger.
+
+    `fork_class` (lapis-pm-autonomy-actuator-v0, Design 6): additive optional
+    key in the payload JSON — the deterministic fork shape derived at
+    emission, so `cmd_ratify` can copy it into the adjudication record without
+    re-derivation or network. Absent (None) => key omitted; the existing JSON
+    shape and the read_options contract are unchanged.
+    """
     import copy
     option_templates = _CLOSED_FORM_TRIGGERS.get(trigger)
     if not option_templates:
@@ -396,6 +406,8 @@ def _write_options_sibling(
         "trigger": trigger,
         "options": options,
     }
+    if isinstance(fork_class, dict):
+        payload["fork_class"] = fork_class
     episodic.write_brief_options(target_id, json.dumps(payload, ensure_ascii=False),
                                  extra_tags=extra_tags)
 

@@ -2779,6 +2779,373 @@ def _mem() -> MemoryStore:
     return node_identity.writable_store()
 
 
+# ---------------------------------------------------------------------------
+# Autonomy actuator hooks (lapis-pm-autonomy-actuator-v0, U1/U2/U3 wiring)
+#
+# Single dial, ships in shadow (Design 1): PM_AUTONOMY_ACTUATOR=shadow (default)
+# | enforce. Unknown values fail-safe to shadow (same convention as
+# PM_AUTO_RESOLVE, auto_resolve.py:19-25). Shadow: the hooks compute and record
+# but never act. Enforce: U1 flips pm_verification from an observed pipeline
+# run; U2 merges on a verified precedent match. Every hook is never-raise:
+# a failed act attempt degrades to today's behavior (the brief is still
+# emitted), never to a skipped brief.
+# ---------------------------------------------------------------------------
+
+_AUTONOMY_ACTUATOR_DIAL_ENV = "PM_AUTONOMY_ACTUATOR"
+_AUTONOMY_ACTUATOR_KEY = "pm/autonomy-actuator/last-run"
+
+
+def _autonomy_dial() -> str:
+    """Read PM_AUTONOMY_ACTUATOR. Unknown values fail-safe to 'shadow'."""
+    val = os.environ.get(_AUTONOMY_ACTUATOR_DIAL_ENV, "shadow").lower().strip()
+    if val in ("shadow", "enforce"):
+        return val
+    logger.warning(
+        "%s=%r is unknown; treating as 'shadow'",
+        _AUTONOMY_ACTUATOR_DIAL_ENV, val,
+    )
+    return "shadow"
+
+
+_AUTONOMY_INFLIGHT = False
+
+
+def _autonomy_inflight() -> bool:
+    """True while an autonomy op (attestation or backstop sweep) is in flight.
+
+    Single shared concurrency guard (Design 9 / H2): the tick path never stacks
+    two 900s autonomy ops — an in-flight op makes the other skip and retry next
+    tick. Process-local (each timer-fired tick is a fresh process; a crashed
+    op clears naturally on the next process start).
+    """
+    return _AUTONOMY_INFLIGHT
+
+
+def _autonomy_set_inflight(value: bool) -> None:
+    global _AUTONOMY_INFLIGHT
+    _AUTONOMY_INFLIGHT = bool(value)
+
+
+def _autonomy_op_daily_gated(key_suffix: str, window_s: float = 86400.0) -> bool:
+    """Once-a-day gate on a mem key (same 'once a day, out of tick' pattern as
+    hold_shadow_summary). Returns True when the op may run this tick."""
+    key = f"{_AUTONOMY_ACTUATOR_KEY}/{key_suffix}"
+    try:
+        rec = _mem().get(key)
+        if rec:
+            last = datetime.fromisoformat(str(rec.get("content", "")).replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - last).total_seconds() < window_s:
+                return False
+    except Exception:
+        pass  # fail-open: a read error lets the op run (it re-records the stamp)
+    return True
+
+
+def _autonomy_stamp(key_suffix: str) -> None:
+    key = f"{_AUTONOMY_ACTUATOR_KEY}/{key_suffix}"
+    try:
+        _mem().set(key, _now_iso(), tags=["lapis-pm", "pm:autonomy-actuator"])
+    except Exception as e:
+        logger.warning("autonomy-actuator: stamp write failed for %s: %s", key, e)
+
+
+def _attestation_hook(target_id: str, cls: authority.PRClassification,
+                      payload: dict) -> None:
+    """U1 hook: pipeline-attested machine verification (Design 2, U1.2).
+
+    Fires only for non-hold advisory-clean targets whose pm_verification is
+    still 'pm-live-test'. Runs (or reuses the head-SHA cache of) the
+    two-worktree failure-set diff and, in enforce mode only, flips
+    pm_verification to 'machine' on an attested result. unattested /
+    inconclusive NEVER flip the field (fail-safe to the human brief in both
+    dial modes). Never-raise.
+    """
+    try:
+        dial = _autonomy_dial()
+        from . import verification_attestation as _va
+
+        # Fresh store read at the hook site (the hook precedes the shared read
+        # by construction — H1: the shared read must reflect a same-tick grant).
+        t = TargetStore().get(target_id)
+        if t is None:
+            return
+        if t.data.get("pm_verification", "pm-live-test") != "pm-live-test":
+            return  # already machine (or a non-default value) — nothing to do
+
+        pr = payload.get("pr") or {}
+        head_sha = (pr.get("head") or {}).get("sha", "")
+        if not head_sha:
+            return
+        pr_number = cls.pr_number
+        repo = cls.repo or ""
+        if not repo:
+            return
+
+        # Derive the PR head branch slug from the payload's PR head ref
+        # (e.g. "lapis/<tid>/local" -> slug "local"). attest() builds the
+        # head branch as "lapis/<tid>/<slug>"; the default slug ("forced")
+        # does not exist for real PR branches, so without the correct slug
+        # worktree creation would always fail -> always inconclusive.
+        # If the ref is missing or does not match the expected prefix, do
+        # NOT call attest() at all — inconclusive by omission is fail-safe;
+        # never call attest with a wrong slug.
+        head_ref = (pr.get("head") or {}).get("ref", "")
+        prefix = f"lapis/{target_id}/"
+        if not head_ref or not head_ref.startswith(prefix):
+            return
+        slug = head_ref[len(prefix):]
+        if not slug:
+            return
+
+        # One run per head SHA: reuse the cached result while the head is
+        # unchanged (a force-push re-runs it).
+        mem = _mem()
+        cached = _va.read_cache(mem, target_id, pr_number, head_sha)
+        if cached is None:
+            if _autonomy_inflight():
+                return  # shared concurrency guard — retry next tick
+            _autonomy_set_inflight(True)
+            try:
+                att = _va.attest(
+                    repo, pr_number, head_sha,
+                    changed_paths=list(getattr(cls, "changed_paths", None) or []),
+                    target_id=target_id,
+                    slug=slug,
+                )
+            finally:
+                _autonomy_set_inflight(False)
+            _va.write_cache(mem, target_id, pr_number, head_sha, att,
+                            shadow=(dial != "enforce"))
+        else:
+            att = cached
+
+        # Pre-existing failures: recorded as finding/ keys per the skill's
+        # recipe (deduped per (repo, test, day)).
+        preexisting = att.get("preexisting") or []
+        if preexisting:
+            try:
+                _va.record_preexisting(mem, repo, preexisting)
+            except Exception as e:
+                logger.warning("attestation: preexisting finding write failed: %s", e)
+
+        if att.get("result") != "attested":
+            # unattested / inconclusive — never flip the field (fail-safe).
+            episodic.write_observation(
+                target_id,
+                f"attestation: result={att.get('result')} "
+                f"(reason={att.get('reason') or ('pr_failures' if att.get('pr_failures') else 'n/a')}); "
+                f"pm_verification unchanged — human brief as today",
+                extra_tags=[
+                    "pm:attestation", f"pm:attestation-result={att.get('result')}",
+                    f"pm:pr={pr_number}", "pm:dial=" + dial,
+                ],
+            )
+            return
+
+        if dial != "enforce":
+            episodic.write_observation(
+                target_id,
+                f"attestation (shadow): WOULD grant pm_verification=machine "
+                f"(head={head_sha[:12]}, suite={att.get('suite', '?')}) — "
+                f"field untouched in shadow mode",
+                extra_tags=[
+                    "pm:attestation", "pm:attestation-would-grant",
+                    f"pm:pr={pr_number}", "pm:dial=shadow",
+                ],
+            )
+            return
+
+        # Enforce + attested: flip pm_verification from the OBSERVED run.
+        t.data["pm_verification"] = "machine"
+        t.save()
+        episodic.write_observation(
+            target_id,
+            f"attestation (enforce): pm_verification flipped to machine from "
+            f"observed pipeline run (head={head_sha[:12]}, suite={att.get('suite', '?')})",
+            extra_tags=[
+                "pm:attestation", "pm:attestation-granted",
+                f"pm:pr={pr_number}", "pm:dial=enforce",
+            ],
+        )
+    except Exception as e:
+        logger.warning(
+            "attestation hook failed for %s PR #%s (%s) — continuing to brief",
+            target_id, cls.pr_number, e,
+        )
+
+
+def _precedent_hook(target_id: str, cls: authority.PRClassification,
+                    payload: dict) -> str | None:
+    """U2 hook: precedent actuator (Design 3/4/5, U2.5).
+
+    Fires ONLY for effective_trigger == 'advisory-clean' and not hold (the
+    merge-safe state; screen-issue and fixable-low forks keep the human in
+    v0). Enforce mode: requires the fork class to be promoted AND a verified
+    precedent match (Design 5 lineage chain), then merges via the proven
+    brief._act_merge_pr path + writes the resolution record + returns the
+    action string. Shadow mode: same derivation, records the would-be call to
+    /srv/lapis/autonomy-shadow/precedent-calls.jsonl, never merges, returns None
+    (the brief is still emitted). On ANY merge exception it returns None —
+    fall through to the normal brief path, never swallow a brief.
+    """
+    try:
+        dial = _autonomy_dial()
+        from . import precedent as _pc
+
+        fork = _pc.derive_fork_class(cls, "clean", repo=cls.repo)
+        if fork.get("held_paths_class") != "none":
+            _pc.record_shadow_call(
+                target_id, cls.repo or "", cls.pr_number, fork,
+                would_merge=False,
+                would_merge_reason="held_paths_class!=none (unconditional human gate)",
+                matched_precedent=None, no_match_reason="held_paths", dial=dial,
+            )
+            return None
+        # Merge-safe state: reviewer clean, no issues, LOC within MAX_AUTO_LOC.
+        if cls.issues:
+            _pc.record_shadow_call(
+                target_id, cls.repo or "", cls.pr_number, fork,
+                would_merge=False,
+                would_merge_reason="issues present (not merge-safe)",
+                matched_precedent=None, no_match_reason="issues", dial=dial,
+            )
+            return None
+        if int(getattr(cls, "diff_loc", 0) or 0) > _pc.MAX_AUTO_LOC:
+            _pc.record_shadow_call(
+                target_id, cls.repo or "", cls.pr_number, fork,
+                would_merge=False,
+                would_merge_reason=f"loc {getattr(cls, 'diff_loc', 0)} > MAX_AUTO_LOC",
+                matched_precedent=None, no_match_reason="loc_bucket", dial=dial,
+            )
+            return None
+
+        mem = _mem()
+        rec = _pc.find_precedent(mem, cls.repo or "", fork)
+        skipped = int(getattr(_pc.find_precedent, "last_skipped", 0) or 0)
+
+        if dial != "enforce":
+            _pc.record_shadow_call(
+                target_id, cls.repo or "", cls.pr_number, fork,
+                would_merge=rec is not None,
+                would_merge_reason=(
+                    "enforce would merge on verified precedent" if rec
+                    else "no verified precedent match"
+                ),
+                matched_precedent=rec.get("_key") if rec else None,
+                no_match_reason=None if rec else "no_match",
+                dial="shadow", skipped=skipped,
+            )
+            return None
+
+        if rec is None:
+            _pc.record_shadow_call(
+                target_id, cls.repo or "", cls.pr_number, fork,
+                would_merge=False,
+                would_merge_reason="no verified precedent match — brief as today",
+                matched_precedent=None, no_match_reason="no_match",
+                dial="enforce", skipped=skipped,
+            )
+            return None
+
+        # Enforce + verified match: the fork class must be promoted (Design 8 —
+        # a class nobody has promoted never auto-resolves).
+        class_key = _pc.class_record_key(
+            cls.repo or "", "clean", fork.get("change_classes", []),
+            fork.get("loc_bucket", ""),
+        )
+        class_rec = None
+        try:
+            raw = mem.get(class_key)
+            if raw:
+                class_rec = json.loads(raw.get("content", ""))
+        except (ValueError, TypeError):
+            class_rec = None
+        if not isinstance(class_rec, dict) or not class_rec.get("promoted"):
+            _pc.record_shadow_call(
+                target_id, cls.repo or "", cls.pr_number, fork,
+                would_merge=False,
+                would_merge_reason=(
+                    "fork class not promoted (manual promotion required)"
+                ),
+                matched_precedent=rec.get("_key"), no_match_reason="class_not_promoted",
+                dial="enforce", skipped=skipped,
+            )
+            return None
+
+        # Merge via the proven path (Design 4). Any exception (incl. Forgejo 4xx
+        # on a not-mergeable PR) falls through to the brief — never swallowed.
+        brief._act_merge_pr(target_id, cls.pr_number)
+        _pc.write_resolution(
+            mem,
+            target_id=target_id, pr_number=cls.pr_number, repo=cls.repo or "",
+            fork=fork, matched_precedent=rec.get("_key", ""),
+        )
+        # Class counter increment (Design 8).
+        try:
+            data = dict(class_rec)
+            data["auto_resolved_count"] = int(data.get("auto_resolved_count", 0)) + 1
+            mem.set(class_key, json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    tags=["lapis-pm", "pm:autonomy-class"])
+        except Exception as e:
+            logger.warning("precedent hook: class counter update failed: %s", e)
+        _pc.record_shadow_call(
+            target_id, cls.repo or "", cls.pr_number, fork,
+            would_merge=True,
+            would_merge_reason="enforce: precedent match + promoted class — merged",
+            matched_precedent=rec.get("_key"), no_match_reason=None,
+            dial="enforce", skipped=skipped,
+        )
+        episodic.write_observation(
+            target_id,
+            f"Precedent-resolved: merged PR #{cls.pr_number} on verified precedent "
+            f"{rec.get('_key', '?')} (fork={_pc.fork_hash(fork)}, dial=enforce)",
+            extra_tags=["pm:precedent-resolved", f"pm:pr={cls.pr_number}"],
+        )
+        return f"action:precedent_resolved:fork={_pc.fork_hash(fork)}:pr={cls.pr_number}"
+    except Exception as e:
+        # Merge exception or hook failure: fall through to the normal brief
+        # path — never swallow a brief (U2.6).
+        logger.warning(
+            "precedent hook failed for %s PR #%s (%s) — falling to brief",
+            target_id, cls.pr_number, e,
+        )
+        return None
+
+
+def _backstop_sweep_tick() -> None:
+    """U3 tick-path invocation (Design 9): daily-gated, one repo per tick,
+    never-raise, fail-soft to logging. Shares the U1 concurrency guard so the
+    tick path never stacks two 900s autonomy ops."""
+    try:
+        if _autonomy_inflight():
+            return  # shared concurrency guard — retry next tick
+        if not _autonomy_op_daily_gated("backstop-sweep"):
+            return  # once per day
+        _autonomy_set_inflight(True)
+        try:
+            from . import autonomy_backstop as _bs
+            outcome = _bs.sweep(_mem())
+        finally:
+            _autonomy_set_inflight(False)
+        _autonomy_stamp("backstop-sweep")
+        logger.info(
+            "[autonomy-backstop] sweep: repo=%s status=%s suspect=%s demoted=%s",
+            outcome.get("repo"), outcome.get("status"),
+            outcome.get("suspect_prs"), outcome.get("demoted_classes"),
+        )
+        if outcome.get("status") == "red":
+            try:
+                _bs.open_regression_brief(
+                    outcome.get("repo") or "?",
+                    (outcome.get("suspect_prs") or [None])[0],
+                    outcome.get("main_failures") or [],
+                )
+            except Exception as e:
+                logger.warning("backstop regression brief failed: %s", e)
+    except Exception as e:
+        logger.warning("[autonomy-backstop] sweep failed (non-fatal): %s", e)
+
+
 def _ensure_dispatch_owned(repo: str) -> None:
     """Gate a fixer/reviewer dispatch on owned_queue_root (Design §3d, I4)."""
     paths = [str(SHAPED_DIR), str(CLAUDE_QUEUE_DIR)]
@@ -6045,6 +6412,14 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         else:
             effective_trigger = "advisory-clean"
 
+    # U1 attestation hook (lapis-pm-autonomy-actuator-v0): pinned BEFORE the
+    # shared TargetStore read so the read below reflects a same-tick
+    # pm_verification grant (H1: persist-then-stale-read would make the grant
+    # dead until a second tick). Never-raise; observation must never affect
+    # the gate result or the brief already being built.
+    if not hold and effective_trigger == "advisory-clean":
+        _attestation_hook(target_id, cls, payload)
+
     # Single TargetStore read shared by the auto-resolve and FC hook blocks below.
     _target = TargetStore().get(target_id)
 
@@ -6075,6 +6450,19 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
                         target_id, cls.pr_number, _ar_exc,
                     )
                     # fall through to normal brief/gem path
+
+    # U2 precedent hook (lapis-pm-autonomy-actuator-v0): fires ONLY for
+    # effective_trigger == 'advisory-clean' and not hold (the merge-safe state;
+    # screen-issue and fixable-low forks keep the human in v0). Enforce mode
+    # merges on a verified precedent match and returns the action string;
+    # shadow mode records the would-be call and returns None. On any merge
+    # exception it returns None — fall through to the normal brief path, never
+    # swallow a brief.
+    if not hold and effective_trigger == "advisory-clean":
+        _precedent_action = _precedent_hook(target_id, cls, payload)
+        if _precedent_action is not None:
+            _mark_pr_classified(target_id, cls.pr_number)
+            return _precedent_action
 
     reviewer_verdict_text: str | None = None
     if effective_trigger == "advisory-clean" or hold:
@@ -6176,6 +6564,19 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
                 target_id, cls.pr_number, _fc_exc,
             )
 
+    # U2 fork-class persistence (lapis-pm-autonomy-actuator-v0, Design 6):
+    # derive the deterministic fork shape at emission (classifier data is
+    # fresh here) and persist it in the pm:brief-options sibling so
+    # cmd_ratify can copy it without re-derivation or network. Never-raise —
+    # a derivation failure leaves the sibling unchanged (fork_class=None).
+    _fork_class: dict | None = None
+    try:
+        from . import precedent as _pc
+        _fork_class = _pc.derive_fork_class(cls, cls.screen_verdict or "clean",
+                                            repo=cls.repo)
+    except Exception as e:
+        logger.warning("fork-class derivation failed for %s: %s", target_id, e)
+
     b = brief.synthesize(
         target_id,
         trigger=effective_trigger,
@@ -6186,6 +6587,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         notify=NotifyPriority.NORMAL if hold else None,
         reviewer_verdict_text=reviewer_verdict_text,
         functional_critic_text=functional_critic_text,
+        fork_class=_fork_class,
     )
     _mark_pr_classified(target_id, cls.pr_number)
     _set_brief_outstanding(target_id, b, verified=True)
@@ -9136,6 +9538,15 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         set_pause_state(target_id, cur_state)
     if cur_state == "paused":
         return TickResult(target_id, True, "paused", 0, "noop:paused")
+
+    # 1.5 Autonomy backstop sweep (lapis-pm-autonomy-actuator-v0, U3 / Design 9):
+    # daily-gated, one repo per tick, never-raise, fail-soft to logging. Shares
+    # the U1 concurrency guard so the tick path never stacks two 900s autonomy
+    # ops (attestation OR sweep, never both stacked).
+    try:
+        _backstop_sweep_tick()
+    except Exception as e:
+        logger.warning("[autonomy-backstop] tick-path sweep failed (non-fatal): %s", e)
 
     # 2. Cursor + perceive
     # Reconcile pending dispatch records against ClaudeQueue terminal state

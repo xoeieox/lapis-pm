@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -1151,11 +1152,140 @@ def cmd_ratify(args) -> int:
         print(f"ERROR: ratification failed: {e}", file=sys.stderr)
         return 1
 
+    # Adjudication record (lapis-pm-autonomy-actuator-v0, Design 5): written
+    # alongside the ratification-outcome entry in the SAME call, idempotent per
+    # (tid, pr, outcome). The fork block is copied from the pm:brief-options
+    # sibling when present, else null (auditable, never matches). The
+    # ghost-ratify marker (rev 4) records whether this CLI ran interactively.
+    adjudication_key = None
+    try:
+        from . import precedent as _pc
+
+        # Resolve the PR number: --pr flag > adopted_pr_number > prior key.
+        pr_number = getattr(args, "pr", None)
+        if pr_number is None:
+            try:
+                store = pm_core.TargetStore()
+                t = store.get(target_id)
+                if t is not None:
+                    pr_number = t.data.get("adopted_pr_number")
+            except Exception:
+                pr_number = None
+        if pr_number is None and prior_event_id:
+            m = re.search(r"(?:^|/)(\d+)$", prior_event_id or "")
+            if m:
+                pr_number = int(m.group(1))
+        if pr_number is None:
+            pr_number = 0
+
+        repo = ""
+        try:
+            store = pm_core.TargetStore()
+            t = store.get(target_id)
+            if t is not None:
+                repo = t.pm_repo or ""
+        except Exception:
+            repo = ""
+
+        # fork copied from the pm:brief-options sibling (Design 5); null when
+        # missing/unparseable (briefs predating this spec, non-PR briefs).
+        mem = pm_core._mem()
+        fork = _pc._fork_from_options_sibling(mem, target_id)
+
+        adjudication_key = _pc.write_adjudication(
+            mem,
+            target_id=target_id,
+            pr_number=pr_number,
+            outcome=outcome,
+            repo=repo,
+            fork=fork,
+            intent=intent or "",
+            citations=[key],
+            invoked_interactive=sys.stdin.isatty(),
+        )
+    except Exception as e:
+        # Never block the ratify itself on an adjudication write failure.
+        print(f"WARNING: adjudication record write failed: {e}", file=sys.stderr)
+
     if as_json:
-        print(json.dumps({"key": key}))
+        print(json.dumps({"key": key, "adjudication_key": adjudication_key}))
     else:
         print(f"Ratified {target_id} ({outcome}): {key}")
+        if adjudication_key:
+            print(f"Adjudication record: {adjudication_key}")
     return 0
+
+
+def cmd_backstop_sweep(args) -> int:
+    """Run one repo's autonomy-backstop sweep step (U3.4).
+
+    Idempotent within the daily window (one repo per tick, round-robin cursor
+    persisted in the class records' last_sweep_ts). Output discipline mirrors
+    `lapis-pm land --dry-run`: human-readable, machine-greppable.
+    """
+    from . import autonomy_backstop as _bs
+
+    mem = pm_core._mem()
+    now = _now_iso()
+    outcome = _bs.sweep(mem, now=now, repo_cursor=getattr(args, "repo", None))
+
+    print(
+        f"backstop-sweep: repo={outcome.get('repo')} "
+        f"status={outcome.get('status')} "
+        f"suspect_prs={outcome.get('suspect_prs')} "
+        f"demoted={len(outcome.get('demoted_classes') or [])} "
+        f"ts={outcome.get('ts')}"
+    )
+    for pr in outcome.get("suspect_prs") or []:
+        print(f"  SUSPECT: PR #{pr} (suspect, not proven — coarse attribution)")
+    for key in outcome.get("demoted_classes") or []:
+        print(f"  DEMOTED: {key}")
+    for key in outcome.get("findings") or []:
+        print(f"  FINDING: {key}")
+    if outcome.get("status") == "red":
+        # U3.2: open the HIGH regression brief (suspect, not proven).
+        suspect_pr = (outcome.get("suspect_prs") or [None])[0]
+        _bs.open_regression_brief(
+            outcome.get("repo") or "?", suspect_pr,
+            outcome.get("main_failures") or [],
+        )
+    return 0
+
+
+def cmd_autonomy_promote(args) -> int:
+    """Manual promotion path for a fork class (U3.3, Design 7/8).
+
+    Demotion-cooldown guard: refuses a class with regression_count > 0 and
+    last_regression_ts within 14 days without --force; with regression_count
+    > 2 within 14 days, even --force requires a logged --justification.
+    """
+    from . import autonomy_backstop as _bs
+
+    change_classes = [c.strip() for c in (args.change_classes or "").split(",") if c.strip()]
+    mem = pm_core._mem()
+    result = _bs.promote(
+        mem,
+        repo=args.repo,
+        verdict_class=args.verdict_class,
+        change_classes=change_classes,
+        loc_bucket=args.loc_bucket,
+        force=args.force,
+        justification=args.justification,
+    )
+    if result.get("promoted"):
+        print(
+            f"promoted: {result.get('key')} by={result.get('promoted_by')} "
+            f"ts={result.get('ts')}"
+        )
+        return 0
+    reason = result.get("reason", "unknown")
+    print(f"promotion refused: {reason} (key={result.get('key')})", file=sys.stderr)
+    return 1
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def cmd_directive(args) -> int:
@@ -2375,6 +2505,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rat.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "PR number the ratification resolves (lapis-pm-autonomy-actuator-v0). "
+            "When omitted, auto-resolved from the target's adopted_pr_number or "
+            "the PR number embedded in the prior decision's mem key."
+        ),
+    )
+    rat.add_argument(
         "--json",
         action="store_true",
         help="Print written mem key as JSON {\"key\": ...}",
@@ -3150,6 +3291,66 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     hss.set_defaults(func=cmd_hold_shadow_summary)
+
+    # ------------------------------------------------------------------
+    # backstop-sweep — one repo's autonomy-backstop sweep step (U3.4)
+    # ------------------------------------------------------------------
+    bsw = sub.add_parser(
+        "backstop-sweep",
+        help=(
+            "Run one repo's autonomy-backstop sweep step: re-run the main "
+            "baseline, attribute red suites to recently resolved PRs, demote "
+            "suspect fork classes (lapis-pm-autonomy-actuator-v0, U3)."
+        ),
+    )
+    bsw.add_argument(
+        "--repo",
+        default=None,
+        metavar="REPO",
+        help="Force the round-robin cursor to this repo (default: oldest last_sweep_ts).",
+    )
+    bsw.set_defaults(func=cmd_backstop_sweep)
+
+    # ------------------------------------------------------------------
+    # autonomy-promote — manual promotion of a fork class (U3.3)
+    # ------------------------------------------------------------------
+    ap = sub.add_parser(
+        "autonomy-promote",
+        help=(
+            "Promote a fork class to auto-resolve (manual path; demotion is "
+            "automatic, promotion is Erah's from the Thursday reading). "
+            "Refuses within the 14-day regression cooldown without --force; "
+            "with regression_count > 2, --force requires --justification."
+        ),
+    )
+    ap.add_argument("repo", help="Repo name (e.g. 'lapis-pm').")
+    ap.add_argument(
+        "verdict_class",
+        choices=["clean", "fixable-low", "fixable-nonlow", "needs-human", "needs-review"],
+        help="Verdict class of the fork.",
+    )
+    ap.add_argument(
+        "change_classes",
+        help="Comma-separated change classes (e.g. 'code,test').",
+    )
+    ap.add_argument(
+        "loc_bucket",
+        choices=["lt100", "100_400", "gt400"],
+        help="LOC bucket of the fork.",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Promote despite the regression cooldown (recorded as Erah-force).",
+    )
+    ap.add_argument(
+        "--justification",
+        default=None,
+        metavar="TEXT",
+        help="Required with --force when regression_count > 2 within 14 days; logged on the class record.",
+    )
+    ap.set_defaults(func=cmd_autonomy_promote)
 
     # ------------------------------------------------------------------
     # steer — file a typed mid-run steer message

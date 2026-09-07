@@ -11,3 +11,4 @@ dist/
 
 # Editor / IDE
 *.code-workspace
+MagicMock/

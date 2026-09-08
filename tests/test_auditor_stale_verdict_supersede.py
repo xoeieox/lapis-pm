@@ -220,13 +220,17 @@ def test_decide_stale_verdict_does_not_hold_brief_from_stale():
     assert decision.kind != "hold_brief", (
         f"stale verdict drove hold_brief — the R2 wedge. got {decision.kind!r}"
     )
-    # The supersede observation names both shas.
-    stale_obs = [c for c in ep.all_comments.return_value
-                 if "pm:verdict-stale-superseded" in c.tags]
-    assert stale_obs, "pm:verdict-stale-superseded observation not written"
-    obs = stale_obs[0]
-    assert OLD_SHA in obs.tags or OLD_SHA in obs.content
-    assert NEW_SHA in obs.tags or NEW_SHA in obs.content
+    # The supersede observation names both shas. It is written via
+    # episodic.write_observation (a mock method) — inspect the call record,
+    # not the static input fixture list.
+    stale_calls = [
+        c for c in ep.write_observation.call_args_list
+        if "pm:verdict-stale-superseded" in (c.kwargs.get("extra_tags") or [])
+    ]
+    assert stale_calls, "pm:verdict-stale-superseded observation not written"
+    obs_tags = stale_calls[0].kwargs["extra_tags"]
+    assert f"pm:verdict-stale-rendered-sha={OLD_SHA}" in obs_tags
+    assert f"pm:verdict-stale-current-sha={NEW_SHA}" in obs_tags
 
 
 def test_decide_fresh_verdict_behaves_exactly_as_today():

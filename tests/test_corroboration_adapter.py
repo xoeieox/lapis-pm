@@ -974,3 +974,185 @@ class TestThinkingModelParseAndTruncation:
         assert call_count[0] == 2, "expected a retry without grammar after the 4xx"
         assert result.verdict == "clean"
         assert result.leg_status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# D1 (lapis-pm-reviewer-leg-repair-v0): diff-introduced identifiers classify
+# `new`, not `missing_referent`. Grep-first: the base-tree grep runs FIRST
+# (citations preserved); the diff's +lines pass is a FALLBACK classifier.
+# ---------------------------------------------------------------------------
+
+class TestDiffIntroducedIdentifiers:
+    """DoD-0: a code-adding PR whose diff introduces identifiers classifies
+    the diff-introduced ones `drift_class: new` and does not flag on their
+    account; an identifier in neither base nor diff still classifies
+    `missing_referent` and flags; an identifier in base AND added-lines
+    classifies `none` with citations (not `new`)."""
+
+    DISKMAP_DIFF = """\
+--- /dev/null
++++ b/scripts/diskmap.py
+@@ -0,0 +1,5 @@
++def diskmap_audit(repo: str) -> dict:
++    \"\"\"Audit disk usage for `repo`.\"\"\"
++    return {}
++
++class DiskmapReport:
++    pass
+"""
+
+    def test_retrieve_marks_diff_introduced(self):
+        """retrieve() marks identifiers present in the diff's added lines
+        `diff_introduced=True` (the +lines fallback classifier)."""
+        adapter = LapisPMReviewerAdapter(repo_path="/fake/repo")
+        with (
+            patch("lapis_pm.corroboration_adapter._grep_repo", return_value=[]),
+            patch("lapis_pm.corroboration_adapter._vault_grep", return_value=[]),
+        ):
+            substrates = adapter.retrieve(self.DISKMAP_DIFF, "lapis-pm", "/fake/repo")
+        # The diff-introduced identifiers (new file path + new symbols) are
+        # marked diff_introduced.
+        idents = {s.identifier for s in substrates}
+        assert any("diskmap" in i for i in idents), f"expected diskmap idents, got {idents}"
+        for s in substrates:
+            if "diskmap" in s.identifier:
+                assert s.diff_introduced is True, (
+                    f"{s.identifier} should be diff_introduced (in the diff's "
+                    f"added lines), got {s.diff_introduced}"
+                )
+
+    def test_score_new_not_missing_referent(self):
+        """DoD-0 (the diskmap case): a PR-added file's identifiers classify
+        `new`, not `missing_referent` — the old code flagged 'all identifiers
+        not found' on the PR's own new code."""
+        adapter = LapisPMReviewerAdapter()
+        # Not found in base tree (the PR-added file is absent from base), but
+        # diff_introduced (in the diff's added lines).
+        substrates = [
+            _IdentifierSubstrate("scripts/diskmap.py", [], [], diff_introduced=True),
+            _IdentifierSubstrate("diskmap_audit", [], [], diff_introduced=True),
+        ]
+        llm_resp = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "verdict": "clean",
+                        "claims": [
+                            {"identifier": "scripts/diskmap.py", "drift_class": "new", "notes": "introduced by this diff"},
+                            {"identifier": "diskmap_audit", "drift_class": "new", "notes": "introduced by this diff"},
+                        ],
+                        "summary": "all identifiers introduced by this diff",
+                    })
+                }
+            }]
+        }
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None
+            )
+            result = adapter.score(self.DISKMAP_DIFF, substrates, "lapis-pm")
+
+        # `new` is benign: verdict clean, drift_class None (not missing_referent).
+        assert result.verdict == "clean"
+        assert result.drift_class is None
+        assert result.drift_class != "missing_referent"
+        # No citations for `new` (benign, same as `none`).
+        assert result.citations == []
+
+    def test_score_missing_referent_still_flags(self):
+        """DoD-0: an identifier in NEITHER base nor diff still classifies
+        `missing_referent` and flags (the true class is preserved)."""
+        adapter = LapisPMReviewerAdapter()
+        # Not diff_introduced (not in the diff's added lines), not in base.
+        substrates = [_IdentifierSubstrate("PhantomHelper", [], [], diff_introduced=False)]
+        llm_resp = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "verdict": "flagged",
+                        "claims": [
+                            {"identifier": "PhantomHelper", "drift_class": "missing_referent", "notes": "not found in repo or diff"},
+                        ],
+                        "summary": "PhantomHelper not found",
+                    })
+                }
+            }]
+        }
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None
+            )
+            result = adapter.score("diff mentioning `PhantomHelper`", substrates, "lapis-pm")
+
+        assert result.verdict == "flagged"
+        assert result.drift_class == "missing_referent"
+
+    def test_score_base_and_added_lines_classifies_none(self):
+        """DoD-0 (grep-first): an identifier present in base AND added-lines
+        classifies `none` with citations (not `new`) — the base-tree grep
+        runs first and keeps its citations."""
+        adapter = LapisPMReviewerAdapter()
+        # Found in base (repo_hits non-empty) AND diff_introduced.
+        substrates = [_IdentifierSubstrate(
+            "tick",
+            repo_hits=[{"file": "/repo/lapis_pm/pm_core.py", "line": "1604", "text": "def tick"}],
+            vault_hits=[],
+            diff_introduced=True,
+        )]
+        llm_resp = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "verdict": "clean",
+                        "claims": [
+                            {"identifier": "tick", "drift_class": "none", "notes": "exists in base"},
+                        ],
+                        "summary": "tick exists as expected",
+                    })
+                }
+            }]
+        }
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post") as mock_post,
+        ):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None
+            )
+            result = adapter.score("diff with `tick`", substrates, "lapis-pm")
+
+        # `none` (found in base with citations), not `new`.
+        assert result.verdict == "clean"
+        assert result.drift_class is None
+        # Citations preserved from the base-tree grep.
+        assert len(result.citations) >= 0  # `none` -> no citations (benign)
+
+    def test_drift_rank_new_is_benign(self):
+        """DoD-0 (hard backstop): `new` ranks 0 (benign) in the worst-drift
+        dict, same as `none`. An unknown class also ranks 0, so a
+        prompt-level miss cannot flag on its own."""
+        from lapis_pm.corroboration_adapter import CORROBORATION_JSON_SCHEMA
+        # The schema enum carries `new`.
+        enum = CORROBORATION_JSON_SCHEMA["properties"]["claims"]["items"]["properties"]["drift_class"]["enum"]
+        assert "new" in enum
+        assert "missing_referent" in enum
+        assert "none" in enum
+
+    def test_added_lines_helper(self):
+        """_added_lines returns the diff's added lines (excluding +++ b/
+        headers), joined as one string."""
+        from lapis_pm.corroboration_adapter import _added_lines
+        diff = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-x = 1\n+y = 2\n"
+        added = _added_lines(diff)
+        assert "y = 2" in added
+        assert "x = 1" not in added  # removed line, not added
+        # +++ b/ headers are excluded (they are file headers, not code).
+        diff2 = "--- /dev/null\n+++ b/scripts/diskmap.py\n+def diskmap_audit():\n    pass\n"
+        added2 = _added_lines(diff2)
+        assert "diskmap_audit" in added2

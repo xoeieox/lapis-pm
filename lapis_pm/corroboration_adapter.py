@@ -5,9 +5,16 @@ from the cross-node-corroboration-v0 spec.
 
 - retrieve: extracts doc-mentioned-identifier claims from a PR diff;
   greps repo to check existence; also greps vault when available.
+  Identifiers the diff itself introduces (present in the diff's added
+  lines) are marked `diff_introduced` so the score pass classifies them
+  `new`, never `missing_referent` (lapis-pm-reviewer-leg-repair-v0, D1).
 - score: single constrained-JSON LLM call against the retrieved substrate;
   returns CorroborationResult with drift_class in:
-  {"missing_referent", "stale_referent", "renamed_referent", "none"}.
+  {"missing_referent", "stale_referent", "renamed_referent", "new", "none"}.
+  The node2 (Phala TEE) leg runs through the sanctioned
+  agents_core.phala_tee.PhalaTeeClient verifying path (attestation + ACI
+  verify hop on every call) — no raw Bearer POST (lapis-pm-reviewer-leg-
+  repair-v0, D2 / I2).
 
 Invariants (from spec §Invariants):
 - Read-only: never mutates reviewer verdict mainline fields.
@@ -49,7 +56,7 @@ class CorroborationResult:
     citations: list[Citation]
     freshness_stamp: str       # ISO timestamp (UTC)
     scope_id: str              # e.g. "repo:lapis-pm"
-    drift_class: str | None = None   # "missing_referent" | "stale_referent" | "renamed_referent" | "none"
+    drift_class: str | None = None   # "missing_referent" | "stale_referent" | "renamed_referent" | "new" | "none"
     notes: str | None = None
     primitive_decomposition: dict | None = None  # entry-time decomposition; compost-routing handle (spec Compost invariant)
     # Structured leg health, independent of `claim`/`notes` prose. "claim" can be
@@ -174,6 +181,22 @@ def _grep_repo(identifier: str, repo_path: str) -> list[dict]:
         return []
 
 
+def _added_lines(diff_text: str) -> str:
+    """Return the diff's added lines (a unified-diff `+` line, excluding the
+    `+++ b/` file header) joined as one string.
+
+    D1 (lapis-pm-reviewer-leg-repair-v0): the fallback classifier for
+    diff-introduced identifiers. `_extract_identifiers` is pure regex and
+    text-agnostic, so it can be run over this projection — `+++ b/` headers
+    still yield new-file paths, `+def foo` / `+class Bar` yield new symbols.
+    """
+    lines = []
+    for line in diff_text.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            lines.append(line[1:])
+    return "\n".join(lines)
+
+
 def _vault_grep(identifier: str) -> list[dict]:
     """Grep vault for identifier. Returns [] if vault not present."""
     if not _VAULT_PATH.exists():
@@ -214,6 +237,13 @@ class _IdentifierSubstrate:
     identifier: str
     repo_hits: list[dict]
     vault_hits: list[dict]
+    # D1 (lapis-pm-reviewer-leg-repair-v0): True when this identifier appears
+    # in the diff's ADDED lines. Such an identifier is, by construction,
+    # present at the PR head, so an absent-in-base-tree grep is NOT a
+    # missing referent — it is a `new` (diff-introduced) identifier. The
+    # base-tree grep still runs first and keeps its citations; this flag only
+    # reclassifies what the grep misses (the +lines fallback classifier).
+    diff_introduced: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -255,29 +285,65 @@ _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _L
 # substrate's capacity — arm E completed at 125 tokens).
 _MAX_TOKENS = 16384
 
-# Node 2 — Phala TEE (unguarded direct path), deepseek/deepseek-v4-flash-0731.
-# Re-pointed 2026-09-01 (lapis-pm-panel-leg-survival-v0, D3; tenancy ratified by
-# Erah 2026-09-01): the previous substrate — a MacBook Pro (MLX, 100.124.203.15:8080,
-# the May 2026 mesh-milestone witness) — sleeps and drops off the tailnet when
-# asleep, so the panel's only independent substrate was the least reliable machine
-# in the fleet. Phala is a different host, model family and engine, always-on.
-# Tenancy basis (code review only): the node2 prompt is CODE-ONLY — the diff
-# excerpt + repo grep hits, never vault content (`include_vault=False`, pinned
-# by test); one outside caller is acceptable; local-first is preserved (two of
-# three legs stay local). The unguarded direct path is the operator's choice:
-# the sealed :8413 proxy is one-mode-at-a-time and carries interactive-session
-# failure modes. Known-degradation cause: transient upstream 502 bursts — the
-# leg then fails closed (substrate_unavailable), which is the safe direction.
-# The API key comes from the PHALA_API_KEY environment variable (read at call
-# time, node2 path only — see _phala_api_key); its value lives only in
-# /data/agents/config/phala.env and must never appear in any notes/error/claim.
-_NODE2_URL = "https://inference.phala.com/v1/chat/completions"
+# Node 2 — Phala TEE through the SANCTIONED verifying client
+# (lapis-pm-reviewer-leg-repair-v0, D2; I2: no direct LLM API calls).
+#
+# Re-pointed to Phala 2026-09-01 (lapis-pm-panel-leg-survival-v0, D3; tenancy
+# ratified by Erah 2026-09-01): the previous substrate — a MacBook Pro (MLX,
+# 100.124.203.15:8080, the May 2026 mesh-milestone witness) — sleeps and drops
+# off the tailnet when asleep. Phala is a different host, model family and
+# engine, always-on. Tenancy basis (code review only): the node2 prompt is
+# CODE-ONLY — the diff excerpt + repo grep hits, never vault content
+# (`include_vault=False`, pinned by test); local-first is preserved (two of
+# three legs stay local).
+#
+# The 2026-09-07 defect this unit removes: the re-point shipped a hardcoded
+# _NODE2_URL + raw Bearer POST that BYPASSED the sanctioned PhalaTeeClient
+# verifying path — no attestation fetch, no ACI verify hop, so 100% of node2
+# calls failed with HTTPStatusError and the panel ran 2-of-3 legs on every
+# verdict. The call now goes through agents_core.phala_tee.PhalaTeeClient.
+# chat_completion(): attestation fetch + ACI verify hop (the two-leg `aci`
+# CLI) on EVERY call, loopback-refusal policy, $2/day spend cap (fail-closed
+# before I/O), one locality-ledger row per call. The daemon service already
+# sources /data/agents/config/phala.env (PHALA_BASE_URL=loopback verifying
+# hop, ACI_VERIFIER_BIN, PHALA_API_KEY) — no new env, no plaintext key path.
 _NODE2_MODEL = "deepseek/deepseek-v4-flash-0731"
 # 120s stays a runaway guard, not a size estimate: arm E measured 15.3s on a
 # 1,838-char prompt (7.8x margin); the production node2 prompt is code-bounded
 # (~15-16k chars worst case: diff[:2500] + 10 identifiers x 3 repo hits, 200
-# chars each, vault excluded) — >=4x margin at worst case.
+# chars each, vault excluded) — >=4x margin at worst case. Pinned explicitly
+# on the client (whose default is 300s): the node2 leg must not out-run the
+# tick's budget.
 _NODE2_TIMEOUT = 120
+# ACI-hop budget (D2): the two-leg `aci` CLI verify runs synchronously on the
+# tick path (via _run_corroboration_pass_sync) and is never cached. The
+# client's per-leg subprocess timeout is pinned here so a hung verify cannot
+# block the tick unboundedly — 30s per leg x 2 legs + attestation fetch stays
+# inside the 120s node2 guard.
+_NODE2_ACI_LEG_TIMEOUT_S = 30.0
+
+# Named node2 error classes (D2 / DoD-1): a genuine unavailability is one of
+# these four, surfaced on the DEGRADED PANEL line and the pm/review-state mem
+# summary — never collapsed into a generic "unavailable" (the operational
+# boundary stated, not masked).
+#   node2_unavailable          — genuine probe/transport failure (the TEE hop
+#                                is down / unreachable).
+#   node2_aci_unverified       — the attestation failed the ACI verify hop
+#                                (toolchain fault or report failure).
+#   node2_cap_refused          — the $2/day spend cap refused the call BEFORE
+#                                any I/O (a cost decision, not an outage).
+#   node2_client_import_error  — the cross-repo PhalaTeeClient import/resolve
+#                                failed (a WIRING defect, not a TEE outage).
+NODE2_ERROR_UNAVAILABLE = "node2_unavailable"
+NODE2_ERROR_ACI_UNVERIFIED = "node2_aci_unverified"
+NODE2_ERROR_CAP_REFUSED = "node2_cap_refused"
+NODE2_ERROR_CLIENT_IMPORT = "node2_client_import_error"
+NODE2_ERROR_CLASSES = (
+    NODE2_ERROR_UNAVAILABLE,
+    NODE2_ERROR_ACI_UNVERIFIED,
+    NODE2_ERROR_CAP_REFUSED,
+    NODE2_ERROR_CLIENT_IMPORT,
+)
 
 
 def _phala_api_key() -> str | None:
@@ -290,6 +356,61 @@ def _phala_api_key() -> str | None:
     a note naming PHALA_API_KEY) without touching the local legs.
     """
     return os.environ.get("PHALA_API_KEY")
+
+
+def _node2_error_class(exc: BaseException) -> str:
+    """Map a node2-path exception to one of the four named error classes.
+
+    Best-effort cross-repo typing: agents_core may be unavailable in test
+    isolation, so the exception classes are resolved lazily by name match.
+    A genuine transport failure (requests.ConnectionError / httpx /
+    ConnectionError) is `node2_unavailable`; the ACI verify hop failures
+    (AciError subclasses incl. ReportVerificationError) are
+    `node2_aci_unverified`; the spend-cap refusal is `node2_cap_refused`.
+    Anything else (e.g. a 5xx HTTPStatusError from the hop) stays
+    `node2_unavailable` — a genuine unavailability.
+    """
+    try:
+        from agents_core import phala_tee as _pt
+        if isinstance(exc, _pt.PhalaSpendCapExceededError):
+            return NODE2_ERROR_CAP_REFUSED
+        if isinstance(exc, _pt.AciError):
+            return NODE2_ERROR_ACI_UNVERIFIED
+    except Exception:
+        pass
+    return NODE2_ERROR_UNAVAILABLE
+
+
+def _build_node2_client() -> Any:
+    """Construct the sanctioned PhalaTeeClient (node2 path only).
+
+    Raises ImportError (or an agents_core resolve error) when the cross-repo
+    import fails — the caller maps that to `node2_client_import_error` (a
+    wiring defect, NOT a TEE outage). The client reads PHALA_API_KEY /
+    PHALA_BASE_URL / ACI_VERIFIER_BIN from the daemon env (phala.env, already
+    in the service EnvironmentFile); the per-leg ACI subprocess timeout is
+    pinned to _NODE2_ACI_LEG_TIMEOUT_S and the call timeout to
+    _NODE2_TIMEOUT.
+    """
+    from agents_core import phala_tee as _pt
+
+    # Pin the ACI-hop budget: patch the module-level default used by the
+    # two-leg `aci` CLI subprocess calls (audit + verify) so a hung verify
+    # cannot block the tick past the node2 guard. The wrap is applied ONCE
+    # per process (guarded by a sentinel attribute) — re-wrapping on every
+    # call would accumulate wrappers on the shared module-level function.
+    if hasattr(_pt, "_run_aci_json") and not getattr(
+            _pt._run_aci_json, "_lapis_aci_budget_patched", False):
+        _orig = _pt._run_aci_json
+
+        def _aci_with_budget(*args, **kwargs):
+            kwargs.setdefault("timeout", _NODE2_ACI_LEG_TIMEOUT_S)
+            return _orig(*args, **kwargs)
+
+        _aci_with_budget._lapis_aci_budget_patched = True
+        _pt._run_aci_json = _aci_with_budget
+
+    return _pt.PhalaTeeClient(timeout=float(_NODE2_TIMEOUT))
 
 # Grammar constraint, copied from local_reviewer_witness.py's REVIEWER_JSON_SCHEMA
 # shape — proven on this exact GravityWell seat 2026-08-12 (measured FASTER than no
@@ -307,7 +428,10 @@ CORROBORATION_JSON_SCHEMA = {
                     "identifier": {"type": "string"},
                     "drift_class": {
                         "type": "string",
-                        "enum": ["missing_referent", "stale_referent", "renamed_referent", "none"],
+                        # `new` (lapis-pm-reviewer-leg-repair-v0, D1):
+                        # diff-introduced identifiers — benign, never flags.
+                        "enum": ["missing_referent", "stale_referent",
+                                 "renamed_referent", "new", "none"],
                     },
                     "notes": {"type": "string"},
                 },
@@ -346,15 +470,45 @@ class LapisPMReviewerAdapter:
         repo: str,
         repo_path: str | None = None,
     ) -> list[_IdentifierSubstrate]:
-        """Extract identifiers from diff and grep repo + vault for each."""
+        """Extract identifiers from diff and grep repo + vault for each.
+
+        D1 (lapis-pm-reviewer-leg-repair-v0): the base-tree grep runs FIRST
+        (existing behavior — citations preserved for identifiers found in
+        base). Identifiers that appear in the diff's ADDED lines are marked
+        `diff_introduced`: they are present at the PR head by construction,
+        so the score prompt classifies them `new` (not `missing_referent`)
+        when the base-tree grep misses them. An identifier in neither the
+        base tree nor the added lines stays a true `missing_referent`.
+        """
         rpath = repo_path or self._repo_path or f"/srv/git/{repo}-working"
         identifiers = _extract_identifiers(diff_text)
+        # +lines fallback classifier: which extracted identifiers does the
+        # diff itself introduce? (Grep-first: this only reclassifies what the
+        # base-tree grep misses — an identifier present in base AND added
+        # lines classifies `none` with citations, not `new`.)
+        # Grep-first (D1): the base-tree grep runs FIRST (above). The +lines
+        # fallback classifier runs over the diff's added lines PLUS the
+        # `+++ b/` file headers — the headers yield new-file paths, which the
+        # added-lines projection alone drops (a `+++ b/` line is a file
+        # header, not an added code line). `_extract_identifiers` is pure
+        # regex and text-agnostic, so it picks up both.
+        added_lines = _added_lines(diff_text)
+        # Reconstruct a diff-shaped projection: the `+++ b/` headers (new-file
+        # paths) + the added lines. The `--- a/` headers are dropped (they
+        # yield the OLD path, which is present in base and not diff-introduced).
+        plus_headers = [
+            line for line in diff_text.splitlines()
+            if line.startswith("+++ ")
+        ]
+        projection = "\n".join(plus_headers + added_lines.splitlines())
+        added_idents = set(_extract_identifiers(projection)) if projection else set()
         substrates = []
         for ident in identifiers[:_MAX_IDENTIFIERS]:
             substrates.append(_IdentifierSubstrate(
                 identifier=ident,
                 repo_hits=_grep_repo(ident, rpath),
                 vault_hits=_vault_grep(ident),
+                diff_introduced=ident in added_idents,
             ))
         return substrates
 
@@ -368,6 +522,7 @@ class LapisPMReviewerAdapter:
         node_model: str | None = None,
         node_timeout: int | None = None,
         include_vault: bool = True,
+        via_node2_client: bool = False,
     ) -> CorroborationResult:
         """Single LLM call to check identifier claims against substrate.
 
@@ -404,6 +559,15 @@ class LapisPMReviewerAdapter:
                     substrate_lines.append(
                         f"  repo:{h['file']}:{h['line']}: {h['text']}"
                     )
+            elif s.diff_introduced:
+                # D1 (lapis-pm-reviewer-leg-repair-v0): absent in the base
+                # tree but present in the diff's added lines — by construction
+                # present at the PR head. Classify `new`, never
+                # `missing_referent` (I1).
+                substrate_lines.append(
+                    "  (not found in base tree; introduced by this diff — "
+                    "classify as `new`)"
+                )
             else:
                 substrate_lines.append("  (not found in repo)")
             if include_vault and s.vault_hits:
@@ -421,16 +585,22 @@ class LapisPMReviewerAdapter:
             f"## Substrate (grep results)\n{substrate_text}\n\n"
             f"For each identifier listed in the substrate, determine whether "
             f"it exists in the repo as claimed. Classify each as:\n"
-            f"- `missing_referent`: identifier mentioned in diff prose but not found in repo\n"
+            f"- `missing_referent`: identifier mentioned in diff prose but not found in repo "
+            f"AND not introduced by this diff\n"
             f"- `renamed_referent`: identifier mentioned but found only under a different name\n"
             f"- `stale_referent`: identifier found but its state doesn't match the claim\n"
+            f"- `new`: identifier not found in the base tree but introduced by this diff's "
+            f"added lines (present at the PR head by construction) — benign, not drift\n"
             f"- `none`: identifier exists as claimed (no drift)\n\n"
             f"Return ONLY valid JSON with this exact schema:\n"
             f'{{"verdict": "clean"|"flagged"|"uncertain", '
-            f'"claims": [{{"identifier": str, "drift_class": "missing_referent"|"stale_referent"|"renamed_referent"|"none", "notes": str}}], '
+            f'"claims": [{{"identifier": str, "drift_class": "missing_referent"|"stale_referent"|"renamed_referent"|"new"|"none", "notes": str}}], '
             f'"summary": str}}\n'
-            f"verdict=flagged if any claim has non-none drift_class. "
-            f"verdict=clean if all none. verdict=uncertain if substrate insufficient.\n"
+            f"verdict=flagged if any claim has drift_class in "
+            f"(missing_referent, renamed_referent, stale_referent) — `new` and `none` "
+            f"never flag. "
+            f"verdict=clean if all claims are `new` or `none`. "
+            f"verdict=uncertain if substrate insufficient.\n"
             f"No prose outside the JSON."
         )
 
@@ -458,21 +628,36 @@ class LapisPMReviewerAdapter:
                 }
             return body
 
+        def _node2_extra_body(use_grammar: bool) -> dict:
+            """D2 (lapis-pm-reviewer-leg-repair-v0): the node2 payload fields
+            that ride `extra_body` on the sanctioned client. ALL THREE —
+            temperature, max_tokens, and the json_schema grammar — must ride
+            through: PhalaTeeClient merges extra_body verbatim into the POST
+            body, and dropping max_tokens would apply TEE defaults ->
+            truncated reasoning -> failed leg. `model` is passed as the
+            client's own kwarg (it is set on the body by the client)."""
+            body = _build_body(use_grammar)
+            body.pop("messages", None)
+            body.pop("model", None)
+            return body
+
         try:
             import httpx
             _url = node_url or _llm_url()
             _timeout = node_timeout or _LLM_TIMEOUT
 
-            # Phala key gate (lapis-pm-panel-leg-survival-v0, Change 2): the
-            # PHALA_API_KEY read and the Authorization header live on the
-            # node2 path only (gated on the Phala origin). Node1 and the
-            # witness never read the key, so a daemon env missing it takes
-            # down node2 only, never the local legs. Absent key fails closed
-            # with a greppable note naming the env var — never the value.
-            _headers: dict[str, str] = {}
-            if _url.startswith("https://inference.phala.com"):
-                _phala_key = _phala_api_key()
-                if not _phala_key:
+            if via_node2_client:
+                # D2 (lapis-pm-reviewer-leg-repair-v0): the node2 leg goes
+                # through the sanctioned PhalaTeeClient verifying path —
+                # attestation fetch + ACI verify hop on every call,
+                # loopback-refusal policy, $2/day spend cap, locality-ledger
+                # row. No raw Bearer POST, no hardcoded URL (I2).
+                try:
+                    _client = _build_node2_client()
+                except Exception as _imp_exc:
+                    # Cross-repo import/resolve failure: a WIRING defect, not
+                    # a TEE outage. Named class, never masked as generic
+                    # unavailability (gate-4 amendment).
                     self._last_model = None
                     self._last_prompt_hash = None
                     return CorroborationResult(
@@ -483,38 +668,139 @@ class LapisPMReviewerAdapter:
                         scope_id=scope_id,
                         drift_class=None,
                         notes=(
-                            f"PHALA_API_KEY not set in daemon env — node2 "
-                            f"({_url}) failed closed without a call; local "
-                            f"legs unaffected"
+                            f"{NODE2_ERROR_CLIENT_IMPORT}: "
+                            f"{type(_imp_exc).__name__} — node2 wiring "
+                            f"defect (cross-repo PhalaTeeClient import "
+                            f"failed); local legs unaffected"
                         ),
                         leg_status="substrate_unavailable",
                     )
-                _headers["Authorization"] = f"Bearer {_phala_key}"
+                try:
+                    resp_json = _client.chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=node_model or _NODE2_MODEL,
+                        extra_body=_node2_extra_body(True),
+                    )
+                except Exception as _n2_exc:
+                    # Named error classes (D2 / DoD-1): map the exception to
+                    # node2_unavailable / node2_aci_unverified /
+                    # node2_cap_refused; the note carries the class so the
+                    # DEGRADED PANEL line and the pm/review-state mem summary
+                    # can surface it.
+                    #
+                    # Grammar-degrade retry (D2): the client raises on 4xx
+                    # (the raw POST path used to inspect the status code
+                    # directly), so a 400/422 grammar rejection is caught
+                    # here and retried ONCE without response_format —
+                    # otherwise a grammar-rejecting hop would fail the leg
+                    # 100%, the exact failure D2 exists to kill.
+                    #
+                    # Key-redaction sentinel (extended, D2): the key value
+                    # lives only in the client's auth headers; the named
+                    # client exceptions carry spend/URL, never the key. The
+                    # note echoes only the exception CLASS NAME, never the
+                    # message, for every named client exception class — so a
+                    # future exception string carrying a key cannot leak
+                    # through this path.
+                    _n2_class = _node2_error_class(_n2_exc)
+                    _n2_note = (
+                        f"{_n2_class}: {type(_n2_exc).__name__} — node2 "
+                        f"(PhalaTeeClient) failed closed; local legs "
+                        f"unaffected"
+                    )
+                    if "400" in str(_n2_exc) or "422" in str(_n2_exc):
+                        try:
+                            resp_json = _client.chat_completion(
+                                messages=[{"role": "user", "content": prompt}],
+                                model=node_model or _NODE2_MODEL,
+                                extra_body=_node2_extra_body(False),
+                            )
+                        except Exception as _n2_exc2:
+                            _n2_class = _node2_error_class(_n2_exc2)
+                            _n2_note = (
+                                f"{_n2_class}: {type(_n2_exc2).__name__} — "
+                                f"node2 (PhalaTeeClient) grammar-degrade "
+                                f"retry failed; local legs unaffected"
+                            )
+                            self._last_model = None
+                            self._last_prompt_hash = None
+                            return CorroborationResult(
+                                verdict="uncertain",
+                                claim="(substrate unavailable)",
+                                citations=[],
+                                freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                                scope_id=scope_id,
+                                drift_class=None,
+                                notes=_n2_note,
+                                leg_status="substrate_unavailable",
+                            )
+                    else:
+                        self._last_model = None
+                        self._last_prompt_hash = None
+                        return CorroborationResult(
+                            verdict="uncertain",
+                            claim="(substrate unavailable)",
+                            citations=[],
+                            freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                            scope_id=scope_id,
+                            drift_class=None,
+                            notes=_n2_note,
+                            leg_status="substrate_unavailable",
+                        )
+            else:
+                # Phala key gate (lapis-pm-panel-leg-survival-v0, Change 2):
+                # the PHALA_API_KEY read and the Authorization header live on
+                # the raw-POST path only. Node1 and the witness never read the
+                # key, so a daemon env missing it takes down node2 only, never
+                # the local legs. Absent key fails closed with a greppable
+                # note naming the env var — never the value.
+                _headers: dict[str, str] = {}
+                if _url.startswith("https://inference.phala.com"):
+                    _phala_key = _phala_api_key()
+                    if not _phala_key:
+                        self._last_model = None
+                        self._last_prompt_hash = None
+                        return CorroborationResult(
+                            verdict="uncertain",
+                            claim="(substrate unavailable)",
+                            citations=[],
+                            freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                            scope_id=scope_id,
+                            drift_class=None,
+                            notes=(
+                                f"PHALA_API_KEY not set in daemon env — node2 "
+                                f"({_url}) failed closed without a call; local "
+                                f"legs unaffected"
+                            ),
+                            leg_status="substrate_unavailable",
+                        )
+                    _headers["Authorization"] = f"Bearer {_phala_key}"
 
-            if not node_reachable(_url, timeout=_PROBE_TIMEOUT):
-                self._last_model = None
-                self._last_prompt_hash = None
-                return CorroborationResult(
-                    verdict="uncertain",
-                    claim="(substrate unavailable)",
-                    citations=[],
-                    freshness_stamp=datetime.now(timezone.utc).isoformat(),
-                    scope_id=scope_id,
-                    drift_class=None,
-                    notes=f"node unreachable (probe {_PROBE_TIMEOUT}s): {_url}",
-                    leg_status="substrate_unavailable",
-                )
+                if not node_reachable(_url, timeout=_PROBE_TIMEOUT):
+                    self._last_model = None
+                    self._last_prompt_hash = None
+                    return CorroborationResult(
+                        verdict="uncertain",
+                        claim="(substrate unavailable)",
+                        citations=[],
+                        freshness_stamp=datetime.now(timezone.utc).isoformat(),
+                        scope_id=scope_id,
+                        drift_class=None,
+                        notes=f"node unreachable (probe {_PROBE_TIMEOUT}s): {_url}",
+                        leg_status="substrate_unavailable",
+                    )
 
-            resp = httpx.post(_url, json=_build_body(True), headers=_headers, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
-            if resp.status_code in (400, 422):
-                # Grammar-not-supported vs validation-failed, per the precedent at
-                # local_reviewer_witness.py:330-345: an HTTP 4xx on the first
-                # (grammar-carrying) attempt means the endpoint rejects json_schema —
-                # degrade to a plain call rather than hard-failing a seat that can't
-                # take the grammar. One retry, never a hard fail.
-                resp = httpx.post(_url, json=_build_body(False), headers=_headers, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
-            resp.raise_for_status()
-            resp_json = resp.json()
+                resp = httpx.post(_url, json=_build_body(True), headers=_headers, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
+                if resp.status_code in (400, 422):
+                    # Grammar-not-supported vs validation-failed, per the
+                    # precedent at local_reviewer_witness.py:330-345: an HTTP
+                    # 4xx on the first (grammar-carrying) attempt means the
+                    # endpoint rejects json_schema — degrade to a plain call
+                    # rather than hard-failing a seat that can't take the
+                    # grammar. One retry, never a hard fail.
+                    resp = httpx.post(_url, json=_build_body(False), headers=_headers, timeout=httpx.Timeout(_timeout, connect=_CONNECT_TIMEOUT))
+                resp.raise_for_status()
+                resp_json = resp.json()
 
             choice0 = resp_json["choices"][0]
             extracted = extract_completion_text(choice0.get("message"), choice0.get("finish_reason"))
@@ -603,11 +889,13 @@ class LapisPMReviewerAdapter:
 
         claims = result_data.get("claims", [])
 
-        # Build citations from substrate grep results for flagged identifiers
+        # Build citations from substrate grep results for flagged identifiers.
+        # D1 (lapis-pm-reviewer-leg-repair-v0): `new` is benign — no
+        # citations, same treatment as `none`.
         citations: list[Citation] = []
         for claim_item in claims:
             dc = claim_item.get("drift_class", "none")
-            if dc == "none":
+            if dc in ("none", "new"):
                 continue
             ident = claim_item.get("identifier", "")
             for s in substrates:
@@ -620,11 +908,16 @@ class LapisPMReviewerAdapter:
                         ))
                     break
 
-        # Worst drift_class across all claims
+        # Worst drift_class across all claims.
+        # D1 (lapis-pm-reviewer-leg-repair-v0): `new` is benign (rank 0, same
+        # as `none`). Hard backstop: an UNKNOWN class also ranks 0 via
+        # `_drift_rank.get(dc, 0)`, so even a prompt-level miss that emits an
+        # unrecognized class cannot flag on its own.
         _drift_rank = {
             "missing_referent": 3,
             "renamed_referent": 2,
             "stale_referent": 1,
+            "new": 0,
             "none": 0,
         }
         worst_dc: str | None = None
@@ -739,15 +1032,20 @@ def run_corroboration_pass(
 
     def _score_n2() -> CorroborationResult:
         try:
+            # D2 (lapis-pm-reviewer-leg-repair-v0): node2 rides the sanctioned
+            # PhalaTeeClient verifying path (attestation + ACI verify hop on
+            # every call), not a raw Bearer POST. The client reads
+            # PHALA_API_KEY / PHALA_BASE_URL / ACI_VERIFIER_BIN from the
+            # daemon env (phala.env, already in the service EnvironmentFile).
             return adapter_n2.score(
                 diff_text, substrates, repo,
-                node_url=_NODE2_URL,
                 node_model=_NODE2_MODEL,
                 node_timeout=_NODE2_TIMEOUT,
                 # Code-only tenancy constraint (Erah, 2026-09-01): the outside
                 # caller never sees vault content — diff excerpt + repo grep
                 # hits only. Build-time guard; `substrates` is not mutated.
                 include_vault=False,
+                via_node2_client=True,
             )
         except Exception as exc:
             return _make_uncertain(repo, f"Node2 error: {type(exc).__name__}: {exc}")

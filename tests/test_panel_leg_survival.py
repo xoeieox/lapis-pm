@@ -34,7 +34,6 @@ from lapis_pm.corroboration_adapter import (
     _IdentifierSubstrate,
     _NODE2_MODEL,
     _NODE2_TIMEOUT,
-    _NODE2_URL,
     _MAX_TOKENS,
     _LLM_TIMEOUT,
     run_corroboration_pass,
@@ -148,9 +147,16 @@ class TestThinkingOnPayload:
 # ---------------------------------------------------------------------------
 
 class TestNode2Repoint:
+    """D2 (lapis-pm-reviewer-leg-repair-v0): node2 rides the sanctioned
+    PhalaTeeClient verifying path (attestation + ACI verify hop on every
+    call), not a raw Bearer POST. The raw POST + hardcoded _NODE2_URL are
+    gone; the four named error classes (node2_unavailable /
+    node2_aci_unverified / node2_cap_refused / node2_client_import_error)
+    surface on the DEGRADED PANEL line and the pm/review-state mem summary.
+    The code-only tenancy constraint (no vault lines in the node2 prompt) is
+    preserved."""
 
-    def test_node2_constants_are_phala(self):
-        assert _NODE2_URL == "https://inference.phala.com/v1/chat/completions"
+    def test_node2_model_constant_is_phala(self):
         assert _NODE2_MODEL == "deepseek/deepseek-v4-flash-0731"
 
     def test_node2_prompt_excludes_vault_and_node1_keeps_it(self):
@@ -181,18 +187,25 @@ class TestNode2Repoint:
         assert r1.leg_status == "ok"
         assert any("vault:" in p for p in n1_prompts), "node1 prompt must carry vault lines"
 
-        # node2 (include_vault=False) — no vault lines. The Phala key gate
-        # reads the env var at call time, so the test supplies one.
+        # node2 (include_vault=False, via_node2_client=True) — no vault
+        # lines. The sanctioned client reads PHALA_API_KEY from the env at
+        # call time, so the test supplies one.
         n2_prompts: list[str] = []
+
+        def _fake_chat_completion(*, messages, model, nonce=None, extra_body=None):
+            n2_prompts.append(messages[0]["content"])
+            return VALID_CORR_RESP
+
         with (
-            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
-            patch("httpx.post", side_effect=capture_posts(n2_prompts)),
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
             patch.dict("os.environ", {"PHALA_API_KEY": "phala-test-key"}),
         ):
+            mock_client.return_value.chat_completion.side_effect = _fake_chat_completion
             r2 = adapter.score(
                 FAKE_DIFF, substrates, "lapis-pm",
-                node_url=_NODE2_URL, node_model=_NODE2_MODEL,
+                node_model=_NODE2_MODEL,
                 node_timeout=_NODE2_TIMEOUT, include_vault=False,
+                via_node2_client=True,
             )
         assert r2.leg_status == "ok"
         assert n2_prompts, "no node2 prompt captured"
@@ -212,10 +225,10 @@ class TestNode2Repoint:
         assert r3.leg_status == "ok"
         assert any("vault:" in p for p in n1_again), "node1 re-run must still see vault lines"
 
-    def test_run_corroboration_pass_node2_is_code_only_and_key_gated(self):
+    def test_run_corroboration_pass_node2_is_code_only_and_client_gated(self):
         """End-to-end: with the key set, node2's captured prompt is code-only
-        while node1's carries the vault lines; node2's POST carries the
-        Authorization header and node1's does not."""
+        while node1's carries the vault lines; node2 rides the sanctioned
+        PhalaTeeClient (not a raw Bearer POST)."""
         substrates = [_IdentifierSubstrate(
             "tick",
             repo_hits=[{"file": "f", "line": "1", "text": "def tick"}],
@@ -224,21 +237,22 @@ class TestNode2Repoint:
 
         n1_prompts: list[str] = []
         n2_prompts: list[str] = []
-        n2_headers: list[dict | None] = []
 
-        def _post(url, *, json=None, timeout=None, headers=None, **kw):
-            if str(url) == _NODE2_URL:
-                n2_prompts.append(json["messages"][0]["content"])
-                n2_headers.append(headers)
-            else:
-                n1_prompts.append(json["messages"][0]["content"])
+        def _post(url, *, json=None, timeout=None, **kw):
+            n1_prompts.append(json["messages"][0]["content"])
             return MagicMock(status_code=200, json=lambda: VALID_CORR_RESP, raise_for_status=lambda: None)
+
+        def _fake_chat_completion(*, messages, model, nonce=None, extra_body=None):
+            n2_prompts.append(messages[0]["content"])
+            return VALID_CORR_RESP
 
         with (
             patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
             patch("httpx.post", side_effect=_post),
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
             patch.dict("os.environ", {"PHALA_API_KEY": "phala-test-key"}),
         ):
+            mock_client.return_value.chat_completion.side_effect = _fake_chat_completion
             result = run_corroboration_pass(FAKE_DIFF, "lapis-pm")
 
         assert result["cross_node_divergence"] == "agree"
@@ -246,11 +260,8 @@ class TestNode2Repoint:
         assert result["node2_corroboration"]["leg_status"] == "ok"
         assert n2_prompts and not any("vault:" in p for p in n2_prompts)
         assert n1_prompts and any("vault:" in p for p in n1_prompts)
-        # Authorization header on the node2 path only.
-        assert n2_headers and all(
-            h and h.get("Authorization") == "Bearer phala-test-key"
-            for h in n2_headers
-        )
+        # node2 rode the sanctioned client (not a raw Bearer POST).
+        mock_client.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -260,18 +271,24 @@ class TestNode2Repoint:
 class TestPhalaKeyFailClosed:
 
     def test_missing_key_node2_fails_closed_node1_ok(self):
-        """With PHALA_API_KEY unset: node2 returns
-        leg_status='substrate_unavailable' with a note containing the literal
-        PHALA_API_KEY; node1 on the same pass is still 'ok'; no exception
-        escapes."""
+        """With PHALA_API_KEY unset: the sanctioned client raises (no key ->
+        no auth), node2 returns leg_status='substrate_unavailable' with a
+        named error class; node1 on the same pass is still 'ok'; no
+        exception escapes."""
         substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+
+        class _NoKeyError(Exception):
+            pass
+
         with (
             patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
             patch("httpx.post", return_value=MagicMock(
                 status_code=200, json=lambda: VALID_CORR_RESP, raise_for_status=lambda: None,
             )),
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
             patch.dict("os.environ", {}, clear=False),
         ):
+            mock_client.return_value.chat_completion.side_effect = _NoKeyError("no key")
             # Ensure the key is absent for this test.
             import os as _os
             _os.environ.pop("PHALA_API_KEY", None)
@@ -280,12 +297,14 @@ class TestPhalaKeyFailClosed:
         assert result["leg_status"] == "ok", "node1 (local leg) must stay healthy"
         n2 = result["node2_corroboration"]
         assert n2["leg_status"] == "substrate_unavailable"
-        assert "PHALA_API_KEY" in (n2["notes"] or "")
+        # Named error class (node2_unavailable for a genuine transport/key
+        # failure — not masked as a generic unavailability).
+        assert "node2_" in (n2["notes"] or "")
         assert result["cross_node_divergence"] == "node2_unavailable"
 
-    def test_missing_key_no_post_attempted(self):
+    def test_missing_key_no_raw_post_attempted(self):
         """No half-call: with the key absent, node2 never reaches httpx.post
-        for the Phala URL."""
+        (it rides the sanctioned client, not a raw Bearer POST)."""
         substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
         posted_urls: list[str] = []
 
@@ -293,26 +312,36 @@ class TestPhalaKeyFailClosed:
             posted_urls.append(str(url))
             return MagicMock(status_code=200, json=lambda: VALID_CORR_RESP, raise_for_status=lambda: None)
 
+        class _NoKeyError(Exception):
+            pass
+
         import os as _os
         _os.environ.pop("PHALA_API_KEY", None)
         with (
             patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
             patch("httpx.post", side_effect=_post),
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
         ):
+            mock_client.return_value.chat_completion.side_effect = _NoKeyError("no key")
             adapter = LapisPMReviewerAdapter()
             result = adapter.score(
                 FAKE_DIFF, substrates, "lapis-pm",
-                node_url=_NODE2_URL, node_model=_NODE2_MODEL,
+                node_model=_NODE2_MODEL,
                 node_timeout=_NODE2_TIMEOUT, include_vault=False,
+                via_node2_client=True,
             )
         assert result.leg_status == "substrate_unavailable"
-        assert "PHALA_API_KEY" in (result.notes or "")
-        assert _NODE2_URL not in posted_urls, "no POST to Phala without a key"
+        assert "node2_" in (result.notes or "")
+        # No raw POST to Phala (the client path, not a raw Bearer POST).
+        assert posted_urls == [], "no raw httpx POST on the node2 path"
 
     def test_key_value_never_appears_in_result_strings(self):
-        """Sentinel: a fake key value forced through a failing call appears in
-        no notes/error/claim string of the result (the env var name may be
-        named; the value must never leak)."""
+        """Sentinel (extended, D2): a fake key value forced through a failing
+        call appears in no notes/error/claim string of the result (the env
+        var name may be named; the value must never leak). The note echoes
+        only the exception CLASS NAME, never the message, for every named
+        client exception class — so a future exception string carrying a key
+        cannot leak through this path."""
         fake_key = "phala-test-key"
         substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
 
@@ -322,14 +351,16 @@ class TestPhalaKeyFailClosed:
 
         with (
             patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
-            patch("httpx.post", side_effect=_KeyLeakingError()),
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
             patch.dict("os.environ", {"PHALA_API_KEY": fake_key}),
         ):
+            mock_client.return_value.chat_completion.side_effect = _KeyLeakingError()
             adapter = LapisPMReviewerAdapter()
             result = adapter.score(
                 FAKE_DIFF, substrates, "lapis-pm",
-                node_url=_NODE2_URL, node_model=_NODE2_MODEL,
+                node_model=_NODE2_MODEL,
                 node_timeout=_NODE2_TIMEOUT, include_vault=False,
+                via_node2_client=True,
             )
 
         assert result.leg_status == "substrate_unavailable"
@@ -341,6 +372,177 @@ class TestPhalaKeyFailClosed:
         for field in ("notes", "claim"):
             if d.get(field):
                 assert fake_key not in d[field]
+
+
+# ---------------------------------------------------------------------------
+# D2 (lapis-pm-reviewer-leg-repair-v0): four named node2 error classes
+# ---------------------------------------------------------------------------
+
+class TestNode2ErrorClasses:
+    """DoD-1: a genuine node2 unavailability surfaces a NAMED error class
+    (probe / ACI / cap-refused / client-import) on a PM surface — the
+    DEGRADED PANEL line and the pm/review-state mem summary carry the
+    error-class tail of node2_corroboration.notes. The raw Bearer POST and
+    hardcoded URL are gone; the 400/422 grammar-degrade retry is exercised."""
+
+    def test_node2_error_class_constants(self):
+        """The four named error classes exist and are distinct."""
+        from lapis_pm.corroboration_adapter import (
+            NODE2_ERROR_UNAVAILABLE, NODE2_ERROR_ACI_UNVERIFIED,
+            NODE2_ERROR_CAP_REFUSED, NODE2_ERROR_CLIENT_IMPORT,
+            NODE2_ERROR_CLASSES,
+        )
+        assert NODE2_ERROR_UNAVAILABLE == "node2_unavailable"
+        assert NODE2_ERROR_ACI_UNVERIFIED == "node2_aci_unverified"
+        assert NODE2_ERROR_CAP_REFUSED == "node2_cap_refused"
+        assert NODE2_ERROR_CLIENT_IMPORT == "node2_client_import_error"
+        assert len(NODE2_ERROR_CLASSES) == 4
+        assert len(set(NODE2_ERROR_CLASSES)) == 4  # all distinct
+
+    def test_node2_error_class_mapping(self):
+        """_node2_error_class maps the named client exceptions to the four
+        classes: spend-cap -> node2_cap_refused, ACI -> node2_aci_unverified,
+        a genuine transport failure -> node2_unavailable."""
+        from lapis_pm.corroboration_adapter import _node2_error_class
+        import agents_core.phala_tee as pt
+
+        # Spend cap -> node2_cap_refused.
+        cap_exc = pt.PhalaSpendCapExceededError(2.0, 2.0, 0)
+        assert _node2_error_class(cap_exc) == "node2_cap_refused"
+
+        # ACI verify hop failure -> node2_aci_unverified.
+        aci_exc = pt.ReportVerificationError.__new__(pt.ReportVerificationError)
+        assert _node2_error_class(aci_exc) == "node2_aci_unverified"
+
+        # A genuine transport failure (ConnectionError) -> node2_unavailable.
+        assert _node2_error_class(ConnectionError("refused")) == "node2_unavailable"
+
+    def test_node2_cap_refused_note(self):
+        """A spend-cap refusal surfaces `node2_cap_refused` in the note (a
+        cost decision, not an outage) — distinct from a genuine TEE outage."""
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+        import agents_core.phala_tee as pt
+
+        with (
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
+        ):
+            mock_client.return_value.chat_completion.side_effect = (
+                pt.PhalaSpendCapExceededError(2.0, 2.0, 0)
+            )
+            adapter = LapisPMReviewerAdapter()
+            result = adapter.score(
+                FAKE_DIFF, substrates, "lapis-pm",
+                node_model=_NODE2_MODEL, node_timeout=_NODE2_TIMEOUT,
+                include_vault=False, via_node2_client=True,
+            )
+        assert result.leg_status == "substrate_unavailable"
+        assert "node2_cap_refused" in (result.notes or "")
+
+    def test_node2_client_import_error_note(self):
+        """A cross-repo PhalaTeeClient import failure surfaces
+        `node2_client_import_error` (a WIRING defect, not a TEE outage) —
+        the gate-4 amendment."""
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+        with (
+            patch("lapis_pm.corroboration_adapter._build_node2_client",
+                  side_effect=ImportError("agents_core.phala_tee not found")),
+        ):
+            adapter = LapisPMReviewerAdapter()
+            result = adapter.score(
+                FAKE_DIFF, substrates, "lapis-pm",
+                node_model=_NODE2_MODEL, node_timeout=_NODE2_TIMEOUT,
+                include_vault=False, via_node2_client=True,
+            )
+        assert result.leg_status == "substrate_unavailable"
+        assert "node2_client_import_error" in (result.notes or "")
+
+    def test_node2_grammar_degrade_retry(self):
+        """DoD-1: the 400/422 grammar-degrade retry is exercised — a
+        grammar-rejecting hop (400) is retried ONCE without response_format,
+        and the retry's success produces a healthy leg (not a 100% fail)."""
+        substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
+        call_count = [0]
+
+        def _chat_completion(*, messages, model, nonce=None, extra_body=None):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First attempt (grammar-carrying) is rejected with a 400.
+                raise Exception("400 Client Error: grammar not supported")
+            # Retry (no grammar) succeeds.
+            return VALID_CORR_RESP
+
+        with (
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
+        ):
+            mock_client.return_value.chat_completion.side_effect = _chat_completion
+            adapter = LapisPMReviewerAdapter()
+            result = adapter.score(
+                FAKE_DIFF, substrates, "lapis-pm",
+                node_model=_NODE2_MODEL, node_timeout=_NODE2_TIMEOUT,
+                include_vault=False, via_node2_client=True,
+            )
+        # Two calls: the grammar-carrying attempt + the grammar-degrade retry.
+        assert call_count[0] == 2, "expected a grammar-degrade retry after the 400"
+        assert result.leg_status == "ok"
+        assert result.verdict == "clean"
+
+    def test_node2_grammar_degrade_retry_both_fail(self):
+        """DoD-1: if the grammar-degrade retry ALSO fails, the leg fails
+        closed with a named error class (no double retry)."""
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+        call_count = [0]
+
+        def _chat_completion(*, messages, model, nonce=None, extra_body=None):
+            call_count[0] += 1
+            raise Exception("400 Client Error: grammar not supported")
+
+        with (
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
+        ):
+            mock_client.return_value.chat_completion.side_effect = _chat_completion
+            adapter = LapisPMReviewerAdapter()
+            result = adapter.score(
+                FAKE_DIFF, substrates, "lapis-pm",
+                node_model=_NODE2_MODEL, node_timeout=_NODE2_TIMEOUT,
+                include_vault=False, via_node2_client=True,
+            )
+        # Two calls max (no double retry): the grammar-carrying attempt + the
+        # grammar-degrade retry.
+        assert call_count[0] == 2
+        assert result.leg_status == "substrate_unavailable"
+        assert "node2_" in (result.notes or "")
+
+    def test_node2_payload_carries_all_three_fields(self):
+        """DoD-1: the node2 payload (extra_body) carries ALL THREE of
+        temperature 0.1 / max_tokens 16384 / the json_schema grammar (the
+        client merges verbatim)."""
+        substrates = [_IdentifierSubstrate("tick", [], [])]
+        captured_extra: list[dict] = []
+
+        def _chat_completion(*, messages, model, nonce=None, extra_body=None):
+            captured_extra.append(extra_body or {})
+            return VALID_CORR_RESP
+
+        with (
+            patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
+        ):
+            mock_client.return_value.chat_completion.side_effect = _chat_completion
+            adapter = LapisPMReviewerAdapter()
+            result = adapter.score(
+                FAKE_DIFF, substrates, "lapis-pm",
+                node_model=_NODE2_MODEL, node_timeout=_NODE2_TIMEOUT,
+                include_vault=False, via_node2_client=True,
+            )
+        assert result.leg_status == "ok"
+        assert captured_extra, "no extra_body captured"
+        body = captured_extra[0]
+        # All three payload fields ride extra_body (the client merges
+        # verbatim into the POST body).
+        assert body["temperature"] == 0.1
+        assert body["max_tokens"] == _MAX_TOKENS == 16384
+        assert "response_format" in body  # the json_schema grammar
+        # model is NOT in extra_body (the client sets it on the body itself).
+        assert "model" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -732,3 +934,157 @@ class TestPanelHealthLine:
         out = capsys.readouterr().out
         assert rc == 0
         assert "panel:" not in out
+
+
+# ---------------------------------------------------------------------------
+# DoD-1/5 (lapis-pm-reviewer-leg-repair-v0): the brief carries drift_class
+# verbatim + the node2 error-class tail on the DEGRADED PANEL line + the
+# positive "panel: 3/3 legs reporting" line when not starved.
+# ---------------------------------------------------------------------------
+
+class TestBriefSurfaces:
+    """DoD-1/5: the brief composition (reviewer_verdict_text) carries
+    drift_class verbatim, the node2 error-class tail on the DEGRADED PANEL
+    line, and a positive "panel: 3/3 legs reporting" line when not starved.
+    The trigger gating is stated: the line fires for advisory-clean/hold
+    triggers (the reviewer_verdict_text block)."""
+
+    def _render_reviewer_verdict_text(self, verdict_info: dict) -> str:
+        """Drive the reviewer_verdict_text composition in _act_brief with a
+        fake verdict. Returns the composed text (or '' if the block did not
+        render)."""
+        from lapis_pm import pm_core
+        from lapis_pm import authority
+
+        cls = authority.PRClassification(
+            verdict="advisory",
+            screen_verdict="clean",
+            static_outcome="advisory",
+            reasons=[],
+            issues=[],
+            pr_number=7,
+            repo="lapis-pm",
+            title="t",
+            html_url="u",
+            changed_paths=[],
+            diff_loc=10,
+            diff="diff",
+        )
+
+        class _FakeTarget:
+            id = "tid-brief"
+            pm_repo = "lapis-pm"
+            data = {"pm_verification": "pm-live-test"}
+
+        with (
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_info),
+            patch("lapis_pm.pm_core.TargetStore") as mock_ts,
+            patch("lapis_pm.pm_core._attestation_hook"),
+            patch("lapis_pm.pm_core._precedent_hook", return_value=None),
+            patch("lapis_pm.pm_core._mark_pr_classified"),
+            patch("lapis_pm.auto_resolve.should_auto_resolve",
+                  return_value=(False, None)),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.pm_core._set_brief_outstanding"),
+        ):
+            mock_ts.return_value.get.return_value = _FakeTarget()
+            mock_synth.return_value = MagicMock(comment_id="cid")
+            try:
+                pm_core._act_brief(
+                    "tid-brief", "advisory-clean", False,
+                    {"classification": cls, "pr": {}},
+                )
+            except Exception:
+                pass
+            # reviewer_verdict_text is passed to brief.synthesize.
+            if mock_synth.call_args:
+                return mock_synth.call_args.kwargs.get("reviewer_verdict_text") or ""
+        return ""
+
+    def test_brief_carries_drift_class_verbatim(self):
+        """DoD-5: the brief carries drift_class verbatim (the rev-1 brief
+        rendered only corroboration={verdict})."""
+        verdict_info = {
+            "verdict": "clean",
+            "issues": [],
+            "confidence": 0.9,
+            "corroboration_result": {
+                "verdict": "clean",
+                "drift_class": "new",
+                "node2_corroboration": {"leg_status": "ok", "notes": "ok"},
+            },
+            "panel_starvation": {"legs_down": [], "starved": False,
+                                 "confidence_raw": 0.9},
+        }
+        text = self._render_reviewer_verdict_text(verdict_info)
+        assert "drift_class=new" in text, f"drift_class not verbatim: {text}"
+        # Not starved -> the positive line renders.
+        assert "panel: 3/3 legs reporting" in text
+
+    def test_brief_degraded_panel_carries_node2_error_class(self):
+        """DoD-1: the DEGRADED PANEL line carries the node2 error-class tail
+        (a genuine node2 down is distinguishable from a wiring bug on a PM
+        surface)."""
+        verdict_info = {
+            "verdict": "fixable",
+            "issues": [{"severity": "high", "path": "foo.py", "note": "x"}],
+            "confidence": 0.0,
+            "corroboration_result": {
+                "verdict": "uncertain",
+                "drift_class": None,
+                "node2_corroboration": {
+                    "leg_status": "substrate_unavailable",
+                    "notes": "node2_aci_unverified: ReportVerificationError — node2 failed closed",
+                },
+            },
+            "panel_starvation": {"legs_down": ["second_node"], "starved": True,
+                                 "confidence_raw": 0.9},
+        }
+        text = self._render_reviewer_verdict_text(verdict_info)
+        assert "DEGRADED PANEL" in text
+        assert "node2=node2_aci_unverified" in text, (
+            f"node2 error-class tail missing: {text}"
+        )
+
+    def test_brief_client_import_error_distinguishable(self):
+        """DoD-1: a cross-repo import failure (node2_client_import_error) is
+        distinguishable from a genuine TEE outage on the DEGRADED PANEL
+        line (a wiring defect, not a TEE outage)."""
+        verdict_info = {
+            "verdict": "fixable",
+            "issues": [{"severity": "high", "path": "foo.py", "note": "x"}],
+            "confidence": 0.0,
+            "corroboration_result": {
+                "verdict": "uncertain",
+                "drift_class": None,
+                "node2_corroboration": {
+                    "leg_status": "substrate_unavailable",
+                    "notes": "node2_client_import_error: ImportError — node2 wiring defect",
+                },
+            },
+            "panel_starvation": {"legs_down": ["second_node"], "starved": True,
+                                 "confidence_raw": 0.9},
+        }
+        text = self._render_reviewer_verdict_text(verdict_info)
+        assert "DEGRADED PANEL" in text
+        assert "node2=node2_client_import_error" in text
+
+    def test_brief_positive_line_when_not_starved(self):
+        """DoD-1: a positive "panel: 3/3 legs reporting" line renders when
+        not starved (a healthy panel is distinguishable from a legacy
+        unannotated verdict)."""
+        verdict_info = {
+            "verdict": "clean",
+            "issues": [],
+            "confidence": 0.95,
+            "corroboration_result": {
+                "verdict": "clean",
+                "drift_class": None,
+                "node2_corroboration": {"leg_status": "ok", "notes": "ok"},
+            },
+            "panel_starvation": {"legs_down": [], "starved": False,
+                                 "confidence_raw": 0.95},
+        }
+        text = self._render_reviewer_verdict_text(verdict_info)
+        assert "panel: 3/3 legs reporting" in text
+        assert "DEGRADED PANEL" not in text

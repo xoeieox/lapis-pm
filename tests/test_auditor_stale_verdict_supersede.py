@@ -278,6 +278,8 @@ def test_decide_no_sha_observed_treated_as_fresh():
             p.stop()
         ep.stop()
     assert decision.kind == "hold_brief"
-    stale_obs = [c for c in ep.all_comments.return_value
-                 if "pm:verdict-stale-superseded" in c.tags]
-    assert not stale_obs
+    stale_calls = [
+        c for c in ep.write_observation.call_args_list
+        if "pm:verdict-stale-superseded" in (c.kwargs.get("extra_tags") or [])
+    ]
+    assert not stale_calls

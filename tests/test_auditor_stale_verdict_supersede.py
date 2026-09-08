@@ -330,6 +330,7 @@ def reviewer_encode_store(tmp_path):
         return c
 
     mem_p = patch("lapis_pm.pm_core._mem", return_value=store)
+    mem_p.start()
     ep = patch("lapis_pm.pm_core.episodic").start()
     ep.all_comments.side_effect = lambda tid: list(state["comments"])
     ep.spec.return_value = "/srv/lapis/planning/specs/fixer-reception-v0.md"

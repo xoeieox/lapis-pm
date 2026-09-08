@@ -651,6 +651,20 @@ _CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS: tuple[str, ...] = (
     "gw-night-pre.py",
     "gw-night-post.py",
     "scout-night-pre.py",
+    # night-deploy-manifest-attestation-v0 (DoD-1/DoD-2): the three scripts the
+    # night DAG actually executes that were NOT in any deploy manifest (the
+    # measured 2026-09-07 hole — mini_1f916_night.py 2 days stale,
+    # keeper_v0.py ~6 weeks stale, council_sweep.py absent from
+    # /data/agents/scripts). Their consumers are the plan file's DAG commands
+    # (absolute-path invocation), which sit outside night_plan.py's
+    # producer-import closure — so the BRIX_GW_RUNTIME family, NOT
+    # _CONDUCTOR_NIGHT_SCRIPTS (whose exact-equality closure tests would fail
+    # on a naive append). The checker (lapis_pm/attestation.py) audits this
+    # tuple; it is itself invoked as a module from the deploy clone and needs
+    # no entry here.
+    "mini_1f916_night.py",
+    "keeper_v0.py",
+    "council_sweep.py",
 )
 
 # D4: host-reachability policy — never wake, always retry on the next land.
@@ -1940,6 +1954,239 @@ def _report_gw_host_script_drift(results: list) -> None:
     _write_gw_drift_ledger(ledger)
 
 
+# ---------------------------------------------------------------------------
+# D3: land-time deploy reporting (night-deploy-manifest-attestation-v0)
+# ---------------------------------------------------------------------------
+# The land output states, in plain terms, what the deploy pass delivered
+# (which host, which script, verified how) — or states explicitly that nothing
+# was deployed and why. Silent-success land is the crack Erah named. The data
+# source is the hook's existing result + _DEPLOY_LOG; no new deploy mechanism.
+#
+# Gate-3 amendments (folded rev 4):
+#   * just-merged-PR gap naming — land lists any script named by the
+#     just-merged PR's diff that is absent from the deployed set at land time.
+#   * the mark reflects CURRENT LIVE STATE, not the historical ledger —
+#     computed at land time from live inputs (fresh closure comparison + the
+#     latest run-record verdict + the waiver file). The ledger remains the
+#     enduring record (duration, waiver debt); the mark is a point-in-time
+#     reading of it.
+#   * the scar carries temporal context — the mark lands with its duration
+#     from the ledger (DRIFT (3 nights, oldest 2026-09-05)).
+
+_DEPLOY_ATTESTATION_MARKS = ("DRIFT", "WAIVER", "WAIVER_EXPIRED", "CLEAN")
+
+
+def _just_merged_pr_scripts(repo: str, clone_paths: list[str]) -> list[str]:
+    """Scripts named by the just-merged PR's diff (D3 gate-3 amendment).
+
+    Derives the changed paths from the deploy-log line the hook just wrote
+    (the same source `run_post_land_attestation` consumes — NOT an extra pair
+    of git rev-parse calls competing with the hook's own HEAD checks). A
+    .py path under the repo's scripts/ (or any .py the diff touched) is a
+    candidate. Best-effort — an unreadable log / no diff is a clean [].
+    """
+    out: list[str] = []
+    if not clone_paths:
+        return out
+    primary = clone_paths[0]
+    try:
+        old_sha, new_sha = _last_deploy_log_shas(primary, "post-land-hook")
+        if not old_sha or not new_sha:
+            return out
+        diff = subprocess.run(
+            ["git", "-C", primary, "diff", "--name-only", old_sha, new_sha],
+            capture_output=True, text=True, timeout=10,
+        )
+        if diff.returncode != 0:
+            return out
+        for ln in diff.stdout.splitlines():
+            ln = ln.strip()
+            if ln.endswith(".py"):
+                base = ln.rsplit("/", 1)[-1]
+                if base not in out:
+                    out.append(base)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return out
+
+
+def _attestation_drift_duration(ledger_records: list) -> str | None:
+    """Duration from the attestation ledger (the temporal scar, D3): how many
+    nights the drift has persisted and the oldest observed date. None if the
+    ledger has no drift record."""
+    drift_dates: list[str] = []
+    for rec in ledger_records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("verdict") == "held" and rec.get("reason") in (
+            "drift", "waiver_expired", "waiver_forever",
+        ):
+            ts = rec.get("ts")
+            if ts:
+                drift_dates.append(str(ts)[:10])
+    if not drift_dates:
+        return None
+    oldest = min(drift_dates)
+    nights = len(drift_dates)
+    return f"{nights} nights, oldest {oldest}"
+
+
+def _compute_land_attestation_mark(
+    repo: str,
+    pr_scripts: list[str],
+    ledger_records: list | None = None,
+) -> tuple[str, str]:
+    """Compute the land-time mark from CURRENT LIVE inputs (D3): fresh
+    closure comparison + latest run-record verdict + waiver file.
+
+    Returns (mark, detail). mark is one of DRIFT / WAIVER / WAIVER_EXPIRED /
+    CLEAN; detail carries the duration (the temporal scar).
+    """
+    from . import attestation as _att
+
+    waivers, _problems = _att.load_waivers()
+    ledger_records = ledger_records if ledger_records is not None else _att.read_ledger()
+
+    # Fresh closure comparison: which pr scripts are in a manifest / waived /
+    # drifted right now.
+    try:
+        closure = _att.manifest_closure_from_pm_core()
+    except Exception:
+        closure = None
+    local_manifested = closure.local_manifested() if closure else set()
+
+    drifted: list[str] = []
+    waived_now: list[str] = []
+    waived_expired: list[str] = []
+    for script in pr_scripts:
+        base = Path(script).name
+        w = _att.waiver_for(script, waivers)
+        if w is not None:
+            if w.is_expired():
+                waived_expired.append(base)
+            else:
+                waived_now.append(base)
+        # A pr script absent from every manifest and not waived is the named
+        # gap — it is a drift row at land time.
+        if base not in local_manifested and w is None:
+            drifted.append(base)
+
+    if waived_expired:
+        return "WAIVER_EXPIRED", ", ".join(waived_expired)
+    if drifted:
+        return "DRIFT", ", ".join(drifted)
+    if waived_now:
+        return "WAIVER", ", ".join(waived_now)
+    return "CLEAN", ""
+
+
+def render_land_deploy_report(
+    repo: str,
+    pr_scripts: list[str] | None = None,
+    ledger_records: list | None = None,
+) -> str:
+    """D3: the plain-terms land output statement. States what the deploy pass
+    delivered (host, script, verified how) — or explicitly that nothing was
+    deployed and why — PLUS names any just-merged-PR script absent from the
+    deployed set. The mark (DRIFT/WAIVER/WAIVER_EXPIRED/CLEAN) is computed at
+    land time from current live inputs and carries duration from the ledger.
+
+    Best-effort — a failure here must never fail the land (it lands on the
+    land output before the archive step, but a reporting bug degrades to a
+    minimal statement, never a crash).
+    """
+    from . import attestation as _att
+
+    lines: list[str] = []
+    lines.append("[land:deploy] deploy pass report")
+
+    # --- what the deploy pass delivered (from _DEPLOY_LOG, current live) ---
+    delivered = _deploy_log_lines_for_repo(repo)
+    if delivered:
+        lines.append(f"  delivered {len(delivered)} script(s) this pass:")
+        for d in delivered:
+            lines.append(f"    {d['tree']} | {d['change']} | verified: {d['verified']}")
+    else:
+        # Explicit: nothing was deployed, and why (D3 — no silent green).
+        reason = _why_no_deploy(repo)
+        lines.append(f"  nothing deployed this pass ({reason})")
+
+    # --- just-merged-PR gap naming (D3 gate-3 amendment) ---
+    pr_scripts = pr_scripts if pr_scripts is not None else _just_merged_pr_scripts(
+        repo, _POST_LAND_PULL.get(repo) or []
+    )
+    if pr_scripts:
+        try:
+            closure = _att.manifest_closure_from_pm_core()
+            local_manifested = closure.local_manifested()
+        except Exception:
+            local_manifested = set()
+        absent = [s for s in pr_scripts if Path(s).name not in local_manifested]
+        if absent:
+            lines.append(
+                f"  GAP: {len(absent)} script(s) from the just-merged PR are "
+                f"absent from the deployed set at land time: {', '.join(absent)}"
+                " — waived? (a silent-green land is the crack this report closes)"
+            )
+        else:
+            lines.append(
+                f"  just-merged PR scripts ({len(pr_scripts)}): all in the "
+                "deployed set"
+            )
+
+    # --- the mark (current live state + duration from the ledger) ---
+    if ledger_records is None:
+        try:
+            ledger_records = _att.read_ledger()
+        except Exception:
+            ledger_records = []
+    mark, detail = _compute_land_attestation_mark(repo, pr_scripts, ledger_records)
+    duration = _attestation_drift_duration(ledger_records)
+    if mark == "DRIFT" and duration:
+        lines.append(f"  mark: DRIFT ({duration}) — {detail}")
+    elif mark == "DRIFT":
+        lines.append(f"  mark: DRIFT — {detail}")
+    elif mark in ("WAIVER", "WAIVER_EXPIRED"):
+        lines.append(f"  mark: {mark} — {detail}")
+    else:
+        lines.append("  mark: CLEAN")
+
+    return "\n".join(lines)
+
+
+def _deploy_log_lines_for_repo(repo: str) -> list[dict]:
+    """The most recent deploy-log lines for `repo`'s trees (current live read
+    of _DEPLOY_LOG). `verified` is how the pass verified delivery (the
+    per-file tracked-and-unmodified D3 gate + the atomic copy)."""
+    trees = set(_POST_LAND_PULL.get(repo) or [])
+    out: list[dict] = []
+    try:
+        lines = Path(_DEPLOY_LOG).read_text().splitlines()
+    except OSError:
+        return out
+    for line in reversed(lines):
+        m = _DEPLOY_LOG_LINE_RE.match(line)
+        if m and m.group("tree") in trees:
+            change = m.group("old") + ".." + m.group("new")
+            out.append({
+                "tree": m.group("tree"),
+                "change": change,
+                "verified": "per-file tracked-and-unmodified vs HEAD + atomic copy",
+            })
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _why_no_deploy(repo: str) -> str:
+    """Why nothing was deployed this pass (D3 — explicit, not silent)."""
+    if _DEPLOY_HOOK_DISABLED:
+        return "deploy hook disabled (LAPIS_PM_DEPLOY_HOOK_DISABLE=1)"
+    if repo not in _POST_LAND_PULL:
+        return f"{repo} has no deploy-clone pull mapping"
+    return "HEAD unchanged (no-op pull) or source not fresh — runtime preserved"
+
+
 def _deploy_conductor_gw_host_scripts_impl(trigger: str) -> None:
     clone = _CONDUCTOR_DEPLOY_CLONE
     src_dir = Path(_CONDUCTOR_SCRIPTS_SRC)
@@ -2558,6 +2805,20 @@ def _post_land_deploy_hook(
         # gravitywell:/usr/local/sbin/. Independent of the local copy above (own
         # never-raises contract); never converges or restarts a GW serving unit.
         _deploy_conductor_gw_host_scripts(trigger=trigger)
+
+    # night-deploy-manifest-attestation-v0 (D3): the land output states what
+    # the deploy pass delivered (host, script, verified how) — or explicitly
+    # that nothing was deployed and why — plus names any just-merged-PR script
+    # absent from the deployed set. The mark (DRIFT/WAIVER/WAIVER_EXPIRED/
+    # CLEAN) is computed at land time from current live inputs and carries
+    # duration from the attestation ledger. Silent-success land is the crack
+    # Erah named; this statement lands on the land output before archive.
+    # Best-effort — a reporting bug degrades to a minimal statement, never a
+    # crash, and never fails the land.
+    try:
+        print(render_land_deploy_report(repo), file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[post-land-deploy] D3 deploy report failed (non-fatal): {e}", file=sys.stderr)
 
     units = _POST_LAND_RESTART.get(repo)
     if units:

@@ -1065,6 +1065,23 @@ def cmd_land(args) -> int:
     return 0
 
 
+def cmd_attestation_check(args) -> int:
+    """night-deploy-manifest-attestation-v0: the pre-PR / manual attestation
+    entry. Runs the deploy-manifest completeness checker (lapis_pm/attestation)
+    and returns the exit code the DAG node's success_predicate maps (0 clean /
+    2 held / 3 failed). For pre-PR use — the DAG node itself invokes this
+    module as a module from the /srv/git/lapis-pm deploy clone."""
+    from . import attestation
+    return attestation.main([
+        *(["--plan", args.plan] if args.plan else []),
+        *(["--waivers", args.waivers] if args.waivers else []),
+        *(["--ledger", args.ledger] if args.ledger else []),
+        *(["--src", args.src] if args.src else []),
+        *(["--dest", args.dest] if args.dest else []),
+        *([] if not args.no_emit else ["--no-emit"]),
+    ])
+
+
 def cmd_ratify(args) -> int:
     """Principal-feedback surface: record ratification of a Router decision.
 
@@ -2446,6 +2463,21 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--dry-run", action="store_true",
                     help="Print arc doc to stdout instead of writing to /srv/lapis/lapis-state/")
     ld.set_defaults(func=cmd_land)
+
+    # night-deploy-manifest-attestation-v0: the deploy-manifest completeness
+    # checker (pre-PR / manual entry). The DAG node invokes the module directly;
+    # this is the CLI surface for operators + the pre-PR proof.
+    ac = sub.add_parser(
+        "attestation-check",
+        help="Run the deploy-manifest completeness attestation (0 clean / 2 held / 3 failed).",
+    )
+    ac.add_argument("--plan", default=None, help="Night plan path (default /data/slots/night-plan.yaml)")
+    ac.add_argument("--waivers", default=None, help="Waiver file path")
+    ac.add_argument("--ledger", default=None, help="Attestation ledger path")
+    ac.add_argument("--src", default=None, help="Conductor scripts source dir")
+    ac.add_argument("--dest", default=None, help="BRIX host-op scripts dir")
+    ac.add_argument("--no-emit", action="store_true", help="Do not print the JSON line")
+    ac.set_defaults(func=cmd_attestation_check)
 
     fr = sub.add_parser("friction", help="Friction capture queue operations (operator/debug surface).")
     fr_sub = fr.add_subparsers(dest="friction_cmd", required=True)

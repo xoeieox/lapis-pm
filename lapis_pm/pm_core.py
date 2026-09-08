@@ -9599,6 +9599,55 @@ def _act_lost_fixer_retry(target_id: str, rec: dict) -> str:
     return f"fixer_lost:retrying:dispatch={orig_gpu_id}"
 
 
+_LOST_BRIEF_RESURFACE_WINDOW_HOURS = 24
+
+
+def _lost_brief_resurface_attempt_tag(target_id: str, orig_id: str) -> str | None:
+    """Return the ts of the most recent lost-brief resurface attempt for
+    (target, orig_gpu), or None.
+
+    The attempt record is the pm:lost-brief-resurface attempt observation
+    (written when the resurface path runs) or the pm:lost-brief-resurface-failed
+    observation (written when the key-set inside the resurface path fails).
+    Both carry the pm:lost-original-gpu tag.
+    """
+    gpu_tag = f"pm:lost-original-gpu={orig_id}"
+    latest: str | None = None
+    for c in episodic.all_comments(target_id):
+        if gpu_tag not in c.tags:
+            continue
+        if (
+            "pm:lost-brief-resurface" in c.tags
+            or "pm:lost-brief-resurface-failed" in c.tags
+        ):
+            if latest is None or c.ts > latest:
+                latest = c.ts
+    return latest
+
+
+def _lost_brief_resurface_allowed(
+    target_id: str, orig_id: str, now: datetime
+) -> bool:
+    """At most one resurface attempt per 24h per orig_gpu_id (spec
+    lapis-pm-lost-brief-must-surface-v0 §3). A missing/unparseable attempt ts
+    is treated as "no attempt yet" so the first resurface always runs."""
+    latest = _lost_brief_resurface_attempt_tag(target_id, orig_id)
+    if latest is None:
+        return True
+    try:
+        last = datetime.fromisoformat(latest)
+    except ValueError:
+        return True
+    # Normalize to the same tz-awareness as `now` so subtraction never
+    # raises (production `now` is a naive Pacific wall clock; the attempt
+    # ts is tz-aware Pacific from CommentStore).
+    if last.tzinfo is not None and now.tzinfo is None:
+        last = last.replace(tzinfo=None)
+    elif last.tzinfo is None and now.tzinfo is not None:
+        last = last.replace(tzinfo=now.tzinfo)
+    return (now - last) >= timedelta(hours=_LOST_BRIEF_RESURFACE_WINDOW_HOURS)
+
+
 def _act_lost_brief(
     target_id: str, original_rec: dict, retry_rec: dict | None
 ) -> str:
@@ -9612,6 +9661,14 @@ def _act_lost_brief(
     pm:lost-original-gpu=<orig_gpu_id> already exists for this dispatch,
     and the outstanding-brief mem key still matches, the brief is not
     re-composed.  Returns noop:lost-brief-suppressed:gpu=<id> in that case.
+
+    Resurface (lapis-pm-lost-brief-must-surface-v0): when the guard finds a
+    prior lost-dispatch brief-options comment but the outstanding-brief mem
+    key is absent or stale, the brief may NEVER have been delivered (the
+    2026-08-28 case: comment written, key never set).  The stale/absent
+    branch then re-emits the brief through the normal compose/surface path
+    below (bounded to one attempt per 24h per orig_gpu_id) instead of
+    suppressing forever.
     """
     orig_id = original_rec.get("gpu_id", "unknown")
     orig_error = original_rec.get("error") or "no error recorded"
@@ -9650,17 +9707,25 @@ def _act_lost_brief(
             # Brief is outstanding and matches — suppress entirely (noop).
             return f"noop:lost-brief-suppressed:gpu={orig_id}"
         else:
-            # Mem key is stale (lapis-pm-outstanding-brief-write-verify-v0
-            # addresses this path separately).  Still suppress composition but
-            # write a single observation so the mismatch is visible in episodic.
+            # Mem key is stale or absent.  The guard cannot distinguish "the
+            # brief was delivered and the key went stale" from "the brief was
+            # never delivered and the key was never set" (the 2026-08-28
+            # case).  Re-emit through the normal compose/surface path below
+            # instead of suppressing forever — bounded to one attempt per
+            # 24h per orig_gpu_id so a persistently failing key-set degrades
+            # to a once-a-day loud observation, not per-tick spam.
+            now = datetime.now(PACIFIC)
+            if not _lost_brief_resurface_allowed(target_id, orig_id, now):
+                return f"noop:lost-brief-suppressed:gpu={orig_id}"
             episodic.write_observation(
                 target_id,
-                f"Lost-brief suppressed (mem-stale): orig_gpu={orig_id} "
+                f"Lost-brief resurface attempt: orig_gpu={orig_id} "
                 f"existing_brief={existing_brief_id} "
-                f"mem_key={current_outstanding!r}",
-                extra_tags=["pm:lost-brief-suppressed", gpu_tag],
+                f"mem_key={current_outstanding!r} "
+                f"attempt_ts={now.isoformat(timespec='microseconds')}",
+                extra_tags=["pm:lost-brief-resurface", gpu_tag],
             )
-            return f"noop:lost-brief-suppressed:gpu={orig_id}"
+            # Fall through: re-emit the brief via the normal path below.
     # --- End idempotency guard ---
 
     # Close the attribution slot for terminal fixer_retry records. The slot was
@@ -9687,7 +9752,22 @@ def _act_lost_brief(
         notify=NotifyPriority.NORMAL,
         options_extra_tags=[gpu_tag],
     )
-    _set_brief_outstanding(target_id, b)
+    # The key-set is part of the same surface path (the contract: the key's
+    # presence means the brief is outstanding/surfaced).  If it fails to
+    # persist, the resurface attempt record above already bounds re-fires to
+    # one per 24h; a loud observation keeps the failure visible in
+    # claude-view instead of a silent suppression.
+    try:
+        _set_brief_outstanding(target_id, b)
+    except Exception as exc:
+        episodic.write_observation(
+            target_id,
+            f"Lost-brief resurface key-set failed: orig_gpu={orig_id} "
+            f"brief={b.comment_id} err={exc!r} — resurface re-bounded to "
+            f"{_LOST_BRIEF_RESURFACE_WINDOW_HOURS}h",
+            extra_tags=["pm:error", "pm:lost-brief-resurface-failed", gpu_tag],
+        )
+        raise
 
     dispatch_ids = f"{orig_id},{retry_id}" if retry_rec else orig_id
     return f"fixer_lost:briefing:dispatches={dispatch_ids}"

@@ -24,6 +24,7 @@ Coverage (spec AC5):
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest

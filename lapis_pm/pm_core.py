@@ -5643,6 +5643,65 @@ def _last_review_verdict(target_id: str, pr_number: int) -> dict | None:
         return None
 
 
+def _verdict_rendered_sha(target_id: str, pr_number: int, comment_ts: str | None) -> str | None:
+    """D7: the head sha a reviewer verdict was rendered against.
+
+    Preference order:
+    1. the verdict comment's own `pm:reviewer-sha=<sha>` tag (D7's
+       render-time tag — the exact sha the verdict was rendered against);
+    2. else the latest `pm:pr=N:sha=` observation at or before the verdict
+       comment's ts (computable: sha observations encode in the same tick
+       BEFORE gpu results — the ordering is hard-required by the tick's
+       encode-phase comment);
+    3. else the latest `pm:pr=N:sha=` observation overall (pre-tag verdicts
+       and the `sha=unknown` perceive-miss case — treated as fresh when it
+       does not differ from the current head).
+
+    Returns None when nothing is available — the caller treats that as
+    FRESH (effectively unreachable), per the spec's `sha=unknown` rule.
+    """
+    prefix = f"pm:reviewer:pr={pr_number}:cycle="
+    sha_prefix = f"pm:pr={pr_number}:sha="
+    verdict_comment = None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                if t.split(":verdict=")[-1] != "pending":
+                    verdict_comment = c
+    if verdict_comment is not None:
+        for t in verdict_comment.tags:
+            if t.startswith("pm:reviewer-sha="):
+                return t[len("pm:reviewer-sha="):] or None
+    sha: str | None = None
+    for c in episodic.all_comments(target_id):
+        if comment_ts is not None and c.ts > comment_ts:
+            continue
+        for t in c.tags:
+            if t.startswith(sha_prefix):
+                sha = t[len(sha_prefix):]
+    if sha is not None:
+        return sha
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(sha_prefix):
+                sha = t[len(sha_prefix):]
+    return sha
+
+
+def _last_review_verdict_comment(target_id: str, pr_number: int):
+    """The most recent completed reviewer-verdict Comment for this PR (or
+    None). Same tag scan as _last_review_verdict — factored out so the
+    verdict's ts is available for the D7 rendered-against-sha lookup."""
+    prefix = f"pm:reviewer:pr={pr_number}:cycle="
+    last_comment = None
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix) and ":verdict=" in t:
+                if t.split(":verdict=")[-1] != "pending":
+                    last_comment = c
+    return last_comment
+
+
 def _review_verdict_for_cycle(target_id: str, pr_number: int, cycle: int) -> dict | None:
     """Return the verdict dict for a specific reviewer cycle, or None if absent.
 
@@ -5784,6 +5843,449 @@ def _reviewer_dispatch_ts(target_id: str, pr_number: int, cycle: int) -> str | N
                 and r.get("cycle") == cycle):
             return r.get("ts")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Auditor (fixer-reception-v0, leg 2, D5/D6): the LLM-powered receiving role
+# for non-passing fixer terminations (Erah 2026-09-07, ratified). The
+# auditor investigates the actual state (three-head suite runs + file:line
+# root-cause evidence) and returns a structured JSON audit brief; the daemon
+# encodes it into the pm:auditor comment (D6c) — the auditor posts nothing.
+#
+# Invariants honored here (spec §Invariants):
+# - the auditor is an ENCODE-phase trigger, not a reordering of the decide
+#   phase's single FIFO action (the FIFO lowest-number rule is unchanged);
+# - the auditor does NOT consume the review budget (it is not a reviewer
+#   cycle and never touches the reviewer-attempt counters);
+# - no schema change to Target/Comment: the audit brief is a
+#   comment-with-tags + pm/audit/<tid>/pr=N/* mem keys, the same substrate
+#   the reviewer verdicts use.
+# ---------------------------------------------------------------------------
+
+AUDITOR_AGENT_TYPE = "auditor"
+
+# Per-target audit budget (D6a gate iii): at most N auditor dispatches per
+# target per 12h. Env-var-resolved constant (gate finding, transmuter, run
+# 2026-09-07-224357): the arbiter-tightening doctrine (spec Invariant 2)
+# applies SYMMETRICALLY to loosening AND tightening — either direction tunes
+# without a code change. Default 2 (the census in hand: 9 salvage PRs in one
+# evening on 2026-09-07).
+AUDIT_BUDGET_PER_12H_DEFAULT = 2
+AUDIT_BUDGET_PER_12H_ENV = "GW_AGENT_AUDIT_BUDGET_PER_12H"
+_AUDIT_BUDGET_WINDOW_HOURS = 12
+
+
+def _audit_budget_per_12h() -> int:
+    """Call-time env read (same discipline as the reviewer-attempt ceiling
+    env reads): the per-target auditor dispatch budget per 12h window."""
+    raw = os.environ.get(AUDIT_BUDGET_PER_12H_ENV)
+    if raw is None:
+        return AUDIT_BUDGET_PER_12H_DEFAULT
+    try:
+        n = int(raw)
+        return n if n > 0 else AUDIT_BUDGET_PER_12H_DEFAULT
+    except ValueError:
+        return AUDIT_BUDGET_PER_12H_DEFAULT
+
+
+def _audit_budget_key(target_id: str) -> str:
+    return f"pm/audit/{target_id}/budget"
+
+
+def _audit_dispatched_key(target_id: str, pr_number: int) -> str:
+    """Gate (i) marker (D6a): the VALUE is the head sha that was audited.
+    Re-triggers only when the current head sha differs from the stored
+    value; a failed/timed-out audit clears it (D6c) so the un-audited head
+    re-dispatches."""
+    return f"pm/audit/{target_id}/pr={pr_number}/dispatched"
+
+
+def _audit_brief_key(target_id: str, pr_number: int) -> str:
+    """The encoded audit brief JSON (D6c): the five-section brief the
+    advisory brief surface renders from."""
+    return f"pm/audit/{target_id}/pr={pr_number}/brief"
+
+
+def _audit_budget_record(target_id: str) -> dict:
+    """Read + prune the per-target audit budget ledger (dispatch count +
+    timestamps within the trailing AUDIT_BUDGET_PER_12H window)."""
+    rec = _mem().get(_audit_budget_key(target_id))
+    try:
+        data = json.loads(rec["content"]) if rec else {}
+        entries = data.get("entries", []) if isinstance(data, dict) else []
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        entries = []
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=_AUDIT_BUDGET_WINDOW_HOURS)).isoformat()
+    return {"entries": [e for e in entries if isinstance(e, str) and e >= cutoff]}
+
+
+def _audit_budget_used(target_id: str) -> int:
+    return len(_audit_budget_record(target_id)["entries"])
+
+
+def _audit_budget_has_room(target_id: str) -> bool:
+    return _audit_budget_used(target_id) < _audit_budget_per_12h()
+
+
+def _record_audit_budget(target_id: str) -> None:
+    rec = _audit_budget_record(target_id)
+    rec["entries"].append(datetime.now(timezone.utc).isoformat())
+    _mem().set(_audit_budget_key(target_id), json.dumps(rec),
+               tags=["lapis-pm", "pm:audit-budget"])
+
+
+def _audit_dispatched_head(target_id: str, pr_number: int) -> str | None:
+    """Gate (i): the head sha the last audit for this PR covered, or None."""
+    rec = _mem().get(_audit_dispatched_key(target_id, pr_number))
+    if not rec:
+        return None
+    try:
+        data = json.loads(rec["content"])
+        return data.get("head_sha") if isinstance(data, dict) else None
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
+def _set_audit_dispatched(target_id: str, pr_number: int, head_sha: str) -> None:
+    _mem().set(
+        _audit_dispatched_key(target_id, pr_number),
+        json.dumps({"head_sha": head_sha, "ts": _now_iso()}),
+        tags=["lapis-pm", "pm:audit-dispatched"],
+    )
+
+
+def _clear_audit_dispatched(target_id: str, pr_number: int) -> None:
+    """D6c: a failed/timed-out audit is retryable — the head is still
+    un-audited, so the marker is cleared (not a timeout-only carve-out: a
+    failed parse and a hard-kill both lose the audit)."""
+    _mem().delete(_audit_dispatched_key(target_id, pr_number))
+
+
+def _has_pending_auditor_for_pr(target_id: str, pr_number: int) -> bool:
+    """Gate (ii) (D6a): same shape as _has_pending_reviewer_for_pr — a
+    pending audit defers to the next tick (in-flight guard; the council's
+    900s-timeout x trigger-density finding)."""
+    return any(
+        r.get("status") == "pending"
+        and r.get("agent_type") == AUDITOR_AGENT_TYPE
+        and r.get("pr_number") == pr_number
+        for r in load_dispatched(target_id)
+    )
+
+
+def _is_salvage_pr(pr: dict) -> bool:
+    """The salvage PR shape (spec Invariant 3 — consumed, not reshaped):
+    head.ref ends in `-salvage-<sha8>` AND the body carries the
+    `lapis-salvage: true` marker (agents_core/shaped_runner.py:683-685)."""
+    head_ref = (pr.get("head") or {}).get("ref") or ""
+    if "-salvage-" not in head_ref:
+        return False
+    body = pr.get("body") or ""
+    return "lapis-salvage: true" in body
+
+
+def _pr_head_sha(pr: dict) -> str | None:
+    return (pr.get("head") or {}).get("sha") or None
+
+
+def _previous_head_sha(target_id: str, pr_number: int, current_sha: str | None) -> str | None:
+    """D5 input: the most recent prior salvage/fixer head sha for this PR
+    from the target's pm:pr=N:sha= observations (all_comments order =
+    chronological); for a fresh salvage with no prior head, the original
+    tracked PR's fixer head (the first observed sha). None when no sha has
+    ever been observed (the caller falls back to the current head)."""
+    prefix = f"pm:pr={pr_number}:sha="
+    shas: list[str] = []
+    for c in episodic.all_comments(target_id):
+        for t in c.tags:
+            if t.startswith(prefix):
+                shas.append(t[len(prefix):])
+    if not shas:
+        return None
+    if current_sha is not None and shas[-1] == current_sha:
+        return shas[-2] if len(shas) >= 2 else shas[-1]
+    return shas[-1]
+
+
+def _baseline_main_sha(repo: str) -> str | None:
+    """D5 input: the daemon's `git rev-parse origin/main` at dispatch time,
+    in the repo's working clone. Best-effort — None when the clone or the
+    ref is unavailable (the template renders 'unresolved')."""
+    repo_name = repo.rsplit("/", 1)[-1]
+    clone = Path(f"/srv/git/{repo_name}-working")
+    if not clone.is_dir():
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "origin/main"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _render_audit_brief(audit_json: dict, pr_number: int, head_sha: str | None) -> str:
+    """D6c: render the auditor's five-section JSON into the advisory brief
+    surface (the comment content). The JSON is the contract; this is a
+    human-readable projection of it."""
+    def _fmt_state(name: str, st: dict) -> str:
+        return (f"{name} sha={st.get('sha', '?')[:12]} "
+                f"passed={st.get('passed', '?')} failed={st.get('failed', '?')} "
+                f"errors={st.get('errors', '?')}")
+
+    states = audit_json.get("suite_states") or {}
+    delta = audit_json.get("failure_set_delta") or {}
+    root_cause = audit_json.get("root_cause") or []
+    delta_to_green = audit_json.get("delta_to_green") or []
+    deliverables = audit_json.get("deliverables_evaluation") or []
+
+    lines = [
+        f"## Audit brief — PR #{pr_number} (head {str(head_sha or '?')[:12]})",
+        "",
+        "### 1. Suite states (three-head runs)",
+        _fmt_state("main", states.get("main") or {}),
+        _fmt_state("previous_head", states.get("previous_head") or {}),
+        _fmt_state("salvage_head", states.get("salvage_head") or {}),
+        "",
+        "### 2. Failure-set delta",
+        f"classification: {delta.get('classification', '?')}",
+        f"new_failures: {', '.join(delta.get('new_failures') or []) or '(none)'}",
+        f"fixed_failures: {', '.join(delta.get('fixed_failures') or []) or '(none)'}",
+        f"unchanged_count: {delta.get('unchanged_count', '?')}",
+        "",
+        "### 3. Root causes (claim + file:line evidence)",
+    ]
+    for rc in root_cause:
+        verified = "verified" if rc.get("verified") else "UNVERIFIED (honest: false)"
+        lines.append(f"- {rc.get('failure_class', '?')}: {rc.get('claim', '?')} "
+                     f"[{rc.get('evidence', '?')}] ({verified})")
+    if not root_cause:
+        lines.append("- (none reported)")
+    lines += ["", "### 4. Delta-to-green (the next fixer's brief)"]
+    for unit in delta_to_green:
+        lines.append(f"- {unit.get('unit', '?')} — gate: {unit.get('gate', '?')}")
+    if not delta_to_green:
+        lines.append("- (none reported)")
+    lines += ["", "### 5. Deliverables evaluation"]
+    for d in deliverables:
+        lines.append(f"- {d.get('deliverable', '?')}: {d.get('status', '?')} "
+                     f"[{d.get('evidence', '?')}]")
+    if not deliverables:
+        lines.append("- (none reported)")
+    return "\n".join(lines)
+
+
+def _act_dispatch_auditor(target_id: str, pr: dict, mode: str = "salvage") -> str:
+    """D6: dispatch the auditor agent via the existing dispatch machinery.
+
+    mode: "salvage" (D6a — a new salvage-shaped PR) or "noop" (D6b — a
+    healthy-verdict fixer-retry no-op). The encode-phase dispatch is SEPARATE
+    from the decide phase's single FIFO action; the FIFO action is
+    unchanged (spec Invariant 4).
+
+    The auditor is NOT a reviewer cycle: it never touches the
+    reviewer-attempt counters or the review budget (spec Invariant 6). It
+    does consume the per-target audit budget (D6a gate iii).
+    """
+    pr_number = pr["number"]
+    repo = pr.get("repo") or ""
+    pr_ref = (pr.get("head") or {}).get("ref") or ""
+    head_sha = _pr_head_sha(pr)
+
+    # Gate (iii): the per-target audit budget (at most N per 12h).
+    if not _audit_budget_has_room(target_id):
+        episodic.write_observation(
+            target_id,
+            f"Auditor dispatch deferred for PR #{pr_number}: per-target audit "
+            f"budget exhausted ({_audit_budget_used(target_id)}/"
+            f"{_audit_budget_per_12h()} in the trailing "
+            f"{_AUDIT_BUDGET_WINDOW_HOURS}h window)",
+            extra_tags=[
+                f"pm:pr={pr_number}",
+                "pm:auditor-budget-exhausted",
+                f"pm:audit-mode={mode}",
+            ],
+        )
+        return f"noop:auditor_budget_exhausted:pr={pr_number}"
+
+    # D5 inputs (daemon-resolved at dispatch).
+    spec_path = episodic.spec(target_id) or "(bound spec path unresolved)"
+    vars_: dict = {
+        "target_id": target_id,
+        "repo": repo,
+        "repo_cwd": Shaper.resolve_repo_cwd(repo),
+        "pr_number": pr_number,
+        "existing_branch": pr_ref,
+        "salvage_head_sha": head_sha or "(unresolved)",
+        "previous_head_sha": (
+            _previous_head_sha(target_id, pr_number, head_sha) or head_sha or "(unresolved)"
+        ),
+        "baseline_main_sha": _baseline_main_sha(repo) or "(unresolved)",
+        "bound_spec_path": spec_path,
+    }
+
+    intent = (
+        f"audit PR #{pr_number} ({mode}): three-head suite states + root-cause "
+        f"evidence + delta-to-green for the next fixer"
+    )
+
+    steer.inject_overlay(target_id, vars_, AUDITOR_AGENT_TYPE)
+    _ensure_dispatch_owned(vars_.get("repo", ""))
+    res = _SHAPER.dispatch(AUDITOR_AGENT_TYPE, target_id, intent, vars_=vars_)
+    _check_calcification(target_id)
+
+    record = {
+        "gpu_id": res.task_id,
+        "spec_id": res.spec_id,
+        "agent_type": AUDITOR_AGENT_TYPE,
+        "intent": intent,
+        "repo": repo,
+        "pr_number": pr_number,
+        "mode": mode,
+        "head_sha": head_sha,
+        "existing_branch": pr_ref,
+        "ts": _now_iso(),
+        "status": "pending",
+        "retry_count": 0,
+    }
+    append_dispatched(target_id, record)
+
+    # Budget ledger (gate iii) is recorded at dispatch time — a lost audit
+    # still cost a dispatch. The gate (i) marker (value = head sha) is set at
+    # ENCODE time (D6c) so a failed/timed-out audit leaves no marker and the
+    # head re-dispatches.
+    _record_audit_budget(target_id)
+
+    episodic.write_dispatch(
+        target_id,
+        f"Auditor dispatched ({mode}) for PR #{pr_number} (head "
+        f"{str(head_sha or '?')[:12]}): {AUDITOR_AGENT_TYPE} → {res.task_id}\n"
+        f"PR title: {pr.get('title', '')}",
+        extra_tags=[
+            f"pm:repo={repo}",
+            f"pm:pr={pr_number}",
+            "pm:auditor",
+            f"pm:audit-mode={mode}",
+        ],
+    )
+    return f"action:auditor_dispatched:pr={pr_number}:mode={mode}"
+
+
+def _maybe_dispatch_auditor_salvage(target_id: str, repo: str, pr: dict) -> str | None:
+    """D6a salvage trigger (encode phase): a NEW open PR on a pm_bound target
+    matching the salvage shape triggers exactly ONE auditor dispatch via the
+    shared gate sequence (i)/(ii)/(iii). Returns the action string on
+    dispatch, or None when a gate held (the caller counts it as a noop)."""
+    if not _is_salvage_pr(pr):
+        return None
+    return _maybe_dispatch_auditor_salvage_gates(target_id, pr, mode="salvage")
+
+
+def _maybe_dispatch_auditor_noop(target_id: str, rec: dict, pr_num) -> str | None:
+    """D6b no-op trigger: a fixer-retry no-op against a HEALTHY verdict
+    dispatches the auditor for the same PR (audit why the retry produced no
+    change + the delta-to-green). The starved/refuted case keeps its existing
+    _escalate_noop_retry_if_degraded path UNCHANGED (spec Invariant 8).
+
+    Once-per-pr+cycle marker in the existing escalation-marker shape
+    (:7311-7312); the same three gates as D6a apply (the budget gate uses the
+    no-op PR's head sha via the dispatch record's head_sha).
+    """
+    try:
+        pr_number = pr_num if isinstance(pr_num, int) else int(pr_num)
+    except (TypeError, ValueError):
+        return None
+    cycle = rec.get("cycle", 1)
+
+    # Healthy-verdict partition: the degraded path owns starved/refuted.
+    verdict_info = _review_verdict_for_cycle(target_id, pr_number, cycle)
+    if verdict_info is None:
+        return None
+    from . import panel_starvation as _panel_starvation
+    if _panel_starvation.verdict_is_starved(verdict_info):
+        return None
+    if verdict_info.get("refuted_absence_findings"):
+        return None
+
+    # Once-per-pr+cycle marker (the existing escalation-marker shape).
+    marker_key = (
+        f"pm/noop-audit/{target_id}/pr={pr_number}/cycle={cycle}/recorded"
+    )
+    if _mem().get(marker_key):
+        return None
+
+    # Reconstruct the PR dict the dispatch needs (head ref + sha). The
+    # dispatch record's head_sha is the no-op PR's head sha (D6b: the budget
+    # gate uses it); the head ref comes from the open PR list when
+    # available, else the dispatch record.
+    repo = rec.get("repo") or ""
+    head_sha = rec.get("head_sha")
+    pr_ref = rec.get("existing_branch") or ""
+    title = f"PR #{pr_number} (noop audit)"
+    if repo and head_sha:
+        try:
+            repo_name, owner = _repo_owner(repo)
+            for open_pr in get_open_prs(repo_name, owner=owner):
+                if open_pr.get("number") == pr_number:
+                    head_sha = _pr_head_sha(open_pr) or head_sha
+                    pr_ref = (open_pr.get("head") or {}).get("ref") or pr_ref
+                    title = open_pr.get("title") or title
+                    break
+        except Exception:
+            pass  # Forgejo unreachable: dispatch with the record's sha
+    pr = {
+        "number": pr_number,
+        "repo": repo,
+        "head": {"ref": pr_ref, "sha": head_sha},
+        "title": title,
+    }
+
+    action = _maybe_dispatch_auditor_salvage_gates(target_id, pr, mode="noop")
+    if action is None:
+        return None
+    _mem().set(
+        marker_key,
+        json.dumps({
+            "target_id": target_id,
+            "pr_number": pr_number,
+            "cycle": cycle,
+            "head_sha": head_sha,
+            "action": action,
+        }),
+        tags=["lapis-pm", "noop-audit"],
+    )
+    return action
+
+
+def _maybe_dispatch_auditor_salvage_gates(target_id: str, pr: dict, mode: str) -> str | None:
+    """The D6a gate sequence (i)/(ii)/(iii) shared by the salvage trigger
+    and the no-op trigger (D6b applies the same three gates; the no-op path
+    skips the salvage-shape check because a no-op PR is not salvage-shaped)."""
+    pr_number = pr.get("number")
+    if pr_number is None:
+        return None
+    head_sha = _pr_head_sha(pr)
+    audited_head = _audit_dispatched_head(target_id, pr_number)
+    if audited_head is not None and (head_sha is None or audited_head == head_sha):
+        return None
+    if _has_pending_auditor_for_pr(target_id, pr_number):
+        return None
+    try:
+        return _act_dispatch_auditor(target_id, pr, mode=mode)
+    except Exception as exc:
+        logger.warning("auditor dispatch failed for PR #%s (%s): %s",
+                       pr_number, mode, exc)
+        episodic.write_observation(
+            target_id,
+            f"Auditor dispatch failed for PR #{pr_number} ({mode}): "
+            f"{type(exc).__name__}: {exc}",
+            extra_tags=[f"pm:pr={pr_number}", "pm:auditor-dispatch-failed",
+                        f"pm:audit-mode={mode}"],
+        )
+        return None
 
 
 def _pr_advanced_since(target_id: str, pr_number: int, since_ts: str) -> bool:
@@ -6449,6 +6951,98 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
     if verdict_info is None:
         # Shouldn't happen; defensively noop
         return Decision("noop_no_change", {"reason": "reviewer_count > fixer_count but no verdict found"})
+
+    # ---------------------------------------------------------------------------
+    # D7 (fixer-reception-v0, leg 2): the stale-verdict supersede.
+    #
+    # Verdicts are keyed by PR number, not head SHA — the R2 wedge: a
+    # needs-human verdict rendered against an OLD head re-briefs forever
+    # (live-observed 2026-09-07 20:41 PT). Before acting on a stored
+    # verdict (clean/fixable/needs-human), compare its rendered-against
+    # sha (the pm:reviewer-sha= render-time tag, falling back to the
+    # latest pm:pr=N:sha= observation at or before the verdict's ts) to
+    # the PR's current head sha (the perceive-phase PR data): if they
+    # differ, the verdict is STALE — it neither blocks (hold_brief /
+    # review_exhausted_brief) nor briefs from itself.
+    #
+    # Supersede partition (AC5):
+    #   (i) budget room: dispatch a fresh reviewer on the current head
+    #       through _act_dispatch_reviewer — it passes the existing
+    #       ceiling/backoff/kill-switch checks exactly as a normal
+    #       reviewer dispatch does (the re-review CONSUMES a reviewer
+    #       cycle — spec Invariant 6, the named cost of superseding);
+    #   (ii) budget exhausted: no dispatch — the normal exhausted path
+    #       (review_exhausted_brief) surfaces to the human with the stale
+    #       note attached.
+    # Both cases log the pm:verdict-stale-superseded observation (both
+    # shas) and do NOT re-emit the stale brief.
+    #
+    # Loop safety (verified): while a reviewer is pending,
+    # _has_pending_reviewer_for_pr returns noop_reviewer_in_flight every
+    # tick (checked above, before the verdict fork) — the supersede
+    # re-fire cannot cascade. A matching sha (or no sha available — the
+    # `sha=unknown` perceive-miss rule) behaves EXACTLY as today.
+    # ---------------------------------------------------------------------------
+    _d7_verdict_comment = _last_review_verdict_comment(target_id, pr_number)
+    _d7_rendered_sha = _verdict_rendered_sha(
+        target_id, pr_number,
+        _d7_verdict_comment.ts if _d7_verdict_comment else None,
+    )
+    _d7_current_sha = (pr.get("head") or {}).get("sha")
+    if (
+        _d7_rendered_sha is not None
+        and _d7_current_sha is not None
+        and _d7_rendered_sha != _d7_current_sha
+    ):
+        episodic.write_observation(
+            target_id,
+            f"Verdict stale-superseded for PR #{pr_number}: the stored "
+            f"verdict was rendered against head {_d7_rendered_sha[:12]} but "
+            f"the current head is {_d7_current_sha[:12]} — the verdict "
+            f"neither blocks nor briefs from its stale head",
+            extra_tags=[
+                f"pm:pr={pr_number}",
+                "pm:verdict-stale-superseded",
+                f"pm:verdict-stale-rendered-sha={_d7_rendered_sha}",
+                f"pm:verdict-stale-current-sha={_d7_current_sha}",
+            ],
+        )
+        if reviewer_count < budget:
+            # Partition (i): budget room — a fresh reviewer on the
+            # current head. The kill-switch / ceiling / backoff checks
+            # run exactly as a normal reviewer dispatch (the re-review
+            # consumes one reviewer cycle — Invariant 6).
+            if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
+                _set_review_gate_paused(True)
+                return Decision("review_gate_pause", {"pr": pr, "cls": cls})
+            next_cycle = reviewer_count + 1
+            ceiling_decision = _reviewer_attempt_ceiling_check(
+                target_id, pr_number, next_cycle
+            )
+            if ceiling_decision is not None:
+                return ceiling_decision
+            backoff_decision = _reviewer_infra_backoff_check(
+                target_id, pr_number, next_cycle
+            )
+            if backoff_decision is not None:
+                return backoff_decision
+            payload["stale_verdict"] = {
+                "rendered_sha": _d7_rendered_sha,
+                "current_sha": _d7_current_sha,
+            }
+            return Decision("dispatch_reviewer", {
+                "pr": pr, "cls": cls, "mode": mode, "cycle": next_cycle,
+            })
+        # Partition (ii): budget exhausted — no dispatch; the normal
+        # exhausted path surfaces with the stale note attached.
+        history = _collect_review_history(target_id, pr_number)
+        payload["stale_verdict"] = {
+            "rendered_sha": _d7_rendered_sha,
+            "current_sha": _d7_current_sha,
+        }
+        return Decision("review_exhausted_brief", {
+            "pr": pr, "cls": cls, "history": history,
+        })
 
     verdict = verdict_info.get("verdict", "needs-human")
     issues = verdict_info.get("issues", [])
@@ -8699,6 +9293,21 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                             f"{type(_esc_exc).__name__}",
                             extra_tags=["pm:noop-retry-escalation-skipped"],
                         )  # best-effort; never fail verdict encoding
+                    # D6b (fixer-reception-v0, leg 2): a no-op retry against a
+                    # HEALTHY verdict (the starved/refuted case is owned by the
+                    # escalation above — Invariant 8, untouched) dispatches the
+                    # auditor for the same PR: audit why the retry produced no
+                    # change + the delta-to-green. Best-effort, same discipline
+                    # as the escalation check.
+                    try:
+                        _maybe_dispatch_auditor_noop(target_id, rec, pr_num)
+                    except Exception as _aud_exc:
+                        episodic.write_observation(
+                            target_id,
+                            f"noop-audit check skipped for PR #{pr_num}: "
+                            f"{type(_aud_exc).__name__}",
+                            extra_tags=["pm:noop-audit-skipped"],
+                        )  # best-effort; never fail verdict encoding
                 continue  # fixer_retry never falls to reviewer verdict path
             # fixer_retry without pr_number: fall through to GPU output file path
             # as defensive fallback (shouldn't happen in practice).
@@ -8925,10 +9534,27 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                         extra_tags=["pm:absence-grounding-skipped"],
                     )  # best-effort; never fail verdict encoding
 
+                # D7 (fixer-reception-v0, leg 2): tag the verdict with the
+                # head sha it was rendered against — the latest pm:pr=N:sha=
+                # observation at or before this comment's ts (sha
+                # observations encode in the same tick BEFORE gpu results,
+                # so the verdict's own sha is already in the stream). The
+                # tag is ADDITIVE: _last_review_verdict / the cycle parsers
+                # read the tag prefix + JSON body only, so existing
+                # consumers are unaffected. If no sha observation exists
+                # (a Forgejo perceive miss) the tag is omitted and the
+                # verdict is treated as FRESH by _decide_for_pr
+                # (effectively unreachable).
+                _rendered_sha = (
+                    _last_observed_pr_sha(target_id, pr_num)
+                    if isinstance(pr_num, int) else None
+                )
                 result_tags = tags + [
                     f"pm:reviewer:pr={pr_num}:cycle={cycle_num}:verdict={verdict_val}",
                     f"pm:pr={pr_num}",
                 ]
+                if _rendered_sha:
+                    result_tags.append(f"pm:reviewer-sha={_rendered_sha}")
                 if parse_recovered:
                     result_tags.append("pm:reviewer:parse-recovered")
                 episodic.write_result(
@@ -8936,6 +9562,69 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     f"Reviewer verdict for PR #{pr_num}:\n{stored_json}",
                     extra_tags=result_tags,
                 )
+            elif rec.get("agent_type") == AUDITOR_AGENT_TYPE:
+                # D6c (fixer-reception-v0, leg 2): the auditor's result
+                # encode. The agent posts NOTHING — the daemon is the writer
+                # (no agent has a comment-posting tool). On successful JSON
+                # parse: the pm:auditor:pr=N:sha=<head> tagged comment (the
+                # five-section brief rendered from the JSON, formatted for
+                # the advisory brief surface) + the mem keys
+                # pm/audit/<tid>/pr=N/dispatched (value = head sha) and
+                # pm/audit/<tid>/pr=N/brief (the JSON). On None/parse-fail:
+                # a pm:auditor:pr=N:failed observation and NO dispatched
+                # marker (a failed audit is retryable next tick).
+                _aud_pr_num = rec.get("pr_number")
+                _aud_head_sha = rec.get("head_sha")
+                _aud_result_tags = tags + [
+                    "pm:auditor",
+                    f"pm:pr={_aud_pr_num}",
+                ]
+                if _aud_head_sha:
+                    _aud_result_tags.append(f"pm:auditor:pr={_aud_pr_num}:sha={_aud_head_sha}")
+                _aud_raw = text.strip()
+                if _aud_raw.startswith("```"):
+                    _aud_raw = re.sub(r"^```(?:json)?\s*", "", _aud_raw)
+                    _aud_raw = re.sub(r"\s*```$", "", _aud_raw.strip())
+                _aud_json = None
+                if not is_failure and _aud_raw:
+                    try:
+                        _aud_json = json.loads(_aud_raw)
+                    except json.JSONDecodeError:
+                        _aud_json = None
+                if isinstance(_aud_json, dict):
+                    _aud_brief = _render_audit_brief(
+                        _aud_json, _aud_pr_num, _aud_head_sha
+                    )
+                    episodic.write_result(
+                        target_id,
+                        _aud_brief,
+                        extra_tags=_aud_result_tags,
+                    )
+                    # Gate (i) marker (value = head sha) + the brief JSON.
+                    if _aud_head_sha:
+                        _set_audit_dispatched(
+                            target_id, _aud_pr_num, _aud_head_sha
+                        )
+                    _mem().set(
+                        _audit_brief_key(target_id, _aud_pr_num),
+                        json.dumps(_aud_json, ensure_ascii=False),
+                        tags=["lapis-pm", "pm:audit-brief"],
+                    )
+                else:
+                    # None/parse-fail: retryable — the failed observation is
+                    # written, the dispatched marker is NOT set (and is
+                    # cleared if a prior partial state left one), so the
+                    # next tick may re-dispatch the un-audited head.
+                    _clear_audit_dispatched(target_id, _aud_pr_num)
+                    episodic.write_result(
+                        target_id,
+                        f"FAILED — auditor task {rec['gpu_id']} produced no "
+                        f"parseable audit JSON (output: {snippet[:400]})",
+                        extra_tags=_aud_result_tags + [
+                            "pm:auditor:pr=%s:failed" % _aud_pr_num,
+                            "pm:failure",
+                        ],
+                    )
             else:
                 episodic.write_result(
                     target_id,
@@ -9180,6 +9869,16 @@ def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
         if rec.get("agent_type") in _REVIEWER_AGENT_TYPES and t["state"] == "processed":
             continue  # output-file verdict-encoder owns reviewer → processed
 
+        # auditor carve-out (fixer-reception-v0, leg 2, D6c): the output-file
+        # result-encoder in _encode_gpu_results is the sole authority for
+        # auditor → processed (it writes the pm:auditor comment + the
+        # gate-(i) marker). Leave a "completed" auditor pending, exactly as
+        # the reviewer carve-out above. Failed flips for auditors are still
+        # permitted (a hard-killed/timeout job produces no output file; the
+        # marker clear below makes the un-audited head re-dispatch).
+        if rec.get("agent_type") == AUDITOR_AGENT_TYPE and t["state"] == "processed":
+            continue  # output-file result-encoder owns auditor → processed
+
         # Flip the record to the terminal state.
         rec["status"] = t["state"]
         if t["error"] is not None:
@@ -9190,6 +9889,16 @@ def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
             rec["failure_reason"] = t["failure_reason"]
         changed = True
         flipped += 1
+
+        # auditor failure marker clear (fixer-reception-v0, leg 2, D6c): on a
+        # hard-kill / timeout flip the audit is lost but the head is still
+        # un-audited — clear any pending pm/audit/<tid>/pr=N/dispatched
+        # marker so the next tick re-dispatches (a failed audit is
+        # retryable, unlike a completed one).
+        if (rec.get("agent_type") == AUDITOR_AGENT_TYPE
+                and t["state"] == "failed"
+                and rec.get("pr_number") is not None):
+            _clear_audit_dispatched(target_id, rec["pr_number"])
 
         # D3 fix (lapis-pm-reviewer-attempts-not-consumed-by-infra-v0): a
         # reviewer/reviewer_fresh job that crashed before writing an output
@@ -10095,6 +10804,29 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     # Track PR head SHA advances (must precede _encode_gpu_results so the SHA
     # observation is visible when fixer_retry completion is checked below).
     encoded += _encode_pr_sha_updates(target_id, open_prs)
+
+    # D6a (fixer-reception-v0, leg 2): a NEW salvage-shaped PR on this
+    # pm_bound target triggers the auditor (the LLM-powered receiving role
+    # for non-passing fixer terminations). ENCODE-phase dispatch — separate
+    # from the decide phase's single FIFO action, which is unchanged (spec
+    # Invariant 4). Runs AFTER _encode_pr_sha_updates so the new head's sha
+    # observation is visible to the gate (i) marker check (the marker's
+    # VALUE is the audited head sha; a fresh salvage with no marker always
+    # triggers, and a same-head re-dispatch is blocked by the marker). The
+    # three gates (marker/pending/budget) bound the dispatch to exactly one
+    # per head.
+    for _new_pr in new_prs:
+        try:
+            _auditor_action = _maybe_dispatch_auditor_salvage(
+                target_id, repo, _new_pr
+            )
+        except Exception as _auditor_exc:
+            logger.warning("auditor salvage trigger failed: %s", _auditor_exc)
+            _auditor_action = None
+        if _auditor_action is not None:
+            encoded += 1
+            if decision_str == "noop:no_change":
+                decision_str = _auditor_action
 
     # Track PR description changes (body fingerprint), also before _encode_gpu_results
     # so a description-only fixer_retry is perceived as complete this tick.

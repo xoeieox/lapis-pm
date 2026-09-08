@@ -113,18 +113,18 @@ SMOKE_PREFIXES = (
     'lapis/pm-wire-disp-',
 )
 
-REPOS = ('conductor', 'lapis-test')
+REPOS = (('Erah', 'conductor'), ('conductor', 'lapis-test'))
 closed = 0
-for repo in REPOS:
+for repo_owner, repo in REPOS:
     try:
-        r = httpx.get(f'{API}/repos/{OWNER}/{repo}/pulls', headers=HDRS,
+        r = httpx.get(f'{API}/repos/{repo_owner}/{repo}/pulls', headers=HDRS,
                       params={'state': 'open', 'limit': 50}, timeout=T)
         if r.status_code == 404:
             continue
         r.raise_for_status()
         prs = r.json()
     except Exception as e:
-        print(f'[smoke] backfill: list-prs {repo}: {e}')
+        print(f'[smoke] backfill: list-prs {repo_owner}/{repo}: {e}')
         continue
     for pr in prs:
         head_ref = (pr.get('head') or {}).get('ref', '')
@@ -132,14 +132,14 @@ for repo in REPOS:
             continue
         pr_num = pr['number']
         try:
-            httpx.patch(f'{API}/repos/{OWNER}/{repo}/pulls/{pr_num}', headers=HDRS,
+            httpx.patch(f'{API}/repos/{repo_owner}/{repo}/pulls/{pr_num}', headers=HDRS,
                         json={'state': 'closed'}, timeout=T).raise_for_status()
-            print(f'[smoke] backfill: closed {repo}#{pr_num} ({head_ref})')
+            print(f'[smoke] backfill: closed {repo_owner}/{repo}#{pr_num} ({head_ref})')
             closed += 1
         except Exception as e:
-            print(f'[smoke] backfill: close {repo}#{pr_num}: {e}')
+            print(f'[smoke] backfill: close {repo_owner}/{repo}#{pr_num}: {e}')
         try:
-            httpx.delete(f'{API}/repos/{OWNER}/{repo}/branches/{head_ref}',
+            httpx.delete(f'{API}/repos/{repo_owner}/{repo}/branches/{head_ref}',
                          headers=HDRS, timeout=T)
         except Exception:
             pass
@@ -302,7 +302,7 @@ green "target created"
 
 # --- Bind ---------------------------------------------------------------
 step "2. Bind target with spec"
-$LAPIS bind "$TID" --spec-from "$SPEC_FILE" --repo lapis-test --authority advisory
+$LAPIS bind "$TID" --spec-from "$SPEC_FILE" --repo conductor/lapis-test --authority advisory
 JSONL="$COMMENTS_DIR/${TID}.jsonl"
 [ -f "$JSONL" ] || red "comments JSONL missing"
 grep -q '"spec:bound"' "$JSONL" || red "spec:bound tag not in JSONL"
@@ -427,7 +427,7 @@ stages:
   - name: smoke-stage
     status: active
 EOF
-    $LAPIS bind "$tid" --spec-from "$SPEC_FILE" --repo lapis-test --authority advisory
+    $LAPIS bind "$tid" --spec-from "$SPEC_FILE" --repo conductor/lapis-test --authority advisory
     # Simulate a PR having been opened and merged: write synthetic observations.
     /usr/bin/python3 -c "
 from agents_core.comments import CommentStore

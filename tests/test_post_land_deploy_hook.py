@@ -3676,18 +3676,24 @@ class TestConductorBrixGwRuntimeDeploy:
     @pytest.mark.parametrize("fname", [
         "gw_topology.py", "gw_actuator.py", "gw_host_safety.py", "flip_controller.py",
         "gw-topology", "gw-night-pre.py", "gw-night-post.py", "scout-night-pre.py",
+        # night-deploy-manifest-attestation-v0: the three DAG-command scripts that
+        # were unmanifested (the measured 2026-09-07 hole).
+        "mini_1f916_night.py", "keeper_v0.py", "council_sweep.py",
     ])
     def test_manifest_includes_gw_runtime_family_member(self, fname):
         assert fname in pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
 
-    def test_manifest_is_exactly_the_eight_files(self):
+    def test_manifest_is_exactly_the_eleven_files(self):
         """No more, no fewer — the deliberately-out-of-scope files
         (gw_topology_cache.py, gw_enforce_rearm_ab.py, gw-serve, gw-dual) must not
-        be present."""
+        be present. night-deploy-manifest-attestation-v0 adds the three
+        DAG-command scripts (mini_1f916_night.py, keeper_v0.py, council_sweep.py)
+        that were unmanifested (the measured 2026-09-07 hole)."""
         assert set(pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS) == {
             "gw_topology.py", "gw_actuator.py", "gw_host_safety.py",
             "flip_controller.py", "gw-topology", "gw-night-pre.py",
             "gw-night-post.py", "scout-night-pre.py",
+            "mini_1f916_night.py", "keeper_v0.py", "council_sweep.py",
         }
 
     def test_manifest_disjoint_from_night_scripts(self):

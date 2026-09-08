@@ -402,11 +402,6 @@ def _run_reviewer_encode(store, ep, completed, *, seed_sha: bool):
     out_file.write_text("```json\n" + REVIEW_VERDICT_JSON + "\n```")
     store.set(pm_core._dispatched_key(TID),
               json.dumps([_reviewer_record()]), tags=["lapis-pm"])
-    import sys
-    print("DBG: _mem() is store:", pm_core._mem() is store, file=sys.stderr)
-    print("DBG: load_dispatched:", pm_core.load_dispatched(TID), file=sys.stderr)
-    print("DBG: out_path:", pm_core._gpu_output_path(REVIEW_GPU), file=sys.stderr)
-    print("DBG: COMPLETED_DIR:", pm_core.COMPLETED_DIR, file=sys.stderr)
     with patch("lapis_pm.pm_core._run_corroboration_pass_sync",
                return_value={"verdict": "agree", "claim": "",
                              "citations": []}), \

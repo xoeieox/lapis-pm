@@ -250,10 +250,20 @@ def _write_sweep_started_stamp(mem, now: str) -> None:
 def _repo_change_class(recs: list[dict]) -> list[str]:
     """Derive the repo's change_class from its class records' change_classes
     (D4: the class is derived from changed paths via derive_change_classes
-    and recorded in the finding/shadow line)."""
+    and recorded in the finding/shadow line).
+
+    A record with NO change_classes derives from its key slug
+    (`pm/autonomy-class/{repo}/{verdict}/{slug}/{loc}` — the slug is the
+    sorted, comma-joined change_classes from `precedent.class_record_key`),
+    so records written before the field existed still classify correctly
+    instead of collapsing to the unknown class."""
     classes = set()
     for r in recs:
-        for c in r["data"].get("change_classes", []) or []:
+        cs = r["data"].get("change_classes")
+        if not cs:
+            slug = str(r["key"].split("/")[-2]) if r["key"].count("/") >= 4 else ""
+            cs = [c for c in slug.split(",") if c and c != "none"]
+        for c in cs or []:
             classes.add(c)
     return sorted(classes)
 
@@ -278,7 +288,9 @@ def _repo_eligible(mem, repo: str, recs: list[dict], now: str) -> tuple[bool, st
     - running-path class: eligible every 15m cycle ONLY on a NEW demotion
       (last_regression_ts > last_sweep_ts) — no re-sweeping the same red
       state ~every 16 minutes until green (the unbounded re-eligibility rev-1
-      implied, ~9/day).
+      implied, ~9/day). A repo that has NEVER been swept is eligible (the
+      sweep is how a red state is first discovered — gating the first sweep
+      on a demotion would never discover the regression).
     """
     change_classes = _repo_change_class(recs)
     _now_dt = _parse_iso(now) or datetime.now(timezone.utc)
@@ -302,6 +314,9 @@ def _repo_eligible(mem, repo: str, recs: list[dict], now: str) -> tuple[bool, st
             last_sweep_dt = _parse_iso(last_sweep) if last_sweep else None
             if last_reg_dt and (last_sweep_dt is None or last_reg_dt > last_sweep_dt):
                 return True, "new_demotion"
+    # Never swept -> eligible (the sweep discovers the first red state).
+    if not any(r["data"].get("last_sweep_ts") for r in recs):
+        return True, "never_swept"
     return False, "no_new_demotion"
 
 
@@ -407,6 +422,7 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
     # D4: change_class + sweep_count in the finding line (the operator
     # visibility surface — the rev-1 finding had no class field, so a
     # docs-only repo and a running-path repo left identical state).
+    today = now[:10]
     finding_key = f"finding/backstop-sweep/{repo}/{today}"
     try:
         mem.set(finding_key, json.dumps({
@@ -491,14 +507,17 @@ def open_regression_brief(repo: str, suspect_pr: int, failing_tests: list[str],
     cooldown dedups by (repo, suspect_pr) over a 24h window.
     """
     now = now or _now_iso()
-    # D4: brief cooldown — one HIGH per (repo, suspect PR) per day.
+    # D4: brief cooldown — one HIGH per (repo, suspect PR) per day. The
+    # window is measured against the `now` parameter (test-deterministic);
+    # a real clock is used only when `now` is absent (the default).
     cooldown_key = f"finding/backstop-brief-cooldown/{repo}/{suspect_pr}"
+    _now_dt = _parse_iso(now) or datetime.now(timezone.utc)
     try:
         mem = _mem()
         raw = mem.get(cooldown_key)
         if raw:
             last = _parse_iso(str(raw.get("content", "")))
-            if last and (datetime.now(timezone.utc) - last).total_seconds() < DOCS_ONLY_WINDOW_S:
+            if last and (_now_dt - last).total_seconds() < DOCS_ONLY_WINDOW_S:
                 logger.info(
                     "backstop regression brief suppressed (cooldown): %s PR #%s",
                     repo, suspect_pr,

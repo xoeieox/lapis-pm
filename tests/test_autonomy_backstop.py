@@ -151,11 +151,15 @@ class TestSweepOneRepoPerCall:
 class TestSweepIdempotency:
 
     def test_daily_gate_skips_within_window(self):
-        # AC6: re-running backstop-sweep within the same daily window does not
-        # re-run a repo already swept this window.
+        # AC6 (D4 revision, lapis-pm-reviewer-leg-repair-v0): re-running
+        # backstop-sweep within the same window does not re-run a repo
+        # already swept. The D4 class-dependent gate replaced the flat
+        # same-day skip: a running-path (code) class with no NEW demotion
+        # since the last sweep is not re-swept — the same red state is not
+        # re-swept ~every 16 minutes until green.
         mem = _make_mem()
         key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
-        # Already swept today.
+        # Already swept earlier today (no demotion since).
         mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
                                  "regression_count": 0,
                                  "last_sweep_ts": "2026-09-06T00:00:00Z"}),
@@ -167,8 +171,10 @@ class TestSweepIdempotency:
         ):
             out = ab.sweep(mem, now="2026-09-06T12:00:00Z")
 
-        # The repo was already swept today -> skipped, no suite run.
-        assert out["status"] == "skipped_already_swept_today"
+        # The repo was already swept with no new demotion -> skipped, no
+        # suite run.
+        assert out["status"] == "skipped_not_eligible"
+        assert out.get("reason") == "no_new_demotion"
         assert not mock_baseline.called
 
     def test_cursor_advances_across_repos(self):
@@ -540,9 +546,12 @@ class TestChangeClassAndSweepCount:
     def test_finding_carries_change_class_and_sweep_count(self):
         mem = _make_mem()
         key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
-        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
-                                 "regression_count": 0,
+        # A NEW demotion since the last sweep (D4 re-eligibility rule) makes
+        # the running-path repo eligible for the re-sweep.
+        mem.set(key, json.dumps({"promoted": False, "auto_resolved_count": 0,
+                                 "regression_count": 1,
                                  "change_classes": ["code"],
+                                 "last_regression_ts": "2026-09-05T12:00:00Z",
                                  "last_sweep_ts": "2026-09-05T00:00:00Z"}),
                 tags=["lapis-pm", "pm:autonomy-class"])
         with (

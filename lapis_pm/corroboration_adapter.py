@@ -396,15 +396,18 @@ def _build_node2_client() -> Any:
 
     # Pin the ACI-hop budget: patch the module-level default used by the
     # two-leg `aci` CLI subprocess calls (audit + verify) so a hung verify
-    # cannot block the tick past the node2 guard.
-    if hasattr(_pt, "_run_aci_json"):
+    # cannot block the tick past the node2 guard. The wrap is applied ONCE
+    # per process (guarded by a sentinel attribute) — re-wrapping on every
+    # call would accumulate wrappers on the shared module-level function.
+    if hasattr(_pt, "_run_aci_json") and not getattr(
+            _pt._run_aci_json, "_lapis_aci_budget_patched", False):
         _orig = _pt._run_aci_json
-        _patched = _orig  # keep the original callable for the wrapper
 
         def _aci_with_budget(*args, **kwargs):
             kwargs.setdefault("timeout", _NODE2_ACI_LEG_TIMEOUT_S)
-            return _patched(*args, **kwargs)
+            return _orig(*args, **kwargs)
 
+        _aci_with_budget._lapis_aci_budget_patched = True
         _pt._run_aci_json = _aci_with_budget
 
     return _pt.PhalaTeeClient(timeout=float(_NODE2_TIMEOUT))

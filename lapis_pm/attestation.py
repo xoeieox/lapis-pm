@@ -312,17 +312,31 @@ def manifest_counts_ast() -> dict[str, int]:
     handles BOTH Assign and AnnAssign (the :532 tuple is an AnnAssign; a grep
     or Assign-only AST pass silently misses it — the I4 near-miss).
 
-    Reads the LIVE pm_core.py source (the module this checker audits — single
-    source of truth, not a re-declaration that can drift). Returns
-    {name: count}; a missing name -> 0.
+    Reads the ON-DISK pm_core.py source file (the module this checker audits —
+    single source of truth, not a re-declaration that can drift). The on-disk
+    read is deliberate: an in-memory read (inspect.getsource) verifies the
+    imported module rather than the file, so it cannot catch a case where the
+    source file and the imported module genuinely disagree (e.g. a stale
+    deploy clone). Falls back to inspect.getsource when the on-disk file is
+    unreadable. Returns {name: count}; a missing name -> 0.
     """
     import ast
     import inspect
 
     from . import pm_core
+    source: str | None = None
     try:
-        tree = ast.parse(inspect.getsource(pm_core))
-    except (OSError, SyntaxError):
+        source = Path(inspect.getsourcefile(pm_core)).read_text()
+    except (OSError, TypeError):
+        pass
+    if source is None:
+        try:
+            source = inspect.getsource(pm_core)
+        except (OSError, SyntaxError):
+            return {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
         return {}
     names = {
         "_CONDUCTOR_NIGHT_SCRIPTS",
@@ -513,31 +527,22 @@ def verify_local_script(script: str, src_dir: Path, dest_dir: Path) -> HostRow:
 
 def _gw_ssh_capture(remote_cmd: list, timeout: int = _GW_SSH_CMD_TIMEOUT_SECS) -> str | None:
     """Bounded never-wake ssh probe (D6): list argv, never raises, None on
-    failure. Mirrors pm_core._gw_ssh_capture — BatchMode connect probe is done
-    by the caller; this just runs one bounded command."""
-    try:
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes",
-             "-o", f"ConnectTimeout={_GW_SSH_CONNECT_TIMEOUT_SECS}",
-             _GW_SSH_HOST] + list(remote_cmd),
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    return result.stdout if result.returncode == 0 else None
+    failure.
+
+    DELEGATES to pm_core._gw_ssh_capture — the ssh discipline (BatchMode
+    never-wake, ConnectTimeout bound, None-on-failure) is defined in ONE place
+    (pm_core, the deploy pass) so the two call sites cannot drift. This module
+    only owns the audit surface (which hosts, which rows), not the transport.
+    """
+    from . import pm_core
+    return pm_core._gw_ssh_capture(remote_cmd, timeout=timeout)
 
 
 def _gw_reachable() -> bool:
-    try:
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes",
-             "-o", f"ConnectTimeout={_GW_SSH_CONNECT_TIMEOUT_SECS}",
-             _GW_SSH_HOST, "true"],
-            capture_output=True, timeout=_GW_SSH_CONNECT_TIMEOUT_SECS + 5,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    return result.returncode == 0
+    """Reachability probe — delegates to pm_core._gw_host_reachable (the same
+    single-source-of-truth discipline as _gw_ssh_capture above)."""
+    from . import pm_core
+    return pm_core._gw_host_reachable()
 
 
 def verify_gw_scripts(src_dir: Path, gw_dests: tuple[str, ...]) -> list[HostRow]:

@@ -2031,13 +2031,52 @@ def _attestation_drift_duration(ledger_records: list) -> str | None:
     return f"{nights} nights, oldest {oldest}"
 
 
+def _latest_run_record_attestation(
+    run_record_path: Path | None = None,
+) -> dict | None:
+    """The latest night-plan run record's attestation-node block (current live
+    read of /data/slots/night-plan-runs/latest.json — the pinned DoD-0/D5
+    consumer). Returns {"verdict", "reason", "ended_at"} or None.
+
+    Best-effort — an unreadable/malformed run record is None, never a crash.
+    """
+    from . import attestation as _att
+
+    run_record_path = run_record_path or _att.RUN_RECORD_PATH
+    try:
+        doc = json.loads(Path(run_record_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    nodes = doc.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+    for node in nodes:
+        if isinstance(node, dict) and node.get("id") == _att.ATTTESTATION_NODE_ID:
+            return {
+                "verdict": node.get("verdict"),
+                "reason": node.get("hold_reason_class") or node.get("reason"),
+                "ended_at": node.get("ended_at"),
+            }
+    return None
+
+
 def _compute_land_attestation_mark(
     repo: str,
     pr_scripts: list[str],
     ledger_records: list | None = None,
+    run_record: dict | None = None,
 ) -> tuple[str, str]:
     """Compute the land-time mark from CURRENT LIVE inputs (D3): fresh
-    closure comparison + latest run-record verdict + waiver file.
+    closure comparison + the latest run-record verdict + the waiver file.
+
+    The mark covers the FULL audit surface, not just the just-merged PR's own
+    scripts: the run-record verdict is consulted so a PRE-EXISTING drift in an
+    unrelated script (the attestation node's latest verdict is `held`) reads
+    DRIFT at land time, not CLEAN. The just-merged-PR closure check names the
+    targeted crack (the gate-3 amendment); the run-record verdict carries the
+    rest of the live state.
 
     Returns (mark, detail). mark is one of DRIFT / WAIVER / WAIVER_EXPIRED /
     CLEAN; detail carries the duration (the temporal scar).
@@ -2046,6 +2085,7 @@ def _compute_land_attestation_mark(
 
     waivers, _problems = _att.load_waivers()
     ledger_records = ledger_records if ledger_records is not None else _att.read_ledger()
+    run_record = run_record if run_record is not None else _latest_run_record_attestation()
 
     # Fresh closure comparison: which pr scripts are in a manifest / waived /
     # drifted right now.
@@ -2071,10 +2111,25 @@ def _compute_land_attestation_mark(
         if base not in local_manifested and w is None:
             drifted.append(base)
 
+    # The latest run-record verdict (current live state, D3): a `held`
+    # attestation node means pre-existing drift on the audit surface that the
+    # just-merged-PR subset does not cover.
+    held_reason = ""
+    if run_record and run_record.get("verdict") == "held":
+        held_reason = str(run_record.get("reason") or "held")
+
     if waived_expired:
         return "WAIVER_EXPIRED", ", ".join(waived_expired)
     if drifted:
-        return "DRIFT", ", ".join(drifted)
+        detail = ", ".join(drifted)
+        if held_reason:
+            detail += f"; run-record held ({held_reason})"
+        return "DRIFT", detail
+    if held_reason:
+        # No pr-script gap, but the latest night's attestation node held —
+        # pre-existing drift in an unrelated script. Not CLEAN (D3: the mark
+        # reflects current live state, not just the just-merged PR).
+        return "DRIFT", f"pre-existing drift on the audit surface (run-record held: {held_reason})"
     if waived_now:
         return "WAIVER", ", ".join(waived_now)
     return "CLEAN", ""
@@ -2084,12 +2139,15 @@ def render_land_deploy_report(
     repo: str,
     pr_scripts: list[str] | None = None,
     ledger_records: list | None = None,
+    run_record: dict | None = None,
 ) -> str:
     """D3: the plain-terms land output statement. States what the deploy pass
     delivered (host, script, verified how) — or explicitly that nothing was
     deployed and why — PLUS names any just-merged-PR script absent from the
     deployed set. The mark (DRIFT/WAIVER/WAIVER_EXPIRED/CLEAN) is computed at
-    land time from current live inputs and carries duration from the ledger.
+    land time from current live inputs (fresh closure comparison + the latest
+    run-record verdict + the waiver file) and carries duration from the
+    ledger.
 
     Best-effort — a failure here must never fail the land (it lands on the
     land output before the archive step, but a reporting bug degrades to a
@@ -2140,7 +2198,14 @@ def render_land_deploy_report(
             ledger_records = _att.read_ledger()
         except Exception:
             ledger_records = []
-    mark, detail = _compute_land_attestation_mark(repo, pr_scripts, ledger_records)
+    if run_record is None:
+        try:
+            run_record = _latest_run_record_attestation()
+        except Exception:
+            run_record = None
+    mark, detail = _compute_land_attestation_mark(
+        repo, pr_scripts, ledger_records, run_record=run_record
+    )
     duration = _attestation_drift_duration(ledger_records)
     if mark == "DRIFT" and duration:
         lines.append(f"  mark: DRIFT ({duration}) — {detail}")

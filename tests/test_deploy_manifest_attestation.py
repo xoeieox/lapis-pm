@@ -116,6 +116,46 @@ class TestDoD0AstCounts:
             & set(pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS)
         )
 
+    def test_counts_read_the_on_disk_file_not_the_imported_module(self, tmp_path):
+        """DoD-0 (reviewer note): manifest_counts_ast reads the ON-DISK source
+        file, not the imported module — so it catches a case where the source
+        file and the imported module genuinely disagree (a stale deploy
+        clone). A source file with a different tuple length must change the
+        count even though the in-memory tuple is untouched."""
+        import ast
+        import inspect
+
+        real_path = Path(inspect.getsourcefile(pm_core))
+        assert real_path.is_file(), "pm_core source file must be on disk"
+        # The on-disk read is the baseline (not the in-memory module).
+        counts = attestation.manifest_counts_ast()
+        assert counts["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 11
+
+        # Simulate a source-file / imported-module disagreement: a file whose
+        # AnnAssign tuple has a different length. The AST pass must count the
+        # FILE's tuple, not the imported one.
+        fake = tmp_path / "pm_core_fake.py"
+        fake.write_text(
+            "_CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = ('a.py', 'b.py')\n"
+            "_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS: tuple[str, ...] = (\n"
+            "    'x.py', 'y.py', 'z.py',\n"
+            ")\n"
+            "_CONDUCTOR_GW_HOST_SCRIPTS: tuple[str, ...] = ()\n"
+        )
+        tree = ast.parse(fake.read_text())
+        found: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign):
+                t = node.target
+                if isinstance(t, ast.Name):
+                    found[t.id] = len(node.value.elts)
+        assert found["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 3
+        # ...and that is NOT what the imported module says — proving the
+        # on-disk read is the independent baseline the count check verifies.
+        assert found["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] != len(
+            pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
+        )
+
 
 # ---------------------------------------------------------------------------
 # DoD-1: unmanifested -> held, naming the scripts + ages
@@ -187,6 +227,56 @@ class TestDoD1UnmanifestedHeld:
         assert result.verdict == attestation.VERDICT_HELD
         for n in names:
             assert str(dest / n) in result.unmanifested
+
+
+    def test_live_host_attestation_exercises_real_tree(self, tmp_path):
+        """DoD-1/DoD-2 live regression (reviewer note: the fixture path is a
+        documented substitution because the host was already fixed by the
+        handoff host-op). This test exercises the REAL /data/agents/scripts
+        tree + real conductor source + real plan file through the production
+        entry point, so the detector keeps pointing at the live tree — the
+        regression test no longer relies on the fixture path alone.
+
+        The host is expected to be FIXED (the three scripts manifested +
+        current, DoD-2) — so the assertion is that the live pass runs to a
+        verdict (not internal_error) and every script the live plan invokes
+        from /data/agents/scripts is accounted for by a row. If the host
+        regresses (drift returns), the same pass reports `held` + drift rows —
+        the live detector is the guard, not the fixture."""
+        live_dir = Path("/data/agents/scripts")
+        src_dir = Path("/srv/git/conductor/scripts")
+        plan_path = Path("/data/slots/night-plan.yaml")
+        if not (live_dir.is_dir() and src_dir.is_dir() and plan_path.is_file()):
+            pytest.skip("live host tree not present (not on BRIX)")
+
+        waivers = tmp_path / "waivers.yaml"
+        waivers.write_text("waivers: []\n")
+        ledger = tmp_path / "ledger.json"
+
+        code = attestation.node_main(
+            plan_path=plan_path, waiver_path=waivers, ledger_path=ledger,
+            emit=False,  # no stdout noise; the ledger record is the surface
+        )
+        assert code in (attestation.EXIT_CLEAN, attestation.EXIT_HELD)
+
+        records = attestation.read_ledger(ledger)
+        assert records and records[-1]["verdict"] in ("clean", "held")
+        rec = records[-1]
+        assert rec["reason"] != "internal_error"  # the detector itself is sound
+
+        # Every /data/agents/scripts script the live plan invokes must be
+        # accounted for by a row (clean/drift/waived/absent/unverifiable) —
+        # the live tree is what the night actually executes.
+        parsed = attestation.parse_plan_narrow(plan_path.read_text())
+        live_invoked = [
+            s for s in (
+                s for n in parsed.nodes for s in attestation.resolve_scripts(n.command)
+            )
+            if s.startswith(str(live_dir) + "/")
+        ]
+        row_scripts = {r["script"] for r in rec["rows"]}
+        for s in live_invoked:
+            assert s in row_scripts, f"{s} invoked by the live plan but has no attestation row"
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +690,91 @@ class TestDoD4LandReport:
         assert "DRIFT" in report
         assert "3 nights" in report
         assert "oldest 2026-09-05" in report
+
+
+    def test_land_report_mark_drift_on_preexisting_run_record_held(self, tmp_path):
+        """D3 (current live state, not just the just-merged PR): a held
+        attestation verdict in the latest run record — pre-existing drift in
+        an UNRELATED script — reads DRIFT at land time, not CLEAN. The
+        just-merged-PR subset is empty/manifested here; only the run-record
+        verdict carries the drift."""
+        log = tmp_path / "deploy-log.md"
+        log.write_text("")
+        waivers = tmp_path / "waivers.yaml"
+        waivers.write_text("waivers: []\n")
+        ledger = tmp_path / "ledger.json"
+        run_record = tmp_path / "latest.json"
+        run_record.write_text(json.dumps({
+            "run_id": "2026-09-07T00:00:00Z",
+            "status": "ended",
+            "nodes": [
+                {"id": "clone-currency-sync", "verdict": "clean"},
+                {"id": "night-deploy-attestation", "verdict": "held",
+                 "hold_reason_class": "drift",
+                 "ended_at": "2026-09-07T01:00:00+00:00"},
+            ],
+        }))
+        with (
+            patch.object(pm_core, "_DEPLOY_LOG", str(log)),
+            patch.object(attestation, "WAIVER_FILE", waivers),
+            patch.object(attestation, "ATTESTATION_LEDGER_PATH", ledger),
+            patch.object(attestation, "RUN_RECORD_PATH", run_record),
+        ):
+            report = pm_core.render_land_deploy_report("lapis-pm", pr_scripts=[])
+        assert "mark: DRIFT" in report
+        assert "run-record held" in report
+        assert "pre-existing drift" in report
+
+    def test_land_report_mark_clean_ignores_clean_run_record(self, tmp_path):
+        """The run-record consultation does not flip a genuinely clean state:
+        a `clean` attestation verdict in the run record leaves the mark CLEAN."""
+        log = tmp_path / "deploy-log.md"
+        log.write_text("")
+        waivers = tmp_path / "waivers.yaml"
+        waivers.write_text("waivers: []\n")
+        ledger = tmp_path / "ledger.json"
+        run_record = tmp_path / "latest.json"
+        run_record.write_text(json.dumps({
+            "run_id": "2026-09-07T00:00:00Z",
+            "nodes": [
+                {"id": "night-deploy-attestation", "verdict": "clean"},
+            ],
+        }))
+        with (
+            patch.object(pm_core, "_DEPLOY_LOG", str(log)),
+            patch.object(attestation, "WAIVER_FILE", waivers),
+            patch.object(attestation, "ATTESTATION_LEDGER_PATH", ledger),
+            patch.object(attestation, "RUN_RECORD_PATH", run_record),
+        ):
+            report = pm_core.render_land_deploy_report("lapis-pm", pr_scripts=[])
+        assert "mark: CLEAN" in report
+
+    def test_latest_run_record_attestation_reads_pinned_consumer(self, tmp_path):
+        """_latest_run_record_attestation reads the pinned run-record shape
+        (per-node id/verdict/hold_reason_class/ended_at in the nodes list)
+        and degrades to None on unreadable/malformed records (best-effort,
+        never a crash)."""
+        run_record = tmp_path / "latest.json"
+        run_record.write_text(json.dumps({
+            "nodes": [
+                {"id": "a", "verdict": "clean"},
+                {"id": "night-deploy-attestation", "verdict": "held",
+                 "hold_reason_class": "drift",
+                 "ended_at": "2026-09-07T01:00:00+00:00"},
+            ],
+        }))
+        rec = pm_core._latest_run_record_attestation(run_record)
+        assert rec == {
+            "verdict": "held", "reason": "drift",
+            "ended_at": "2026-09-07T01:00:00+00:00",
+        }
+        # No attestation node -> None.
+        run_record.write_text(json.dumps({"nodes": [{"id": "a", "verdict": "clean"}]}))
+        assert pm_core._latest_run_record_attestation(run_record) is None
+        # Unreadable / malformed -> None (never raises).
+        assert pm_core._latest_run_record_attestation(tmp_path / "missing.json") is None
+        run_record.write_text("{not json")
+        assert pm_core._latest_run_record_attestation(run_record) is None
 
 
 # ---------------------------------------------------------------------------

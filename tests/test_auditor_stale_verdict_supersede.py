@@ -283,3 +283,164 @@ def test_decide_no_sha_observed_treated_as_fresh():
         if "pm:verdict-stale-superseded" in (c.kwargs.get("extra_tags") or [])
     ]
     assert not stale_calls
+
+
+# ---------------------------------------------------------------------------
+# The D7 encode side: the pm:reviewer-sha= render-time tag
+# ---------------------------------------------------------------------------
+#
+# The reviewer-result branch in _encode_gpu_results tags the verdict
+# comment with the head sha it was rendered against (the latest
+# pm:pr=N:sha= observation — sha observations encode in the same tick
+# BEFORE gpu results). If no sha observation exists (a Forgejo perceive
+# miss) the tag is omitted and the verdict is treated as FRESH by
+# _decide_for_pr. These tests drive _encode_gpu_results with a pending
+# reviewer dispatch record (the pending-dispatch + episodic patch
+# pattern from tests/test_auditor_triggers_and_encode.py).
+
+
+REVIEW_PR = 42
+REVIEW_SHA = "review0000000000000000000000000000000000"
+REVIEW_GPU = "gpu-rev-1"
+REVIEW_VERDICT_JSON = json.dumps({
+    "verdict": "needs-human",
+    "issues": [{"path": "a.py"}],
+    "confidence": 0.8,
+})
+
+
+@pytest.fixture
+def reviewer_encode_store(tmp_path):
+    """The pending-dispatch + episodic patch pattern: a real mem store
+    (load_dispatched/save_dispatched) + an in-memory episodic store
+    (write_* appends Comment objects the tests assert on). Yields
+    (mem_store, episodic_mock)."""
+    from agents_core.mem import MemoryStore
+
+    store = MemoryStore(tmp_path / "mem.db")
+    state: dict = {"comments": []}
+
+    def _append(content: str, tags: list[str]) -> Comment:
+        c = Comment(id=f"cm-{len(state['comments'])}",
+                    ts=f"2026-09-08T14:00:00.{len(state['comments']):06d}",
+                    author="lapis-pm", author_type="agent",
+                    content=content, tags=list(tags))
+        state["comments"].append(c)
+        return c
+
+    mem_p = patch("lapis_pm.pm_core._mem", return_value=store)
+    ep = patch("lapis_pm.pm_core.episodic").start()
+    ep.all_comments.side_effect = lambda tid: list(state["comments"])
+    ep.spec.return_value = "/srv/lapis/planning/specs/fixer-reception-v0.md"
+    ep.spec_summary.return_value = "(spec summary)"
+    ep.write_observation.side_effect = (
+        lambda tid, content, extra_tags=None:
+        _append(content, ["pm:observation"] + list(extra_tags or []))
+    )
+    ep.write_result.side_effect = (
+        lambda tid, content, extra_tags=None:
+        _append(content, ["pm:result"] + list(extra_tags or []))
+    )
+    ep.write_dispatch.side_effect = (
+        lambda tid, content, extra_tags=None:
+        _append(content, ["pm:dispatch"] + list(extra_tags or []))
+    )
+    ep.write_brief.side_effect = (
+        lambda tid, content, extra_tags=None:
+        _append(content, ["pm:brief"] + list(extra_tags or []))
+    )
+    yield store, ep
+    ep.stop()
+    mem_p.stop()
+
+
+@pytest.fixture
+def reviewer_gpu_dirs(tmp_path, monkeypatch):
+    """Redirect the gpu-queue output dirs to a tmp root so the
+    _gpu_output_path lookup finds the test's reviewer output file."""
+    completed = tmp_path / "gpu_queue.completed"
+    failed = tmp_path / "gpu_queue.failed"
+    completed.mkdir(parents=True)
+    failed.mkdir(parents=True)
+    monkeypatch.setattr(pm_core, "COMPLETED_DIR", completed)
+    monkeypatch.setattr(pm_core, "FAILED_DIR", failed)
+    monkeypatch.setattr(pm_core, "CLAUDE_QUEUE_COMPLETED_DIR", completed)
+    monkeypatch.setattr(pm_core, "CLAUDE_QUEUE_FAILED_DIR", failed)
+    return completed, failed
+
+
+def _reviewer_record(**over) -> dict:
+    rec = {
+        "gpu_id": REVIEW_GPU,
+        "agent_type": "reviewer",
+        "pr_number": REVIEW_PR,
+        "cycle": 1,
+        "repo": "lapis-pm",
+        "ts": "2026-09-08T13:00:00-07:00",
+        "status": "pending",
+    }
+    rec.update(over)
+    return rec
+
+
+def _run_reviewer_encode(store, ep, completed, *, seed_sha: bool):
+    """Drive _encode_gpu_results with one pending reviewer dispatch whose
+    output file is a clean JSON verdict. The LLM-side passes (corroboration,
+    local witness) are patched to no-op dicts so the encode runs offline;
+    the sha observation (when seeded) is in the comment stream BEFORE the
+    encode, exactly as the perceive-phase ordering guarantees. Returns the
+    result comment written for the verdict."""
+    if seed_sha:
+        ep.write_observation(
+            TID,
+            f"PR #{REVIEW_PR} head observed",
+            extra_tags=[f"pm:pr={REVIEW_PR}",
+                        f"pm:pr={REVIEW_PR}:sha={REVIEW_SHA}"],
+        )
+    out_file = completed / f"{REVIEW_GPU}-output.md"
+    out_file.write_text("```json\n" + REVIEW_VERDICT_JSON + "\n```")
+    store.set(pm_core._dispatched_key(TID),
+              json.dumps([_reviewer_record()]), tags=["lapis-pm"])
+    with patch("lapis_pm.pm_core._run_corroboration_pass_sync",
+               return_value={"verdict": "agree", "claim": "",
+                             "citations": []}), \
+         patch("lapis_pm.local_reviewer_witness.run_local_reviewer_witness",
+               return_value=SimpleNamespace(agreement="agree",
+                                             to_dict=lambda: {})), \
+         patch("lapis_pm.absence_ground.ground_verdict_issues",
+               return_value=None):
+        encoded, failed = pm_core._encode_gpu_results(TID)
+    assert encoded == 1
+    assert not failed
+    comments = ep.all_comments(TID)
+    result_comments = [
+        c for c in comments
+        if f"pm:reviewer:pr={REVIEW_PR}:cycle=1:verdict=needs-human" in c.tags
+    ]
+    assert len(result_comments) == 1, (
+        f"expected exactly one reviewer result comment, got "
+        f"{len(result_comments)}"
+    )
+    return result_comments[0]
+
+
+def test_encode_reviewer_result_tagged_with_sha_observation(
+        reviewer_encode_store, reviewer_gpu_dirs):
+    """(a) When the comment stream contains a pm:pr=N:sha=<S> observation,
+    the reviewer result comment carries the pm:reviewer-sha=<S> tag — the
+    head sha the verdict was rendered against."""
+    store, ep = reviewer_encode_store
+    completed, _ = reviewer_gpu_dirs
+    result = _run_reviewer_encode(store, ep, completed, seed_sha=True)
+    assert f"pm:reviewer-sha={REVIEW_SHA}" in result.tags
+
+
+def test_encode_reviewer_result_untagged_when_no_sha_observed(
+        reviewer_encode_store, reviewer_gpu_dirs):
+    """(b) When no sha observation exists (a Forgejo perceive miss), no
+    pm:reviewer-sha= tag is added — the verdict is treated as FRESH by
+    _decide_for_pr (the `sha=unknown` rule)."""
+    store, ep = reviewer_encode_store
+    completed, _ = reviewer_gpu_dirs
+    result = _run_reviewer_encode(store, ep, completed, seed_sha=False)
+    assert not any(t.startswith("pm:reviewer-sha=") for t in result.tags)

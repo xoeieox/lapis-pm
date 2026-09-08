@@ -61,6 +61,23 @@ PROMOTE_COOLDOWN_DAYS = 14
 # Demoted more than twice within 14d -> --force requires --justification.
 PROMOTE_FORCE_JUSTIFY_THRESHOLD = 2
 
+# D4 (lapis-pm-reviewer-leg-repair-v0): the sweep moves OUT of the 60s tick
+# into a dedicated lapis-pm-backstop unit (15m cycle, 1200s timeout). The
+# in-flight guard in pm_core is process-local (each tick is a fresh process),
+# so serialization is enforced by the persistent sweep_started_ts stamp
+# (written at sweep START) + a minimum interval >= the sweep cost (~900s).
+# The 15m cycle floor is the minimum interval; a sweep that started < 15m ago
+# is skipped (no re-sweep of an in-flight or just-completed sweep).
+SWEEP_MIN_INTERVAL_S = 900.0  # 15m cycle floor (>= ~900s sweep cost)
+
+# D4 (lapis-pm-reviewer-leg-repair-v0): class-dependent eligibility.
+# docs/test-only class: 24h daily window (the existing _autonomy_op_daily_gated
+# semantics, per class). running-path class: eligible every sweep cycle (15m)
+# ONLY on a NEW demotion (last_regression_ts > last_sweep_ts) — no re-sweeping
+# the same red state ~every 16 minutes until green.
+DOCS_ONLY_WINDOW_S = 86400.0  # 24h daily window for docs/test-only class
+SWEEP_STAMP_KEY = "pm/autonomy-actuator/backstop-sweep-started"
+
 SHADOW_DIR = Path("/srv/lapis/autonomy-shadow")
 SHADOW_SWEEP_OUTCOMES = SHADOW_DIR / "sweep-outcomes.jsonl"
 
@@ -216,12 +233,91 @@ def _demote_class(mem, key: str, now: str) -> None:
             tags=["lapis-pm", "pm:autonomy-class"])
 
 
+def _sweep_started_stamp(mem) -> str | None:
+    """Read the persistent sweep_started_ts stamp (D4: written at sweep
+    START, not completion — a killed sweep still leaves the stamp, so the
+    next cycle sees it and skips rather than stacking)."""
+    raw = mem.get(SWEEP_STAMP_KEY)
+    if not raw:
+        return None
+    return str(raw.get("content", "")).strip() or None
+
+
+def _write_sweep_started_stamp(mem, now: str) -> None:
+    mem.set(SWEEP_STAMP_KEY, now, tags=["lapis-pm", "pm:autonomy-actuator"])
+
+
+def _repo_change_class(recs: list[dict]) -> list[str]:
+    """Derive the repo's change_class from its class records' change_classes
+    (D4: the class is derived from changed paths via derive_change_classes
+    and recorded in the finding/shadow line)."""
+    classes = set()
+    for r in recs:
+        for c in r["data"].get("change_classes", []) or []:
+            classes.add(c)
+    return sorted(classes)
+
+
+def _is_docs_only(change_classes: list[str]) -> bool:
+    """True when the repo's change_class is docs/test-only (no code/config/
+    deploy). D4: docs/test-only class gets the 24h daily window; running-path
+    class (any code/config/deploy) gets the 15m cycle eligibility."""
+    if not change_classes:
+        return False  # unknown class -> treat as running-path (conservative)
+    return all(c in ("docs", "test") for c in change_classes)
+
+
+def _repo_eligible(mem, repo: str, recs: list[dict], now: str) -> tuple[bool, str]:
+    """D4 (lapis-pm-reviewer-leg-repair-v0): class-dependent eligibility.
+
+    Returns (eligible, reason). The gate runs POST-selection (the repo must
+    be known before its class can be derived — the rev-1 global pre-selection
+    gate was wrong).
+
+    - docs/test-only class: 24h daily window (at most one sweep per 24h).
+    - running-path class: eligible every 15m cycle ONLY on a NEW demotion
+      (last_regression_ts > last_sweep_ts) — no re-sweeping the same red
+      state ~every 16 minutes until green (the unbounded re-eligibility rev-1
+      implied, ~9/day).
+    """
+    change_classes = _repo_change_class(recs)
+    _now_dt = _parse_iso(now) or datetime.now(timezone.utc)
+    if _is_docs_only(change_classes):
+        # 24h daily window: at most one sweep per 24h.
+        for r in recs:
+            last = r["data"].get("last_sweep_ts")
+            if last:
+                last_dt = _parse_iso(last)
+                if last_dt and (_now_dt - last_dt).total_seconds() < DOCS_ONLY_WINDOW_S:
+                    return False, "docs_only_window"
+        return True, "docs_only_eligible"
+    # running-path class: eligible only on a NEW demotion since the last
+    # sweep. last_regression_ts > last_sweep_ts means a new demotion occurred
+    # after the last sweep — the repo is red and needs re-checking.
+    for r in recs:
+        last_reg = r["data"].get("last_regression_ts")
+        last_sweep = r["data"].get("last_sweep_ts")
+        if last_reg:
+            last_reg_dt = _parse_iso(last_reg)
+            last_sweep_dt = _parse_iso(last_sweep) if last_sweep else None
+            if last_reg_dt and (last_sweep_dt is None or last_reg_dt > last_sweep_dt):
+                return True, "new_demotion"
+    return False, "no_new_demotion"
+
+
 def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
     """Run ONE repo's sweep step (Design 9 round-robin; cursor persists in
     the class records' last_sweep_ts).
 
+    D4 (lapis-pm-reviewer-leg-repair-v0): the sweep runs on a dedicated
+    15m cycle (not the 60s tick). Serialization: the persistent
+    sweep_started_ts stamp (written at sweep START) + the 15m minimum
+    interval. Class-dependent eligibility (docs/test-only 24h, running-path
+    on new demotion) is checked POST-selection.
+
     Returns a per-repo outcome dict:
-        {repo, status: "green"|"red"|"inconclusive"|"no_candidates",
+        {repo, status: "green"|"red"|"inconclusive"|"no_candidates"|
+         "skipped_in_flight"|"skipped_not_eligible",
          suspect_prs: [pr], demoted_classes: [key], findings: [key], ...}
     """
     now = now or _now_iso()
@@ -229,6 +325,20 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
     if not repos:
         return {"repo": None, "status": "no_candidates", "suspect_prs": [],
                 "demoted_classes": [], "findings": [], "ts": now}
+
+    # D4: serialization — the persistent sweep_started_ts stamp (written at
+    # sweep START) + the 15m minimum interval. A sweep that started < 15m ago
+    # is skipped (no re-sweep of an in-flight or just-completed sweep). The
+    # interval is measured against the `now` parameter (test-deterministic);
+    # a real clock is used only when `now` is absent (the default).
+    started = _sweep_started_stamp(mem)
+    if started:
+        started_dt = _parse_iso(started)
+        _now_dt = _parse_iso(now) or datetime.now(timezone.utc)
+        if started_dt and (_now_dt - started_dt).total_seconds() < SWEEP_MIN_INTERVAL_S:
+            return {"repo": None, "status": "skipped_in_flight",
+                    "suspect_prs": [], "demoted_classes": [], "findings": [],
+                    "ts": now, "started_ts": started}
 
     # Round-robin: pick the repo whose last_sweep_ts is oldest (or the
     # cursor if given and present).
@@ -244,15 +354,19 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
 
     recs = _class_records_for_repo(mem, repo)
 
-    # One main-baseline run per repo per day (Design 9 cost bound).
-    today = now[:10]
-    already_swept_today = any(
-        (r["data"].get("last_sweep_ts") or "").startswith(today) for r in recs
-    )
-    if already_swept_today:
-        return {"repo": repo, "status": "skipped_already_swept_today",
+    # D4: class-dependent eligibility (POST-selection — the repo must be
+    # known before its class can be derived).
+    eligible, reason = _repo_eligible(mem, repo, recs, now)
+    if not eligible:
+        return {"repo": repo, "status": "skipped_not_eligible",
                 "suspect_prs": [], "demoted_classes": [], "findings": [],
-                "ts": now}
+                "ts": now, "reason": reason,
+                "change_class": _repo_change_class(recs)}
+
+    # D4: write the persistent sweep_started_ts stamp at sweep START (not
+    # completion — a killed sweep still leaves the stamp, so the next cycle
+    # sees it and skips rather than stacking).
+    _write_sweep_started_stamp(mem, now)
 
     # Re-run the suite on origin/main in a throwaway worktree (same budget /
     # cleanup discipline as U1). Dedicated main-baseline run: ONE detached
@@ -283,7 +397,16 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
                     _demote_class(mem, rec["key"], now)
                     demoted_classes.append(rec["key"])
 
+    # D4: sweep count — how many sweeps this repo has had (the steady-state
+    # signal: a docs-only repo swept once and a running-path repo swept 20x
+    # leave DIFFERENT state, not identical).
+    sweep_count = sum(1 for r in recs if r["data"].get("last_sweep_ts"))
+    change_class = _repo_change_class(recs)
+
     # Record the sweep outcome (finding/ key, red or green, per repo).
+    # D4: change_class + sweep_count in the finding line (the operator
+    # visibility surface — the rev-1 finding had no class field, so a
+    # docs-only repo and a running-path repo left identical state).
     finding_key = f"finding/backstop-sweep/{repo}/{today}"
     try:
         mem.set(finding_key, json.dumps({
@@ -291,6 +414,8 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
             "main_failures": main_failures,
             "suspect_prs": suspect_prs,
             "demoted_classes": demoted_classes,
+            "change_class": change_class,
+            "sweep_count": sweep_count,
         }, ensure_ascii=False, sort_keys=True),
                 tags=["lapis-pm", "finding", "backstop-sweep"])
         findings.append(finding_key)
@@ -314,19 +439,25 @@ def sweep(mem, now: str | None = None, repo_cursor: str | None = None) -> dict:
         mem.set(rec["key"], json.dumps(data, ensure_ascii=False, sort_keys=True),
                 tags=["lapis-pm", "pm:autonomy-class"])
 
-    # Shadow file (Design 10).
+    # Shadow file (Design 10). D4: change_class + sweep_count in the shadow
+    # line (the operator visibility surface).
     _record_shadow_sweep(repo, status, main_failures, suspect_prs,
-                          demoted_classes, now)
+                          demoted_classes, now,
+                          change_class=change_class,
+                          sweep_count=sweep_count)
 
     return {
         "repo": repo, "status": status, "suspect_prs": suspect_prs,
         "demoted_classes": demoted_classes, "findings": findings,
         "main_failures": main_failures, "ts": now,
+        "change_class": change_class, "sweep_count": sweep_count,
     }
 
 
 def _record_shadow_sweep(repo, status, main_failures, suspect_prs,
-                          demoted_classes, now) -> None:
+                          demoted_classes, now, *,
+                          change_class: list[str] | None = None,
+                          sweep_count: int | None = None) -> None:
     try:
         SHADOW_DIR.mkdir(parents=True, exist_ok=True)
         line = {
@@ -337,6 +468,12 @@ def _record_shadow_sweep(repo, status, main_failures, suspect_prs,
             "main_failures": main_failures,
             "suspect_prs": suspect_prs,
             "demoted_classes": demoted_classes,
+            # D4 (lapis-pm-reviewer-leg-repair-v0): change_class + sweep_count
+            # in the shadow line (the operator visibility surface — the rev-1
+            # line had no class field, so a docs-only repo and a running-path
+            # repo left identical state).
+            "change_class": change_class or [],
+            "sweep_count": sweep_count or 0,
         }
         with open(SHADOW_SWEEP_OUTCOMES, "a") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
@@ -346,7 +483,31 @@ def _record_shadow_sweep(repo, status, main_failures, suspect_prs,
 
 def open_regression_brief(repo: str, suspect_pr: int, failing_tests: list[str],
                           now: str | None = None) -> None:
-    """Open a Pushover HIGH regression brief (U3.2). Suspect, not proven."""
+    """Open a Pushover HIGH regression brief (U3.2). Suspect, not proven.
+
+    D4 (lapis-pm-reviewer-leg-repair-v0): brief cooldown — one HIGH per
+    (repo, suspect PR) per day. A red-storm of re-sweeps (a persistently-red
+    running-path repo) must not fire a HIGH brief on every red sweep; the
+    cooldown dedups by (repo, suspect_pr) over a 24h window.
+    """
+    now = now or _now_iso()
+    # D4: brief cooldown — one HIGH per (repo, suspect PR) per day.
+    cooldown_key = f"finding/backstop-brief-cooldown/{repo}/{suspect_pr}"
+    try:
+        mem = _mem()
+        raw = mem.get(cooldown_key)
+        if raw:
+            last = _parse_iso(str(raw.get("content", "")))
+            if last and (datetime.now(timezone.utc) - last).total_seconds() < DOCS_ONLY_WINDOW_S:
+                logger.info(
+                    "backstop regression brief suppressed (cooldown): %s PR #%s",
+                    repo, suspect_pr,
+                )
+                return
+        mem.set(cooldown_key, now, tags=["lapis-pm", "finding", "backstop-brief-cooldown"])
+    except Exception:
+        pass  # fail-open: a cooldown read/write error lets the brief fire
+
     try:
         from agents_core.notify import send_notification, Priority
         send_notification(

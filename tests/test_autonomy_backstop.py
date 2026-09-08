@@ -331,3 +331,231 @@ class TestTickPathNeverRaise:
         ):
             # The tick-path hook must not propagate the exception.
             pm_core._backstop_sweep_tick()
+
+
+# ---------------------------------------------------------------------------
+# D4 (lapis-pm-reviewer-leg-repair-v0): the cadence split + the sweep that
+# can complete. The sweep moves OUT of the 60s tick into a dedicated unit;
+# a persistent sweep_started_ts stamp (written at sweep START) + 15m minimum
+# interval serialize it; class-dependent eligibility (docs/test-only 24h,
+# running-path on new demotion); brief cooldown one HIGH per (repo, suspect
+# PR) per day; change_class + sweep count in the finding/shadow line.
+# ---------------------------------------------------------------------------
+
+class TestSweepStartedStamp:
+    """DoD-3: the sweep writes a persistent sweep_started_ts stamp at START
+    (not completion), so a killed sweep still leaves the stamp and the next
+    cycle skips rather than stacking (the kill loop does not recur)."""
+
+    def test_sweep_writes_started_stamp_at_start(self):
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        with (
+            patch.object(va, "attest_main_baseline",
+                         return_value=_att("attested", pr_failures=[])),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
+        # The stamp is written at sweep START (a real sweep ran, not skipped).
+        assert out["status"] == "green"
+        assert ab.SWEEP_STAMP_KEY in mem._data, (
+            f"sweep_started_ts stamp missing from mem: {list(mem._data)}"
+        )
+        assert mem._data[ab.SWEEP_STAMP_KEY]["content"] == "2026-09-06T00:00:00Z"
+
+    def test_sweep_skips_when_started_recently(self):
+        """DoD-3: a sweep that started < 15m ago is skipped (no re-sweep of
+        an in-flight or just-completed sweep) — the kill loop does not
+        recur."""
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        # A sweep started 5 minutes ago (< 15m).
+        mem.set(ab.SWEEP_STAMP_KEY, "2026-09-06T00:05:00Z",
+                tags=["lapis-pm", "pm:autonomy-actuator"])
+        with (
+            patch.object(va, "attest_main_baseline") as mock_baseline,
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:10:00Z")
+        assert out["status"] == "skipped_in_flight"
+        assert not mock_baseline.called, "no suite run when a sweep is in flight"
+
+    def test_sweep_runs_after_15m(self):
+        """DoD-3: a sweep that started > 15m ago is eligible (the 15m cycle
+        floor has passed)."""
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        # A sweep started 20 minutes ago (> 15m).
+        mem.set(ab.SWEEP_STAMP_KEY, "2026-09-06T00:00:00Z",
+                tags=["lapis-pm", "pm:autonomy-actuator"])
+        with (
+            patch.object(va, "attest_main_baseline",
+                         return_value=_att("attested", pr_failures=[])),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:20:00Z")
+        assert out["status"] == "green"
+
+
+class TestClassDependentEligibility:
+    """DoD-4: a docs/test-only-class target is re-swept at most once per 24h;
+    a running-path-class target is re-swept within one 15m cycle of a NEW
+    demotion and NOT re-swept for the same red state."""
+
+    def test_docs_only_class_24h_window(self):
+        """DoD-4: a docs/test-only class is re-swept at most once per 24h."""
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/docs/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0,
+                                 "change_classes": ["docs"],
+                                 "last_sweep_ts": "2026-09-06T00:00:00Z"}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        # 12h later (< 24h) -> not eligible (docs/test-only window).
+        with (
+            patch.object(va, "attest_main_baseline") as mock_baseline,
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T12:00:00Z")
+        assert out["status"] == "skipped_not_eligible"
+        assert out.get("reason") == "docs_only_window"
+        assert not mock_baseline.called
+
+    def test_docs_only_class_eligible_after_24h(self):
+        """DoD-4: a docs/test-only class is eligible after 24h."""
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/docs/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0,
+                                 "change_classes": ["docs"],
+                                 "last_sweep_ts": "2026-09-05T00:00:00Z"}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        # 25h later (> 24h) -> eligible.
+        with (
+            patch.object(va, "attest_main_baseline",
+                         return_value=_att("attested", pr_failures=[])),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T01:00:00Z")
+        assert out["status"] == "green"
+
+    def test_running_path_eligible_on_new_demotion(self):
+        """DoD-4: a running-path class is eligible on a NEW demotion
+        (last_regression_ts > last_sweep_ts)."""
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": False, "auto_resolved_count": 0,
+                                 "regression_count": 1,
+                                 "change_classes": ["code"],
+                                 "last_regression_ts": "2026-09-06T00:30:00Z",
+                                 "last_sweep_ts": "2026-09-06T00:00:00Z"}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        # last_regression_ts (00:30) > last_sweep_ts (00:00) -> new demotion.
+        with (
+            patch.object(va, "attest_main_baseline",
+                         return_value=_att("attested", pr_failures=[])),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:45:00Z")
+        assert out["status"] == "green"
+
+    def test_running_path_not_reswept_same_red_state(self):
+        """DoD-4: a running-path class is NOT re-swept for the SAME red
+        state (last_regression_ts <= last_sweep_ts) — no re-sweeping the same
+        red state ~every 16 minutes until green."""
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": False, "auto_resolved_count": 0,
+                                 "regression_count": 1,
+                                 "change_classes": ["code"],
+                                 "last_regression_ts": "2026-09-06T00:00:00Z",
+                                 "last_sweep_ts": "2026-09-06T00:00:00Z"}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        # last_regression_ts == last_sweep_ts -> NOT a new demotion.
+        with (
+            patch.object(va, "attest_main_baseline") as mock_baseline,
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:15:00Z")
+        assert out["status"] == "skipped_not_eligible"
+        assert out.get("reason") == "no_new_demotion"
+        assert not mock_baseline.called
+
+
+class TestBriefCooldown:
+    """DoD-3: brief cooldown — one HIGH per (repo, suspect PR) per day under
+    a red-storm fixture."""
+
+    def test_brief_cooldown_suppresses_second_high(self):
+        """DoD-3: a second HIGH brief for the same (repo, suspect PR) within
+        24h is suppressed (one HIGH per (repo, suspect PR) per day)."""
+        mem = _make_mem()
+        # Pre-seed the cooldown stamp (a brief fired 1h ago).
+        mem.set(f"finding/backstop-brief-cooldown/lapis-pm/42",
+                "2026-09-06T00:00:00Z",
+                tags=["lapis-pm", "finding", "backstop-brief-cooldown"])
+        with (
+            patch("lapis_pm.autonomy_backstop._mem", return_value=mem),
+            patch("agents_core.notify.send_notification") as mock_notify,
+        ):
+            ab.open_regression_brief("lapis-pm", 42,
+                                     ["lapis_pm/foo.py::test_x"],
+                                     now="2026-09-06T01:00:00Z")
+        # The brief is suppressed (cooldown) — no notification sent.
+        assert not mock_notify.called
+
+    def test_brief_cooldown_fires_after_24h(self):
+        """DoD-3: a HIGH brief fires again after 24h (the cooldown window
+        has passed)."""
+        mem = _make_mem()
+        # Pre-seed the cooldown stamp (a brief fired 25h ago).
+        mem.set(f"finding/backstop-brief-cooldown/lapis-pm/42",
+                "2026-09-04T00:00:00Z",
+                tags=["lapis-pm", "finding", "backstop-brief-cooldown"])
+        with (
+            patch("lapis_pm.autonomy_backstop._mem", return_value=mem),
+            patch("agents_core.notify.send_notification") as mock_notify,
+        ):
+            ab.open_regression_brief("lapis-pm", 42,
+                                     ["lapis_pm/foo.py::test_x"],
+                                     now="2026-09-06T01:00:00Z")
+        # The brief fires (cooldown window passed).
+        assert mock_notify.called
+
+
+class TestChangeClassAndSweepCount:
+    """DoD-4: the class is derived from changed paths via
+    derive_change_classes and recorded (change_class + count in the
+    finding/shadow line)."""
+
+    def test_finding_carries_change_class_and_sweep_count(self):
+        mem = _make_mem()
+        key = "pm/autonomy-class/lapis-pm/clean/code/lt100"
+        mem.set(key, json.dumps({"promoted": True, "auto_resolved_count": 0,
+                                 "regression_count": 0,
+                                 "change_classes": ["code"],
+                                 "last_sweep_ts": "2026-09-05T00:00:00Z"}),
+                tags=["lapis-pm", "pm:autonomy-class"])
+        with (
+            patch.object(va, "attest_main_baseline",
+                         return_value=_att("attested", pr_failures=[])),
+            patch("lapis_pm.episodic.write_observation"),
+        ):
+            out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
+        assert out["status"] == "green"
+        assert out["change_class"] == ["code"]
+        assert out["sweep_count"] >= 1
+        # The finding line carries change_class + sweep_count.
+        finding_key = out["findings"][0]
+        finding = json.loads(mem._data[finding_key]["content"])
+        assert finding["change_class"] == ["code"]
+        assert finding["sweep_count"] >= 1

@@ -3113,25 +3113,48 @@ def _precedent_hook(target_id: str, cls: authority.PRClassification,
 
 
 def _backstop_sweep_tick() -> None:
-    """U3 tick-path invocation (Design 9): daily-gated, one repo per tick,
-    never-raise, fail-soft to logging. Shares the U1 concurrency guard so the
-    tick path never stacks two 900s autonomy ops."""
+    """U3 tick-path invocation — D4 (lapis-pm-reviewer-leg-repair-v0): the
+    backstop sweep is NO LONGER run from the 60s tick.
+
+    The landed actuator's sweep was dead on arrival: a ~900s sweep inside a
+    60s `Type=oneshot` tick capped at `TimeoutStartSec=300` was killed
+    mid-run (8 consecutive `Failed with result 'timeout'` at exact 5-min
+    intervals, 2026-09-07 13:03-13:38), wrote no completion stamp, and
+    retried every tick. The sweep now runs on a dedicated
+    `lapis-pm-backstop.timer` (15m cycle, `TimeoutStartSec=1200s`) wired to
+    the `lapis-pm backstop-sweep` CLI (cli.py cmd_backstop_sweep), which
+    calls `_run_backstop_sweep_standalone()` below.
+
+    This function is retained as a no-op so the tick's step 1.5 call site and
+    the existing never-raise test keep working; it logs once that the sweep
+    moved to the dedicated unit.
+    """
+    logger.debug(
+        "[autonomy-backstop] tick-path sweep is a no-op — the sweep runs on "
+        "the dedicated lapis-pm-backstop timer (15m cycle, 1200s timeout); "
+        "see _run_backstop_sweep_standalone()"
+    )
+
+
+def _run_backstop_sweep_standalone() -> dict:
+    """D4 (lapis-pm-reviewer-leg-repair-v0): the backstop sweep on its
+    dedicated 15m cycle (wired to the `lapis-pm backstop-sweep` CLI, which
+    the dedicated `lapis-pm-backstop.timer` unit invokes).
+
+    Serialization is enforced by the persistent `sweep_started_ts` stamp
+    (written at sweep START, 15m minimum interval) — NOT by the process-local
+    in-flight guard (each tick is a fresh process; the dedicated oneshot unit
+    is one-at-a-time host-wide). Never-raise, fail-soft to logging.
+    """
     try:
-        if _autonomy_inflight():
-            return  # shared concurrency guard — retry next tick
-        if not _autonomy_op_daily_gated("backstop-sweep"):
-            return  # once per day
-        _autonomy_set_inflight(True)
-        try:
-            from . import autonomy_backstop as _bs
-            outcome = _bs.sweep(_mem())
-        finally:
-            _autonomy_set_inflight(False)
-        _autonomy_stamp("backstop-sweep")
+        from . import autonomy_backstop as _bs
+        outcome = _bs.sweep(_mem())
         logger.info(
-            "[autonomy-backstop] sweep: repo=%s status=%s suspect=%s demoted=%s",
+            "[autonomy-backstop] sweep: repo=%s status=%s suspect=%s demoted=%s "
+            "change_class=%s sweep_count=%s",
             outcome.get("repo"), outcome.get("status"),
             outcome.get("suspect_prs"), outcome.get("demoted_classes"),
+            outcome.get("change_class"), outcome.get("sweep_count"),
         )
         if outcome.get("status") == "red":
             try:
@@ -3142,8 +3165,11 @@ def _backstop_sweep_tick() -> None:
                 )
             except Exception as e:
                 logger.warning("backstop regression brief failed: %s", e)
+        return outcome
     except Exception as e:
         logger.warning("[autonomy-backstop] sweep failed (non-fatal): %s", e)
+        return {"repo": None, "status": "error", "error": str(e),
+                "suspect_prs": [], "demoted_classes": [], "findings": []}
 
 
 def _ensure_dispatch_owned(repo: str) -> None:
@@ -3312,6 +3338,22 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
                     "verdict": corr.get("verdict"),
                     "drift_class": corr.get("drift_class"),
                 }
+                # DoD-1 (lapis-pm-reviewer-leg-repair-v0): the mem cache
+                # carries the node2 error-class tail (the four named classes)
+                # so a genuine node2 down is distinguishable from a wiring
+                # bug on the pm/review-state surface (today only the episodic
+                # JSON did).
+                _n2_notes = (corr.get("node2_corroboration") or {}).get("notes") or ""
+                _n2_class = None
+                for _ec in (
+                    "node2_client_import_error", "node2_aci_unverified",
+                    "node2_cap_refused", "node2_unavailable",
+                ):
+                    if _ec in _n2_notes:
+                        _n2_class = _ec
+                        break
+                if _n2_class:
+                    last_corroboration["node2_error_class"] = _n2_class
             # Leg 1 legibility (DoD #4): surface starvation in the same
             # compact cache claude-view already reads, without opening the
             # verdict JSON. Additive — absent on verdicts that predate this.
@@ -6473,9 +6515,17 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             n_issues = len(verdict_info.get("issues") or [])
             corr = verdict_info.get("corroboration_result") or {}
             corr_v = corr.get("verdict")
+            # DoD-5 (lapis-pm-reviewer-leg-repair-v0): the brief carries
+            # drift_class verbatim — the rev-1 brief rendered only
+            # corroboration={verdict}, so a reader could not see the
+            # per-pass drift class without opening the verdict JSON.
+            corr_dc = corr.get("drift_class")
             parts = [f"local reviewer: verdict={v}", f"confidence={conf}", f"issues={n_issues}"]
             if corr_v:
-                parts.append(f"corroboration={corr_v}")
+                _corr_part = f"corroboration={corr_v}"
+                if corr_dc:
+                    _corr_part += f" (drift_class={corr_dc})"
+                parts.append(_corr_part)
             # Leg 1 legibility (DoD #4): a reader must see degradation without
             # opening the verdict JSON. panel_starvation is additive — absent
             # on verdicts written before this landed, so guard with .get.
@@ -6483,10 +6533,32 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             if _pstarv.get("starved"):
                 _legs_down = ", ".join(_pstarv.get("legs_down") or []) or "unknown"
                 _raw_conf = _pstarv.get("confidence_raw", "?")
+                # DoD-1 (lapis-pm-reviewer-leg-repair-v0): the DEGRADED PANEL
+                # line carries the node2 error-class tail (the four named
+                # classes: node2_unavailable / node2_aci_unverified /
+                # node2_cap_refused / node2_client_import_error) so a genuine
+                # node2 down is distinguishable from a wiring bug on a PM
+                # surface (today only the episodic JSON did).
+                _n2_notes = (corr.get("node2_corroboration") or {}).get("notes") or ""
+                _n2_class = ""
+                for _ec in (
+                    "node2_client_import_error", "node2_aci_unverified",
+                    "node2_cap_refused", "node2_unavailable",
+                ):
+                    if _ec in _n2_notes:
+                        _n2_class = _ec
+                        break
+                _n2_part = f"; node2={_n2_class}" if _n2_class else ""
                 parts.append(
-                    f"DEGRADED PANEL (legs down: {_legs_down}; raw confidence "
-                    f"{_raw_conf} attenuated to {conf}) — advisory only, not gated"
+                    f"DEGRADED PANEL (legs down: {_legs_down}{_n2_part}; raw "
+                    f"confidence {_raw_conf} attenuated to {conf}) — advisory "
+                    f"only, not gated"
                 )
+            else:
+                # DoD-1 (lapis-pm-reviewer-leg-repair-v0): a POSITIVE line
+                # renders when not starved, so a healthy panel is
+                # distinguishable from a legacy unannotated verdict.
+                parts.append("panel: 3/3 legs reporting")
             _refuted = verdict_info.get("refuted_absence_findings") or []
             if _refuted:
                 parts.append(f"refuted absence claims={len(_refuted)}")
@@ -9539,10 +9611,13 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
     if cur_state == "paused":
         return TickResult(target_id, True, "paused", 0, "noop:paused")
 
-    # 1.5 Autonomy backstop sweep (lapis-pm-autonomy-actuator-v0, U3 / Design 9):
-    # daily-gated, one repo per tick, never-raise, fail-soft to logging. Shares
-    # the U1 concurrency guard so the tick path never stacks two 900s autonomy
-    # ops (attestation OR sweep, never both stacked).
+    # 1.5 Autonomy backstop sweep — D4 (lapis-pm-reviewer-leg-repair-v0): the
+    # sweep is NO LONGER run from the 60s tick. A ~900s sweep inside a 60s
+    # `Type=oneshot` tick capped at `TimeoutStartSec=300` was killed mid-run
+    # (the 8x-timeout loop, 2026-09-07 13:03-13:38). The sweep now runs on a
+    # dedicated `lapis-pm-backstop.timer` (15m cycle, `TimeoutStartSec=1200s`)
+    # wired to the `lapis-pm backstop-sweep` CLI. `_backstop_sweep_tick()` is
+    # a no-op (retained for the tick call site + the never-raise test).
     try:
         _backstop_sweep_tick()
     except Exception as e:

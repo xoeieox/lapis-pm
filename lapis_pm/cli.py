@@ -1219,9 +1219,15 @@ def cmd_ratify(args) -> int:
 def cmd_backstop_sweep(args) -> int:
     """Run one repo's autonomy-backstop sweep step (U3.4).
 
-    Idempotent within the daily window (one repo per tick, round-robin cursor
-    persisted in the class records' last_sweep_ts). Output discipline mirrors
-    `lapis-pm land --dry-run`: human-readable, machine-greppable.
+    D4 (lapis-pm-reviewer-leg-repair-v0): this is the entry point the
+    dedicated `lapis-pm-backstop.timer` (15m cycle, `TimeoutStartSec=1200s`)
+    invokes. The sweep is serialized by the persistent `sweep_started_ts`
+    stamp (written at sweep START, 15m minimum interval) + the dedicated
+    oneshot unit (one at a time host-wide) — NOT by the process-local
+    in-flight guard. Class-dependent eligibility (docs/test-only 24h,
+    running-path on new demotion) is checked post-selection. Output
+    discipline mirrors `lapis-pm land --dry-run`: human-readable,
+    machine-greppable.
     """
     from . import autonomy_backstop as _bs
 
@@ -1234,6 +1240,8 @@ def cmd_backstop_sweep(args) -> int:
         f"status={outcome.get('status')} "
         f"suspect_prs={outcome.get('suspect_prs')} "
         f"demoted={len(outcome.get('demoted_classes') or [])} "
+        f"change_class={outcome.get('change_class')} "
+        f"sweep_count={outcome.get('sweep_count')} "
         f"ts={outcome.get('ts')}"
     )
     for pr in outcome.get("suspect_prs") or []:
@@ -1244,6 +1252,7 @@ def cmd_backstop_sweep(args) -> int:
         print(f"  FINDING: {key}")
     if outcome.get("status") == "red":
         # U3.2: open the HIGH regression brief (suspect, not proven).
+        # D4: brief cooldown — one HIGH per (repo, suspect PR) per day.
         suspect_pr = (outcome.get("suspect_prs") or [None])[0]
         _bs.open_regression_brief(
             outcome.get("repo") or "?", suspect_pr,

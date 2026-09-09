@@ -660,6 +660,12 @@ def cmd_clear_dispatch(args) -> int:
     return 0
 
 
+def cmd_stall_check(args) -> int:
+    """Dedicated stall checker (attestation-contract-v0 leg 2, D6a)."""
+    from . import stall_check
+    return stall_check.main()
+
+
 def cmd_tick(args) -> int:
     # Force-dispatch: bypass the normal decide path for smoke testing.
     if args.force_dispatch:
@@ -2424,6 +2430,14 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--force-brief", action="store_true")
     t.add_argument("--force-dispatch", help="AGENT:INTENT — bypass decide, smoke test dispatch")
     t.set_defaults(func=cmd_tick)
+
+    sc = sub.add_parser(
+        "stall-check",
+        help="Dedicated tick-coverage + directive-outcome stall checker "
+             "(attestation-contract-v0 leg 2, D6a). stdlib + mem reads only, "
+             "no LLM calls; run by lapis-pm-stall-check.timer on a 10m cadence.",
+    )
+    sc.set_defaults(func=cmd_stall_check)
 
     s = sub.add_parser("status", help="Show PM state for bound target(s).")
     s.add_argument("target_id", nargs="?")

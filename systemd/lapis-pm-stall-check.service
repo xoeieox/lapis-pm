@@ -1,0 +1,21 @@
+[Unit]
+Description=Lapis PM - dedicated tick-coverage + directive-outcome stall checker (attestation-contract-v0 leg 2, D6a)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStart=/usr/bin/python3 -m lapis_pm.cli stall-check
+# D6a unit hygiene (spec pin): this unit is stdlib + mem reads only and
+# reads NO credentials - it MUST NOT inherit the credential env files
+# (the conductor env file / the phala env file) that lapis-pm.service
+# carries.
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

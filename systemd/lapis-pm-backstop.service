@@ -1,0 +1,21 @@
+[Unit]
+Description=Lapis PM - demotion-backstop sweep, dedicated 15m lane (lapis-pm-reviewer-leg-repair-v0 D4a)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStart=/usr/bin/python3 -m lapis_pm.cli backstop-sweep
+EnvironmentFile=-/data/agents/config/conductor.env
+EnvironmentFile=-/data/agents/config/phala.env
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# D4a: the sweep costs ~900s; the 1200s unit timeout is what kills the 8x
+# 300s-kill loop the in-tick sweep ran into (spec D4, rev-3).
+TimeoutStartSec=1200
+
+[Install]
+WantedBy=multi-user.target

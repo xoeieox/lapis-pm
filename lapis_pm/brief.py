@@ -271,6 +271,7 @@ def synthesize(
     notify: NotifyPriority | None = NotifyPriority.NORMAL,
     options_extra_tags: list[str] | None = None,
     reviewer_verdict_text: str | None = None,
+    reviewer_scope_text: str | None = None,
     functional_critic_text: str | None = None,
     fork_class: dict | None = None,
 ) -> Brief:
@@ -318,12 +319,20 @@ def synthesize(
     if reviewer_verdict_text:
         verdict_block = f"Reviewer verdict:\n{reviewer_verdict_text}\n"
 
+    scope_block = ""
+    if reviewer_scope_text:
+        # D8 (attestation-contract-v0 leg 2): the reviewer's reported
+        # verification scope rides the SAME surface as the verdict line —
+        # a green verdict with no scope is a false signal.
+        scope_block = f"Reviewer scope:\n{reviewer_scope_text}\n"
+
     user = (
         f"Thread: {target_id}\n"
         f"{trigger_block}\n"
         f"Spec:\n{spec_summary}\n\n"
         f"Recent PM episodes (most relevant first):\n{episodes_block}\n"
         f"{verdict_block}"
+        f"{scope_block}"
         f"{diff_block}"
         f"{issues_block}"
     )

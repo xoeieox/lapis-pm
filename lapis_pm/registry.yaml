@@ -164,7 +164,8 @@ agents:
       {{
         "verdict": "clean" | "fixable" | "needs-human",
         "issues": [{{ "severity": "low|med|high", "path": "...", "note": "..." }}],
-        "confidence": 0.0-1.0
+        "confidence": 0.0-1.0,
+        "scope": "<one line: the suite/files actually run + the test count>"
       }}
       No prose outside the JSON.{absence_grounding_block}
     timeout_s: 600
@@ -236,7 +237,8 @@ agents:
       {{
         "verdict": "clean" | "fixable" | "needs-human",
         "issues": [{{ "severity": "low|med|high", "path": "...", "note": "..." }}],
-        "confidence": 0.0-1.0
+        "confidence": 0.0-1.0,
+        "scope": "<one line: the suite/files actually run + the test count>"
       }}
       No prose outside the JSON.{absence_grounding_block}
     timeout_s: 600

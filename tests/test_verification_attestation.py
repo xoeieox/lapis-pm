@@ -129,8 +129,8 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_a"], 0),
-                                       ("python3 -m pytest -q", ["tests/test_x.py::test_a"], 0),
+                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_a"], 0, 4),
+                                       ("python3 -m pytest -q", ["tests/test_x.py::test_a"], 0, 4),
                          ]),
         ):
             res = va.attest("lapis-pm", 42, "abc123",
@@ -147,8 +147,8 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_new"], 1),
-                                       ("python3 -m pytest -q", [], 0),
+                         side_effect=[("python3 -m pytest -q", ["tests/test_x.py::test_new"], 1, 1),
+                                       ("python3 -m pytest -q", [], 0, 4),
                          ]),
         ):
             res = va.attest("lapis-pm", 42, "abc123",
@@ -182,8 +182,8 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         side_effect=[("bash smoke.sh", [], 1),
-                                       ("bash smoke.sh", [], 0),
+                         side_effect=[("bash smoke.sh", [], 1, 0),
+                                       ("bash smoke.sh", [], 0, 0),
                          ]),
         ):
             res = va.attest("lapis-pm", 42, "abc123",
@@ -199,8 +199,8 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         side_effect=[("bash smoke.sh", [], 0),
-                                       ("bash smoke.sh", [], 0),
+                         side_effect=[("bash smoke.sh", [], 0, 0),
+                                       ("bash smoke.sh", [], 0, 0),
                          ]),
         ):
             res = va.attest("lapis-pm", 42, "abc123",
@@ -232,7 +232,7 @@ class TestAttestResults:
             patch.object(va, "_create_worktree") as mock_create,
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         return_value=("bash smoke.sh", [], 0)),
+                         return_value=("bash smoke.sh", [], 0, 0)),
         ):
             res = va.attest_main_baseline("lapis-pm", base_branch="main")
         assert res["result"] == "attested"
@@ -252,7 +252,7 @@ class TestAttestResults:
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
                          return_value=("python3 -m pytest -q",
-                                       ["tests/test_x.py::test_a"], 1)),
+                                       ["tests/test_x.py::test_a"], 1, 2)),
         ):
             res = va.attest_main_baseline("lapis-pm")
         assert res["result"] == "unattested"
@@ -267,7 +267,7 @@ class TestAttestResults:
             patch.object(va, "_create_worktree"),
             patch.object(va, "_remove_worktree"),
             patch.object(va, "_run_suite_in_worktree",
-                         return_value=("bash smoke.sh", [], 1)),
+                         return_value=("bash smoke.sh", [], 1, 0)),
         ):
             res = va.attest_main_baseline("lapis-pm")
         assert res["result"] == "inconclusive"
@@ -452,3 +452,86 @@ class TestContainmentPinIntact:
 
         src = inspect.getsource(bundle_autodispatch._bind)
         assert 'verification="pm-live-test"' in src or "verification='pm-live-test'" in src
+
+
+# ---------------------------------------------------------------------------
+# D8 - verification scope attestation (attestation-contract-v0 leg 2)
+#
+# Every attestation record carries `scope` (suite entrypoint + collected
+# test count + explicit complete flag); a timed-out run records
+# scope=incomplete-timeout and an inconclusive result - NEVER green.
+# ---------------------------------------------------------------------------
+
+class TestScopeAttestation:
+
+    def test_complete_run_records_scope_with_count(self):
+        # A completed attestation run records scope with complete=true and
+        # the collected test count from the actual run.
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         side_effect=[("python3 -m pytest -q", [], 0, 42),
+                                       ("python3 -m pytest -q", [], 0, 42),
+                         ]),
+        ):
+            res = va.attest("lapis-pm", 42, "abc123",
+                            changed_paths=["lapis_pm/foo.py"])
+        assert res["result"] == "attested"
+        assert res["scope"] == {"suite": "python3 -m pytest -q",
+                                "collected": 42, "complete": True}
+
+    def test_timeout_records_incomplete_timeout_never_green(self):
+        # A run hitting its timeout records scope=incomplete-timeout and an
+        # inconclusive result - NO green-verdict path for a timed-out run.
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         side_effect=subprocess.TimeoutExpired(cmd="pytest", timeout=900)),
+        ):
+            res = va.attest("lapis-pm", 42, "abc123",
+                            changed_paths=["lapis_pm/foo.py"])
+        assert res["result"] == "inconclusive"
+        assert res["reason"] == "wall_budget_exceeded"
+        assert res["scope"] == {"suite": "incomplete-timeout",
+                                "collected": 0, "complete": False}
+
+    def test_main_baseline_timeout_records_incomplete_timeout(self):
+        with (
+            patch.object(va, "_repo_clone_path", return_value="/tmp/fake-clone"),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(va, "_create_worktree"),
+            patch.object(va, "_remove_worktree"),
+            patch.object(va, "_run_suite_in_worktree",
+                         side_effect=subprocess.TimeoutExpired(cmd="pytest", timeout=900)),
+        ):
+            res = va.attest_main_baseline("lapis-pm")
+        assert res["result"] == "inconclusive"
+        assert res["scope"] == {"suite": "incomplete-timeout",
+                                "collected": 0, "complete": False}
+
+    def test_collected_test_count_parses_pytest_summary(self):
+        # The count reads the `= N failed, M passed ... =` summary line.
+        out = "FAILED tests/test_x.py::test_a\n= 1 failed, 41 passed in 1.23s =\n"
+        assert va._collected_test_count(out) == 42
+        out = "= 42 passed in 1.0s =\n"
+        assert va._collected_test_count(out) == 42
+        # No parseable summary (e.g. smoke.sh output) -> 0.
+        assert va._collected_test_count("step 1: ok\nstep 2: ok\n") == 0
+
+    def test_write_cache_carries_scope(self):
+        # The scope attestation rides the cache record.
+        mem = _make_mem()
+        res = {"result": "attested", "pr_failures": [], "preexisting": [],
+               "suite": "python3 -m pytest -q", "ts": "2026-09-09T00:00:00Z",
+               "scope": {"suite": "python3 -m pytest -q",
+                         "collected": 7, "complete": True}}
+        va.write_cache(mem, "my-target", 42, "abc123", res)
+        import json as _json
+        stored = _json.loads(mem._data[va.cache_key("my-target", 42)]["content"])
+        assert stored["scope"] == res["scope"]

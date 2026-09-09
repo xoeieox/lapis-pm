@@ -6038,6 +6038,97 @@ def _baseline_main_sha(repo: str) -> str | None:
         return None
 
 
+def _salvage_audit_json(text: str) -> dict | None:
+    """D6c parse entry point (auditor-diagnosability-v0): recover the
+    auditor's five-section audit JSON from the raw output text.
+
+    The live output shape is [complete JSON] + [trailing metadata lines
+    the runner appends: `Running as unit: ...` / `WARN: worktree_setup:
+    ...`], optionally wrapped in fences or leading prose. A whole-text
+    `json.loads` on that shape fails, so:
+
+    (1) `json.loads` on the stripped text first (the clean case -
+        behavior unchanged);
+    (2) on failure, scan for the first balanced top-level JSON object:
+        walk forward from each `{` tracking string state (in-string +
+        escape) and brace depth, capture the slice at depth 0, and
+        `json.loads` it. The winning slice must be a dict carrying a
+        `suite_states` key (the audit contract's own field) - a slice
+        that loads to a dict WITHOUT `suite_states` is a decoy (a
+        leading quoted/erroneous object, e.g. the model quoting
+        `{"error": "unknown tool: run_tests"}` as tool output) and is
+        SKIPPED, the scan advancing to the next `{` candidate; the first
+        `suite_states`-bearing slice that loads to a dict wins;
+    (3) no qualifying slice loads -> None (the failed path).
+
+    A truncated (unbalanced) JSON is NOT salvaged. The scan is
+    BOM-tolerant (a BOM-prefixed output that failed to parse before now
+    salvages). Fence handling falls out naturally: fence lines carry no
+    braces, so leading fences/prose are skipped by the scan and trailing
+    fences/metadata after the closing `}` are ignored.
+
+    Worst-case bound: O(N^2) char-ops on adversarial brace density (N is
+    bounded by the seat's 32768-token output cap); the encode runs
+    exactly once per audit completion, so this is a minutes-scale worst
+    case on pathological input and ~ms at live sizes."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    # Salvage scan: find the first balanced top-level JSON object that
+    # loads to a dict carrying `suite_states`.
+    n = len(stripped)
+    i = 0
+    while i < n:
+        if stripped[i] != "{":
+            i += 1
+            continue
+        # Walk forward from this `{`, tracking string state and depth.
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < n:
+            ch = stripped[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            j += 1
+        else:
+            # Ran off the end with depth > 0: unbalanced (truncated)
+            # candidate - no further `{` in this slice can close it.
+            break
+        candidate = stripped[i:j + 1]
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and "suite_states" in parsed:
+            return parsed
+        # Decoy (loaded to a non-dict or a dict without suite_states):
+        # advance past this candidate and keep scanning.
+        i = j + 1
+    return None
+
+
 def _render_audit_brief(audit_json: dict, pr_number: int, head_sha: str | None) -> str:
     """D6c: render the auditor's five-section JSON into the advisory brief
     surface (the comment content). The JSON is the contract; this is a

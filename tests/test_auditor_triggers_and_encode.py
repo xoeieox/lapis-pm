@@ -690,6 +690,196 @@ def test_encode_failed_audit_clears_stale_marker(
     assert mem_store.get(pm_core._audit_dispatched_key(TID, PR)) is None
 
 
+# ---------------------------------------------------------------------------
+# D-L1 (auditor-diagnosability-v0): parse robustness - fence-anywhere +
+# first-JSON-object salvage with the suite_states shape gate
+# ---------------------------------------------------------------------------
+
+LIVE_TRAILER = (
+    "Running as unit: lapis-fixer-gpu-aud-1.scope; "
+    "invocation ID: 1727\n"
+    "WARN: worktree_setup: .claude/settings.json missing at "
+    "/tmp/lapis-pm-worktrees/gpu-aud-1\n"
+)
+
+
+def _encode_audit_output(mem_store, episodic_store, gpu_dirs, content: str):
+    """Write the auditor output file + pending record, run the encode,
+    and return (encoded, comments, mem_store)."""
+    completed, _ = gpu_dirs
+    out_file = completed / f"{_auditor_record()['gpu_id']}-output.md"
+    out_file.write_text(content)
+    rec = _auditor_record()
+    mem_store.set(pm_core._dispatched_key(TID), json.dumps([rec]),
+                  tags=["lapis-pm"])
+    with patch("lapis_pm.pm_core._reap_verdict", return_value=None):
+        encoded, _ = pm_core._encode_gpu_results(TID)
+    return encoded, episodic_store.all_comments(TID), out_file
+
+
+def _assert_success_encode(encoded, comments, mem_store):
+    assert encoded >= 1
+    brief_comments = [
+        c for c in comments
+        if f"pm:auditor:pr={PR}:sha={HEAD_SHA}" in c.tags
+    ]
+    assert len(brief_comments) == 1
+    assert "### 1. Suite states" in brief_comments[0].content
+    marker = mem_store.get(pm_core._audit_dispatched_key(TID, PR))
+    assert marker is not None
+    assert json.loads(marker["content"])["head_sha"] == HEAD_SHA
+    stored = mem_store.get(pm_core._audit_brief_key(TID, PR))
+    assert stored is not None
+    assert json.loads(stored["content"])["suite_states"]["main"]["passed"] == 375
+
+
+def _assert_failed_encode(comments, mem_store):
+    failed = [c for c in comments if "pm:failure" in c.tags
+              and f"pm:auditor:pr={PR}:failed" in c.tags]
+    assert len(failed) == 1
+    assert mem_store.get(pm_core._audit_dispatched_key(TID, PR)) is None
+
+
+def test_salvage_audit_json_clean_and_fenced():
+    """(1) the clean whole-text parse is untouched; a leading fence is
+    still handled (regression)."""
+    assert pm_core._salvage_audit_json(json.dumps(AUDIT_JSON)) == AUDIT_JSON
+    assert (pm_core._salvage_audit_json(
+        "```json\n" + json.dumps(AUDIT_JSON) + "\n```") == AUDIT_JSON)
+
+
+def test_salvage_audit_json_trailing_metadata():
+    """The LIVE shape: complete JSON + the runner's trailing metadata
+    lines (no fence)."""
+    text = json.dumps(AUDIT_JSON) + "\n" + LIVE_TRAILER
+    assert pm_core._salvage_audit_json(text) == AUDIT_JSON
+
+
+def test_salvage_audit_json_prose_wrapped_and_braces_in_strings():
+    """Leading prose + fenced JSON; the JSON carries braces inside
+    string values (the string-state tracking is pinned)."""
+    aud = json.loads(json.dumps(AUDIT_JSON))
+    aud["root_cause"][0]["evidence"] = (
+        'tool output: {"error": "unknown tool: run_tests"} on every '
+        "call, see conductor/models.py:453"
+    )
+    text = (
+        "Here is the audit result:\n"
+        "```json\n" + json.dumps(aud, indent=2) + "\n```\n"
+        + LIVE_TRAILER
+    )
+    assert pm_core._salvage_audit_json(text) == aud
+
+
+def test_salvage_audit_json_skips_decoy_leader():
+    """A leading NON-AUDIT dict (the live decoy shape: run 1 quotes
+    {\"error\": \"unknown tool: run_tests\"} as tool output) is SKIPPED
+    (no suite_states); the real audit JSON wins."""
+    text = (
+        '{"error": "unknown tool: run_tests"}\n'
+        + json.dumps(AUDIT_JSON) + "\n" + LIVE_TRAILER
+    )
+    assert pm_core._salvage_audit_json(text) == AUDIT_JSON
+
+
+def test_salvage_audit_json_bom_prefixed():
+    """A BOM-prefixed valid audit JSON now salvages (BOM tolerance)."""
+    text = "\ufeff" + json.dumps(AUDIT_JSON) + "\n" + LIVE_TRAILER
+    assert pm_core._salvage_audit_json(text) == AUDIT_JSON
+
+
+def test_salvage_audit_json_truncated_and_prose_only():
+    """A truncated (unbalanced) JSON is NOT salvaged (no fabrication);
+    prose-only -> None."""
+    full = json.dumps(AUDIT_JSON)
+    truncated = full[: len(full) // 2]  # cut mid-object
+    assert pm_core._salvage_audit_json(truncated) is None
+    assert pm_core._salvage_audit_json(
+        "I could not complete the audit - the suite hung.") is None
+    assert pm_core._salvage_audit_json("") is None
+
+
+def test_encode_audit_live_shape_encodes_success(
+        mem_store, episodic_store, gpu_dirs):
+    """D6c + D-L1: the LIVE output shape (five-section JSON + trailing
+    metadata lines) encodes to the success path - brief comment rendered,
+    gate-(i) marker set, brief mem key written."""
+    encoded, comments, _ = _encode_audit_output(
+        mem_store, episodic_store, gpu_dirs,
+        json.dumps(AUDIT_JSON) + "\n" + LIVE_TRAILER,
+    )
+    _assert_success_encode(encoded, comments, mem_store)
+
+
+def test_encode_audit_decoy_leader_encodes_success(
+        mem_store, episodic_store, gpu_dirs):
+    """D6c + D-L1: the live decoy shape (a leading non-audit dict
+    followed by the real audit JSON + trailer) encodes to the success
+    path - the decoy is skipped, the real JSON wins."""
+    encoded, comments, _ = _encode_audit_output(
+        mem_store, episodic_store, gpu_dirs,
+        '{"error": "unknown tool: run_tests"}\n'
+        + json.dumps(AUDIT_JSON) + "\n" + LIVE_TRAILER,
+    )
+    _assert_success_encode(encoded, comments, mem_store)
+
+
+def test_encode_audit_truncated_output_takes_failed_path(
+        mem_store, episodic_store, gpu_dirs):
+    """D6c + D-L1: a truncated (unbalanced) JSON still takes the failed
+    path (NOT salvaged - no fabrication)."""
+    full = json.dumps(AUDIT_JSON)
+    encoded, comments, _ = _encode_audit_output(
+        mem_store, episodic_store, gpu_dirs, full[: len(full) // 2],
+    )
+    _assert_failed_encode(comments, mem_store)
+
+
+# ---------------------------------------------------------------------------
+# D-L2 (auditor-diagnosability-v0): retain the full failed output
+# ---------------------------------------------------------------------------
+
+def test_encode_failed_audit_retains_full_output_and_names_path(
+        mem_store, episodic_store, gpu_dirs):
+    """D6c + D-L2: a failed encode with a >1500-char output retains the
+    FULL raw text at the failed-output mem key and names the output file
+    path in the failed comment; the failed tags and the cleared-marker
+    (retryable) semantics are unchanged."""
+    prose = ("I could not complete the audit - the suite hung. " * 100)
+    assert len(prose) > 1500
+    encoded, comments, out_file = _encode_audit_output(
+        mem_store, episodic_store, gpu_dirs, prose,
+    )
+    failed = [c for c in comments if "pm:failure" in c.tags
+              and f"pm:auditor:pr={PR}:failed" in c.tags]
+    assert len(failed) == 1
+    # The full raw text is retained (not the 400-char snippet).
+    stored = mem_store.get(pm_core._audit_failed_output_key(TID, PR))
+    assert stored is not None
+    assert stored["content"] == prose
+    assert "pm:audit-failed-output" in stored["tags"]
+    # The failed comment names the output file path (and keeps the
+    # inline snippet for brief-surface readability).
+    assert f"full output: {out_file}" in failed[0].content
+    assert "(output: " in failed[0].content
+    # Retryable: the marker is NOT set.
+    assert mem_store.get(pm_core._audit_dispatched_key(TID, PR)) is None
+
+
+def test_encode_failed_audit_clears_stale_marker_and_retains_output(
+        mem_store, episodic_store, gpu_dirs):
+    """A parse-fail still CLEARS a marker a prior partial state left
+    (gate (i) stays released for the retry) AND retains the full output."""
+    pm_core._set_audit_dispatched(TID, PR, HEAD_SHA)
+    assert mem_store.get(pm_core._audit_dispatched_key(TID, PR)) is not None
+    prose = "not json at all " + ("x" * 1600)
+    encoded, comments, _ = _encode_audit_output(
+        mem_store, episodic_store, gpu_dirs, prose,
+    )
+    assert mem_store.get(pm_core._audit_dispatched_key(TID, PR)) is None
+    assert mem_store.get(pm_core._audit_failed_output_key(TID, PR)) is not None
+
+
 def test_reconcile_failed_flip_clears_marker(mem_store, episodic_store,
                                              monkeypatch):
     """D6c (reconcile): on a hard-kill/timeout flip the audit is lost

@@ -9683,16 +9683,9 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 ]
                 if _aud_head_sha:
                     _aud_result_tags.append(f"pm:auditor:pr={_aud_pr_num}:sha={_aud_head_sha}")
-                _aud_raw = text.strip()
-                if _aud_raw.startswith("```"):
-                    _aud_raw = re.sub(r"^```(?:json)?\s*", "", _aud_raw)
-                    _aud_raw = re.sub(r"\s*```$", "", _aud_raw.strip())
                 _aud_json = None
-                if not is_failure and _aud_raw:
-                    try:
-                        _aud_json = json.loads(_aud_raw)
-                    except json.JSONDecodeError:
-                        _aud_json = None
+                if not is_failure and text.strip():
+                    _aud_json = _salvage_audit_json(text)
                 if isinstance(_aud_json, dict):
                     _aud_brief = _render_audit_brief(
                         _aud_json, _aud_pr_num, _aud_head_sha

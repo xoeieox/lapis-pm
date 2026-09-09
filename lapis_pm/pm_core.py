@@ -5906,6 +5906,14 @@ def _audit_brief_key(target_id: str, pr_number: int) -> str:
     return f"pm/audit/{target_id}/pr={pr_number}/brief"
 
 
+def _audit_failed_output_key(target_id: str, pr_number: int) -> str:
+    """The full raw auditor output retained on a parse-fail encode (D6c,
+    auditor-diagnosability-v0): symmetric with the success path's brief
+    key. Overwrites per PR (bounded by distinct audited PRs); disposable
+    - the raw file path is also named in the failed observation."""
+    return f"pm/audit/{target_id}/pr={pr_number}/failed-output"
+
+
 def _audit_budget_record(target_id: str) -> dict:
     """Read + prune the per-target audit budget ledger (dispatch count +
     timestamps within the trailing AUDIT_BUDGET_PER_12H window)."""

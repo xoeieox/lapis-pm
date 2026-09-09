@@ -385,9 +385,9 @@ def test_non_salvage_pr_does_not_trigger(mem_store, episodic_store):
 # ---------------------------------------------------------------------------
 
 def test_previous_head_sha_from_observations(mem_store, episodic_store):
-    """The most recent prior head sha from the target's
-    pm:pr=N:sha= observations; for a fresh salvage (no prior head),
-    the first observed sha."""
+    """The latest observed sha DISTINCT from the current head; falls back
+    to the head only when nothing distinct exists; None when nothing has
+    been observed."""
     with patch("lapis_pm.pm_core.episodic") as ep:
         ep.all_comments.return_value = [
             _comment("2026-09-08T10:00:00", [f"pm:pr={PR}:sha={PREV_SHA}"]),
@@ -396,8 +396,8 @@ def test_previous_head_sha_from_observations(mem_store, episodic_store):
         # Current head is the latest observation → the previous head is
         # the one before it.
         assert pm_core._previous_head_sha(TID, PR, HEAD_SHA) == PREV_SHA
-        # No prior head (fresh salvage, only one observation) → the first
-        # (original tracked PR's fixer head).
+        # No prior head (fresh salvage, only one observation) → the head
+        # itself (the fallback).
         ep.all_comments.return_value = [
             _comment("2026-09-08T10:00:00", [f"pm:pr={PR}:sha={HEAD_SHA}"]),
         ]
@@ -405,6 +405,28 @@ def test_previous_head_sha_from_observations(mem_store, episodic_store):
         # Nothing observed → None (the caller falls back to the current head).
         ep.all_comments.return_value = []
         assert pm_core._previous_head_sha(TID, PR, HEAD_SHA) is None
+
+
+def test_previous_head_sha_latest_distinct_matrix(mem_store, episodic_store):
+    """auditor-diagnosability-v0 D-L3: the resolver returns the latest
+    DISTINCT sha, not merely the second-to-last observation. [A, H, H]
+    with current=H returns A (today returns H - the degenerate case the
+    2026-09-08 live run hit); [A, B] with current=H returns B (latest
+    distinct, not latest overall)."""
+    with patch("lapis_pm.pm_core.episodic") as ep:
+        # [A, H, H] current=H -> A (the live degenerate case).
+        ep.all_comments.return_value = [
+            _comment("2026-09-08T10:00:00", [f"pm:pr={PR}:sha={PREV_SHA}"]),
+            _comment("2026-09-08T11:00:00", [f"pm:pr={PR}:sha={HEAD_SHA}"]),
+            _comment("2026-09-08T12:00:00", [f"pm:pr={PR}:sha={HEAD_SHA}"]),
+        ]
+        assert pm_core._previous_head_sha(TID, PR, HEAD_SHA) == PREV_SHA
+        # [A, B] current=H -> B (latest distinct, not latest overall).
+        ep.all_comments.return_value = [
+            _comment("2026-09-08T10:00:00", [f"pm:pr={PR}:sha={PREV_SHA}"]),
+            _comment("2026-09-08T11:00:00", [f"pm:pr={PR}:sha={MAIN_SHA}"]),
+        ]
+        assert pm_core._previous_head_sha(TID, PR, HEAD_SHA) == MAIN_SHA
 
 
 # ---------------------------------------------------------------------------

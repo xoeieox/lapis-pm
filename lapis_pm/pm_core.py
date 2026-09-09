@@ -5906,14 +5906,6 @@ def _audit_brief_key(target_id: str, pr_number: int) -> str:
     return f"pm/audit/{target_id}/pr={pr_number}/brief"
 
 
-def _audit_failed_output_key(target_id: str, pr_number: int) -> str:
-    """The full raw auditor output retained on a parse-fail encode (D6c,
-    auditor-diagnosability-v0): symmetric with the success path's brief
-    key. Overwrites per PR (bounded by distinct audited PRs); disposable
-    - the raw file path is also named in the failed observation."""
-    return f"pm/audit/{target_id}/pr={pr_number}/failed-output"
-
-
 def _audit_budget_record(target_id: str) -> dict:
     """Read + prune the per-target audit budget ledger (dispatch count +
     timestamps within the trailing AUDIT_BUDGET_PER_12H window)."""
@@ -5997,13 +5989,11 @@ def _pr_head_sha(pr: dict) -> str | None:
 
 
 def _previous_head_sha(target_id: str, pr_number: int, current_sha: str | None) -> str | None:
-    """D5 input: the latest observed sha DISTINCT from the current head
-    for this PR, from the target's pm:pr=N:sha= observations
-    (all_comments order = chronological). Walks the collected shas in
-    reverse and returns the first sha != current_sha. Falls back to the
-    head (the latest observed sha) only when nothing distinct exists;
-    None when no sha has ever been observed (the caller falls back to
-    the current head)."""
+    """D5 input: the most recent prior salvage/fixer head sha for this PR
+    from the target's pm:pr=N:sha= observations (all_comments order =
+    chronological); for a fresh salvage with no prior head, the original
+    tracked PR's fixer head (the first observed sha). None when no sha has
+    ever been observed (the caller falls back to the current head)."""
     prefix = f"pm:pr={pr_number}:sha="
     shas: list[str] = []
     for c in episodic.all_comments(target_id):
@@ -6012,9 +6002,8 @@ def _previous_head_sha(target_id: str, pr_number: int, current_sha: str | None) 
                 shas.append(t[len(prefix):])
     if not shas:
         return None
-    for sha in reversed(shas):
-        if current_sha is None or sha != current_sha:
-            return sha
+    if current_sha is not None and shas[-1] == current_sha:
+        return shas[-2] if len(shas) >= 2 else shas[-1]
     return shas[-1]
 
 
@@ -6036,97 +6025,6 @@ def _baseline_main_sha(repo: str) -> str | None:
         return out.stdout.strip() or None
     except (OSError, subprocess.SubprocessError):
         return None
-
-
-def _salvage_audit_json(text: str) -> dict | None:
-    """D6c parse entry point (auditor-diagnosability-v0): recover the
-    auditor's five-section audit JSON from the raw output text.
-
-    The live output shape is [complete JSON] + [trailing metadata lines
-    the runner appends: `Running as unit: ...` / `WARN: worktree_setup:
-    ...`], optionally wrapped in fences or leading prose. A whole-text
-    `json.loads` on that shape fails, so:
-
-    (1) `json.loads` on the stripped text first (the clean case -
-        behavior unchanged);
-    (2) on failure, scan for the first balanced top-level JSON object:
-        walk forward from each `{` tracking string state (in-string +
-        escape) and brace depth, capture the slice at depth 0, and
-        `json.loads` it. The winning slice must be a dict carrying a
-        `suite_states` key (the audit contract's own field) - a slice
-        that loads to a dict WITHOUT `suite_states` is a decoy (a
-        leading quoted/erroneous object, e.g. the model quoting
-        `{"error": "unknown tool: run_tests"}` as tool output) and is
-        SKIPPED, the scan advancing to the next `{` candidate; the first
-        `suite_states`-bearing slice that loads to a dict wins;
-    (3) no qualifying slice loads -> None (the failed path).
-
-    A truncated (unbalanced) JSON is NOT salvaged. The scan is
-    BOM-tolerant (a BOM-prefixed output that failed to parse before now
-    salvages). Fence handling falls out naturally: fence lines carry no
-    braces, so leading fences/prose are skipped by the scan and trailing
-    fences/metadata after the closing `}` are ignored.
-
-    Worst-case bound: O(N^2) char-ops on adversarial brace density (N is
-    bounded by the seat's 32768-token output cap); the encode runs
-    exactly once per audit completion, so this is a minutes-scale worst
-    case on pathological input and ~ms at live sizes."""
-    stripped = text.strip()
-    if not stripped:
-        return None
-    try:
-        parsed = json.loads(stripped)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    # Salvage scan: find the first balanced top-level JSON object that
-    # loads to a dict carrying `suite_states`.
-    n = len(stripped)
-    i = 0
-    while i < n:
-        if stripped[i] != "{":
-            i += 1
-            continue
-        # Walk forward from this `{`, tracking string state and depth.
-        depth = 0
-        in_string = False
-        escape = False
-        j = i
-        while j < n:
-            ch = stripped[j]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        break
-            j += 1
-        else:
-            # Ran off the end with depth > 0: unbalanced (truncated)
-            # candidate - no further `{` in this slice can close it.
-            break
-        candidate = stripped[i:j + 1]
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict) and "suite_states" in parsed:
-            return parsed
-        # Decoy (loaded to a non-dict or a dict without suite_states):
-        # advance past this candidate and keep scanning.
-        i = j + 1
-    return None
 
 
 def _render_audit_brief(audit_json: dict, pr_number: int, head_sha: str | None) -> str:
@@ -9683,9 +9581,16 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 ]
                 if _aud_head_sha:
                     _aud_result_tags.append(f"pm:auditor:pr={_aud_pr_num}:sha={_aud_head_sha}")
+                _aud_raw = text.strip()
+                if _aud_raw.startswith("```"):
+                    _aud_raw = re.sub(r"^```(?:json)?\s*", "", _aud_raw)
+                    _aud_raw = re.sub(r"\s*```$", "", _aud_raw.strip())
                 _aud_json = None
-                if not is_failure and text.strip():
-                    _aud_json = _salvage_audit_json(text)
+                if not is_failure and _aud_raw:
+                    try:
+                        _aud_json = json.loads(_aud_raw)
+                    except json.JSONDecodeError:
+                        _aud_json = None
                 if isinstance(_aud_json, dict):
                     _aud_brief = _render_audit_brief(
                         _aud_json, _aud_pr_num, _aud_head_sha
@@ -9711,21 +9616,10 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     # cleared if a prior partial state left one), so the
                     # next tick may re-dispatch the un-audited head.
                     _clear_audit_dispatched(target_id, _aud_pr_num)
-                    # Retain the FULL raw output (auditor-diagnosability-v0):
-                    # the observation carries only a snippet, so the full text
-                    # lives in a mem key symmetric with the success path's
-                    # brief key (overwrites per PR; disposable - the raw file
-                    # path is named in the observation).
-                    _mem().set(
-                        _audit_failed_output_key(target_id, _aud_pr_num),
-                        text,
-                        tags=["lapis-pm", "pm:audit-failed-output"],
-                    )
                     episodic.write_result(
                         target_id,
                         f"FAILED — auditor task {rec['gpu_id']} produced no "
-                        f"parseable audit JSON (output: {snippet[:400]}; "
-                        f"full output: {out_path})",
+                        f"parseable audit JSON (output: {snippet[:400]})",
                         extra_tags=_aud_result_tags + [
                             "pm:auditor:pr=%s:failed" % _aud_pr_num,
                             "pm:failure",

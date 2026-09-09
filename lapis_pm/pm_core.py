@@ -5989,11 +5989,13 @@ def _pr_head_sha(pr: dict) -> str | None:
 
 
 def _previous_head_sha(target_id: str, pr_number: int, current_sha: str | None) -> str | None:
-    """D5 input: the most recent prior salvage/fixer head sha for this PR
-    from the target's pm:pr=N:sha= observations (all_comments order =
-    chronological); for a fresh salvage with no prior head, the original
-    tracked PR's fixer head (the first observed sha). None when no sha has
-    ever been observed (the caller falls back to the current head)."""
+    """D5 input: the latest observed sha DISTINCT from the current head
+    for this PR, from the target's pm:pr=N:sha= observations
+    (all_comments order = chronological). Walks the collected shas in
+    reverse and returns the first sha != current_sha. Falls back to the
+    head (the latest observed sha) only when nothing distinct exists;
+    None when no sha has ever been observed (the caller falls back to
+    the current head)."""
     prefix = f"pm:pr={pr_number}:sha="
     shas: list[str] = []
     for c in episodic.all_comments(target_id):
@@ -6002,8 +6004,9 @@ def _previous_head_sha(target_id: str, pr_number: int, current_sha: str | None) 
                 shas.append(t[len(prefix):])
     if not shas:
         return None
-    if current_sha is not None and shas[-1] == current_sha:
-        return shas[-2] if len(shas) >= 2 else shas[-1]
+    for sha in reversed(shas):
+        if current_sha is None or sha != current_sha:
+            return sha
     return shas[-1]
 
 

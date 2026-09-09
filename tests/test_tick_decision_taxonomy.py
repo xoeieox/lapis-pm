@@ -570,3 +570,43 @@ def test_noop_and_action_families_are_disjoint():
     noop_set = {d.split(":")[0] for d in NOOP_VARIANTS}
     action_set = {d.split(":")[0] for d in ACTION_VARIANTS}
     assert noop_set.isdisjoint(action_set)
+
+
+# ---------------------------------------------------------------------------
+# D6a auditor-salvage encode-phase side effect (decision_str pre-init regression)
+# ---------------------------------------------------------------------------
+
+class TestD6aAuditorSalvageEncodePhase:
+    def test_auditor_salvage_new_pr_does_not_raise_unbound(self):
+        """D6a: a NEW salvage-shaped PR whose _maybe_dispatch_auditor_salvage
+        returns a non-None action must NOT raise UnboundLocalError from the
+        encode-phase D6a block (which previously read decision_str before the
+        decide phase bound it). The dispatch is an encode-phase side effect:
+        it is counted in `encoded` but must NOT become the decide-phase action.
+
+        Regression for lapis-pm-d6a-auditor-decision-str-unbound-v0: the pre-fix
+        code `if decision_str == "noop:no_change": decision_str = _auditor_action`
+        raised UnboundLocalError on the first tick where new_prs was non-empty
+        and _maybe_dispatch_auditor_salvage returned non-None.
+        """
+        target = _mock_target()
+        salvage_pr = {"number": 957, "head_sha": "abc123", "title": "salvage"}
+        extra_patches = {
+            "lapis_pm.pm_core._encode_new_prs": MagicMock(
+                return_value=[salvage_pr]),
+            "lapis_pm.pm_core._maybe_dispatch_auditor_salvage": MagicMock(
+                return_value="action:auditor_dispatched:pr=957:mode=salvage"),
+        }
+        # (a) returns without raising UnboundLocalError
+        result = _tick_with_patches(target, extra_patches)
+        # (b) not skipped
+        assert result.skipped is False
+        # (c) decision is well-formed (the auditor dispatch did NOT leak into
+        #     the decide-phase action; with no PRs it falls through to noop)
+        assert result.decision.startswith(("noop:", "action:")), (
+            f"Expected well-formed decision, got: {result.decision}")
+        # (d) the encode-phase dispatch was still counted
+        assert result.encoded >= 1
+        # The dispatch was invoked exactly once for the new salvage PR.
+        extra_patches[
+            "lapis_pm.pm_core._maybe_dispatch_auditor_salvage"].assert_called_once()

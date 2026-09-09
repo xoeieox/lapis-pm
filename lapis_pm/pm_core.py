@@ -10825,8 +10825,11 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
             _auditor_action = None
         if _auditor_action is not None:
             encoded += 1
-            if decision_str == "noop:no_change":
-                decision_str = _auditor_action
+            # D6a is an encode-phase side effect (fixer-reception-v0 Invariant 4: the
+            # decide-phase FIFO action is unchanged). It must NOT assign decision_str,
+            # which is first bound in the decide phase below - the prior read here was a
+            # reference-before-init UnboundLocalError. The dispatch is already recorded
+            # via episodic.write_dispatch and counted in `encoded`.
 
     # Track PR description changes (body fingerprint), also before _encode_gpu_results
     # so a description-only fixer_retry is perceived as complete this tick.

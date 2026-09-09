@@ -9711,10 +9711,21 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     # cleared if a prior partial state left one), so the
                     # next tick may re-dispatch the un-audited head.
                     _clear_audit_dispatched(target_id, _aud_pr_num)
+                    # Retain the FULL raw output (auditor-diagnosability-v0):
+                    # the observation carries only a snippet, so the full text
+                    # lives in a mem key symmetric with the success path's
+                    # brief key (overwrites per PR; disposable - the raw file
+                    # path is named in the observation).
+                    _mem().set(
+                        _audit_failed_output_key(target_id, _aud_pr_num),
+                        text,
+                        tags=["lapis-pm", "pm:audit-failed-output"],
+                    )
                     episodic.write_result(
                         target_id,
                         f"FAILED — auditor task {rec['gpu_id']} produced no "
-                        f"parseable audit JSON (output: {snippet[:400]})",
+                        f"parseable audit JSON (output: {snippet[:400]}; "
+                        f"full output: {out_path})",
                         extra_tags=_aud_result_tags + [
                             "pm:auditor:pr=%s:failed" % _aud_pr_num,
                             "pm:failure",

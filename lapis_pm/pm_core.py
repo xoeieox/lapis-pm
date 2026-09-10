@@ -3232,19 +3232,28 @@ def _check_directive_stalls(store, now: datetime) -> int:
     (Standing ratification 1 — this detector does NOT make a directive
     dispatch work; it only attests the outcome). For each
     `pm:directive-seen` observation older than the threshold, an outcome
-    holds when ANY of (a) a dispatch was recorded after the directive ts,
-    (b) the open PR head advanced past the baseline recorded on the
-    observation (`pm:pr-head=<sha>`; `none` + any open PR counts), or
-    (c) the directive's brief was actioned (outstanding brief consumed).
+    holds when ANY of (a) a dispatch was recorded after the directive ts
+    (timezone-aware comparison), (b) the open PR head advanced past the
+    baseline recorded on the observation (`pm:pr-head=<sha>`; `none` +
+    any open PR counts), or (c) the directive's OWN brief was consumed —
+    REV 4 pin: outcome (c) is keyed on the specific brief id recorded on
+    the observation (`pm:brief-id=<cid>`, `none` when the raise failed);
+    an EMPTY outstanding-brief slot does NOT count (the over-broad
+    `get_outstanding_brief is None -> True` reading suppressed the page
+    for any target with no outstanding brief — the common steady state —
+    defeating the detector).
 
     The detector is Forgejo-free (mem + episodic reads only — the current
     PR head comes from the pm/pr-head/<tid> record the tick's PR-perception
-    site writes). I5: one page per directive episode (dedup key
-    pm/directive-stall/<tid>/<directive-id>). Returns the number of pages.
+    site writes). PAUSED targets are excluded (parity with D6: a paused
+    target is intentionally not being ticked, and the first tick after
+    un-pause re-evaluates the directive). I5: one page per directive
+    episode (dedup key pm/directive-stall/<tid>/<directive-id>). Returns
+    the number of pages.
     """
     pages = 0
     for t in store.load_all():
-        if not t.pm_bound:
+        if not t.pm_bound or t.paused:
             continue
         tid = t.id
         for obs in _directive_seen_observations(tid):
@@ -3255,10 +3264,18 @@ def _check_directive_stalls(store, now: datetime) -> int:
                 continue
             if obs_dt.tzinfo is None:
                 obs_dt = obs_dt.replace(tzinfo=PACIFIC)
+            if now.tzinfo is None:
+                # Defensive: `now` is tz-aware by construction (PACIFIC);
+                # a naive `now` would make the age comparison raise
+                # TypeError, so skip rather than mis-compare.
+                continue
             age = (now - obs_dt).total_seconds()
             if age < DIRECTIVE_OUTCOME_STALL_S:
                 continue
-            if _directive_outcome_holds(tid, c.ts, obs["pr_head_baseline"]):
+            if _directive_outcome_holds(
+                tid, c.ts, obs["pr_head_baseline"],
+                brief_id=obs["brief_id"],
+            ):
                 continue
             dedup_key = _directive_stall_key(tid, obs["directive_id"])
             if _mem().get(dedup_key):
@@ -3934,10 +3951,14 @@ def _persist_pr_head_record(target_id: str, open_prs: list[dict]) -> None:
     first — the same PR the decide phase drives). The directive-outcome
     detector reads this record and compares the current head against the
     baseline recorded on the directive-seen observation; it makes no
-    Forgejo call of its own.
+    Forgejo call of its own. PRs with no resolvable number are skipped
+    (a None number would break the sort key and poison the record).
     """
     recs = []
-    for pr in sorted(open_prs or [], key=lambda p: p.get("number", 1 << 30)):
+    for pr in sorted(
+        (p for p in (open_prs or []) if p.get("number") is not None),
+        key=lambda p: p.get("number", 1 << 30),
+    ):
         recs.append({
             "number": pr.get("number"),
             "head_sha": (pr.get("head") or {}).get("sha") or "",
@@ -4674,9 +4695,31 @@ def _get_forgejo_consecutive_fails() -> int:
 def _directive_seen_observations(target_id: str) -> list:
     """D7 (attestation-contract-v0 leg 2): the target's `pm:directive-seen`
     observations, oldest first (CommentStore.list order). Each carries the
-    directive id + ts and, since the D7 baseline pin, a `pm:pr-head=<sha>`
-    tag (the open-PR head at directive time; `none` when no PR was open)."""
+    directive id + ts and a `pm:pr-head=<sha>` tag (the open-PR head at
+    directive time; `none` when no PR was open).
+
+    REV 4 pin: the raised brief's comment id rides a companion
+    `pm:directive-brief-raised` observation written on the same tick
+    (`pm:brief-id=<cid>`, `pm:brief-id=none` when the raise failed) — the
+    cid is paired onto the directive-seen observation by directive id (the
+    latest such companion for the same `pm:directive-id`; `brief_id` is
+    None when no companion exists, e.g. pre-rev-4 observations, and
+    outcome (c) is then unprovable — fail-open to paging rather than to
+    the over-broad suppression)."""
     out = []
+    companions: dict[str, str | None] = {}
+    for c in episodic.all_comments(target_id):
+        if "pm:directive-brief-raised" not in c.tags:
+            continue
+        d_id = ""
+        b_id = None
+        for t in c.tags:
+            if t.startswith("pm:directive-id="):
+                d_id = t.split("=", 1)[1]
+            elif t.startswith("pm:brief-id="):
+                b_id = t.split("=", 1)[1] or None
+        if d_id:
+            companions[d_id] = b_id
     for c in episodic.all_comments(target_id):
         if "pm:directive-seen" not in c.tags:
             continue
@@ -4691,35 +4734,64 @@ def _directive_seen_observations(target_id: str) -> list:
             "comment": c,
             "directive_id": directive_id,
             "pr_head_baseline": pr_head,
+            "brief_id": companions.get(directive_id),
         })
     return out
+
+
+def _parse_ts_aware(ts: str) -> datetime | None:
+    """Parse an ISO timestamp into a tz-aware datetime (PACIFIC when naive),
+    or None when unparseable."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=PACIFIC)
+    return dt
 
 
 def _directive_outcome_holds(
     target_id: str,
     directive_ts: str,
     pr_head_baseline: str | None,
+    brief_id: str | None = None,
 ) -> bool:
     """D7 (attestation-contract-v0 leg 2): True when ANY of the three
     outcomes holds for the directive observed at `directive_ts`:
 
       (a) a dispatch was recorded after the directive ts
-          (pm/dispatched/<tid> entry with ts > directive_ts);
+          (pm/dispatched/<tid> entry with a ts parsed TIMEZONE-AWARE and
+          compared as datetimes — a string compare mis-orders timestamps
+          across offset spellings, e.g. `+07:00` vs `+00:00`);
       (b) the target's open PR head advanced PAST THE BASELINE recorded on
           the directive-seen observation (pm/pr-head/<tid> record written
           at the tick's PR-perception site — the detector makes NO Forgejo
           call of its own); a `none` baseline + any open PR counts as an
           advance;
-      (c) the directive's brief was actioned (the outstanding brief was
-          cleared — a decision consumed or an ack).
+      (c) the directive's OWN brief was consumed — REV 4 pin: keyed on the
+          specific brief id recorded on the observation
+          (`pm:brief-id=<cid>`): a decision audit recorded against that cid
+          (decision/brief-resolved/<cid>, written by the single brief
+          resolution path) or a clear of that cid (the outstanding-brief
+          slot holding a different cid at the directive's age means this
+          one was consumed). An EMPTY outstanding-brief slot does NOT
+          count — the over-broad `get_outstanding_brief is None -> True`
+          reading suppressed the page for any target with no outstanding
+          brief (the common steady state), defeating the detector.
+          `brief_id=None` (pre-rev-4 observation or a failed raise) makes
+          (c) unprovable: it holds only when the slot is non-empty, which
+          is the conservative reading (no suppression on the common case).
 
     Forgejo-free by construction: mem reads + episodic reads only.
     """
-    # (a) dispatch after the directive ts
-    for r in load_dispatched(target_id):
-        ts = r.get("ts")
-        if ts and ts > directive_ts:
-            return True
+    # (a) dispatch after the directive ts (timezone-aware compare)
+    dir_dt = _parse_ts_aware(directive_ts)
+    if dir_dt is not None:
+        for r in load_dispatched(target_id):
+            r_dt = _parse_ts_aware(r.get("ts") or "")
+            if r_dt is not None and r_dt > dir_dt:
+                return True
     # (b) PR head advanced past the baseline
     rec = _mem().get(_pr_head_key(target_id))
     if rec:
@@ -4737,8 +4809,20 @@ def _directive_outcome_holds(
                     return True
             elif current and any(s != pr_head_baseline for s in current):
                 return True
-    # (c) the directive's brief was actioned (outstanding brief consumed)
-    if get_outstanding_brief(target_id) is None:
+    # (c) the directive's OWN brief was consumed (specific-cid contract)
+    if brief_id:
+        # A decision recorded against that cid (the single resolution path
+        # writes the audit key before clearing the slot).
+        audit = _mem().get(f"decision/brief-resolved/{brief_id}")
+        if audit:
+            return True
+        # A clear of that cid: the slot now holds a DIFFERENT brief.
+        if get_outstanding_brief(target_id) not in (None, brief_id):
+            return True
+    elif get_outstanding_brief(target_id) is not None:
+        # No brief id recorded (pre-rev-4 observation / failed raise):
+        # (c) is unprovable; a non-empty slot is the only conservative
+        # suppression (an empty slot does NOT count).
         return True
     return False
 
@@ -11250,6 +11334,29 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         b = brief.synthesize(target_id, trigger=f"user directive: {d.content[:80]}",
                              query=d.content, notify=None)
         _set_brief_outstanding(target_id, b)
+        # D7 REV 4 pin: the directive-seen observation additionally records
+        # the raised brief's comment id (pm:brief-id=<cid>, or
+        # pm:brief-id=none if the raise failed) so the outcome detector's
+        # outcome (c) is keyed on the SPECIFIC brief. The cid is read back
+        # from the mem slot the raise just wrote (best-effort: a failed
+        # raise records `none`); the amend is a separate tagged observation
+        # on the same target, so the detector can pair it with the
+        # directive-seen observation it belongs to.
+        _dir_brief_cid = get_outstanding_brief(target_id) or "none"
+        try:
+            episodic.write_observation(
+                target_id,
+                f"Directive brief raised: cid={_dir_brief_cid}",
+                extra_tags=[
+                    "pm:directive-brief-raised",
+                    f"pm:brief-id={_dir_brief_cid}",
+                    f"pm:directive-id={d.id}",
+                ],
+            )
+        except Exception as _e:
+            logger.warning(
+                "[directive] brief-id amend failed for %s: %s", target_id, _e
+            )
         decision_str = f"action:directive_brief:cid={b.comment_id}"
 
     elif open_prs:

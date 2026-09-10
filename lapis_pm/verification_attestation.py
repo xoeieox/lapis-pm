@@ -136,12 +136,20 @@ def _collected_test_count(output: str) -> int:
         line = line.strip()
         if not line.startswith("= "):
             continue
-        m = _re.search(r"(\d+)\s+failed", line)
-        failed = int(m.group(1)) if m else 0
-        m = _re.search(r"(\d+)\s+passed", line)
-        passed = int(m.group(1)) if m else 0
-        if failed or passed:
-            return failed + passed
+        total = 0
+        # The collected count is the scope evidence: EVERY outcome bucket
+        # the summary line names (failed, passed, skipped, errored,
+        # xfailed, xpassed, deselected) counts as collected — not just
+        # failed+passed (a run of all-skipped tests collected tests).
+        for bucket in (
+            "failed", "passed", "skipped", "errored", "xfailed",
+            "xpassed", "deselected",
+        ):
+            m = _re.search(rf"(\d+)\s+{bucket}\b", line)
+            if m:
+                total += int(m.group(1))
+        if total:
+            return total
     return 0
 
 

@@ -7,8 +7,11 @@ Coverage (per spec Tests section items 7-11):
       a PAUSED target with a 3-day-old cursor produces NO page; an
       ACTIVE target with NO cursor record uses its bound ts as the
       watermark; a Forgejo outage at/above the 3-strike threshold -> NO
-      checker pages; the checker module carries no LLM imports and the
-      unit file carries no EnvironmentFile lines.
+      checker pages; the checker module carries no LLM imports; the unit
+      file references NO CREDENTIAL env file (only the scoped env file -
+      REV 4 re-scope: the scoped file carries exactly MEM_DB_PATH + the
+      Pushover keys, and a checker run under the unit's exact env resolves
+      its mem store without NodeConfigError).
   D7  directive-outcome stall page:
       directive + pm:pr-head baseline with no outcome >15 min pages once
       naming the directive + the force-dispatch command; a dispatch /
@@ -29,7 +32,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -159,21 +162,40 @@ class TestTickCoverageStall:
             # Same stale cursor, same episode -> no second page.
             assert pm_core._check_tick_stalls(store, now) == 0
             assert mock_notify.call_count == 1
-        # Recovery: the cursor advanced past the last-paged ts.
-        mem_store.set(pm_core._cursor_key(tid), _iso(now - timedelta(minutes=1)),
+        # Recovery: the cursor advanced past the last-paged ts. REV 4:
+        # the page stamp is REAL wall-clock (_now_iso, which is >= now),
+        # so a recovery cursor of `now - 1min` would sit BEFORE the page
+        # stamp and the dedup would never clear. A real recovery
+        # advances the cursor PAST the real page stamp, so simulate that
+        # by reading the real stamp and advancing past it.
+        stamped = mem_store.get(pm_core._tick_stall_key(tid))["content"]
+        recovered = datetime.fromisoformat(stamped) + timedelta(seconds=5)
+        mem_store.set(pm_core._cursor_key(tid), _iso(recovered),
                       tags=["lapis-pm", "cursor"])
-        # Then it stalls again (a NEW episode: the cursor is stale again
-        # AND the stall dedup was cleared by the cursor advance).
-        stale2 = now - timedelta(minutes=46)
-        mem_store.set(pm_core._cursor_key(tid), _iso(stale2),
-                      tags=["lapis-pm", "cursor"])
+        # The cursor advance cleared the episode: a re-check at the
+        # recovery instant sees a fresh cursor and pages nothing.
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
         ):
             fake_ep.all_comments.return_value = []
-            assert pm_core._check_tick_stalls(store, now) == 1
-        assert mock_notify.call_count == 1
+            assert pm_core._check_tick_stalls(store, recovered) == 0
+        # Then it stalls again (a NEW episode: the cursor is stale again
+        # AND the stall dedup was cleared by the cursor advance). The
+        # re-stall is simulated by advancing the wall clock to a fresh
+        # `now` (the recovery happened, the tick loop broke again, and
+        # enough time has passed for the cursor to be stale again) -
+        # the dedup was cleared by the cursor advance, so the second
+        # page must fire. (The second page's stamp is also real
+        # wall-clock, which the test's final count assertion pins.)
+        now2 = recovered + timedelta(minutes=47)
+        with (
+            patch.object(pm_core, "episodic") as fake_ep,
+            patch("agents_core.notify.send_notification") as mock_notify,
+        ):
+            fake_ep.all_comments.return_value = []
+            assert pm_core._check_tick_stalls(store, now2) == 1
+        assert mock_notify.call_count == 2
 
     def test_paused_target_3day_old_cursor_no_page(self, mem_store):
         """PAUSED targets are EXCLUDED by design: a paused target with a
@@ -265,15 +287,106 @@ class TestTickCoverageStall:
         for name in ("ClaudeQueue", "call_claude_cli", "call_gw_agent"):
             assert not any(name in i for i in imported), name
 
-    def test_stall_check_unit_carries_no_environment_file(self):
-        """The stall-check unit file carries NO EnvironmentFile lines
-        (a stdlib-only unit reading no credentials must not inherit
-        conductor.env / phala.env)."""
+    def test_stall_check_unit_carries_no_credential_env_file(self):
+        """REV 4 D6 unit env: the stall-check unit references NO CREDENTIAL
+        env file (conductor.env / phala.env - the pin stands), but MUST
+        carry the SCOPED env file (doorman-watchdog precedent) that
+        resolves the mem store + Pushover keys. The scoped file is a
+        post-land host op; its key-set contract (exactly MEM_DB_PATH +
+        PUSHOVER_APP_TOKEN + PUSHOVER_USER_KEY, no FORGEJO_TOKEN, no
+        Phala key) is asserted here, not against a live file."""
         svc = (REPO_ROOT / "systemd" / "lapis-pm-stall-check.service").read_text()
-        assert "EnvironmentFile" not in svc
+        env_file_lines = [
+            ln for ln in svc.splitlines()
+            if ln.strip().startswith("EnvironmentFile")
+        ]
+        # No credential env file may be referenced.
+        for ln in env_file_lines:
+            assert "conductor.env" not in ln
+            assert "phala.env" not in ln
+        # Exactly one scoped env file reference, the pinned path.
+        assert len(env_file_lines) == 1
+        assert "EnvironmentFile=-%h/.config/lapis-pm/stall-check.env" in svc
         # The timer is independent of the tick's lifecycle.
         timer = (REPO_ROOT / "systemd" / "lapis-pm-stall-check.timer").read_text()
         assert "OnUnitActiveSec=600" in timer
+
+    def test_stall_check_scoped_env_file_key_set_contract(self):
+        """The scoped env file's key-set contract: exactly MEM_DB_PATH +
+        the two Pushover keys (no FORGEJO_TOKEN, no Phala key). This
+        asserts the CONTRACT the post-land host op must honor, not a live
+        file (the file itself is created post-land on the host)."""
+        scoped_keys = {
+            "MEM_DB_PATH",
+            "PUSHOVER_APP_TOKEN",
+            "PUSHOVER_USER_KEY",
+        }
+        forbidden = {"FORGEJO_TOKEN", "PHALA_TEE_KEY"}
+        # The contract itself: the allowed set is exactly the scoped set,
+        # and no credential key may ever be part of it.
+        assert scoped_keys == {"MEM_DB_PATH", "PUSHOVER_APP_TOKEN",
+                               "PUSHOVER_USER_KEY"}
+        assert not (scoped_keys & forbidden)
+        # If the live scoped file exists on this host, its key set must
+        # match the contract exactly.
+        from pathlib import Path as _P
+        import os as _os
+        live = _P(_os.path.expanduser("~/.config/lapis-pm/stall-check.env"))
+        if live.exists():
+            live_keys = {
+                ln.split("=", 1)[0].strip()
+                for ln in live.read_text().splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+                and "=" in ln
+            }
+            assert live_keys == scoped_keys, (
+                f"scoped env file key set {sorted(live_keys)} != "
+                f"contract {sorted(scoped_keys)}"
+            )
+
+    def test_stall_check_run_resolves_mem_store_under_unit_env(self):
+        """REV 4 D6 startup-crash check (PM-execution-verified defect):
+        cli.main() resolves node identity fail-closed BEFORE subcommand
+        dispatch and raises NodeConfigError without MEM_DB_PATH, so the
+        checker run under the unit's EXACT env (scoped file: MEM_DB_PATH
+        + Pushover keys; no credential files) must resolve its mem store
+        and complete without NodeConfigError."""
+        import subprocess as _sp
+        import sys as _sys
+        import tempfile as _tf
+        from pathlib import Path as _P
+
+        db = _P(_tf.mkdtemp()) / "mem.db"
+        # The unit's exact env: the scoped file's keys + the unit's
+        # Environment= lines (PYTHONPATH/PATH/XDG/DBUS are irrelevant to
+        # the identity resolution; the load-bearing keys are MEM_DB_PATH
+        # + the Pushover keys).
+        env = {
+            "MEM_DB_PATH": str(db),
+            "PUSHOVER_APP_TOKEN": "test-token",
+            "PUSHOVER_USER_KEY": "test-user",
+            "HOME": str(_P(_tf.mkdtemp())),
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+        }
+        code = (
+            "import sys; "
+            "from lapis_pm import node_identity; "
+            "node_identity.resolve_node_identity(force=True); "
+            "print('resolved')"
+        )
+        proc = _sp.run(
+            [_sys.executable, "-c", code],
+            env=env, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=120,
+        )
+        assert "NodeConfigError" not in proc.stderr, (
+            f"checker run under the unit's exact env raised "
+            f"NodeConfigError: {proc.stderr[-500:]}"
+        )
+        assert proc.returncode == 0, (
+            f"identity resolution under the unit's exact env failed "
+            f"rc={proc.returncode}: {proc.stderr[-500:]}"
+        )
 
     def test_lapis_pm_service_timeout_bumped_to_1800(self):
         """D6b: TimeoutStartSec=300 -> 1800 in the repo unit file."""
@@ -304,20 +417,24 @@ class TestDirectiveOutcomeStall:
              "pm:directive-id=d-42", "pm:pr-head=abc123"],
         )
         # No dispatch after the directive, PR head unchanged (abc123),
-        # outstanding brief still set (not actioned).
+        # and the raised brief's cid is recorded (pm:brief-id) but NOT
+        # consumed (no decision against it, slot empty).
         mem_store.set(pm_core._dispatched_key(tid), "[]",
                       tags=["lapis-pm", "dispatched"])
         mem_store.set(pm_core._pr_head_key(tid),
                       json.dumps([{"number": 7, "head_sha": "abc123"}]),
                       tags=["lapis-pm", "pr-head"])
-        mem_store.set(pm_core._brief_key(tid), "cid-brief-1",
-                      tags=["lapis-pm", "outstanding-brief"])
+        raised = _comment(
+            dir_ts, "Directive brief raised: cid=cid-brief-1",
+            ["pm:directive-brief-raised", "pm:brief-id=cid-brief-1",
+             "pm:directive-id=d-42"],
+        )
 
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
         ):
-            fake_ep.all_comments.return_value = [obs]
+            fake_ep.all_comments.return_value = [obs, raised]
             n = pm_core._check_directive_stalls(store, now)
 
         assert n == 1
@@ -353,8 +470,6 @@ class TestDirectiveOutcomeStall:
         mem_store.set(pm_core._pr_head_key(tid),
                       json.dumps([{"number": 7, "head_sha": "abc123"}]),
                       tags=["lapis-pm", "pr-head"])
-        mem_store.set(pm_core._brief_key(tid), "cid-brief",
-                      tags=["lapis-pm", "outstanding-brief"])
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
@@ -378,8 +493,6 @@ class TestDirectiveOutcomeStall:
         mem_store.set(pm_core._pr_head_key(tid),
                       json.dumps([{"number": 7, "head_sha": "def456"}]),
                       tags=["lapis-pm", "pr-head"])
-        mem_store.set(pm_core._brief_key(tid), "cid-brief",
-                      tags=["lapis-pm", "outstanding-brief"])
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
@@ -389,6 +502,11 @@ class TestDirectiveOutcomeStall:
         assert mock_notify.call_count == 0
 
     def test_brief_actioned_suppresses(self, mem_store):
+        """REV 4 D7 outcome (c): the directive's OWN brief was consumed -
+        keyed on the specific brief id (pm:brief-id=<cid> on the
+        directive-brief-raised companion observation): a decision audit
+        recorded against that cid (decision/brief-resolved/<cid>)
+        suppresses the page."""
         tid = "dir-tid-4"
         store = MagicMock()
         store.load_all.return_value = [_fake_target(tid)]
@@ -397,18 +515,92 @@ class TestDirectiveOutcomeStall:
         obs = _comment(dir_ts, "Directive received:\nx",
                        ["pm:directive-seen", "pm:directive-id=d-1",
                         "pm:pr-head=abc123"])
+        # The raised brief's cid rides the companion observation.
+        raised = _comment(dir_ts, "Directive brief raised: cid=cid-brief-4",
+                          ["pm:directive-brief-raised", "pm:brief-id=cid-brief-4",
+                           "pm:directive-id=d-1"])
         mem_store.set(pm_core._dispatched_key(tid), "[]",
                       tags=["lapis-pm", "dispatched"])
         mem_store.set(pm_core._pr_head_key(tid),
                       json.dumps([{"number": 7, "head_sha": "abc123"}]),
                       tags=["lapis-pm", "pr-head"])
-        # The directive's brief was actioned (outstanding brief consumed)
-        # -> outcome (c).
+        # A decision recorded against that specific cid (the single
+        # resolution path writes the audit key) -> outcome (c) holds.
+        mem_store.set("decision/brief-resolved/cid-brief-4",
+                      json.dumps({"target_id": tid, "option_id": "o1",
+                                  "action_kind": "acknowledge_and_clear",
+                                  "ts": _iso(now - timedelta(minutes=5))}),
+                      tags=["lapis-pm", "brief-resolved"])
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
         ):
-            fake_ep.all_comments.return_value = [obs]
+            fake_ep.all_comments.return_value = [obs, raised]
+            assert pm_core._check_directive_stalls(store, now) == 0
+        assert mock_notify.call_count == 0
+
+    def test_empty_brief_slot_does_not_suppress(self, mem_store):
+        """REV 4 D7 pin: an EMPTY outstanding-brief slot does NOT count as
+        outcome (c) - the over-broad `get_outstanding_brief is None ->
+        True` reading suppressed the page for any target with no
+        outstanding brief (the common steady state), defeating the
+        detector. A directive with a recorded brief id and an empty slot
+        (no decision against that cid) PAGES."""
+        tid = "dir-tid-4b"
+        store = MagicMock()
+        store.load_all.return_value = [_fake_target(tid)]
+        now = _now_pacific()
+        dir_ts = _iso(now - timedelta(minutes=16))
+        obs = _comment(dir_ts, "Directive received:\nx",
+                       ["pm:directive-seen", "pm:directive-id=d-1",
+                        "pm:pr-head=abc123"])
+        raised = _comment(dir_ts, "Directive brief raised: cid=cid-brief-4b",
+                          ["pm:directive-brief-raised", "pm:brief-id=cid-brief-4b",
+                           "pm:directive-id=d-1"])
+        mem_store.set(pm_core._dispatched_key(tid), "[]",
+                      tags=["lapis-pm", "dispatched"])
+        mem_store.set(pm_core._pr_head_key(tid),
+                      json.dumps([{"number": 7, "head_sha": "abc123"}]),
+                      tags=["lapis-pm", "pr-head"])
+        # The outstanding-brief slot is EMPTY (no decision against the
+        # recorded cid) -> outcome (c) does NOT hold -> the page fires.
+        with (
+            patch.object(pm_core, "episodic") as fake_ep,
+            patch("agents_core.notify.send_notification") as mock_notify,
+        ):
+            fake_ep.all_comments.return_value = [obs, raised]
+            assert pm_core._check_directive_stalls(store, now) == 1
+        assert mock_notify.call_count == 1
+
+    def test_brief_clear_of_specific_cid_suppresses(self, mem_store):
+        """REV 4 D7 outcome (c): a CLEAR of the specific cid (the slot now
+        holds a DIFFERENT brief) suppresses the page for that
+        directive."""
+        tid = "dir-tid-4c"
+        store = MagicMock()
+        store.load_all.return_value = [_fake_target(tid)]
+        now = _now_pacific()
+        dir_ts = _iso(now - timedelta(minutes=16))
+        obs = _comment(dir_ts, "Directive received:\nx",
+                       ["pm:directive-seen", "pm:directive-id=d-1",
+                        "pm:pr-head=abc123"])
+        raised = _comment(dir_ts, "Directive brief raised: cid=cid-brief-4c",
+                          ["pm:directive-brief-raised", "pm:brief-id=cid-brief-4c",
+                           "pm:directive-id=d-1"])
+        mem_store.set(pm_core._dispatched_key(tid), "[]",
+                      tags=["lapis-pm", "dispatched"])
+        mem_store.set(pm_core._pr_head_key(tid),
+                      json.dumps([{"number": 7, "head_sha": "abc123"}]),
+                      tags=["lapis-pm", "pr-head"])
+        # The slot holds a DIFFERENT brief: the directive's brief was
+        # cleared (consumed) -> outcome (c) holds.
+        mem_store.set(pm_core._brief_key(tid), "cid-brief-later",
+                      tags=["lapis-pm", "outstanding-brief"])
+        with (
+            patch.object(pm_core, "episodic") as fake_ep,
+            patch("agents_core.notify.send_notification") as mock_notify,
+        ):
+            fake_ep.all_comments.return_value = [obs, raised]
             assert pm_core._check_directive_stalls(store, now) == 0
         assert mock_notify.call_count == 0
 
@@ -428,8 +620,6 @@ class TestDirectiveOutcomeStall:
         mem_store.set(pm_core._pr_head_key(tid),
                       json.dumps([{"number": 9, "head_sha": "fff789"}]),
                       tags=["lapis-pm", "pr-head"])
-        mem_store.set(pm_core._brief_key(tid), "cid-brief",
-                      tags=["lapis-pm", "outstanding-brief"])
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
@@ -452,8 +642,6 @@ class TestDirectiveOutcomeStall:
         mem_store.set(pm_core._pr_head_key(tid),
                       json.dumps([{"number": 7, "head_sha": "abc123"}]),
                       tags=["lapis-pm", "pr-head"])
-        mem_store.set(pm_core._brief_key(tid), "cid-brief",
-                      tags=["lapis-pm", "outstanding-brief"])
         with (
             patch.object(pm_core, "episodic") as fake_ep,
             patch("agents_core.notify.send_notification") as mock_notify,
@@ -483,6 +671,70 @@ class TestDirectiveOutcomeStall:
         src = inspect.getsource(pm_core.tick)
         assert "pm:pr-head=" in src
         assert '"pm:pr-head={_dir_baseline}"' in src
+
+    def test_directive_branch_records_brief_id(self):
+        """REV 4 D7: the raised brief's comment id rides the companion
+        pm:directive-brief-raised observation (pm:brief-id=<cid>, or
+        pm:brief-id=none when the raise failed), read back from the mem
+        slot the raise just wrote."""
+        import inspect
+        src = inspect.getsource(pm_core.tick)
+        assert "pm:directive-brief-raised" in src
+        assert "pm:brief-id=" in src
+
+    def test_paused_target_directive_no_page(self, mem_store):
+        """REV 4: _check_directive_stalls excludes PAUSED targets (parity
+        with D6 at the tick-coverage loop): a paused target with a stale
+        directive produces NO page."""
+        tid = "dir-tid-paused"
+        store = MagicMock()
+        store.load_all.return_value = [_fake_target(tid, paused=True)]
+        now = _now_pacific()
+        dir_ts = _iso(now - timedelta(minutes=16))
+        obs = _comment(dir_ts, "Directive received:\nx",
+                       ["pm:directive-seen", "pm:directive-id=d-1",
+                        "pm:pr-head=abc123"])
+        mem_store.set(pm_core._dispatched_key(tid), "[]",
+                      tags=["lapis-pm", "dispatched"])
+        mem_store.set(pm_core._pr_head_key(tid),
+                      json.dumps([{"number": 7, "head_sha": "abc123"}]),
+                      tags=["lapis-pm", "pr-head"])
+        with (
+            patch.object(pm_core, "episodic") as fake_ep,
+            patch("agents_core.notify.send_notification") as mock_notify,
+        ):
+            fake_ep.all_comments.return_value = [obs]
+            assert pm_core._check_directive_stalls(store, now) == 0
+        assert mock_notify.call_count == 0
+
+    def test_dispatch_ts_compare_timezone_aware(self, mem_store):
+        """REV 4: the dispatch-ts vs directive-ts comparison is
+        timezone-aware (parsed datetimes), not a string compare - a
+        dispatch 5 min after the directive recorded with a different
+        offset spelling (UTC vs Pacific) must still read as 'after'."""
+        now = _now_pacific()
+        dir_ts = _iso(now - timedelta(minutes=16))
+        # 5 min after the directive, spelled in UTC (+00:00) - as a
+        # string it sorts BEFORE the Pacific-spelled dir_ts.
+        dispatch_ts = (
+            now - timedelta(minutes=11)
+        ).astimezone(timezone.utc).isoformat(timespec="microseconds")
+        assert dispatch_ts < dir_ts  # the string-compare trap
+        tid = "dir-tid-tz"
+        mem_store.set(pm_core._dispatched_key(tid),
+                      json.dumps([{"ts": dispatch_ts,
+                                   "agent_type": "fixer"}]),
+                      tags=["lapis-pm", "dispatched"])
+        # Outcome (a) holds via the timezone-aware parse (the brief slot
+        # is empty and no brief id is recorded, so only (a) can hold).
+        assert pm_core._directive_outcome_holds(
+            tid, dir_ts, "abc123", brief_id=None,
+        )
+        # Direct unit assertion on the parse helper.
+        d1 = pm_core._parse_ts_aware(dir_ts)
+        d2 = pm_core._parse_ts_aware(dispatch_ts)
+        assert d1 is not None and d2 is not None
+        assert d2 > d1  # timezone-aware: the dispatch IS after the directive
 
 
 # ---------------------------------------------------------------------------

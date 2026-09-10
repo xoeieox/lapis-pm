@@ -7,10 +7,19 @@ Type=oneshot
 User=user
 WorkingDirectory=/srv/git/lapis-pm
 ExecStart=/usr/bin/python3 -m lapis_pm.cli stall-check
-# D6a unit hygiene (spec pin): this unit is stdlib + mem reads only and
-# reads NO credentials - it MUST NOT inherit the credential env files
-# (the conductor env file / the phala env file) that lapis-pm.service
-# carries.
+# D6a unit hygiene (spec pin, REV 4 re-scope): this unit MUST NOT reference
+# the CREDENTIAL env files (conductor.env / phala.env) that lapis-pm.service
+# carries - no FORGEJO_TOKEN, no Phala key (the detector is Forgejo-free).
+# But cli.main() resolves node identity fail-closed BEFORE subcommand
+# dispatch and raises NodeConfigError without MEM_DB_PATH, and the HIGH page
+# needs the Pushover keys - so the unit carries a SCOPED env file (the
+# doorman-watchdog scoped-env precedent) with EXACTLY:
+#   MEM_DB_PATH=/data/memory/mem.db
+#   PUSHOVER_APP_TOKEN=...
+#   PUSHOVER_USER_KEY=...
+# The scoped file is created by a post-land host op (it is not in the repo);
+# the leading '-' keeps the unit optional-tolerant until that op lands.
+EnvironmentFile=-%h/.config/lapis-pm/stall-check.env
 Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
 Environment=XDG_RUNTIME_DIR=/run/user/1000

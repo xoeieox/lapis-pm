@@ -4717,7 +4717,11 @@ def _directive_seen_observations(target_id: str) -> list:
             if t.startswith("pm:directive-id="):
                 d_id = t.split("=", 1)[1]
             elif t.startswith("pm:brief-id="):
-                b_id = t.split("=", 1)[1] or None
+                # Normalize the `pm:brief-id=none` literal (raise failed)
+                # to None, same as an empty value - fail-open to paging.
+                b_id = t.split("=", 1)[1]
+                if not b_id or b_id == "none":
+                    b_id = None
         if d_id:
             companions[d_id] = b_id
     for c in episodic.all_comments(target_id):

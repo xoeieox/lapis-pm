@@ -153,49 +153,56 @@ class TestTickCoverageStall:
         old = now - timedelta(minutes=46)
         mem_store.set(pm_core._cursor_key(tid), _iso(old),
                       tags=["lapis-pm", "cursor"])
-        with (
-            patch.object(pm_core, "episodic") as fake_ep,
-            patch("agents_core.notify.send_notification") as mock_notify,
-        ):
-            fake_ep.all_comments.return_value = []
-            assert pm_core._check_tick_stalls(store, now) == 1
-            # Same stale cursor, same episode -> no second page.
-            assert pm_core._check_tick_stalls(store, now) == 0
-            assert mock_notify.call_count == 1
-        # Recovery: the cursor advanced past the last-paged ts. REV 4:
-        # the page stamp is REAL wall-clock (_now_iso, which is >= now),
-        # so a recovery cursor of `now - 1min` would sit BEFORE the page
-        # stamp and the dedup would never clear. A real recovery
-        # advances the cursor PAST the real page stamp, so simulate that
-        # by reading the real stamp and advancing past it.
-        stamped = mem_store.get(pm_core._tick_stall_key(tid))["content"]
-        recovered = datetime.fromisoformat(stamped) + timedelta(seconds=5)
-        mem_store.set(pm_core._cursor_key(tid), _iso(recovered),
-                      tags=["lapis-pm", "cursor"])
-        # The cursor advance cleared the episode: a re-check at the
-        # recovery instant sees a fresh cursor and pages nothing.
-        with (
-            patch.object(pm_core, "episodic") as fake_ep,
-            patch("agents_core.notify.send_notification") as mock_notify,
-        ):
-            fake_ep.all_comments.return_value = []
-            assert pm_core._check_tick_stalls(store, recovered) == 0
-        # Then it stalls again (a NEW episode: the cursor is stale again
-        # AND the stall dedup was cleared by the cursor advance). The
-        # re-stall is simulated by advancing the wall clock to a fresh
-        # `now` (the recovery happened, the tick loop broke again, and
-        # enough time has passed for the cursor to be stale again) -
-        # the dedup was cleared by the cursor advance, so the second
-        # page must fire. (The second page's stamp is also real
-        # wall-clock, which the test's final count assertion pins.)
-        now2 = recovered + timedelta(minutes=47)
-        with (
-            patch.object(pm_core, "episodic") as fake_ep,
-            patch("agents_core.notify.send_notification") as mock_notify,
-        ):
-            fake_ep.all_comments.return_value = []
-            assert pm_core._check_tick_stalls(store, now2) == 1
-        assert mock_notify.call_count == 2
+        # One mock for the WHOLE test (episode, recovery, re-stall) so
+        # the call count accumulates across all three phases. The conftest's
+        # _block_real_pushover autouse fixture patches agents_core.notify
+        # with monkeypatch (function-scoped), which UNDOES the test's
+        # patch when the test's `with` block exits - so the second page
+        # (fired outside the block) would hit the conftest's lambda
+        # instead of the mock. Patching pm_core's module attribute
+        # directly avoids the undo-on-exit problem.
+        mock_notify = MagicMock()
+        fake_ep = MagicMock()
+        fake_ep.all_comments.return_value = []
+        # Patch the agents_core.notify module attribute directly (not via
+        # the `with` context manager) so the patch persists for the whole
+        # test, not just the `with` block.
+        import agents_core.notify as _notify_mod
+        _orig_notify = _notify_mod.send_notification
+        _notify_mod.send_notification = mock_notify
+        try:
+            with patch.object(pm_core, "episodic", fake_ep):
+                assert pm_core._check_tick_stalls(store, now) == 1
+                # Same stale cursor, same episode -> no second page.
+                assert pm_core._check_tick_stalls(store, now) == 0
+                assert mock_notify.call_count == 1
+                # Recovery: the cursor advanced past the last-paged ts.
+                # REV 4:
+                # the page stamp is REAL wall-clock (_now_iso, which is >= now),
+                # so a recovery cursor of `now - 1min` would sit BEFORE the page
+                # stamp and the dedup would never clear. A real recovery
+                # advances the cursor PAST the real page stamp, so simulate that
+                # by reading the real stamp and advancing past it.
+                stamped = mem_store.get(pm_core._tick_stall_key(tid))["content"]
+                recovered = datetime.fromisoformat(stamped) + timedelta(seconds=5)
+                mem_store.set(pm_core._cursor_key(tid), _iso(recovered),
+                              tags=["lapis-pm", "cursor"])
+                # The cursor advance cleared the episode: a re-check at the
+                # recovery instant sees a fresh cursor and pages nothing.
+                assert pm_core._check_tick_stalls(store, recovered) == 0
+                # Then it stalls again (a NEW episode: the cursor is stale again
+                # AND the stall dedup was cleared by the cursor advance). The
+                # re-stall is simulated by advancing the wall clock to a fresh
+                # `now` (the recovery happened, the tick loop broke again, and
+                # enough time has passed for the cursor to be stale again) -
+                # the dedup was cleared by the cursor advance, so the second
+                # page must fire. (The second page's stamp is also real
+                # wall-clock, which the test's final count assertion pins.)
+                now2 = recovered + timedelta(minutes=47)
+                assert pm_core._check_tick_stalls(store, now2) == 1
+                assert mock_notify.call_count == 2
+        finally:
+            _notify_mod.send_notification = _orig_notify
 
     def test_paused_target_3day_old_cursor_no_page(self, mem_store):
         """PAUSED targets are EXCLUDED by design: a paused target with a
@@ -714,12 +721,16 @@ class TestDirectiveOutcomeStall:
         offset spelling (UTC vs Pacific) must still read as 'after'."""
         now = _now_pacific()
         dir_ts = _iso(now - timedelta(minutes=16))
-        # 5 min after the directive, spelled in UTC (+00:00) - as a
-        # string it sorts BEFORE the Pacific-spelled dir_ts.
+        # 5 min after the directive, spelled in UTC (+00:00) - a
+        # different offset spelling than the Pacific-spelled dir_ts.
+        # (No string-ordering assertion here: a UTC-spelled string of a
+        # LATER instant never sorts before the Pacific-spelled string
+        # of an earlier one, so there is no string-compare trap to
+        # guard against - the point of the test is that the parse is
+        # timezone-aware and reads the dispatch as 'after' regardless.)
         dispatch_ts = (
             now - timedelta(minutes=11)
         ).astimezone(timezone.utc).isoformat(timespec="microseconds")
-        assert dispatch_ts < dir_ts  # the string-compare trap
         tid = "dir-tid-tz"
         mem_store.set(pm_core._dispatched_key(tid),
                       json.dumps([{"ts": dispatch_ts,

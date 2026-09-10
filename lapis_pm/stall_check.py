@@ -29,9 +29,14 @@ Contract (spec D6):
   * I5 page hygiene: one HIGH page per target per episode (dedup mem key
     pm/tick-stall/<tid> stamped with the last-paged ts; a cursor advance
     clears it);
-  * the unit file MUST carry no EnvironmentFile lines (the stdlib+mem-only
-    checker reads no credentials — it must not inherit conductor.env /
-    phala.env from lapis-pm.service).
+  * REV 4 scoped-env re-scope: the unit file MUST NOT reference the
+    credential files (conductor.env / phala.env from lapis-pm.service),
+    but MUST carry a SCOPED env file (%h/.config/lapis-pm/stall-check.env,
+    the doorman-watchdog scoped-env precedent) containing exactly
+    MEM_DB_PATH + PUSHOVER_APP_TOKEN + PUSHOVER_USER_KEY — cli.main()
+    resolves node identity fail-closed (NodeConfigError) without
+    MEM_DB_PATH, and the checker's HIGH page needs the Pushover creds.
+    No FORGEJO_TOKEN, no Phala key (the detector is Forgejo-free).
 """
 
 from __future__ import annotations

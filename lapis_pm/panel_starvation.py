@@ -13,6 +13,15 @@ threshold is ALL legs surviving, not a graded count. Any leg down drops the
 verdict to advisory — it may inform, it may never gate or auto-dispatch on
 its own authority. This module only computes the condition and the
 attenuated confidence; the gate/advisory routing lives in pm_core.py.
+
+AMENDED (2026-09-10, decision/reviewer-single-leg-local-phala-test-key):
+the GATING legs are the two local legs (local_witness + corroboration, both
+through the local GW :8081). The second_node (Phala TEE) leg is optional for
+gating: its absence attenuates confidence and flags loudly, but does NOT by
+itself drop the verdict to advisory. The PR #220 guard above stands: a
+verdict with BOTH local legs down still never gates or auto-dispatches (in
+that incident all three legs were down, so the amended rule does not reopen
+the failure class).
 """
 
 from __future__ import annotations
@@ -21,6 +30,14 @@ from __future__ import annotations
 # stable — it is used both for the starved-legs list and the attenuation
 # denominator.
 _LEGS = ("local_witness", "corroboration", "second_node")
+
+# Gating legs (AMENDED 2026-09-10,
+# decision/reviewer-single-leg-local-phala-test-key): the reviewer
+# is single-leg LOCAL — a verdict gates on the two local legs surviving.
+# second_node (Phala TEE) absence attenuates + flags loudly but does not
+# starve. PR #220 guard: BOTH local legs are mandatory — in that incident
+# (all three legs down) the verdict still must not gate.
+_GATE_LEGS = ("local_witness", "corroboration")
 
 
 def _local_witness_down(verdict: dict) -> bool:
@@ -99,8 +116,15 @@ def starved_legs(verdict: dict) -> list[str]:
 
 
 def is_panel_starved(verdict: dict) -> bool:
-    """R1: ANY leg down means the panel is not fully corroborated."""
-    return bool(starved_legs(verdict))
+    """AMENDED (2026-09-10): a GATE leg down means the panel is starved.
+
+    The gate legs are the two local legs (`_GATE_LEGS`). A second_node-only
+    absence is NOT starved — it attenuates confidence and flags loudly but
+    the verdict stands on local legs. The PR #220 guard holds: both local
+    legs down (with or without second_node) is starved.
+    """
+    down = set(starved_legs(verdict))
+    return bool(down & set(_GATE_LEGS))
 
 
 def attenuate_confidence(raw_confidence, legs_down: int, legs_total: int = len(_LEGS)):
@@ -155,7 +179,10 @@ def apply_panel_starvation(verdict: dict) -> dict:
 
       {
         "legs_down": [...],       # subset of ("local_witness", "corroboration", "second_node")
-        "starved": bool,          # True if legs_down is non-empty (R1 threshold)
+        "starved": bool,          # True iff a GATE leg (local_witness /
+                                  # corroboration) is down — AMENDED 2026-09-10;
+                                  # legs_down may be non-empty (second_node)
+                                  # with starved False
         "confidence_raw": <original "confidence" value, unmodified>,
       }
 
@@ -172,7 +199,7 @@ def apply_panel_starvation(verdict: dict) -> dict:
 
     verdict["panel_starvation"] = {
         "legs_down": legs_down,
-        "starved": bool(legs_down),
+        "starved": is_panel_starved(verdict),
         "confidence_raw": raw_confidence,
     }
     if attenuated is not None:

@@ -98,12 +98,12 @@ def _force_dispatch(
         patch.object(pm_core._SHAPER, "dispatch", return_value=_make_dispatch_result()),
         patch.object(pm_core._SHAPER, "get_agent", return_value=_make_agent()),
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec summary"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch", write_dispatch_mock),
+            patch("lapis_pm.pm_core.episodic.write_dispatch", write_dispatch_mock),
         patch("lapis_pm.pm_core.append_dispatched", side_effect=_capture),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
-        patch("agents_core.forgejo.get_open_prs", return_value=open_prs or []),
-        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_cycle_count_return),
-        patch("lapis_pm.router_portfolio.emit_decision_dispatch"),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
+            patch("agents_core.forgejo.get_open_prs", return_value=open_prs or []),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_cycle_count_return),
+            patch("lapis_pm.router_portfolio.emit_decision_dispatch"),
     ):
         mock_store_cls.return_value.get.return_value = _make_target(target_id)
         task_id = pm_core.force_dispatch(target_id, agent_type, intent)
@@ -133,13 +133,13 @@ def _force_dispatch_capture_vars(
         patch("lapis_pm.pm_core.TargetStore") as mock_store_cls,
         patch.object(pm_core._SHAPER, "dispatch", dispatch_mock),
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec summary"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch"),
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),
         patch("lapis_pm.pm_core.append_dispatched"),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        patch("agents_core.forgejo.get_open_prs", return_value=open_prs or []),
-        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_cycle_count_return),
-        patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=review_verdict_for_cycle_return),
-        patch("lapis_pm.router_portfolio.emit_decision_dispatch"),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+            patch("agents_core.forgejo.get_open_prs", return_value=open_prs or []),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_cycle_count_return),
+            patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=review_verdict_for_cycle_return),
+            patch("lapis_pm.router_portfolio.emit_decision_dispatch"),
     ):
         mock_store_cls.return_value.get.return_value = _make_target(target_id)
         pm_core.force_dispatch(target_id, agent_type, intent)
@@ -261,14 +261,12 @@ def test_decide_for_pr_reviewer_lt_fixer_dispatches_next_reviewer_cycle():
 
     with (
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value=""),
-        patch("lapis_pm.authority.classify", return_value=cls),
+            patch("lapis_pm.authority.classify", return_value=cls),
         patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
-        patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
         patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
-        patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
-        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-        patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-    ):
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
+        ):
         decision = pm_core._decide_for_pr(
             "my-target", "lapis-pm", pr, pm_authority="advisory"
         )
@@ -278,30 +276,6 @@ def test_decide_for_pr_reviewer_lt_fixer_dispatches_next_reviewer_cycle():
         "reviewer_count < fixer_count must not fall through to noop_no_change."
     )
     assert decision.payload["cycle"] == 2
-
-
-def test_decide_for_pr_reviewer_lt_fixer_respects_kill_switch():
-    """The self-heal branch still honors the review-gate kill-switch."""
-    pr = {"number": 820, "head": {"sha": "abc123"}}
-    cls = _make_cls()
-
-    with (
-        patch("lapis_pm.pm_core.episodic.spec_summary", return_value=""),
-        patch("lapis_pm.authority.classify", return_value=cls),
-        patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
-        patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
-        patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
-        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-        patch("lapis_pm.pm_core._review_gate_counter", return_value=pm_core.REVIEW_GATE_THRESHOLD),
-        patch("lapis_pm.pm_core._set_review_gate_paused") as set_paused_mock,
-    ):
-        decision = pm_core._decide_for_pr(
-            "my-target", "lapis-pm", pr, pm_authority="advisory"
-        )
-
-    assert decision.kind == "review_gate_pause"
-    set_paused_mock.assert_called_once_with(True)
 
 
 # ---------------------------------------------------------------------------
@@ -343,14 +317,12 @@ def test_replay_two_force_dispatched_fixer_retries_then_tick_dispatches_reviewer
 
     with (
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value=""),
-        patch("lapis_pm.authority.classify", return_value=cls),
+            patch("lapis_pm.authority.classify", return_value=cls),
         patch("lapis_pm.pm_core.load_dispatched", return_value=captured),
-        patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
         patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
-        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-        patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-    ):
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
+        ):
         decision = pm_core._decide_for_pr(
             target_id, "lapis-pm", pr, pm_authority="advisory"
         )

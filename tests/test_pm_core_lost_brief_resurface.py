@@ -112,7 +112,7 @@ class TestMatchBranchSuppress:
             patch("lapis_pm.episodic.write_observation") as mock_obs,
             patch("lapis_pm.pm_core.set_outstanding_brief") as mock_set,
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         assert result == "noop:lost-brief-suppressed:gpu=gpu-match-001"
@@ -163,7 +163,7 @@ class TestResurfaceOnAbsentKey:
             patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec body"),
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         # Brief was composed and surfaced (not suppressed).
@@ -197,7 +197,7 @@ class TestResurfaceOnAbsentKey:
             patch("lapis_pm.episodic.write_observation"),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec body"),
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         assert result == "fixer_lost:briefing:dispatches=gpu-stale-001"
@@ -230,7 +230,7 @@ class TestSuppressedObservationWrittenOnce:
             patch("lapis_pm.episodic.write_observation") as mock_obs,
             patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set,
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         assert result == "noop:lost-brief-suppressed:gpu=gpu-once-001"
@@ -268,7 +268,7 @@ class TestSuppressedObservationWrittenOnce:
             patch("lapis_pm.episodic.write_observation") as mock_obs,
             patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set,
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             r2 = pm_core._act_lost_brief("my-target", orig, None)
 
         assert r2 == "noop:lost-brief-suppressed:gpu=gpu-twotick-001"
@@ -348,7 +348,7 @@ class TestResurfaceBound:
             patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set2,
             patch("lapis_pm.episodic.write_observation") as mock_obs2,
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         # Bounded: suppressed, no second resurface attempt.
@@ -375,7 +375,7 @@ class TestResurfaceBound:
             patch("lapis_pm.episodic.write_observation"),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec"),
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         assert result == "fixer_lost:briefing:dispatches=gpu-bound2-001"
@@ -391,7 +391,7 @@ class TestResurfaceBound:
         old = now - timedelta(hours=25)
         with (
             patch("lapis_pm.episodic.all_comments", return_value=[]),
-        ):
+            ):
             assert pm_core._lost_brief_resurface_allowed("t", "g", now) is True
         with (
             patch("lapis_pm.episodic.all_comments",

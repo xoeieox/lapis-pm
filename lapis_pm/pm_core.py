@@ -136,7 +136,7 @@ _INITIAL_FIXER_TYPES = ("fixer", "fixer_local")
 # parsing artifact only (lapis-pm-phala-test-key, D4) — no live
 # code path produces this agent_type anymore. It stays in the tuple so
 # historical dispatch records containing it still classify correctly
-# (attempt ceiling, review-gate kill-switch, verdict decode, output-file
+# (attempt ceiling, verdict decode, output-file
 # processing) instead of silently falling outside that accounting.
 _REVIEWER_AGENT_TYPES = ("reviewer", "reviewer_fresh", "reviewer_fresh_contractor")
 
@@ -209,20 +209,6 @@ def _absence_grounding_block_for(agent_type: str) -> str:
     family = "reviewer_fresh" if agent_type in ("reviewer_fresh", "reviewer_fresh_contractor") else "reviewer"
     return ABSENCE_GROUNDING_BLOCK if _absence_grounding_enabled(family) else ""
 
-
-# Review-gate loop constants
-REVIEW_GATE_THRESHOLD = 40          # local reviewer (reviewer/reviewer_fresh seat) calls before soft-pause
-REVIEW_GATE_WINDOW_DAYS = 7          # trailing window the threshold is measured over (a rate, not a lifetime total)
-REVIEW_GATE_COUNTER_KEY = "pm/review-gate/cycles-this-window"
-REVIEW_GATE_PAUSED_KEY = "pm/review-gate/paused"
-REVIEW_GATE_PAUSE_BRIEF_KEY = "pm/review-gate/pause-brief-posted"
-# Separate diagnostic ledger (lapis-pm-review-gate-counter-infra-nonruns-v0):
-# infra non-runs are retracted from REVIEW_GATE_COUNTER_KEY (so they stop
-# consuming kill-switch slots) but still recorded here so the pause signal —
-# and a future operator — can distinguish "38 reviews, 22 infra non-runs"
-# from a bare "40 / 40". Same trailing-window, prune-on-read semantics as the
-# counter, so it never grows past the window's own bound.
-REVIEW_GATE_INFRA_LEDGER_KEY = "pm/review-gate/infra-nonruns-this-window"
 
 # Synth-fail counter constants
 _SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
@@ -3929,7 +3915,6 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
         "mode": mode,
         "last_verdict": verdict if has_real_verdict else None,
         "last_issues": state.get("issues") if (has_real_verdict and verdict == "fixable") else None,
-        "paused": _review_gate_paused(),
         "updated_at": _now_iso(),
         "last_corroboration": last_corroboration,
         "panel_starvation": panel_starvation_summary,
@@ -5477,236 +5462,6 @@ def _act_brief_already_satisfied_invalid(target_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Review-gate kill-switch helpers
-# ---------------------------------------------------------------------------
-
-def _review_gate_window_timestamps() -> list[str]:
-    """Read the raw dispatch-timestamp list, dropping anything outside the
-    trailing REVIEW_GATE_WINDOW_DAYS window. Handles the pre-window storage
-    format (a bare int) by treating it as that many events at an
-    unknown-but-recent time, so it counts fully rather than crashing.
-    """
-    rec = _mem().get(REVIEW_GATE_COUNTER_KEY)
-    if not rec:
-        return []
-    raw = rec["content"]
-    try:
-        parsed = json.loads(raw)
-    except (ValueError, TypeError):
-        parsed = None
-    if not isinstance(parsed, list):
-        # Legacy bare-int counter (pre sliding-window migration). Cannot
-        # recover real timestamps, so treat every unit as "now" — counts in
-        # full until it ages out of the window on its own.
-        try:
-            legacy_count = int(parsed if parsed is not None else raw)
-        except (ValueError, TypeError):
-            return []
-        now_iso = datetime.now(timezone.utc).isoformat()
-        return [now_iso] * legacy_count
-    cutoff = datetime.now(timezone.utc) - timedelta(days=REVIEW_GATE_WINDOW_DAYS)
-    kept = []
-    for ts in parsed:
-        if not isinstance(ts, str):
-            continue
-        try:
-            dt = datetime.fromisoformat(ts)
-        except ValueError:
-            continue
-        if dt >= cutoff:
-            kept.append(ts)
-    return kept
-
-
-def _review_gate_counter() -> int:
-    """Count of review-gate-tripping dispatches within the trailing
-    REVIEW_GATE_WINDOW_DAYS days — a rate, not a lifetime total, so the guard
-    measures runaway behavior rather than tripping on any activity level
-    given enough time.
-    """
-    return len(_review_gate_window_timestamps())
-
-
-def _increment_review_gate_counter() -> str:
-    """Record one reviewer dispatch attempt against the kill-switch, BEFORE
-    the dispatch fires (record-then-retract shape, mandated by the
-    2026-08-04 spec-review gate). This preserves the runaway-guard signal for
-    a dispatch that hangs or crashes without ever classifying — the entry
-    stays counted unless a later, classified infra failure retracts it via
-    _retract_review_gate_counter_entry.
-
-    Returns the appended ISO-8601 timestamp (not the count) — the caller
-    stashes it on the dispatch record so a later infra-classified failure can
-    retract this exact entry rather than any entry.
-    """
-    timestamps = _review_gate_window_timestamps()
-    ts = datetime.now(timezone.utc).isoformat()
-    timestamps.append(ts)
-    _mem().set(REVIEW_GATE_COUNTER_KEY, json.dumps(timestamps),
-               tags=["lapis-pm", "review-gate"])
-    return ts
-
-
-def _retract_review_gate_counter_entry(ts: str | None) -> bool:
-    """Retract one previously-recorded kill-switch entry, keyed by the exact
-    timestamp _increment_review_gate_counter returned at dispatch time.
-
-    Called only for a dispatch that failed for a classified
-    REVIEWER_INFRA_FAIL_REASONS cause — the record-then-retract shape means
-    every other outcome (success, hang, crash, unclassified failure) leaves
-    the pre-dispatch increment standing.
-
-    Must tolerate a missing entry (Council open question 1: double-retract, a
-    race with window-expiry pruning, or ts=None from an older dispatch record
-    that predates this field) — swallow and return False, never raise, never
-    write a corrupted ledger. Under-counting (a retraction that silently
-    no-ops because the entry already aged out) is the safe direction; the
-    counter measures pressure, not per-dispatch identity, so no UUID is
-    introduced here.
-    """
-    if not ts:
-        return False
-    try:
-        timestamps = _review_gate_window_timestamps()
-        if ts not in timestamps:
-            return False
-        timestamps.remove(ts)
-        _mem().set(REVIEW_GATE_COUNTER_KEY, json.dumps(timestamps),
-                   tags=["lapis-pm", "review-gate"])
-        return True
-    except Exception:
-        return False
-
-
-def _infra_nonrun_window_timestamps() -> list[str]:
-    """Same trailing-window, prune-on-read semantics as
-    _review_gate_window_timestamps, applied to the separate diagnostic
-    infra-non-run ledger. No legacy bare-int format exists for this key (it
-    is new), so no migration handling is needed."""
-    rec = _mem().get(REVIEW_GATE_INFRA_LEDGER_KEY)
-    if not rec:
-        return []
-    try:
-        parsed = json.loads(rec["content"])
-    except (ValueError, TypeError):
-        return []
-    if not isinstance(parsed, list):
-        return []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=REVIEW_GATE_WINDOW_DAYS)
-    kept = []
-    for ts in parsed:
-        if not isinstance(ts, str):
-            continue
-        try:
-            dt = datetime.fromisoformat(ts)
-        except ValueError:
-            continue
-        if dt >= cutoff:
-            kept.append(ts)
-    return kept
-
-
-def _record_infra_nonrun() -> int:
-    """Append one entry to the diagnostic infra-non-run ledger. Independent
-    of, and unaffected by, kill-switch retraction — retracting an entry from
-    REVIEW_GATE_COUNTER_KEY must not erase the fact that an infra non-run
-    happened. Returns the new trailing-window count."""
-    timestamps = _infra_nonrun_window_timestamps()
-    timestamps.append(datetime.now(timezone.utc).isoformat())
-    _mem().set(REVIEW_GATE_INFRA_LEDGER_KEY, json.dumps(timestamps),
-               tags=["lapis-pm", "review-gate", "infra-ledger"])
-    return len(timestamps)
-
-
-def _infra_nonrun_counter() -> int:
-    return len(_infra_nonrun_window_timestamps())
-
-
-def _review_gate_span_desc() -> str:
-    """Human-readable window-span + infra-nonrun clause for pause signals
-    (DoD Part 2) — turns a bare "40 / 40" into something an operator can
-    judge without a manual mem dig, e.g. "40 entries spanning 2026-08-04T17:22Z
-    to 2026-08-04T22:15Z (7d window); 22 of the past dispatches were infra
-    non-runs (see the separate infra ledger)."."""
-    span = _review_gate_window_span()
-    if span["count"] == 0:
-        return "0 entries in the current window"
-    return (
-        f"{span['count']} entries spanning {span['oldest']} to {span['newest']} "
-        f"({REVIEW_GATE_WINDOW_DAYS}d window); {span['infra_nonruns']} infra "
-        f"non-runs recorded separately in this window"
-    )
-
-
-def _review_gate_window_span() -> dict:
-    """Diagnostic detail for the pause signal (DoD Part 2): entry count plus
-    the oldest/newest timestamp in the trailing window, and the infra
-    non-run count from the separate ledger — so an operator sees "38 reviews,
-    22 infra non-runs" instead of a bare "40 / 40"."""
-    timestamps = _review_gate_window_timestamps()
-    return {
-        "count": len(timestamps),
-        "oldest": min(timestamps) if timestamps else None,
-        "newest": max(timestamps) if timestamps else None,
-        "infra_nonruns": _infra_nonrun_counter(),
-    }
-
-
-def _review_gate_paused() -> bool:
-    rec = _mem().get(REVIEW_GATE_PAUSED_KEY)
-    return bool(rec and rec["content"] == "1")
-
-
-def _set_review_gate_paused(paused: bool) -> None:
-    _mem().set(REVIEW_GATE_PAUSED_KEY, "1" if paused else "0",
-               tags=["lapis-pm", "review-gate"])
-
-
-def review_gate_resume(reason: str) -> int:
-    """Manually override an active rate trip. Returns the trailing-window
-    count at the moment of resume.
-
-    This is a rate-trip override, not a budget re-arm: the counter tracks
-    dispatches within the trailing REVIEW_GATE_WINDOW_DAYS days, so clearing
-    it early means "resume before the window would have aged the count back
-    below threshold on its own," not "grant a fresh allowance." The reason is
-    written to mem under `decision/review-gate-resume/<iso8601-ts>` as a
-    tagged audit entry. Empty or whitespace-only reasons raise ValueError —
-    the caller (CLI or future agent) is responsible for eliciting a
-    substantive reason before invoking.
-    """
-    if not reason or not reason.strip():
-        raise ValueError("review_gate_resume requires a non-empty reason")
-    count = _review_gate_counter()
-    _mem().set(REVIEW_GATE_COUNTER_KEY, "[]", tags=["lapis-pm", "review-gate"])
-    _set_review_gate_paused(False)
-    _mem().delete(REVIEW_GATE_PAUSE_BRIEF_KEY)
-    # Decision audit-trail
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _mem().set(
-        f"decision/review-gate-resume/{ts}",
-        f"Review-gate rate-trip manually overridden at count={count}/{REVIEW_GATE_THRESHOLD} "
-        f"(trailing {REVIEW_GATE_WINDOW_DAYS}d). Reason: {reason.strip()}",
-        tags=["lapis-pm", "review-gate", "resume-audit"],
-    )
-    return count
-
-
-def review_gate_status() -> dict:
-    """Return kill-switch state for `lapis-pm review-gate status`."""
-    span = _review_gate_window_span()
-    return {
-        "counter": _review_gate_counter(),
-        "threshold": REVIEW_GATE_THRESHOLD,
-        "paused": _review_gate_paused(),
-        "window_days": REVIEW_GATE_WINDOW_DAYS,
-        "window_oldest": span["oldest"],
-        "window_newest": span["newest"],
-        "infra_nonruns": span["infra_nonruns"],
-    }
-
-
-# ---------------------------------------------------------------------------
 # Reviewer attempt ceiling (lapis-pm-reviewer-attempt-ceiling-v0)
 #
 # Bounds *attempts*, not successes. Keyed the same way cycle accounting is
@@ -5825,7 +5580,6 @@ def _increment_reviewer_attempt(target_id: str, pr_number: int, cycle: int) -> i
 
 
 def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, reason: str,
-                                    review_gate_ts: str | None = None,
                                     wait_s: float | None = None,
                                     completed_at: str | None = None) -> None:
     """Stash the most recent failure reason for this pr+cycle, as-reported and
@@ -5846,15 +5600,6 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
     defaulted to 0) when the caller has no measured duration — a 0 would be
     indistinguishable from an instant refusal and would defeat the
     telemetry's purpose.
-
-    lapis-pm-review-gate-counter-infra-nonruns-v0: reuses this same
-    classification to drive the kill-switch record-then-retract shape — a
-    classified infra failure retracts the pre-dispatch REVIEW_GATE_COUNTER_KEY
-    entry (keyed by review_gate_ts, the dispatch record's stashed timestamp)
-    and records the non-run in the separate diagnostic infra ledger. Any
-    other outcome (unclassified failure, review_gate_ts absent because the
-    dispatch record predates this field) leaves the kill-switch entry
-    standing — the runaway guard must not be weakened.
 
     lapis-pm-reviewer-defer-backoff-v0 (R1): an infra-classified failure also
     stamps next_retry_at = completed_at + backoff(infra_count) via the
@@ -5879,9 +5624,6 @@ def _record_reviewer_attempt_reason(target_id: str, pr_number: int, cycle: int, 
         json.dumps(state),
         tags=["lapis-pm", "reviewer-attempt-ceiling", f"target={target_id}"],
     )
-    if infra_reason is not None:
-        _retract_review_gate_counter_entry(review_gate_ts)
-        _record_infra_nonrun()
 
 
 def _reviewer_infra_backoff_seconds(infra_count: int) -> int:
@@ -7213,7 +6955,7 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
     # machine review first — skipping it would make the PM's highest-blast-radius
     # files (lapis-pm-containment-held-paths-v0, Leg 3) the *least* reviewed
     # artifacts in the system. This reuses the same reviewer-cycle machinery as
-    # the advisory/hold review-gate loop below, capped at exactly one dispatch:
+    # the advisory/hold reviewer loop below, capped at exactly one dispatch:
     # a held PR is never fixer-retried (the fixer must not autonomously edit its
     # own cage), so reviewer_count can only ever be 0 or 1 here. Idempotency
     # ("dispatch once, not once per 60s tick") falls out of the same
@@ -7229,11 +6971,6 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
 
         reviewer_count = _reviewer_cycle_count(target_id, pr_number)
         if reviewer_count == 0:
-            if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
-                _set_review_gate_paused(True)
-                # Fail safe: still raise the hold brief without a reviewer verdict
-                # rather than let the kill-switch block containment entirely.
-                return Decision("hold_brief", payload)
             ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, 1)
             if ceiling_decision is not None:
                 return Decision("hold_brief", payload)
@@ -7255,7 +6992,7 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             payload["reviewer_verdict"] = verdict_info
         return Decision("hold_brief", payload)
 
-    # Auto-merge path: inline Sonnet screen result drives action (unchanged)
+    # Auto-merge path: inline local screen result drives action (unchanged)
     if pm_authority == "auto":
         if cls.verdict == "auto":
             return Decision("merge", payload)
@@ -7263,12 +7000,8 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             return Decision("hold_brief", payload)
         return Decision("advisory_brief", payload)
 
-    # Advisory / hold path — review-gate loop
+    # Advisory / hold path — reviewer loop
     pr_number = pr["number"]
-
-    # Kill-switch: if paused, fall back to inline Sonnet
-    if _review_gate_paused():
-        return _decide_review_gate_fallback(target_id, cls, pr, pm_authority)
 
     # Don't double-dispatch while reviewer or fixer is pending for this PR
     if _has_pending_reviewer_for_pr(target_id, pr_number):
@@ -7311,10 +7044,6 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
             return Decision("review_exhausted_brief", {
                 "pr": pr, "cls": cls, "history": history,
             })
-        # Check kill-switch threshold before dispatching the local reviewer
-        if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
-            _set_review_gate_paused(True)
-            return Decision("review_gate_pause", {"pr": pr, "cls": cls})
         next_cycle = reviewer_count + 1
         ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
         if ceiling_decision is not None:
@@ -7330,9 +7059,6 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
         # One or more fixer_retry dispatches landed without an intervening review
         # (e.g. rapid force-dispatches against an open PR). Self-heal by dispatching
         # the next reviewer cycle rather than falling through to a silent noop.
-        if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
-            _set_review_gate_paused(True)
-            return Decision("review_gate_pause", {"pr": pr, "cls": cls})
         next_cycle = reviewer_count + 1
         ceiling_decision = _reviewer_attempt_ceiling_check(target_id, pr_number, next_cycle)
         if ceiling_decision is not None:
@@ -7366,7 +7092,7 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
     # Supersede partition (AC5):
     #   (i) budget room: dispatch a fresh reviewer on the current head
     #       through _act_dispatch_reviewer — it passes the existing
-    #       ceiling/backoff/kill-switch checks exactly as a normal
+    #       ceiling/backoff checks exactly as a normal
     #       reviewer dispatch does (the re-review CONSUMES a reviewer
     #       cycle — spec Invariant 6, the named cost of superseding);
     #   (ii) budget exhausted: no dispatch — the normal exhausted path
@@ -7407,12 +7133,9 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
         )
         if reviewer_count < budget:
             # Partition (i): budget room — a fresh reviewer on the
-            # current head. The kill-switch / ceiling / backoff checks
+            # current head. The ceiling / backoff checks
             # run exactly as a normal reviewer dispatch (the re-review
             # consumes one reviewer cycle — Invariant 6).
-            if _review_gate_counter() >= REVIEW_GATE_THRESHOLD:
-                _set_review_gate_paused(True)
-                return Decision("review_gate_pause", {"pr": pr, "cls": cls})
             next_cycle = reviewer_count + 1
             ceiling_decision = _reviewer_attempt_ceiling_check(
                 target_id, pr_number, next_cycle
@@ -7626,23 +7349,6 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
     cls.screen_verdict = verdict
     cls.issues = issues
     return Decision("hold_brief", payload)
-
-
-def _decide_review_gate_fallback(target_id: str, cls: authority.PRClassification,
-                                  pr: dict, pm_authority: str) -> Decision:
-    """Inline Sonnet fallback when review-gate kill-switch is active."""
-    spec_summary = episodic.spec_summary(target_id)
-    screen_result = authority.screen(cls.repo, cls.pr_number, spec_summary, cls.diff)
-    sv = screen_result.get("verdict", "needs-human")
-    cls.screen_verdict = sv
-    cls.issues = list(screen_result.get("issues") or [])
-    payload = {"classification": cls, "pr": pr}
-    if sv == "needs-human":
-        cls.verdict = "hold"
-        return Decision("hold_brief", payload)
-    if sv == "clean" and pm_authority == "advisory":
-        return Decision("advisory_brief", payload)
-    return Decision("advisory_brief", payload)
 
 
 def _has_pending_dispatch(target_id: str) -> bool:
@@ -8186,10 +7892,6 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         f'}}]{schema_extra}, "confidence": 0.0-1.0}}'
     )
 
-    # Increment kill-switch counter before dispatch (record-then-retract —
-    # stash the exact entry so a later classified infra failure can retract
-    # this one specifically; see _retract_review_gate_counter_entry).
-    review_gate_ts = _increment_review_gate_counter()
     # Increment the PR+cycle-bound attempt ceiling counter (counts this
     # dispatch regardless of whether it later succeeds or fails).
     _increment_reviewer_attempt(target_id, pr_number, cycle)
@@ -8225,7 +7927,6 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
         "status": "pending",
         "retry_count": 0,
         "model": shaped_agent.model if shaped_agent else None,
-        "review_gate_ts": review_gate_ts,
     }
     append_dispatched(target_id, record)
 
@@ -8663,35 +8364,6 @@ def _act_brief_review_exhausted(target_id: str, payload: dict) -> str:
     _set_brief_outstanding(target_id, b)
     _mark_pr_classified(target_id, cls.pr_number)
     return f"action:review_exhausted_brief:cid={b.comment_id}"
-
-
-def _act_review_gate_pause(target_id: str, payload: dict) -> str:
-    """Emit a single pause brief when the kill-switch threshold is exceeded."""
-    # Only post the pause brief once (idempotent)
-    rec = _mem().get(REVIEW_GATE_PAUSE_BRIEF_KEY)
-    if rec:
-        return "action:review_gate_paused:already_briefed"
-
-    count = _review_gate_counter()
-    span_desc = _review_gate_span_desc()
-    episodic.write_observation(
-        target_id,
-        f"Review-gate loop soft-paused after {count} local reviewer calls in the past {REVIEW_GATE_WINDOW_DAYS}d "
-        f"({span_desc}). "
-        f"Falling back to inline-Sonnet behavior for new PRs. "
-        f"Resume with `lapis-pm review-gate resume --reason \"...\"` (reason is required).",
-        extra_tags=["pm:review-gate-paused"],
-    )
-    b = brief.synthesize(
-        target_id,
-        trigger=f"Review-gate loop soft-paused after {count} local reviewer calls ({span_desc})",
-        query="review-gate pause — token budget exceeded",
-        notify=NotifyPriority.HIGH,
-    )
-    _set_brief_outstanding(target_id, b)
-    _mem().set(REVIEW_GATE_PAUSE_BRIEF_KEY, b.comment_id,
-               tags=["lapis-pm", "review-gate"])
-    return f"action:review_gate_paused:cid={b.comment_id}"
 
 
 def _reviewer_attempt_ceiling_marker_key(target_id: str, pr_number: int, cycle: int) -> str:
@@ -9824,7 +9496,6 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 reported_reason = (text.strip().splitlines() or [""])[0][:500]
                 _record_reviewer_attempt_reason(
                     target_id, rec["pr_number"], rec.get("cycle", 1), reported_reason,
-                    review_gate_ts=rec.get("review_gate_ts"),
                     wait_s=_reviewer_dispatch_wait_seconds(rec),
                     completed_at=rec.get("completed_at"),
                 )
@@ -10346,7 +10017,6 @@ def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
                 and t["error"]):
             _record_reviewer_attempt_reason(
                 target_id, rec["pr_number"], rec.get("cycle", 1), t["error"],
-                review_gate_ts=rec.get("review_gate_ts"),
                 wait_s=_reviewer_dispatch_wait_seconds(rec),
                 completed_at=rec.get("completed_at"),
             )
@@ -11462,8 +11132,6 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
                     decision_str = _act_dispatch_fixer_retry(target_id, decision.payload)
                 elif decision.kind == "review_exhausted_brief":
                     decision_str = _act_brief_review_exhausted(target_id, decision.payload)
-                elif decision.kind == "review_gate_pause":
-                    decision_str = _act_review_gate_pause(target_id, decision.payload)
                 elif decision.kind == "reviewer_attempt_ceiling":
                     decision_str = _act_reviewer_attempt_ceiling_pause(target_id, decision.payload)
                 elif decision.kind == "reviewer_infra_budget_exhausted":
@@ -11614,17 +11282,6 @@ def tick_all() -> list[TickResult]:
         _reconcile_deploy_inventory()
     except Exception:
         pass  # best-effort — must not block target processing
-
-    # Emit one log line per tick when review-gate is paused (persistent visibility signal).
-    if _review_gate_paused():
-        count = _review_gate_counter()
-        logger.info(
-            "[review-gate-paused] counter=%d/%d (%s): dispatching inline-Sonnet fallback for "
-            "advisory PRs. Resume with `lapis-pm review-gate resume --reason \"...\"`.",
-            count,
-            REVIEW_GATE_THRESHOLD,
-            _review_gate_span_desc(),
-        )
 
     # Decided-gem reconciler: process brief-gems Erah has decided on the Desk.
     # Runs once per tick_all (cross-target). Fail-soft — never blocks target processing.

@@ -498,7 +498,7 @@ class TestPostLandGitPull:
             # Slice 1: the selfheal pass owns critical-repo failures; mock it
             # False so this test exercises the legacy notify FALLBACK.
             patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
-        ):
+            ):
             pm_core._post_land_git_pull("lapis-pm")
 
         assert len(notify_calls) == 1, "Expected exactly one Pushover call on pull failure"
@@ -530,7 +530,7 @@ class TestPostLandGitPull:
             # Slice 1: mock the selfheal pass False to exercise the legacy notify
             # fallback (the machine did not own this failure).
             patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
-        ):
+            ):
             pm_core._post_land_git_pull("agents-core")
 
         assert len(notify_calls) >= 1, "agents-core pull failure must send Pushover (CRITICAL repo)"
@@ -673,7 +673,7 @@ class TestDeployCurrencyCheck:
                 side_effect=self._by_path_fake_run(set()),
             ),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._check_deploy_currency()
 
         assert len(notify_calls) == 0
@@ -752,7 +752,7 @@ class TestDeployCurrencyCheck:
         with patch(
             "lapis_pm.pm_core.subprocess.run",
             side_effect=self._by_path_fake_run({"/data/agents"}, distance=3),
-        ):
+            ):
             pm_core._check_deploy_currency()
 
         data = json.loads(pm_core._DEPLOY_CURRENCY_STATUS_FILE.read_text())
@@ -781,7 +781,7 @@ class TestDeployCurrencyCheck:
                 Path("/nonexistent-root/deploy-currency-status.json"),
             ),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._check_deploy_currency()  # must not raise
 
         assert len(notify_calls) == 1
@@ -867,7 +867,7 @@ class TestReconcileDeployInventoryDedup:
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         assert notify_calls == []
@@ -897,7 +897,7 @@ class TestReconcileDeployInventoryDedup:
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         assert notify_calls == ["deploy-inventory: stray_branch"]
@@ -923,7 +923,7 @@ class TestReconcileDeployInventoryDedup:
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         assert len(notify_calls) == 2
@@ -957,7 +957,7 @@ class TestReconcileDeployInventoryDedup:
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         assert notify_calls == ["deploy-inventory: status file unreadable"]
@@ -1118,7 +1118,7 @@ class TestDeployInventoryAutoRecovery:
             patch("lapis_pm.pm_core.subprocess.run",
                   return_value=MagicMock(returncode=0, stdout="active\n")),
             patch("agents_core.notify.send_notification", lambda **kw: True),
-        ):
+            ):
             pm_core._run_deploy_inventory_auto_recovery(status)
 
         fake_hook.assert_called_once_with("experts", trigger="deploy-inventory-auto-recovery")
@@ -1198,7 +1198,7 @@ class TestDeployInventoryAutoRecovery:
                 "lapis_pm.pm_core.subprocess.run",
                 side_effect=[
                     MagicMock(returncode=0, stdout="activating\n"),
-                    MagicMock(returncode=0, stdout="activating\n"),
+            MagicMock(returncode=0, stdout="activating\n"),
                     MagicMock(returncode=0, stdout="active\n"),
                 ],
             ),
@@ -1271,7 +1271,7 @@ class TestDeployInventoryAutoRecovery:
             patch("lapis_pm.pm_core.subprocess.run",
                   return_value=MagicMock(returncode=0, stdout="active\n")),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         from agents_core.notify import Priority
@@ -1339,7 +1339,7 @@ class TestDeployInventoryAutoRecovery:
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         assert notify_calls == ["deploy-inventory: auto_recovery_restart_failed"]
@@ -1351,7 +1351,7 @@ class TestDeployInventoryAutoRecovery:
             patch("lapis_pm.pm_core._mem", return_value=fake_mem),
             patch("lapis_pm.deploy_inventory.run_reconcile_pass", return_value=current),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             pm_core._reconcile_deploy_inventory()
 
         assert notify_calls == [
@@ -1650,7 +1650,7 @@ class TestSynapseDeploy:
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
             patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
-        ):
+            ):
             pm_core._post_land_git_pull("synapse")
 
         assert len(notify_calls) >= 1, "synapse pull failure must send Pushover (CRITICAL repo)"
@@ -1674,7 +1674,7 @@ class TestSynapseDeploy:
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
             patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
-        ):
+            ):
             pm_core._post_land_git_pull("synapse")
 
         assert len(notify_calls) >= 1
@@ -1757,7 +1757,7 @@ class TestSynapseDeploy:
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
             patch("agents_core.notify.send_notification", fake_notify),
             patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure", return_value=False),
-        ):
+            ):
             pm_core._post_land_git_pull("lapis-pm")
 
         assert len(notify_calls) >= 1
@@ -2205,7 +2205,7 @@ class TestPostLandGitPullDirtyTreeAndDivergence:
         with (
             patch.object(pm_core, "_POST_LAND_PULL", {"gardener": [str(clone)]}),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=spy_run),
-        ):
+            ):
             advanced = pm_core._post_land_git_pull("gardener")
 
         assert advanced is False
@@ -2293,7 +2293,7 @@ class TestGradedCollisionSafety:
             patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
             patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", tmp_path / "lock"),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             advanced = pm_core._post_land_git_pull("agents-core")
 
         assert advanced is True, "pull should self-recover once debris is quarantined"
@@ -2350,7 +2350,7 @@ class TestGradedCollisionSafety:
             patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
             patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", tmp_path / "lock"),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             advanced = pm_core._post_land_git_pull("agents-core")
 
         assert advanced is False
@@ -2389,7 +2389,7 @@ class TestGradedCollisionSafety:
             patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
             patch.object(pm_core, "_DEPLOY_PULL_LOCK_DIR", lock_dir),
             patch("agents_core.notify.send_notification", fake_notify),
-        ):
+            ):
             advanced = pm_core._post_land_git_pull("agents-core")
 
             assert advanced is False
@@ -2702,7 +2702,7 @@ class TestReconcileSurvivingHeadBranch:
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments),
             patch("lapis_pm.pm_core._forgejo_get_pr", side_effect=fake_get_pr),
             patch("lapis_pm.pm_core._forgejo_get_branch", side_effect=fake_get_branch),
-        ):
+            ):
             pm_core._reconcile_surviving_head_branch("my-target", "Erah/lapis-pm")
             # No exception, no DELETE attempt (verified by _ensure_head_branch_deleted's
             # own contract, exercised here end-to-end through the reconcile wrapper).
@@ -3385,7 +3385,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test-trigger")
 
         assert (dest_dir / "night_plan.py").read_text() == "print('v1')"
@@ -3411,7 +3411,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test")
 
         assert (dest_dir / "night_plan.py").read_text() == "print('v2')"
@@ -3438,7 +3438,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test")
 
         assert (dest_dir / "night_plan.py").read_text() == content
@@ -3460,7 +3460,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test")  # must not raise
 
         assert list(dest_dir.iterdir()) == []
@@ -3649,7 +3649,7 @@ class TestConductorNightPlanDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test")
 
         result_yaml = (dest_dir / "night_producers.yaml").read_text()
@@ -3735,7 +3735,7 @@ class TestConductorBrixGwRuntimeDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_DEPLOY_LOG", log_file),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test")
 
         log_text = log_file.read_text()
@@ -3809,7 +3809,7 @@ class TestConductorBrixGwRuntimeDeploy:
             # exactly as _DEPLOY_LOG is isolated above.
             patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-drift-ledger.json"),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
-        ):
+            ):
             pm_core._post_land_deploy_hook("conductor")
 
         assert (dest_dir / "night_plan.py").read_text() == "print('night')"
@@ -4011,7 +4011,7 @@ class TestGwHostScriptDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_DEST", str(dest_dir)),
             patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
-        ):
+            ):
             pm_core._deploy_conductor_night_scripts(trigger="test")
             pm_core._deploy_conductor_gw_host_scripts(trigger="test")
 
@@ -4045,7 +4045,7 @@ class TestGwHostScriptDeploy:
         with patch(
             "lapis_pm.pm_core.subprocess.run",
             side_effect=_real_git_with_stubbed_fetch(subprocess.run),
-        ):
+            ):
             is_fresh, reason = pm_core._conductor_source_freshness_gate(str(clone))
 
         assert is_fresh is True, f"untracked .claude/.vscode must not block freshness: {reason}"
@@ -4068,7 +4068,7 @@ class TestGwHostScriptDeploy:
         with patch(
             "lapis_pm.pm_core.subprocess.run",
             side_effect=_real_git_with_stubbed_fetch(subprocess.run),
-        ):
+            ):
             is_fresh, reason = pm_core._conductor_source_freshness_gate(str(clone))
 
         assert is_fresh is False
@@ -4140,7 +4140,7 @@ class TestGwHostScriptDeploy:
             patch.object(pm_core, "_CONDUCTOR_SCRIPTS_SRC", str(src_dir)),
             patch.object(pm_core, "_GW_HOST_SCRIPT_DRIFT_LEDGER", tmp_path / "gw-ledger.json"),
             patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
-        ):
+            ):
             pm_core._deploy_conductor_gw_host_scripts(trigger="test")  # must not raise
 
         ssh_calls = [c for c in calls if c and c[0] in ("ssh", "scp")]
@@ -4192,7 +4192,7 @@ class TestGwHostScriptDeploy:
             patch("lapis_pm.pm_core.subprocess.run", side_effect=gw_fake),
             patch("agents_core.llm.gw_serving_state") as mock_state,
             patch("lapis_pm.deploy_inventory_repair.deposit_gem", side_effect=fake_deposit_gem),
-        ):
+            ):
             mock_state.return_value = MagicMock(in_flight_flip=True)
             pm_core._deploy_conductor_gw_host_scripts(trigger="test")
 

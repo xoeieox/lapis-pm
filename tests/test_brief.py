@@ -80,12 +80,12 @@ def test_brief_prompt_contract_advisory_screen_no_issues():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("brief-cid-contract")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         brief.synthesize(
             target_id="contract-test-tid",
@@ -124,12 +124,12 @@ def test_brief_prompt_inline_screen_ran_when_issues_present():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("brief-cid-ran")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         brief.synthesize(
             target_id="contract-test-tid",
@@ -156,12 +156,12 @@ def test_synthesize_routes_to_local_seat_not_claude():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("routing-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="routing-tid",
@@ -184,12 +184,12 @@ def test_synthesize_fallback_when_local_seat_returns_no_text():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("fallback-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="fallback-tid",
@@ -221,12 +221,12 @@ def test_synthesize_round_trip_returns_brief():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("smoke-brief-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="smoke-tid",
@@ -268,11 +268,11 @@ def test_brief_body_contains_version_line():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", side_effect=capture_write_brief),
-        patch("lapis_pm.brief.episodic.write_brief_options"),
+            patch("lapis_pm.brief.episodic.write_brief_options"),
         # Stub the git call so the test doesn't depend on the git tree
         patch("lapis_pm.brief.subprocess.run",
               return_value=subprocess.CompletedProcess([], 0, stdout="abc1234\n", stderr="")),
@@ -309,11 +309,11 @@ def test_brief_fallback_body_records_seat_unavailable():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", side_effect=capture_write_brief),
-        patch("lapis_pm.brief.episodic.write_brief_options"),
+            patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief.subprocess.run",
               return_value=subprocess.CompletedProcess([], 0, stdout="abc1234\n", stderr="")),
     ):
@@ -351,12 +351,12 @@ def test_brief_synthesis_retries_once_on_empty():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_call),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("retry-brief-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="retry-tid",
@@ -375,12 +375,12 @@ def test_brief_synthesis_fallback_after_two_empties():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("fallback-brief-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="fallback-tid",
@@ -403,12 +403,12 @@ def test_synthesize_returns_synthesis_failed_when_fallback_used():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("synthesis-failed-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="synthesis-failed-tid",
@@ -427,12 +427,12 @@ def test_synthesize_returns_synthesis_false_when_body_produced():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("synthesis-ok-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="synthesis-ok-tid",
@@ -460,12 +460,12 @@ def test_pushover_sent_when_synthesis_succeeds():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_gw),
-        patch("lapis_pm.brief.send_notification", send_notification),
+            patch("lapis_pm.brief.send_notification", send_notification),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment("pushover-success-cid")),
         patch("lapis_pm.brief.episodic.write_brief_options"),
-        patch("lapis_pm.brief._brief_version_line", return_value=""),
+            patch("lapis_pm.brief._brief_version_line", return_value=""),
     ):
         result = brief.synthesize(
             target_id="pushover-success-tid",

@@ -43,9 +43,9 @@ def _run_bind(argv: list[str], targets_dir: Path, extra_patches=()) -> tuple[int
     base_patches = [
         patch("lapis_pm.cli.TargetStore", lambda: TargetStore(targets_dir)),
         patch("lapis_pm.cli.episodic.spec", return_value=None),
-        patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
+            patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
         patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
-        patch("lapis_pm.cli.emit_decision_kickoff", return_value=None),
+            patch("lapis_pm.cli.emit_decision_kickoff", return_value=None),
     ]
     with contextlib.ExitStack() as stack:
         for p in base_patches + list(extra_patches):
@@ -103,7 +103,7 @@ def test_adopt_pr_preflight_uses_resolved_owner_for_slashed_repo(tmp_path):
             patch("agents_core.forgejo.get_pr", side_effect=fake_get_pr),
             # Probe succeeds (empty list = repo exists)
             patch("agents_core.forgejo.get_open_prs", return_value=[]),
-        ],
+            ],
     )
 
     assert len(captured_calls) >= 1, f"get_pr was never called; stderr={err!r}"
@@ -204,7 +204,7 @@ def test_bind_proceeds_on_200(tmp_path):
         targets_dir=tmp_path,
         extra_patches=[
             patch("agents_core.forgejo.get_open_prs", return_value=[]),
-        ],
+            ],
     )
 
     assert rc == 0, f"expected exit 0; stderr={err!r}"
@@ -254,7 +254,7 @@ def test_force_rebind_to_404_repo_aborts_without_clobbering(tmp_path):
         targets_dir=tmp_path,
         extra_patches=[
             patch("agents_core.forgejo.get_open_prs", return_value=[]),
-        ],
+            ],
     )
     original_data = yaml.safe_load((tmp_path / "existing-target.yaml").read_text())
 

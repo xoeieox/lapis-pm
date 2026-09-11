@@ -26,8 +26,6 @@ Coverage:
     action:directive_brief:cid=...       — directive received
     action:abandon_brief:cid=...         — retry exhausted
     action:review_exhausted_brief:cid=... — review budget exhausted
-    action:review_gate_paused:cid=...    — kill-switch threshold exceeded (first time)
-    action:review_gate_pause:already_briefed — kill-switch already briefed
 
   Skip family:
     skipped=True reason=paused           — decision field = noop:paused
@@ -162,9 +160,7 @@ class TestNoopTaxonomy:
             "lapis_pm.pm_core._perceive_prs": MagicMock(return_value=([pr], True)),
             "lapis_pm.pm_core._classified_pr_ids": MagicMock(return_value=set()),
             "lapis_pm.pm_core.authority.classify": MagicMock(return_value=cls),
-            "lapis_pm.pm_core.episodic.spec_summary": MagicMock(return_value="spec"),
-            "lapis_pm.pm_core._review_gate_paused": MagicMock(return_value=False),
-            "lapis_pm.pm_core._has_pending_reviewer_for_pr": MagicMock(return_value=True),
+            "lapis_pm.pm_core.episodic.spec_summary": MagicMock(return_value="spec"),            "lapis_pm.pm_core._has_pending_reviewer_for_pr": MagicMock(return_value=True),
             "lapis_pm.pm_core._reviewer_cycle_count": MagicMock(return_value=2),
         })
         assert result.decision == "noop:reviewer_in_flight:pr=7:cycle=2"
@@ -188,9 +184,7 @@ class TestNoopTaxonomy:
             "lapis_pm.pm_core._perceive_prs": MagicMock(return_value=([pr], True)),
             "lapis_pm.pm_core._classified_pr_ids": MagicMock(return_value=set()),
             "lapis_pm.pm_core.authority.classify": MagicMock(return_value=cls),
-            "lapis_pm.pm_core.episodic.spec_summary": MagicMock(return_value="spec"),
-            "lapis_pm.pm_core._review_gate_paused": MagicMock(return_value=False),
-            "lapis_pm.pm_core._has_pending_reviewer_for_pr": MagicMock(return_value=False),
+            "lapis_pm.pm_core.episodic.spec_summary": MagicMock(return_value="spec"),            "lapis_pm.pm_core._has_pending_reviewer_for_pr": MagicMock(return_value=False),
             "lapis_pm.pm_core._has_pending_fixer_for_pr": MagicMock(return_value=True),
             "lapis_pm.pm_core.load_dispatched": MagicMock(return_value=[dispatch_rec]),
         })
@@ -234,7 +228,7 @@ class TestActionTaxonomy:
             patch("lapis_pm.pm_core.merge_pr"),
             patch("lapis_pm.pm_core.episodic.write_merge"),
             patch("lapis_pm.pm_core._mark_pr_classified"),
-        ):
+            ):
             result = pm_core._act_merge("tid", payload)
         assert result == "action:auto_merge:pr=42"
 
@@ -248,7 +242,7 @@ class TestActionTaxonomy:
         with (
             patch("lapis_pm.pm_core.merge_pr", side_effect=RuntimeError("forbidden")),
             patch("lapis_pm.pm_core.episodic.write_hold"),
-        ):
+            ):
             result = pm_core._act_merge("tid", payload)
         assert result.startswith("action:merge_failed:")
 
@@ -273,7 +267,7 @@ class TestActionTaxonomy:
             patch("lapis_pm.pm_core._post_write_sweep_brief"),
             patch("lapis_pm.pm_core._mark_pr_classified"),
             patch("lapis_pm.pm_core.episodic.write_hold"),
-        ):
+            ):
             result = pm_core._act_brief("tid", trigger="held PR", hold=True,
                                         payload={"classification": cls})
         assert result == "action:brief_emitted:kind=hold:cid=cmt-hold-001"
@@ -341,9 +335,7 @@ class TestActionTaxonomy:
             patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
             patch("lapis_pm.pm_core._SHAPER") as mock_shaper,
             patch("lapis_pm.pm_core.append_dispatched"),
-            patch("lapis_pm.pm_core.episodic.write_dispatch"),
-            patch("lapis_pm.pm_core._increment_review_gate_counter"),
-        ):
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),        ):
             mock_shaper.dispatch.return_value = mock_res
             # Patch get_pr_diff inside the function
             with patch("agents_core.forgejo.get_pr_diff", return_value="--- a\n+++ b",
@@ -494,34 +486,6 @@ class TestActionTaxonomy:
             )
         assert result == "action:review_exhausted_brief:cid=cmt-exhaust-001"
 
-    def test_act_review_gate_paused_first_time(self):
-        """Kill-switch first fire → action:review_gate_paused:cid=..."""
-        mock_brief = MagicMock()
-        mock_brief.comment_id = "cmt-gate-001"
-        mock_brief.synthesis_failed = False
-        from lapis_pm import authority as _auth
-        cls = MagicMock(spec=_auth.PRClassification)
-        pr = {"number": 42}
-        with (
-            patch("lapis_pm.pm_core._mem") as mock_mem_fn,
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=42),
-            patch("lapis_pm.pm_core.episodic.write_observation"),
-            patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_brief),
-            patch("lapis_pm.pm_core.set_outstanding_brief"),
-        ):
-            mock_mem_fn.return_value.get.return_value = None  # not already briefed
-            mock_mem_fn.return_value.set = MagicMock()
-            result = pm_core._act_review_gate_pause("tid", {"pr": pr, "cls": cls})
-        assert result == "action:review_gate_paused:cid=cmt-gate-001"
-
-    def test_act_review_gate_pause_already_briefed(self):
-        """Kill-switch already briefed → action:review_gate_paused:already_briefed."""
-        with patch("lapis_pm.pm_core._mem") as mock_mem_fn:
-            mock_mem_fn.return_value.get.return_value = {"content": "cmt-gate-001"}
-            result = pm_core._act_review_gate_pause("tid", {})
-        assert result == "action:review_gate_paused:already_briefed"
-
-
 # ---------------------------------------------------------------------------
 # Invariant: every noop variant starts with "noop:", every action with "action:"
 # ---------------------------------------------------------------------------
@@ -548,8 +512,6 @@ ACTION_VARIANTS = [
     "action:directive_brief:cid=cmt-001",
     "action:abandon_brief:cid=cmt-001",
     "action:review_exhausted_brief:cid=cmt-001",
-    "action:review_gate_paused:cid=cmt-001",
-    "action:review_gate_paused:already_briefed",
 ]
 
 

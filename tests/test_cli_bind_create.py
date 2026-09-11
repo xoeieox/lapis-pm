@@ -54,9 +54,9 @@ def _run(argv: list[str], targets_dir: Path) -> tuple[int, str, str]:
     with (
         patch("lapis_pm.cli.TargetStore", lambda: TargetStore(targets_dir)),
         patch("lapis_pm.cli.episodic.spec", return_value=None),
-        patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
+            patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
         patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
-        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+            patch("agents_core.forgejo.get_open_prs", return_value=[]),
         redirect_stdout(out_buf),
         redirect_stderr(err_buf),
     ):
@@ -76,9 +76,9 @@ def _run_with_existing_spec(argv: list[str], targets_dir: Path) -> tuple[int, st
     with (
         patch("lapis_pm.cli.TargetStore", lambda: TargetStore(targets_dir)),
         patch("lapis_pm.cli.episodic.spec", return_value="existing spec"),
-        patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
+            patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
         patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
-        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+            patch("agents_core.forgejo.get_open_prs", return_value=[]),
         redirect_stdout(out_buf),
         redirect_stderr(err_buf),
     ):

@@ -72,9 +72,9 @@ def test_synthesize_includes_verdict_block_when_provided():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment()),
         patch("lapis_pm.brief.episodic.write_brief_options"),
     ):
@@ -105,9 +105,9 @@ def test_synthesize_omits_verdict_block_when_none():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment()),
         patch("lapis_pm.brief.episodic.write_brief_options"),
     ):
@@ -138,9 +138,9 @@ def test_synthesize_omits_verdict_block_when_empty_string():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", side_effect=fake_llm),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="stub spec"),
         patch("lapis_pm.brief.episodic.write_brief", return_value=_fake_comment()),
         patch("lapis_pm.brief.episodic.write_brief_options"),
     ):
@@ -186,11 +186,11 @@ def test_act_brief_advisory_clean_passes_verdict_text():
 
     with (
         patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_info),
-        patch("lapis_pm.pm_core.brief.synthesize", side_effect=fake_synthesize),
+            patch("lapis_pm.pm_core.brief.synthesize", side_effect=fake_synthesize),
         patch("lapis_pm.pm_core._mark_pr_classified"),
-        patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
+            patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
         patch("lapis_pm.pm_core._post_write_sweep_brief"),
-        patch("lapis_pm.pm_core.episodic.write_hold"),
+            patch("lapis_pm.pm_core.episodic.write_hold"),
     ):
         result = pm_core._act_brief(
             "anchor-integration-tid",
@@ -230,11 +230,11 @@ def test_act_brief_advisory_clean_no_verdict_passes_none():
 
     with (
         patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
-        patch("lapis_pm.pm_core.brief.synthesize", side_effect=fake_synthesize),
+            patch("lapis_pm.pm_core.brief.synthesize", side_effect=fake_synthesize),
         patch("lapis_pm.pm_core._mark_pr_classified"),
-        patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
+            patch("lapis_pm.pm_core.set_outstanding_brief_verified"),
         patch("lapis_pm.pm_core._post_write_sweep_brief"),
-        patch("lapis_pm.pm_core.episodic.write_hold"),
+            patch("lapis_pm.pm_core.episodic.write_hold"),
     ):
         result = pm_core._act_brief(
             "anchor-integration-tid",

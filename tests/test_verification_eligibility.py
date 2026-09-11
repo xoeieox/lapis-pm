@@ -255,7 +255,7 @@ class TestActBriefVerificationGate:
             patch("lapis_pm.pm_core.brief.synthesize", mock_synthesize),
             patch("lapis_pm.pm_core._set_brief_outstanding", mock_set_outstanding),
             patch("lapis_pm.pm_core._mark_pr_classified"),
-        ):
+            ):
             mock_ts.return_value.get.return_value = target
             mock_bg._held_path_check_live.return_value = (False, "")
 
@@ -473,7 +473,7 @@ class TestStatusLegibility:
             patch("lapis_pm.cli.pm_core.get_cursor", return_value="2026-06-28T00:00:00"),
             patch("lapis_pm.cli.pm_core.load_dispatched", return_value=[]),
             patch("lapis_pm.cli.pm_core.get_outstanding_brief", return_value=None),
-        ):
+            ):
             _print_target_status(t, explain=False)
 
         captured = capsys.readouterr()
@@ -497,7 +497,7 @@ class TestStatusLegibility:
             patch("lapis_pm.cli.pm_core.get_cursor", return_value="2026-06-28T00:00:00"),
             patch("lapis_pm.cli.pm_core.load_dispatched", return_value=[]),
             patch("lapis_pm.cli.pm_core.get_outstanding_brief", return_value=None),
-        ):
+            ):
             _print_target_status(t, explain=False)
 
         captured = capsys.readouterr()

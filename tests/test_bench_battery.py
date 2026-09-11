@@ -400,7 +400,7 @@ def test_cli_run_subcommand(tmp_path):
 
     with (
         patch("lapis_pm.bench.__main__.load_battery", return_value={"name": "x", "pairs": []}),
-        patch("lapis_pm.bench.__main__.run_battery", return_value=cap),
+            patch("lapis_pm.bench.__main__.run_battery", return_value=cap),
     ):
         rc = main(["run", "--battery", "x", "--out", str(out)])
 
@@ -419,7 +419,7 @@ def test_cli_timeout_arg_forwarded(tmp_path):
 
     with (
         patch("lapis_pm.bench.__main__.load_battery", return_value={"name": "x", "pairs": []}),
-        patch("lapis_pm.bench.__main__.run_battery", side_effect=fake_run),
+            patch("lapis_pm.bench.__main__.run_battery", side_effect=fake_run),
     ):
         main(["--battery", "x", "--out", str(out), "--timeout", "60"])
 
@@ -450,7 +450,7 @@ def test_cli_out_creates_parent_dirs(tmp_path):
 
     with (
         patch("lapis_pm.bench.__main__.load_battery", return_value={"name": "x", "pairs": []}),
-        patch("lapis_pm.bench.__main__.run_battery", return_value=cap),
+            patch("lapis_pm.bench.__main__.run_battery", return_value=cap),
     ):
         rc = main(["--battery", "x", "--out", str(out)])
 

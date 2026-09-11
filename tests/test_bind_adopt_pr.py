@@ -66,9 +66,9 @@ def _run_bind(
     ctx_patches = [
         patch("lapis_pm.cli.TargetStore", lambda: TargetStore(targets_dir)),
         patch("lapis_pm.cli.episodic.spec", return_value=None),
-        patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
+            patch("lapis_pm.cli.episodic.write_spec", return_value=MagicMock()),
         patch("lapis_pm.cli.pm_core.clear_classified_prs", return_value=None),
-        patch("lapis_pm.cli.emit_decision_kickoff", return_value=None),
+            patch("lapis_pm.cli.emit_decision_kickoff", return_value=None),
         # Mock existence probe so tests don't depend on Forgejo connectivity.
         patch("agents_core.forgejo.get_open_prs", return_value=[]),
     ]
@@ -328,19 +328,16 @@ def test_tick_adopted_target_dispatches_reviewer_first(tmp_path):
 
     with (
         patch("lapis_pm.pm_core.TargetStore", lambda: store),
-        patch("lapis_pm.pm_core._perceive_prs", return_value=([adopted_pr], True)),
+            patch("lapis_pm.pm_core._perceive_prs", return_value=([adopted_pr], True)),
         patch("lapis_pm.pm_core.authority.classify", return_value=mock_cls),
-        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-        patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-        patch.object(pm_core._SHAPER, "dispatch", side_effect=capture_dispatch),
+            patch.object(pm_core._SHAPER, "dispatch", side_effect=capture_dispatch),
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec summary"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch"),
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),
         patch("lapis_pm.pm_core.append_dispatched"),
-        patch("lapis_pm.pm_core._increment_review_gate_counter"),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        patch("agents_core.forgejo.get_pr_diff", return_value="diff here"),
-        patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd", return_value="/tmp/smoke"),
-    ):
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+            patch("agents_core.forgejo.get_pr_diff", return_value="diff here"),
+            patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd", return_value="/tmp/smoke"),
+        ):
         result = pm_core.tick("adopted-tid")
 
     assert any("reviewer" in a for a in dispatched_agent_types), (
@@ -370,9 +367,9 @@ def test_force_dispatch_blocks_initial_fixer_for_adopted_target(tmp_path):
 
     with (
         patch("lapis_pm.pm_core.TargetStore", lambda: store),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-    ):
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            ):
         with pytest.raises(ValueError, match="adopted PR"):
             pm_core.force_dispatch("adopted-fixer-guard", "fixer", "implement from scratch")
 
@@ -407,11 +404,11 @@ def test_force_dispatch_allows_fixer_after_prior_fixer_dispatch(tmp_path):
 
     with (
         patch("lapis_pm.pm_core.TargetStore", lambda: store),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=[prior_fixer_record]),
-        patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch"),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[prior_fixer_record]),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),
         patch("lapis_pm.pm_core.append_dispatched"),
-        patch.object(pm_core._SHAPER, "dispatch", side_effect=fake_dispatch),
+            patch.object(pm_core._SHAPER, "dispatch", side_effect=fake_dispatch),
     ):
         pm_core.force_dispatch("adopted-fixer-ok", "fixer", "re-implement after review")
 

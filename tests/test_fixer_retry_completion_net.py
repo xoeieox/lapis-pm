@@ -128,7 +128,7 @@ class TestEncodeBodyUpdates:
             patch("lapis_pm.pm_core._last_observed_pr_body_fp", return_value=old_fp),
             patch("lapis_pm.pm_core._mem", return_value=mem_mock),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             pm_core._encode_pr_body_updates("my-target", open_prs)
             result = pm_core._classified_pr_ids("my-target")
 
@@ -246,7 +246,7 @@ class TestEncodeGpuResultsDescriptionFix:
             patch("lapis_pm.episodic.all_comments", return_value=[body_obs]),
             patch("lapis_pm.episodic.write_result", side_effect=capture_result),
             patch("lapis_pm.pm_core._gpu_output_path", return_value=None),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("my-target")
 
         assert rec["status"] == "processed"
@@ -273,7 +273,7 @@ class TestEncodeGpuResultsDescriptionFix:
             patch("lapis_pm.episodic.write_result",
                   side_effect=lambda tid, c, extra_tags=None: written_results.append(c)),
             patch("lapis_pm.pm_core._gpu_output_path", return_value=None),
-        ):
+            ):
             encoded, _ = pm_core._encode_gpu_results("my-target")
 
         assert rec["status"] == "processed"
@@ -379,9 +379,7 @@ class TestDecideForPrBodyAdvanceGate:
             ts=body_advance_ts,
         )
 
-        with (
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+        with (            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
@@ -389,8 +387,7 @@ class TestDecideForPrBodyAdvanceGate:
             patch("lapis_pm.episodic.all_comments", return_value=[body_obs]),
             patch("lapis_pm.pm_core.authority.classify", return_value=self._make_cls()),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-        ):
+            ):
             decision = pm_core._decide_for_pr("my-target", "lapis-pm", pr, "hold")
 
         assert decision.kind == "dispatch_reviewer"
@@ -400,9 +397,7 @@ class TestDecideForPrBodyAdvanceGate:
         pr = self._make_pr()
         reviewer_ts = "2026-06-01T08:00:00Z"
 
-        with (
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+        with (            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
@@ -410,7 +405,7 @@ class TestDecideForPrBodyAdvanceGate:
             patch("lapis_pm.episodic.all_comments", return_value=[]),
             patch("lapis_pm.pm_core.authority.classify", return_value=self._make_cls()),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-        ):
+            ):
             decision = pm_core._decide_for_pr("my-target", "lapis-pm", pr, "hold")
 
         assert decision.kind == "noop_no_change"
@@ -452,7 +447,6 @@ class TestReviewerSeesCurrentPrBody:
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core.append_dispatched"),
             patch("lapis_pm.pm_core.episodic.write_dispatch"),
-            patch("lapis_pm.pm_core._increment_review_gate_counter"),
             patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd", return_value="/tmp"),
         ):
             from agents_core.forgejo import get_pr_diff as _get_diff
@@ -494,10 +488,9 @@ class TestReviewerSeesCurrentPrBody:
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
             patch("lapis_pm.pm_core.append_dispatched"),
             patch("lapis_pm.pm_core.episodic.write_dispatch"),
-            patch("lapis_pm.pm_core._increment_review_gate_counter"),
             patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd", return_value="/tmp"),
             patch("agents_core.forgejo.get_pr_diff", return_value="diff text"),
-        ):
+            ):
             mock_shaper.dispatch.side_effect = capture_dispatch
             pm_core._act_dispatch_reviewer("my-target", pr, cls, mode="fresh", cycle=1)
 

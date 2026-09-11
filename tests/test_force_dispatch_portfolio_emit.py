@@ -67,10 +67,10 @@ def _call_force_dispatch(
         patch.object(pm_core._SHAPER, "dispatch", return_value=_make_dispatch_result()),
         patch.object(pm_core._SHAPER, "get_agent", return_value=_make_agent(model)),
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec summary"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch"),
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),
         patch("lapis_pm.pm_core.append_dispatched"),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
-        patch("lapis_pm.router_portfolio.emit_decision_dispatch", emit_mock),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
+            patch("lapis_pm.router_portfolio.emit_decision_dispatch", emit_mock),
     ):
         mock_store_cls.return_value.get.return_value = _make_target(target_id)
         task_id = pm_core.force_dispatch(target_id, agent_type, intent)
@@ -191,7 +191,7 @@ class TestEmitFailureNonFatal:
             patch("lapis_pm.pm_core.append_dispatched"),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[{"gpu_id": "t1"}]),
             patch("lapis_pm.router_portfolio.emit_decision_dispatch", emit_mock),
-        ):
+            ):
             mock_store_cls.return_value.get.return_value = _make_target()
             task_id = pm_core.force_dispatch("test-tid", "fixer", "intent")
 
@@ -210,7 +210,7 @@ class TestEmitFailureNonFatal:
             patch("lapis_pm.pm_core.append_dispatched"),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[{"gpu_id": "t1"}]),
             patch("lapis_pm.router_portfolio.emit_decision_dispatch", emit_mock),
-        ):
+            ):
             mock_store_cls.return_value.get.return_value = _make_target()
             pm_core.force_dispatch("test-tid", "fixer", "intent")
 

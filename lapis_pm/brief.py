@@ -119,7 +119,7 @@ Rules:
 - Grounding rule: Every claim in 'Risk / spec deviation' MUST cite either (a) a `screen_issues` entry by its severity+path, or (b) a specific line or symbol from the diff section. If neither is available, output `none` for that section.
 - No-screen rule: If the user message states 'no inline screen ran for this PR', the 'Risk / spec deviation' section outputs `none` unless the diff section contains concrete evidence of a problem (held path, deleted test, scope creep beyond spec). Do not infer schema violations, missing dependencies, or convention breaks from a truncated diff.
 - No-absence-from-truncation rule: You cannot conclude something is missing or absent from a truncated diff. If the diff section ends with `(diff truncated)`, do not make absence-claims (e.g. 'missing dependency X', 'no test for Y'); consult the spec_summary for declared dependencies/structure instead, and only claim absence when the spec affirmatively says X should exist and the diff section is complete.
-- Reviewer-anchor rule: When the user message contains a 'Reviewer verdict:' block and that verdict reads 'verdict=clean', the 'Risk / spec deviation' section MUST output `none` UNLESS the diff section shows a held path under {Lapis,room,registry}.yaml or a deleted/skipped test. Do not infer truncation, missing implementation, or schema violations when Opus has already returned clean. The reviewer has the full diff; the composer does not.
+- Reviewer-anchor rule: When the user message contains a 'Reviewer verdict:' block and that verdict reads 'verdict=clean', the 'Risk / spec deviation' section MUST output `none` UNLESS the diff section shows a held path under {Lapis,room,registry}.yaml or a deleted/skipped test. Do not infer truncation, missing implementation, or schema violations when the reviewer has already returned clean. The reviewer has the full diff; the composer does not.
 - Never invent state — if you don't know something, omit it.
 """
 
@@ -311,7 +311,7 @@ def synthesize(
     inline_screen = (
         "ran"
         if screen_issues
-        else "did not run — Opus reviewer is the gate for this advisory-tier PR"
+        else "did not run — the local reviewer is the gate for this advisory-tier PR"
     )
     trigger_block = f"Trigger: {trigger}\nInline screen: {inline_screen}\n"
 

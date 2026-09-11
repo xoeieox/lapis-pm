@@ -28,7 +28,6 @@ lapis-pm pause <target_id> [--reason TEXT]
 lapis-pm resume <target_id>
 lapis-pm clear-reviewer-attempts <target_id>
 lapis-pm clear-dispatch <target_id>
-lapis-pm review-gate resume
 lapis-pm list
 lapis-pm land <target_id> [--dry-run]
 ```
@@ -103,7 +102,7 @@ Every tick emits exactly one decision log line per bound target:
 | `action:auto_merge:pr=<n>` | PR auto-merged by the daemon. |
 | `action:merge_failed:<err>` | Auto-merge attempted but Forgejo returned an error. |
 | `action:auto_land:pr=<n>:arc=<path>` | PR merged + arc doc written + target unbound. |
-| `action:reviewer_dispatched:pr=<n>:cycle=<k>` | Opus reviewer agent dispatched for PR review cycle k. |
+| `action:reviewer_dispatched:pr=<n>:cycle=<k>` | Local reviewer agent dispatched for PR review cycle k. |
 | `action:fixer_dispatched:source=retry:pr=<n>:cycle=<k>` | Fixer retry dispatched after reviewer returned `fixable`. |
 | `action:fixer_dispatched:source=init:dispatch=<id>` | Initial or re-tried fixer dispatch (no open PR yet). |
 | `action:brief_emitted:kind=<kind>:cid=<id>` | Brief synthesized and posted. `kind` ∈ `hold`, `advisory_clean`, `advisory_screen_issue`. |
@@ -111,8 +110,6 @@ Every tick emits exactly one decision log line per bound target:
 | `action:directive_brief:cid=<id>` | Human directive received; brief synthesized for human review. |
 | `action:abandon_brief:cid=<id>` | Fixer failed `MAX_DISPATCH_RETRIES` times; brief posted, dispatch abandoned. |
 | `action:review_exhausted_brief:cid=<id>` | Review cycle budget exhausted; human judgment needed. |
-| `action:review_gate_paused:cid=<id>` | Kill-switch threshold exceeded; review gate soft-paused. |
-| `action:review_gate_pause:already_briefed` | Kill-switch already triggered this period; idempotent. |
 
 ### Skip variants (`skipped=True reason=*`)
 

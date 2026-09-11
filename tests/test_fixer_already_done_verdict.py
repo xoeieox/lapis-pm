@@ -83,7 +83,7 @@ class TestVerdictPresentAutoLand:
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[comment]),
             patch("lapis_pm.pm_core._mem", return_value=_make_mem(landed=False)),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        ):
+            ):
             result = pm_core._already_satisfied_pending("mytid")
 
         assert result is not None
@@ -102,7 +102,7 @@ class TestVerdictPresentAutoLand:
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[comment]),
             patch("lapis_pm.pm_core._mem", return_value=mem),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        ):
+            ):
             assert pm_core._already_satisfied_pending("mytid") is None
 
     def test_already_satisfied_pending_none_when_dispatch_pending(self):
@@ -116,7 +116,7 @@ class TestVerdictPresentAutoLand:
             patch("lapis_pm.pm_core.load_dispatched", return_value=[
                 {"status": "pending", "gpu_id": "x"}
             ]),
-        ):
+            ):
             assert pm_core._already_satisfied_pending("mytid") is None
 
     def test_act_auto_land_already_satisfied_full_flow(self):
@@ -145,7 +145,7 @@ class TestVerdictPresentAutoLand:
             patch("lapis_pm.pm_core.clear_landed_state"),
             patch("lapis_pm.land.generate_arc_doc", return_value=mock_arc) as mock_gen,
             patch("lapis_pm.land.write_arc_doc", return_value=mock_arc.path),
-        ):
+            ):
             result = pm_core._act_auto_land_already_satisfied("mytid")
 
         assert result.startswith("auto_land:already_satisfied:pr=42:")
@@ -189,7 +189,7 @@ class TestVerdictAbsentNoChange:
             patch("lapis_pm.pm_core.save_dispatched"),
             patch("lapis_pm.pm_core.episodic.write_result"),
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("mytid")
 
         # Result encoded normally (no verdict sidecar), not failed
@@ -269,7 +269,7 @@ class TestMalformedVerdict:
             patch("lapis_pm.pm_core.save_dispatched"),
             patch("lapis_pm.pm_core.episodic.write_result"),
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("mytid")
 
         # Sidecar was malformed → verdict ignored, normal encode path ran

@@ -172,7 +172,7 @@ def test_check_calcification_no_artifact():
     mem = _make_mem_mock()
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=None),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
     ):
         _check_calcification("t1")
@@ -188,7 +188,7 @@ def test_check_calcification_void_free_artifact():
     mem = _make_mem_mock(existing_count="2")
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=CLEAN_CONTENT),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
     ):
         _check_calcification("t1")
@@ -204,7 +204,7 @@ def test_check_calcification_increments_counter():
     mem = _make_mem_mock(existing_count="1")
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation"),
     ):
         _check_calcification("t1")
@@ -223,7 +223,7 @@ def test_check_calcification_threshold_fires_at_3():
     mem = _make_mem_mock(existing_count="2")
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
     ):
         _check_calcification("t1")
@@ -242,7 +242,7 @@ def test_check_calcification_no_alert_below_threshold():
     mem = _make_mem_mock(existing_count=None)
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
     ):
         _check_calcification("t1")
@@ -257,7 +257,7 @@ def test_check_calcification_fires_again_at_6():
     mem = _make_mem_mock(existing_count="5")
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
     ):
         _check_calcification("t1")
@@ -272,7 +272,7 @@ def test_check_calcification_episodic_tags():
     mem = _make_mem_mock(existing_count="2")
     with (
         patch("lapis_pm.pm_core._intent_artifact.load", return_value=VOID_CONTENT),
-        patch("lapis_pm.pm_core._mem", return_value=mem),
+            patch("lapis_pm.pm_core._mem", return_value=mem),
         patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
     ):
         _check_calcification("t1")

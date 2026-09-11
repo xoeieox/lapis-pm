@@ -1,9 +1,9 @@
 """Authority gate for PR auto-merge / advisory / hold classification.
 
 Static checks (held paths, size cap) determine whether the reviewer agent
-should be dispatched. For auto-merge targets, an inline Sonnet screen still
+should be dispatched. For auto-merge targets, an inline local screen still
 runs as before. For advisory/hold targets the LLM verdict is a dispatched
-Opus reviewer (see pm_core.py review-gate loop).
+local reviewer (see pm_core.py reviewer loop).
 """
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ Be terse. Only return the JSON object.
 def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict:
     """Inline structured screen via the local seat (call_gw_agent).
 
-    Used only for auto-merge authority targets and as the kill-switch fallback.
+    Used only for auto-merge authority targets.
     Returns parsed JSON or fallback dict.
     """
     if len(diff_text) > DIFF_INLINE_CAP:
@@ -234,10 +234,10 @@ def classify(repo: str, pr_number: int, spec_summary: str,
              verification: str = "pm-live-test") -> PRClassification:
     """Classify a PR based on static checks.
 
-    For auto-merge targets: also runs inline Sonnet screen. If verification is not
+    For auto-merge targets: also runs the inline local screen. If verification is not
     'machine', the auto path downgrades to advisory (raises a brief) rather than merging.
-    For advisory/hold targets: static checks only; Opus reviewer is dispatched
-    by pm_core's review-gate loop (not here).
+    For advisory/hold targets: static checks only; the local reviewer is dispatched
+    by pm_core's reviewer loop (not here).
     """
     if "/" in repo:
         owner, repo_name = repo.split("/", 1)
@@ -272,7 +272,7 @@ def classify(repo: str, pr_number: int, spec_summary: str,
             diff=diff_text,
         )
 
-    # --- Auto-merge path: inline Sonnet screen ---
+    # --- Auto-merge path: inline local screen ---
     if pm_authority == "auto":
         # Gate: verification must be 'machine'. Not machine-verified => downgrade to advisory.
         if verification != "machine":
@@ -324,8 +324,8 @@ def classify(repo: str, pr_number: int, spec_summary: str,
         )
 
     # --- Advisory / hold path: static pass only ---
-    # Opus reviewer will be dispatched by pm_core review-gate loop.
-    reasons = [f"static checks passed, {loc} LOC — Opus reviewer will be dispatched"]
+    # Local reviewer will be dispatched by pm_core's reviewer loop.
+    reasons = [f"static checks passed, {loc} LOC — local reviewer will be dispatched"]
     return PRClassification(
         verdict="advisory",        # tentative; reviewer verdict drives final action
         screen_verdict="unknown",

@@ -73,14 +73,12 @@ def _call_reviewer(mode, now, records=None):
     with (
         patch.object(pm_core._SHAPER, "dispatch", side_effect=capture_dispatch),
         patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd", return_value="/srv/git/myrepo-working"),
-        patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
         patch("lapis_pm.pm_core.episodic.write_dispatch"),
-        patch("lapis_pm.pm_core.append_dispatched", side_effect=fake_append),
-        patch("lapis_pm.pm_core._increment_review_gate_counter", return_value=1),
-        patch("lapis_pm.pm_core._increment_reviewer_attempt"),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        patch("agents_core.forgejo.get_pr_diff", return_value="diff text"),
-        patch("lapis_pm.tou_window.datetime") as mock_dt,
+            patch("lapis_pm.pm_core.append_dispatched", side_effect=fake_append),        patch("lapis_pm.pm_core._increment_reviewer_attempt"),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+            patch("agents_core.forgejo.get_pr_diff", return_value="diff text"),
+            patch("lapis_pm.tou_window.datetime") as mock_dt,
     ):
         mock_dt.now.return_value = now
         pm_core._act_dispatch_reviewer("tid", PR, CLS, mode=mode, cycle=1)

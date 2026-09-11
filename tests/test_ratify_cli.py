@@ -92,7 +92,7 @@ def _run(argv: list[str], mock_mem) -> tuple[int, str, str]:
     rc = 0
     with (
         patch("lapis_pm.router_portfolio._mem", return_value=mock_mem),
-        redirect_stdout(out_buf),
+            redirect_stdout(out_buf),
         redirect_stderr(err_buf),
     ):
         try:

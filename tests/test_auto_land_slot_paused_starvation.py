@@ -63,12 +63,11 @@ def _run_tick_all(targets, eligible_ids, bound_ts_by_id, tick_results_by_id=None
     with (
         patch("lapis_pm.pm_core.probe_forgejo_health", return_value=(True, "")),
         patch("lapis_pm.pm_core._set_forgejo_consecutive_fails"),
-        patch("lapis_pm.pm_core._check_deploy_currency"),
+            patch("lapis_pm.pm_core._check_deploy_currency"),
         patch("lapis_pm.pm_core._reconcile_deploy_inventory"),
-        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-        patch("lapis_pm.pm_core.TargetStore") as MockStore,
+            patch("lapis_pm.pm_core.TargetStore") as MockStore,
         patch("lapis_pm.pm_core._is_auto_land_eligible", side_effect=fake_eligible),
-        patch("lapis_pm.pm_core._spec_bound_ts", side_effect=fake_bound_ts),
+            patch("lapis_pm.pm_core._spec_bound_ts", side_effect=fake_bound_ts),
         patch("lapis_pm.pm_core.tick", side_effect=fake_tick) as mock_tick,
         # AC2.4: assert the branch-reconcile leg never fires from this leg's tests.
         patch("lapis_pm.pm_core._ensure_head_branch_deleted") as mock_ensure_deleted,

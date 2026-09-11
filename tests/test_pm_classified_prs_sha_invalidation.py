@@ -49,7 +49,7 @@ def _patch_encode(target_id: str, open_prs: list[dict], classified: set[int], la
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem_mock),
-        patch("lapis_pm.pm_core._last_observed_pr_sha", return_value=last_sha),
+            patch("lapis_pm.pm_core._last_observed_pr_sha", return_value=last_sha),
         patch("lapis_pm.pm_core.episodic") as episodic_mock,
     ):
         episodic_mock.write_observation = MagicMock()
@@ -87,7 +87,7 @@ def test_sha_advance_invalidates_classified_prs():
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem_mock),
-        patch("lapis_pm.pm_core._last_observed_pr_sha", return_value="oldsha456"),
+            patch("lapis_pm.pm_core._last_observed_pr_sha", return_value="oldsha456"),
         patch("lapis_pm.pm_core.episodic") as episodic_mock,
     ):
         episodic_mock.write_observation = MagicMock()
@@ -121,7 +121,7 @@ def test_sha_unchanged_preserves_classified_prs():
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem_mock),
-        patch("lapis_pm.pm_core._last_observed_pr_sha", return_value="samesha"),
+            patch("lapis_pm.pm_core._last_observed_pr_sha", return_value="samesha"),
         patch("lapis_pm.pm_core.episodic") as episodic_mock,
     ):
         episodic_mock.write_observation = MagicMock()
@@ -160,7 +160,7 @@ def test_sha_advance_unrelated_pr_preserves_classification():
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem_mock),
-        patch("lapis_pm.pm_core._last_observed_pr_sha", side_effect=_last_sha),
+            patch("lapis_pm.pm_core._last_observed_pr_sha", side_effect=_last_sha),
         patch("lapis_pm.pm_core.episodic") as episodic_mock,
     ):
         episodic_mock.write_observation = MagicMock()

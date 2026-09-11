@@ -115,7 +115,7 @@ def _run_main(argv, tmp_path):
     with (
         patch("lapis_pm.cli.TargetStore", return_value=MagicMock()),
         patch("lapis_pm.cli.episodic.spec", return_value=None),
-        redirect_stdout(out_buf),
+            redirect_stdout(out_buf),
         redirect_stderr(err_buf),
     ):
         try:

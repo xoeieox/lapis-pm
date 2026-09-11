@@ -268,13 +268,13 @@ def test_ac6_force_dispatch_self_heals_past_dead_pending_record():
         patch.object(pm_core._SHAPER, "dispatch", return_value=_make_dispatch_result()),
         patch.object(pm_core._SHAPER, "get_agent", return_value=_make_agent()),
         patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec summary"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch"),
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),
         patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]),
-        patch("lapis_pm.pm_core.episodic.write_observation"),
+            patch("lapis_pm.pm_core.episodic.write_observation"),
         patch("lapis_pm.pm_core.append_dispatched"),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
-        patch("lapis_pm.pm_core.save_dispatched"),
-        patch("agents_core.forgejo.get_open_prs", return_value=[]),
+            patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
+            patch("lapis_pm.pm_core.save_dispatched"),
+            patch("agents_core.forgejo.get_open_prs", return_value=[]),
         patch("lapis_pm.router_portfolio.emit_decision_dispatch"),
     ):
         mock_store_cls.return_value.get.return_value = _make_target(target_id)
@@ -310,11 +310,11 @@ def test_ac6_guard_still_fires_when_reap_cannot_prove_death():
         patch("lapis_pm.pm_core.TargetStore") as mock_store_cls,
         patch.object(pm_core, "_ClaudeQueue", return_value=queue),
         patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]),
-        patch("lapis_pm.pm_core.episodic.write_observation"),
+            patch("lapis_pm.pm_core.episodic.write_observation"),
         patch("lapis_pm.pm_core.load_dispatched", return_value=dispatched_list),
-        patch("lapis_pm.pm_core.save_dispatched"),
+            patch("lapis_pm.pm_core.save_dispatched"),
         patch("agents_core.forgejo.get_open_prs", return_value=[]),
-        patch("lapis_pm.pm_core.datetime") as mock_dt,
+            patch("lapis_pm.pm_core.datetime") as mock_dt,
     ):
         import datetime as _real_datetime
         # Freeze "now" 5 minutes past started_at — well within the 1-hour timeout.

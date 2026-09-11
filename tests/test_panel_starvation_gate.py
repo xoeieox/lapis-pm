@@ -70,9 +70,7 @@ class TestR1AdvisoryDowngradeBlocksAutoDispatch:
         fixer retry on its own authority."""
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
@@ -86,9 +84,7 @@ class TestR1AdvisoryDowngradeBlocksAutoDispatch:
         target either — advisory only, never a block."""
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
@@ -109,14 +105,12 @@ class TestR1AdvisoryDowngradeBlocksAutoDispatch:
         }
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=healthy),
-        ):
+            ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "dispatch_fixer_retry"
 
@@ -140,14 +134,12 @@ class TestR1AdvisoryDowngradeBlocksAutoDispatch:
         }
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=1),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=legacy_verdict),
-        ):
+            ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "dispatch_fixer_retry"
 

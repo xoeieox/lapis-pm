@@ -456,7 +456,7 @@ class TestQueueLockSerialization:
         with patch(
             "lapis_pm.pm_core.friction_backfill_provenance",
             side_effect=pm_core._FrictionLockTimeout("friction queue lock timed out after 10s: /tmp/x"),
-        ):
+            ):
             rc = cli.cmd_friction_backfill(args)
         assert rc == 1
 

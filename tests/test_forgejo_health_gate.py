@@ -207,7 +207,7 @@ class TestPushoverPolicy:
             with (
                 patch("lapis_pm.pm_core.probe_forgejo_health", return_value=(False, "connect_error")),
                 patch("lapis_pm.pm_core._mem", return_value=mem_mock),
-                patch("lapis_pm.pm_core.TargetStore") as MockStore,
+            patch("lapis_pm.pm_core.TargetStore") as MockStore,
                 patch("lapis_pm.pm_core._notify_forgejo_unreachable") as mock_notify,
             ):
                 MockStore.return_value.load_all.return_value = []
@@ -252,7 +252,7 @@ class TestRecovery:
             patch("lapis_pm.pm_core.tick", return_value=tick_result),
             patch("lapis_pm.pm_core._is_auto_land_eligible", return_value=False),
             patch("lapis_pm.pm_core._spec_bound_ts", return_value=""),
-        ):
+            ):
             MockStore.return_value.load_all.return_value = [target]
             pm_core.tick_all()
 

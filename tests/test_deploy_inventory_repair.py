@@ -490,7 +490,7 @@ class TestProvenance:
             patch.object(dir_mod, "diagnose_finding", return_value=(dir_mod._degrade(_finding()), "mechanical")),
             patch.object(dir_mod, "deposit_gem", return_value="gem-1"),
             patch("importlib.import_module", return_value=fake_module),
-        ):
+            ):
             action = dir_mod.propose_repair(
                 ledger, clone_path="/srv/git/foo", finding=_finding(),
                 mapped=True, branch="main", commits_behind=3, backing_units=[],

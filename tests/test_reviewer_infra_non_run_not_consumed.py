@@ -307,7 +307,7 @@ class TestReasonPopulationOrdering:
             patch("lapis_pm.pm_core._close_slot_and_deposit"),
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]),
             patch("lapis_pm.pm_core.episodic.write_observation"),
-        ):
+            ):
             pm_core._reconcile_dispatched_with_queue(TID)
             state = pm_core._reviewer_attempt_state(TID, 834, 1)
 

@@ -319,10 +319,10 @@ class TestCheckChainAdvance:
 
             with (
                 patch("lapis_pm.chain.TargetStore", return_value=mock_store),
-                patch("lapis_pm.pm_core.TargetStore", return_value=pm_core_store),
+            patch("lapis_pm.pm_core.TargetStore", return_value=pm_core_store),
                 patch.object(pm_core._SHAPER, "dispatch", mock_dispatch),
                 patch("lapis_pm.pm_core._now_iso", return_value="2026-04-30T00:00:00+00:00"),
-                patch("lapis_pm.episodic.write_dispatch", write_dispatch_mock),
+            patch("lapis_pm.episodic.write_dispatch", write_dispatch_mock),
                 patch("lapis_pm.episodic.spec_summary", return_value="spec text"),
             ):
                 fired = check_chain_advance("leg_a")

@@ -491,7 +491,7 @@ class TestSecondLossBrief:
             patch("lapis_pm.pm_core.brief.synthesize", return_value=fake_brief),
             patch("lapis_pm.pm_core.set_outstanding_brief"),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec summary"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", original, child)
 
         assert result == "fixer_lost:briefing:dispatches=gpu-orig,gpu-child"
@@ -510,7 +510,7 @@ class TestSecondLossBrief:
             patch("lapis_pm.pm_core.brief.synthesize", return_value=fake_brief),
             patch("lapis_pm.pm_core.set_outstanding_brief"),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec summary"),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", original, None)
 
         # No retry child → dispatch_ids is just orig_id
@@ -536,7 +536,7 @@ class TestSecondLossBrief:
             patch("lapis_pm.pm_core.brief.synthesize", side_effect=capture_synthesize),
             patch("lapis_pm.pm_core.set_outstanding_brief"),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec body"),
-        ):
+            ):
             pm_core._act_lost_brief("my-target", original, None)
 
         assert captured_queries, "synthesize not called"
@@ -571,7 +571,7 @@ class TestSecondLossBrief:
             patch("lapis_pm.pm_core.brief.synthesize", side_effect=capture_synthesize),
             patch("lapis_pm.pm_core.set_outstanding_brief"),
             patch("lapis_pm.pm_core.episodic.spec", return_value="spec"),
-        ):
+            ):
             pm_core._act_lost_brief("my-target", original, None)
 
         assert captured_notify == [NotifyPriority.NORMAL]
@@ -981,7 +981,7 @@ class TestActLostBriefIdempotency:
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
             patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
-        ):
+            ):
             result = pm_core._act_lost_brief("my-target", orig, None)
 
         assert result == "noop:lost-brief-suppressed:gpu=gpu-stale-001"
@@ -1116,7 +1116,7 @@ class TestActLostBriefIdempotency:
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
             patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
-        ):
+            ):
             r1 = pm_core._act_lost_brief("my-target", orig, None)
 
         assert r1 == "noop:lost-brief-suppressed:gpu=gpu-repeat-001"
@@ -1133,8 +1133,8 @@ class TestActLostBriefIdempotency:
                     "lapis_pm.episodic.all_comments",
                     return_value=[options_comment, suppressed_comment],
                 ),
-                patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
-                patch("lapis_pm.pm_core.brief.synthesize") as mock_synth_n,
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=stale_mem_value),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth_n,
                 patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
             ):
                 r_n = pm_core._act_lost_brief("my-target", orig, None)

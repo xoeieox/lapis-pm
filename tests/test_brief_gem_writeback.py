@@ -290,7 +290,7 @@ class TestReconcilerExecutesDecidedGem:
             patch("lapis_pm.brief_gem._brief.apply_decision",
                   return_value=apply_result) as mock_apply,
             patch("agents_core.targets.TargetStore"),
-        ):
+            ):
             actions = brief_gem.reconcile_decided_gems()
 
         mock_apply.assert_called_once_with("my-target", "brief-cid-001", "B")
@@ -444,7 +444,7 @@ class TestReconcilerHeldPathFetchFailure:
             patch("lapis_pm.brief_gem.send_notification",
                   side_effect=lambda msg, **kw: notify_calls.append(msg) or True),
             patch("lapis_pm.brief_gem.episodic.write_observation"),
-        ):
+            ):
             MockStore.return_value.get.return_value = mock_target
             actions = brief_gem.reconcile_decided_gems()
 
@@ -505,7 +505,7 @@ class TestReconcilerHoldAuthorityBlocks:
             patch("lapis_pm.brief_gem.send_notification",
                   side_effect=lambda msg, **kw: notify_calls.append((msg, kw)) or True),
             patch("lapis_pm.brief_gem.episodic.write_observation"),
-        ):
+            ):
             MockStore.return_value.get.return_value = mock_target
             actions = brief_gem.reconcile_decided_gems()
 

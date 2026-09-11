@@ -20,7 +20,6 @@ Commands:
     spec-id-backfill [--apply]
     brief --period {morning,afternoon,weekly,live} [--week YYYY-Www]
     brief-resolve <target_id> <option_id>
-    review-gate {status,resume}
     trajectory-rollup --rebuild-index
     trajectory-rollup --period per-target [--target TID | --all]
     trajectory-rollup --period weekly [--week YYYY-Www]
@@ -708,17 +707,6 @@ def cmd_tick(args) -> int:
 
 
 def cmd_status(args) -> int:
-    # Global review-gate kill-switch section (separate from per-target loop state).
-    rg = pm_core.review_gate_status()
-    print("=== review-gate ===")
-    print(f"  counter:       {rg['counter']} / {rg['threshold']}")
-    print(f"  paused:        {rg['paused']}")
-    print(f"  window:        {rg['window_oldest']} to {rg['window_newest']} ({rg['window_days']}d)")
-    print(f"  infra-nonruns: {rg['infra_nonruns']} (separate ledger)")
-    if rg["paused"]:
-        print('  → Resume with: lapis-pm review-gate resume --reason "..."')
-    print()
-
     store = TargetStore()
     if args.target_id:
         t = store.get(args.target_id)
@@ -1733,31 +1721,6 @@ def cmd_local_witness(args) -> int:
     return 0
 
 
-def cmd_review_gate(args) -> int:
-    sub = args.review_gate_sub
-    if sub == "status":
-        state = pm_core.review_gate_status()
-        print(f"review-gate counter:   {state['counter']} / {state['threshold']}")
-        print(f"review-gate paused:    {state['paused']}")
-        print(f"  window:              {state['window_oldest']} to {state['window_newest']} "
-              f"({state['window_days']}d)")
-        print(f"  infra non-runs:      {state['infra_nonruns']} (separate ledger, does not count toward counter)")
-        if state["paused"]:
-            print('  → Resume with: lapis-pm review-gate resume --reason "..."')
-        return 0
-    if sub == "resume":
-        try:
-            prev = pm_core.review_gate_resume(reason=args.reason)
-        except ValueError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 2
-        print(f"Review-gate counter reset (was {prev}). Local reviewer active again.")
-        print(f"Reason recorded: {args.reason}")
-        return 0
-    print(f"ERROR: unknown review-gate subcommand: {sub}", file=sys.stderr)
-    return 2
-
-
 def cmd_spec_review(args) -> int:
     """Handle `lapis-pm spec-review` subcommand."""
     from pathlib import Path
@@ -2640,18 +2603,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Brief cadence to publish (default: morning — v0's only supported feed).",
     )
     tep.set_defaults(func=cmd_tts_episode_publish)
-
-    rg = sub.add_parser("review-gate",
-                        help="Manage the local reviewer kill-switch.")
-    rg_sub = rg.add_subparsers(dest="review_gate_sub", required=True)
-    rg_sub.add_parser("status", help="Print current counter + threshold.")
-    rg_resume = rg_sub.add_parser("resume", help="Reset counter; re-enable the local reviewer.")
-    rg_resume.add_argument(
-        "--reason",
-        required=True,
-        help="Why is the gate being resumed? Captured in mem audit trail.",
-    )
-    rg.set_defaults(func=cmd_review_gate)
 
     tr = sub.add_parser(
         "trajectory-rollup",

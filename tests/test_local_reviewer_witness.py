@@ -334,7 +334,7 @@ class TestWitnessFieldAttachedToReviewerComment:
                   return_value=corr_result),
             patch("lapis_pm.local_reviewer_witness.run_local_reviewer_witness",
                   return_value=wit_result),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("my-target")
 
         assert encoded == 1
@@ -544,7 +544,7 @@ class TestDivergenceObservationOnMajorDiverge:
                   return_value=corr_result),
             patch("lapis_pm.local_reviewer_witness.run_local_reviewer_witness",
                   return_value=wit_result),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("my-target")
 
         assert encoded == 1
@@ -642,7 +642,7 @@ class TestNoDivergenceObservationOnMinorDiverge:
                   return_value=corr_result),
             patch("lapis_pm.local_reviewer_witness.run_local_reviewer_witness",
                   return_value=wit_result),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("my-target")
 
         assert encoded == 1
@@ -743,7 +743,7 @@ class TestNoDivergenceObservationOnAgree:
                   return_value=corr_result),
             patch("lapis_pm.local_reviewer_witness.run_local_reviewer_witness",
                   return_value=wit_result),
-        ):
+            ):
             encoded, failed = pm_core._encode_gpu_results("my-target")
 
         assert encoded == 1

@@ -110,7 +110,7 @@ class TestRetrieveExtractsIdentifiers:
         with (
             patch("lapis_pm.corroboration_adapter._grep_repo", return_value=[]) as mock_grep,
             patch("lapis_pm.corroboration_adapter._vault_grep", return_value=[]),
-        ):
+            ):
             substrates = adapter.retrieve(FIXTURE_DIFF, "lapis-pm", "/fake/repo")
 
         assert mock_grep.called, "Expected _grep_repo to be called"
@@ -445,7 +445,7 @@ class TestLegStatus:
         with patch(
             "lapis_pm.corroboration_adapter.run_corroboration_pass",
             side_effect=RuntimeError("boom"),
-        ):
+            ):
             result = pm_core._run_corroboration_pass_sync("diff", "lapis-pm")
 
         assert result["leg_status"] == "pass_failed"
@@ -593,10 +593,9 @@ class TestReviewerIntegration:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=active_state),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_with_corr),
-        ):
+            ):
             pm_core._persist_review_state_cache("my-target", target, [])
 
         mem.set.assert_called_once()
@@ -632,10 +631,9 @@ class TestReviewerIntegration:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=active_state),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict_no_corr),
-        ):
+            ):
             pm_core._persist_review_state_cache("my-target", target, [])
 
         payload = json.loads(mem.set.call_args[0][1])
@@ -653,7 +651,7 @@ class TestRunCorroborationPass:
         with patch(
             "lapis_pm.corroboration_adapter.LapisPMReviewerAdapter.retrieve",
             side_effect=RuntimeError("boom"),
-        ):
+            ):
             result = run_corroboration_pass("diff text", "lapis-pm")
 
         assert result["verdict"] == "uncertain"
@@ -707,7 +705,7 @@ class TestRunCorroborationPass:
                   side_effect=RuntimeError("both nodes dead")),
             patch("lapis_pm.corroboration_adapter._make_uncertain",
                   side_effect=spy_make_uncertain),
-        ):
+            ):
             result = run_corroboration_pass(FIXTURE_DIFF_CLEAN, "lapis-pm")
 
         # Object identity, not equality: two independent failure results.

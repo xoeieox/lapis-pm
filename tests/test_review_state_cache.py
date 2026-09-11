@@ -66,7 +66,6 @@ class TestPersistReviewStateCacheWrite:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("my-target", target, [])
@@ -81,25 +80,23 @@ class TestPersistReviewStateCacheWrite:
         assert payload["mode"] == "same-reviewer"
         assert payload["last_verdict"] is None   # verdict=pending → None
         assert payload["last_issues"] is None
-        assert payload["paused"] is False
         assert "updated_at" in payload
 
-    def test_all_nine_fields_present(self):
-        """Payload must have exactly the nine schema fields (eight base + last_corroboration)."""
+    def test_all_eight_fields_present(self):
+        """Payload must have exactly the eight schema fields (seven base + last_corroboration)."""
         mem = _make_mem()
         target = _make_target("advisory")
         expected_fields = {
             "pr_number", "cycle", "budget", "mode",
-            "last_verdict", "last_issues", "paused", "updated_at",
+            "last_verdict", "last_issues", "updated_at",
             "last_corroboration",
         }
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
-        ):
+            ):
             pm_core._persist_review_state_cache("my-target", target, [])
 
         raw = mem.set.call_args[0][1]
@@ -119,7 +116,6 @@ class TestModeDerivation:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -133,7 +129,6 @@ class TestModeDerivation:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -159,7 +154,6 @@ class TestBudgetDerivation:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -182,7 +176,6 @@ class TestVerdictSurfacing:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=state),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -199,7 +192,6 @@ class TestVerdictSurfacing:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=state),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -216,7 +208,6 @@ class TestVerdictSurfacing:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=state),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -224,41 +215,6 @@ class TestVerdictSurfacing:
         payload = json.loads(mem.set.call_args[0][1])
         assert payload["last_verdict"] is None
         assert payload["last_issues"] is None
-
-
-# ---------------------------------------------------------------------------
-# paused kill-switch
-# ---------------------------------------------------------------------------
-
-class TestPausedField:
-
-    def test_paused_true_when_gate_paused(self):
-        mem = _make_mem()
-        target = _make_target("advisory")
-
-        with (
-            patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=True),
-            patch("lapis_pm.pm_core._mem", return_value=mem),
-        ):
-            pm_core._persist_review_state_cache("tid", target, [])
-
-        payload = json.loads(mem.set.call_args[0][1])
-        assert payload["paused"] is True
-
-    def test_paused_false_when_gate_not_paused(self):
-        mem = _make_mem()
-        target = _make_target("advisory")
-
-        with (
-            patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._mem", return_value=mem),
-        ):
-            pm_core._persist_review_state_cache("tid", target, [])
-
-        payload = json.loads(mem.set.call_args[0][1])
-        assert payload["paused"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +267,6 @@ class TestTagSet:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -341,7 +296,6 @@ class TestPayloadSize:
 
         with (
             patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._mem", return_value=mem),
         ):
             pm_core._persist_review_state_cache("tid", target, [])
@@ -378,7 +332,7 @@ class TestClearLandedState:
             patch("lapis_pm.pm_core.get_pause_state", return_value=None),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
             patch("lapis_pm.pm_core.save_dispatched"),
-        ):
+            ):
             summary = pm_core.clear_landed_state("my-target")
 
         assert summary["review_state"] == 1
@@ -399,7 +353,7 @@ class TestClearLandedState:
             patch("lapis_pm.pm_core.get_pause_state", return_value=None),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
             patch("lapis_pm.pm_core.save_dispatched"),
-        ):
+            ):
             summary = pm_core.clear_landed_state("my-target")
 
         assert summary["review_state"] == 0
@@ -429,9 +383,7 @@ class TestTickIntegration:
         with (
             patch("lapis_pm.pm_core.TargetStore") as MockStore,
             patch("lapis_pm.pm_core._mem", return_value=mem),
-            patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._perceive_prs", return_value=([], True)),
+            patch("lapis_pm.pm_core._active_review_state", return_value=ACTIVE_STATE),            patch("lapis_pm.pm_core._perceive_prs", return_value=([], True)),
             patch("lapis_pm.pm_core.get_cursor", return_value=None),
             patch("lapis_pm.pm_core.set_cursor"),
             patch("lapis_pm.pm_core.get_pause_state", return_value=None),
@@ -445,7 +397,7 @@ class TestTickIntegration:
             patch("lapis_pm.pm_core._encode_merged_prs", return_value=0),
             patch("lapis_pm.pm_core._encode_user_comments", return_value=[]),
             patch("lapis_pm.pm_core._is_auto_land_eligible", return_value=False),
-        ):
+            ):
             MockStore.return_value.get.return_value = mock_target
             result = pm_core.tick("my-target")
 
@@ -477,7 +429,7 @@ class TestTickIntegration:
             patch("lapis_pm.pm_core._encode_merged_prs", return_value=0),
             patch("lapis_pm.pm_core._encode_user_comments", return_value=[]),
             patch("lapis_pm.pm_core._is_auto_land_eligible", return_value=False),
-        ):
+            ):
             MockStore.return_value.get.return_value = mock_target
             result = pm_core.tick("my-target")
 

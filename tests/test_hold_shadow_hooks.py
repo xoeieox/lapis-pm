@@ -53,13 +53,13 @@ def test_act_brief_hold_branch_calls_observe_hold_fact():
 
     with (
         patch("lapis_pm.pm_core.episodic.write_hold", return_value=hold_comment),
-        patch("lapis_pm.pm_core.TargetStore") as mock_ts,
+            patch("lapis_pm.pm_core.TargetStore") as mock_ts,
         patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
-        patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_result),
+            patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_result),
         patch("lapis_pm.pm_core._mark_pr_classified"),
-        patch("lapis_pm.pm_core._set_brief_outstanding"),
+            patch("lapis_pm.pm_core._set_brief_outstanding"),
         patch("lapis_pm.pm_core._spec_bound_ts", return_value="2026-08-01T00:00:00-07:00"),
-        patch("lapis_pm.hold_shadow.observe_hold_fact") as mock_observe,
+            patch("lapis_pm.hold_shadow.observe_hold_fact") as mock_observe,
     ):
         mock_ts.return_value.get.return_value = fake_target
         result = pm_core._act_brief(
@@ -98,9 +98,9 @@ def test_act_brief_advisory_branch_never_calls_observe_hold_fact():
     with (
         patch("lapis_pm.pm_core.TargetStore") as mock_ts,
         patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
-        patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_result),
+            patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_result),
         patch("lapis_pm.pm_core._mark_pr_classified"),
-        patch("lapis_pm.pm_core._set_brief_outstanding"),
+            patch("lapis_pm.pm_core._set_brief_outstanding"),
         patch("lapis_pm.hold_shadow.observe_hold_fact") as mock_observe,
     ):
         mock_ts.return_value.get.return_value = None

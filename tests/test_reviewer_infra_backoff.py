@@ -203,13 +203,10 @@ class TestBackoffCheck:
             patch("lapis_pm.pm_core._mem", return_value=store),
             patch("lapis_pm.pm_core.datetime", _FrozenDatetime),
             patch("lapis_pm.pm_core.authority.classify", return_value=cls),
-            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
         ):
             _FrozenDatetime.set_frozen(
                 _dt.datetime(2026, 8, 18, 5, 15, 0, tzinfo=pm_core.PACIFIC)
@@ -368,13 +365,11 @@ class TestNonInfraClearsBackoff:
             patch("lapis_pm.pm_core._mem", return_value=store),
             patch("lapis_pm.pm_core.authority.classify", return_value=cls),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-        ):
+            ):
             pm_core._increment_reviewer_attempt(TID, 33, 1)
             pm_core._record_reviewer_attempt_reason(TID, 33, 1, GENUINE_FAILURE)
             decision = pm_core._decide_for_pr(TID, "facets", pr, "advisory")
@@ -482,13 +477,11 @@ class TestPersistenceAndRestart:
             patch("lapis_pm.pm_core._mem", return_value=store),
             patch("lapis_pm.pm_core.authority.classify", return_value=cls),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-        ):
+            ):
             for _ in range(pm_core.REVIEWER_INFRA_RETRY_BUDGET_DEFAULT):
                 pm_core._increment_reviewer_attempt(TID, 12, 1)
                 pm_core._record_reviewer_attempt_reason(
@@ -555,8 +548,8 @@ class TestStatusLineVisibility:
             with (
                 patch("lapis_pm.pm_core._classified_pr_ids", return_value=set()),
                 patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
-                patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
-            ):
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+        ):
                 review_state = pm_core._active_review_state(TID, [{"number": 241}])
                 backoff = pm_core._active_reviewer_backoff(TID, [{"number": 241}])
         assert review_state is None

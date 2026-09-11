@@ -52,7 +52,7 @@ def test_clear_outstanding_brief_supersedes_live_gem(reason):
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=store),
-        patch("lapis_pm.brief_gem._call_supersede_endpoint", side_effect=_fake_supersede),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint", side_effect=_fake_supersede),
         patch("lapis_pm.brief_gem._update_map_status", side_effect=_fake_update),
     ):
         set_outstanding_brief(tid, cid)
@@ -73,7 +73,7 @@ def test_clear_outstanding_brief_no_live_gem_is_silent_noop():
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=store),
-        patch("lapis_pm.brief_gem._call_supersede_endpoint") as mock_sup,
+            patch("lapis_pm.brief_gem._call_supersede_endpoint") as mock_sup,
     ):
         set_outstanding_brief(tid, cid)
         clear_outstanding_brief(tid, reason="unbind")  # must not raise
@@ -90,7 +90,7 @@ def test_clear_outstanding_brief_no_prior_brief_is_silent_noop():
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=store),
-        patch("lapis_pm.brief_gem._reverse_key") as mock_rkey,
+            patch("lapis_pm.brief_gem._reverse_key") as mock_rkey,
     ):
         clear_outstanding_brief(tid, reason="unbind")  # must not raise
 
@@ -109,7 +109,7 @@ def test_clear_outstanding_brief_409_leaves_forward_map_untouched():
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=store),
-        patch("lapis_pm.brief_gem._call_supersede_endpoint", return_value=False),
+            patch("lapis_pm.brief_gem._call_supersede_endpoint", return_value=False),
         patch("lapis_pm.brief_gem._update_map_status") as mock_update,
     ):
         set_outstanding_brief(tid, cid)
@@ -130,7 +130,7 @@ def test_clear_outstanding_brief_supersede_failure_does_not_block_clear(capsys):
 
     with (
         patch("lapis_pm.pm_core._mem", return_value=store),
-        patch("lapis_pm.brief_gem._call_supersede_endpoint",
+            patch("lapis_pm.brief_gem._call_supersede_endpoint",
               side_effect=RuntimeError("weaver down")),
     ):
         set_outstanding_brief(tid, cid)

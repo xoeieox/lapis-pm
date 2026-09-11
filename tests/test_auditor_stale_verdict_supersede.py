@@ -148,7 +148,7 @@ def _make_cls(pm_authority: str = "advisory") -> authority.PRClassification:
     returns this instance, and _decide_for_pr reads cls.static_outcome /
     cls.verdict directly — a bare MagicMock would compare equal to
     authority.StaticOutcome.auto_hold_path (MagicMock == anything) and
-    take the static-hold path instead of the review-gate loop."""
+    take the static-hold path instead of the reviewer loop."""
     return authority.PRClassification(
         verdict="advisory",
         screen_verdict="unknown",
@@ -176,18 +176,15 @@ def _decide_patches(comments: list, verdict: dict, *,
     patches = [
         patch("lapis_pm.authority.classify", return_value=_make_cls()),
         patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
         patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-        patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_count),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=reviewer_count),
         patch("lapis_pm.pm_core._fixer_retry_count", return_value=fixer_count),
-        patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
-        patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-        patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-        patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False),
-        patch("lapis_pm.pm_core._collect_review_history", return_value=[]),
-        patch("lapis_pm.pm_core._reviewer_attempt_ceiling_check",
+            patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),        patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False),
+            patch("lapis_pm.pm_core._collect_review_history", return_value=[]),
+            patch("lapis_pm.pm_core._reviewer_attempt_ceiling_check",
               return_value=None),
-        patch("lapis_pm.pm_core._reviewer_infra_backoff_check",
+            patch("lapis_pm.pm_core._reviewer_infra_backoff_check",
               return_value=None),
     ]
     for p in patches:

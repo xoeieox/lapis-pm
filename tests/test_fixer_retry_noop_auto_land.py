@@ -323,7 +323,7 @@ class TestGenuinelyLostLoudSkip:
             patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]),
             patch("lapis_pm.episodic.all_comments", return_value=[]),
             patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
-        ):
+            ):
             result = pm_core._act_lost_fixer_retry("my-target", rec)
 
         assert result.startswith("skip:lost_fixer_retry_undispatchable:pr=106"), (
@@ -344,7 +344,7 @@ class TestGenuinelyLostLoudSkip:
             patch("lapis_pm.pm_core.load_dispatched", return_value=[rec]),
             patch("lapis_pm.episodic.all_comments", return_value=[seeded]),
             patch("lapis_pm.episodic.write_observation", side_effect=capture_obs),
-        ):
+            ):
             result2 = pm_core._act_lost_fixer_retry("my-target", rec)
 
         assert result2.startswith("skip:lost_fixer_retry_undispatchable:pr=106")

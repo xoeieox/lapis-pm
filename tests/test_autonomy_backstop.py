@@ -82,7 +82,7 @@ class TestSweepOneRepoPerCall:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
 
         # Exactly one repo processed, green.
@@ -109,7 +109,7 @@ class TestSweepOneRepoPerCall:
                          return_value=_att("unattested",
                                            pr_failures=["lapis_pm/foo.py::test_x"])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
 
         assert out["status"] == "red"
@@ -136,7 +136,7 @@ class TestSweepOneRepoPerCall:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
 
         assert out["status"] == "green"
@@ -168,7 +168,7 @@ class TestSweepIdempotency:
         with (
             patch.object(va, "attest_main_baseline") as mock_baseline,
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T12:00:00Z")
 
         # The repo was already swept with no new demotion -> skipped, no
@@ -190,7 +190,7 @@ class TestSweepIdempotency:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out1 = ab.sweep(mem, now="2026-09-06T00:00:00Z")
         first_repo = out1["repo"]
         # After the first sweep, lapis-pm's last_sweep_ts is set. The next
@@ -199,7 +199,7 @@ class TestSweepIdempotency:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out2 = ab.sweep(mem, now="2026-09-07T00:00:00Z")
         second_repo = out2["repo"]
         assert first_repo != second_repo
@@ -226,7 +226,7 @@ class TestSweepIdempotency:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
 
         # The sweep completed with the stubbed main-baseline result.
@@ -363,7 +363,7 @@ class TestSweepStartedStamp:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
         # The stamp is written at sweep START (a real sweep ran, not skipped).
         assert out["status"] == "green"
@@ -387,7 +387,7 @@ class TestSweepStartedStamp:
         with (
             patch.object(va, "attest_main_baseline") as mock_baseline,
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:10:00Z")
         assert out["status"] == "skipped_in_flight"
         assert not mock_baseline.called, "no suite run when a sweep is in flight"
@@ -407,7 +407,7 @@ class TestSweepStartedStamp:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:20:00Z")
         assert out["status"] == "green"
 
@@ -430,7 +430,7 @@ class TestClassDependentEligibility:
         with (
             patch.object(va, "attest_main_baseline") as mock_baseline,
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T12:00:00Z")
         assert out["status"] == "skipped_not_eligible"
         assert out.get("reason") == "docs_only_window"
@@ -450,7 +450,7 @@ class TestClassDependentEligibility:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T01:00:00Z")
         assert out["status"] == "green"
 
@@ -470,7 +470,7 @@ class TestClassDependentEligibility:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:45:00Z")
         assert out["status"] == "green"
 
@@ -490,7 +490,7 @@ class TestClassDependentEligibility:
         with (
             patch.object(va, "attest_main_baseline") as mock_baseline,
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:15:00Z")
         assert out["status"] == "skipped_not_eligible"
         assert out.get("reason") == "no_new_demotion"
@@ -558,7 +558,7 @@ class TestChangeClassAndSweepCount:
             patch.object(va, "attest_main_baseline",
                          return_value=_att("attested", pr_failures=[])),
             patch("lapis_pm.episodic.write_observation"),
-        ):
+            ):
             out = ab.sweep(mem, now="2026-09-06T00:00:00Z")
         assert out["status"] == "green"
         assert out["change_class"] == ["code"]

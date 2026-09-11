@@ -147,14 +147,11 @@ class TestCeilingDecision:
             )
             with (
                 patch("lapis_pm.pm_core.authority.classify", return_value=cls),
-                patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-                patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
-                patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
-                patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),                patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
                 patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
-                patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
-                patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-            ):
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
+        ):
                 decision = pm_core._decide_for_pr(TID, "facets", pr, "advisory")
         assert decision.kind == "reviewer_attempt_ceiling"
         assert decision.payload["pr_number"] == 33
@@ -266,7 +263,7 @@ class TestPersistenceAndClear:
             patch("lapis_pm.pm_core._mem", return_value=store),
             patch("lapis_pm.pm_core.TargetStore", mock_store_cls),
             patch("lapis_pm.pm_core.episodic.write_observation"),
-        ):
+            ):
             pm_core._increment_reviewer_attempt(TID, 33, 1)
             pm_core._increment_reviewer_attempt(TID, 33, 1)
             assert pm_core._reviewer_attempt_ceiling_check(TID, 33, 1) is not None
@@ -343,13 +340,11 @@ class TestIncidentReconstruction:
             patch("lapis_pm.pm_core.episodic.write_observation"),
             patch("lapis_pm.pm_core.authority.classify", return_value=cls),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
-        ):
+            ):
             for _ in range(10):
                 decision = pm_core._decide_for_pr(TID, "facets", pr, "advisory")
                 if decision.kind == "dispatch_reviewer":
@@ -417,12 +412,10 @@ class TestIncidentReconstruction:
             patch("lapis_pm.pm_core.episodic.write_observation"),
             patch("lapis_pm.pm_core.authority.classify", return_value=cls),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-            patch("lapis_pm.pm_core._review_gate_paused", return_value=False),
             patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=0),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=0),
-            patch("lapis_pm.pm_core._review_gate_counter", return_value=0),
             # lapis-pm-reviewer-defer-backoff-v0: this replay drives ticks
             # back-to-back with no simulated wall-clock advance, which is
             # exactly what the backoff feature now paces against by design
@@ -431,7 +424,7 @@ class TestIncidentReconstruction:
             # concern — the infra budget still bounds gw_not_serving without
             # wedging behind the reviewer-attempt ceiling.
             patch("lapis_pm.pm_core._reviewer_infra_backoff_check", return_value=None),
-        ):
+            ):
             # The observed #834 sequence was six dispatches; drive one tick
             # further so the ceiling-check after the sixth failure gets a
             # chance to fire the infra-budget pause (checked at the top of

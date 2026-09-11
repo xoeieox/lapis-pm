@@ -600,8 +600,8 @@ def _run_escalation(comments, rec=None, pr=7, cycle=3, current=None):
 
     with (
         patch("lapis_pm.pm_core._review_verdict_for_cycle", side_effect=fake_for_cycle),
-        patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments),
-        patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments),
+            patch("lapis_pm.pm_core._mem") as mock_mem,
         patch("lapis_pm.pm_core.episodic.write_hold") as mock_hold,
         patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
         patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_outstanding,
@@ -860,11 +860,6 @@ class TestPanelHealthLine:
 
         with (
             patch.object(TargetStore, "get", return_value=_FakeTarget()),
-            patch("lapis_pm.pm_core.review_gate_status", return_value={
-                "counter": 0, "threshold": 3, "paused": False,
-                "window_oldest": None, "window_newest": None, "window_days": 0,
-                "infra_nonruns": 0,
-            }),
             patch("lapis_pm.pm_core.get_cursor", return_value=""),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
@@ -878,7 +873,7 @@ class TestPanelHealthLine:
             patch("lapis_pm.pm_core._active_reviewer_backoff", return_value=None),
             patch("lapis_pm.pm_core._panel_health_summary",
                   return_value={"starved": 1, "total": 2, "legs": ["local_witness"]}),
-        ):
+            ):
             args = MagicMock()
             args.target_id = "tid-panel"
             args.explain = False
@@ -908,11 +903,6 @@ class TestPanelHealthLine:
 
         with (
             patch.object(TargetStore, "get", return_value=_FakeTarget()),
-            patch("lapis_pm.pm_core.review_gate_status", return_value={
-                "counter": 0, "threshold": 3, "paused": False,
-                "window_oldest": None, "window_newest": None, "window_days": 0,
-                "infra_nonruns": 0,
-            }),
             patch("lapis_pm.pm_core.get_cursor", return_value=""),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
@@ -925,7 +915,7 @@ class TestPanelHealthLine:
                   return_value={"verdict": "fixable", "issues": [1]}),
             patch("lapis_pm.pm_core._active_reviewer_backoff", return_value=None),
             patch("lapis_pm.pm_core._panel_health_summary", return_value=None),
-        ):
+            ):
             args = MagicMock()
             args.target_id = "tid-none"
             args.explain = False
@@ -986,7 +976,7 @@ class TestBriefSurfaces:
                   return_value=(False, None)),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
             patch("lapis_pm.pm_core._set_brief_outstanding"),
-        ):
+            ):
             mock_ts.return_value.get.return_value = _FakeTarget()
             mock_synth.return_value = MagicMock(comment_id="cid")
             try:

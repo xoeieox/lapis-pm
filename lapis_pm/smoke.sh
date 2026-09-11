@@ -680,8 +680,7 @@ mock_cls = authority.PRClassification(
 )
 
 with patch('lapis_pm.pm_core._perceive_prs', return_value=([pr], True)), \
-     patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls), \
-     patch('lapis_pm.pm_core._review_gate_paused', return_value=False):
+     patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls):
     result = pm_core.tick('${TID_RIF}')
 print(f'[{result.target_id}] skipped={result.skipped} reason={result.reason} encoded={result.encoded} decision={result.decision}')
 ")
@@ -1155,7 +1154,6 @@ with (
     patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
     patch("lapis_pm.pm_core.episodic.write_dispatch"),
     patch("lapis_pm.pm_core.append_dispatched"),
-    patch("lapis_pm.pm_core._increment_review_gate_counter", return_value=1),
     patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
     patch("agents_core.forgejo.get_pr_diff", return_value="diff"),
 ):
@@ -1290,13 +1288,10 @@ def capture(agent_type, t, user_prompt, vars_=None, **kw):
 with (
     patch('lapis_pm.pm_core._perceive_prs', return_value=([adopted_pr], True)),
     patch('lapis_pm.pm_core.authority.classify', return_value=mock_cls),
-    patch('lapis_pm.pm_core._review_gate_paused', return_value=False),
-    patch('lapis_pm.pm_core._review_gate_counter', return_value=0),
     patch.object(pm_core._SHAPER, 'dispatch', side_effect=capture),
     patch('lapis_pm.pm_core.episodic.spec_summary', return_value='spec'),
     patch('lapis_pm.pm_core.episodic.write_dispatch'),
     patch('lapis_pm.pm_core.append_dispatched'),
-    patch('lapis_pm.pm_core._increment_review_gate_counter'),
     patch('lapis_pm.pm_core.load_dispatched', return_value=[]),
     patch('agents_core.forgejo.get_pr_diff', return_value='diff'),
     patch('lapis_pm.pm_core.Shaper.resolve_repo_cwd', return_value='/tmp/smoke'),
@@ -4678,105 +4673,6 @@ sys.exit(0 if rc == 0 else 1)
 
 green "Phase 46: local-reviewer-witness smoke ✓"
 
-# --- Phase 47: review-gate paused-persistent-signal -------------------------
-step "Phase 47: review-gate paused-persistent-signal smoke"
-
-RG_AUDIT_KEY_PREFIX="decision/review-gate-resume/smoke-test-$$"
-
-# Cleanup for this phase on exit
-cleanup_rg_smoke() {
-    /usr/local/bin/mem delete "pm/review-gate/paused" 2>/dev/null || true
-    /usr/local/bin/mem delete "pm/review-gate/cycles-this-window" 2>/dev/null || true
-    # Remove any audit keys written by this phase (prefix match via list)
-    /usr/local/bin/mem list --tag "resume-audit" --limit 100 2>/dev/null \
-        | awk '{print $1}' \
-        | grep "^decision/review-gate-resume/" \
-        | while read -r k; do
-            /usr/local/bin/mem delete "$k" 2>/dev/null || true
-          done
-}
-trap 'cleanup_rg_smoke; cleanup' EXIT INT TERM
-
-# (a) Seed paused state and counter via mem
-/usr/local/bin/mem set "pm/review-gate/paused" "1" --tags "lapis-pm,review-gate" >/dev/null \
-    || red "Phase 47(a): failed to set review-gate paused"
-/usr/local/bin/mem set "pm/review-gate/cycles-this-window" "42" --tags "lapis-pm,review-gate" >/dev/null \
-    || red "Phase 47(a): failed to set review-gate counter"
-print "(a) review-gate seeded as paused at counter=42: OK" 2>/dev/null || true
-echo "(a) review-gate seeded as paused at counter=42: OK"
-
-# (b/c) Run one tick_all via Python mock and assert [review-gate-paused] log fires once
-RG_TICK_OUT=$(python3 -c "
-import site; site.addsitedir('/home/user/.local/lib/python3.12/site-packages')
-import sys, logging
-sys.path.insert(0, '${REPO_ROOT}')
-sys.path.insert(0, '/srv/git/agents-core-working')
-
-# Capture INFO log output from pm_core logger
-captured = []
-class CapHandler(logging.Handler):
-    def emit(self, r):
-        captured.append(r.getMessage())
-
-handler = CapHandler()
-pm_logger = logging.getLogger('lapis_pm.pm_core')
-pm_logger.addHandler(handler)
-pm_logger.setLevel(logging.DEBUG)
-
-from unittest.mock import patch, MagicMock
-from lapis_pm import pm_core
-
-with (
-    patch('lapis_pm.pm_core.probe_forgejo_health', return_value=(True, 'ok')),
-    patch('lapis_pm.pm_core._set_forgejo_consecutive_fails'),
-    patch('lapis_pm.pm_core.TargetStore') as mock_store_cls,
-):
-    mock_store = MagicMock()
-    mock_store.load_all.return_value = []
-    mock_store_cls.return_value = mock_store
-    pm_core.tick_all()
-
-paused_lines = [m for m in captured if '[review-gate-paused]' in m]
-if len(paused_lines) != 1:
-    print(f'FAIL: expected 1 [review-gate-paused] log line, got {len(paused_lines)}: {paused_lines}')
-    sys.exit(1)
-print('OK: [review-gate-paused] log line count=1')
-print('line:', paused_lines[0])
-") || red "Phase 47(b/c): tick_all paused-tick log test failed"
-echo "$RG_TICK_OUT"
-echo "$RG_TICK_OUT" | grep -q "\[review-gate-paused\]" || red "Phase 47(c): [review-gate-paused] not in tick log output"
-echo "(b/c) tick_all emits [review-gate-paused] log once: OK"
-
-# (d) Attempt bare resume (no --reason) — must exit non-zero
-$LAPIS review-gate resume 2>/dev/null && red "Phase 47(d): bare resume should have failed but exited 0" || true
-echo "(d) bare 'review-gate resume' (no --reason) rejects correctly: OK"
-
-# (e) Resume with --reason — must succeed
-$LAPIS review-gate resume --reason "smoke test resume $$" \
-    || red "Phase 47(e): review-gate resume --reason failed"
-echo "(e) 'review-gate resume --reason' succeeded: OK"
-
-# (f) Verify audit mem entry was written with reason text
-AUDIT_SEARCH=$(/usr/local/bin/mem list --tag "resume-audit" --limit 50 2>/dev/null || echo "")
-if [ -z "$AUDIT_SEARCH" ]; then
-    red "Phase 47(f): no resume-audit mem entries found after resume"
-fi
-# Get the most recent audit entry and verify it contains the reason
-AUDIT_KEY=$(echo "$AUDIT_SEARCH" | awk '{print $1}' | grep "^decision/review-gate-resume/" | head -1)
-if [ -z "$AUDIT_KEY" ]; then
-    red "Phase 47(f): no decision/review-gate-resume/ key in mem after resume"
-fi
-AUDIT_BODY=$(/usr/local/bin/mem get "$AUDIT_KEY" 2>/dev/null || echo "")
-if ! echo "$AUDIT_BODY" | grep -q "smoke test resume"; then
-    red "Phase 47(f): audit entry body does not contain reason 'smoke test resume'. Body: $AUDIT_BODY"
-fi
-echo "(f) audit mem entry decision/review-gate-resume/<ts> contains reason: OK"
-
-# Cleanup phase-specific mem keys (counter/paused already reset by resume; clean audit key)
-/usr/local/bin/mem delete "$AUDIT_KEY" 2>/dev/null || true
-
-green "Phase 47: review-gate paused-persistent-signal smoke ✓"
-
 # --- Phase 48: spec-review facets dispatch (real LLM, real subprocess) ----
 #
 # Exercises _dispatch_facets() end-to-end: spec_text travels via context file,
@@ -4793,7 +4689,7 @@ green "Phase 48: spec-review facets dispatch smoke ✓"
 
 # --- Done ----------------------------------------------------------------
 echo
-green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export, local-reviewer-witness, review-gate-paused-signal, spec-review-facets-dispatch all OK"
+green "Smoke complete: bind, dispatch, encode, pause/resume, directive→brief, auto-land, reviewer-verdict-encode, chain, router-portfolio, notify-routing, sha-invalidation, state-brief, trajectory-rollup, closed-form-brief, already-done-verdict, forgejo-health-gate, lost-dispatch, ratify, merge-aware-lost-dispatch, outstanding-brief-verify, advisory-clean-anchor, council-deliberation, council-scene, council-v0next-agree, council-v0next-stand-aside, council-v0next-laid-down, council-v0next-scene, spec-review-happy-path, spec-review-amend-spec, spec-review-frontmatter-error, spec-review-timeout-side-marker, eval-gate-cli, backcaster-stub, decisions-export, local-reviewer-witness, spec-review-facets-dispatch all OK"
 cat <<MSG
 
 Skipped automatically (need live state):

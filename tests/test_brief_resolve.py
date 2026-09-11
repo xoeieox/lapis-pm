@@ -113,9 +113,9 @@ def test_synthesize_emits_sibling_for_closed_form_triggers(
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
         patch("lapis_pm.brief.episodic.write_brief",
               side_effect=_fake_write_brief_factory(brief_cid)),
         patch("lapis_pm.brief.episodic.write_brief_options",
@@ -143,9 +143,9 @@ def test_synthesize_emits_sibling_with_pr_number():
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
         patch("lapis_pm.brief.episodic.write_brief",
               side_effect=_fake_write_brief_factory(brief_cid)),
         patch("lapis_pm.brief.episodic.write_brief_options",
@@ -173,9 +173,9 @@ def test_synthesize_no_sibling_for_amendment_triggers(trigger):
 
     with (
         patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
-        patch("lapis_pm.brief.send_notification", return_value=False),
+            patch("lapis_pm.brief.send_notification", return_value=False),
         patch("lapis_pm.brief.episodic.recall", return_value=[]),
-        patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
         patch("lapis_pm.brief.episodic.write_brief",
               side_effect=_fake_write_brief_factory("cid-x")),
         patch("lapis_pm.brief.episodic.write_brief_options",
@@ -330,7 +330,7 @@ def _patch_pm_core_for_apply_decision(brief_id, outstanding_id, audit_content=No
 
     return [
         patch("lapis_pm.pm_core._mem", return_value=mock_mem),
-        patch("lapis_pm.pm_core.get_outstanding_brief", return_value=outstanding_id),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=outstanding_id),
         patch("lapis_pm.pm_core.clear_outstanding_brief"),
     ], mock_mem
 
@@ -521,7 +521,7 @@ def test_consume_brief_decisions_pending_to_applied(tmp_path):
 
     with (
         patch("lapis_pm.pm_core._DIRECTIVES_BASE", new=tmp_path),
-        patch("lapis_pm.brief.apply_decision", return_value=apply_result),
+            patch("lapis_pm.brief.apply_decision", return_value=apply_result),
         patch("lapis_pm.pm_core.episodic.write_observation"),
     ):
         result = _pm._consume_brief_decisions(target_id)
@@ -555,7 +555,7 @@ def test_consume_brief_decisions_failed_directive(tmp_path):
 
     with (
         patch("lapis_pm.pm_core._DIRECTIVES_BASE", new=tmp_path),
-        patch("lapis_pm.brief.apply_decision", return_value=apply_result),
+            patch("lapis_pm.brief.apply_decision", return_value=apply_result),
         patch("lapis_pm.pm_core.episodic.write_observation"),
     ):
         result = _pm._consume_brief_decisions(target_id)
@@ -590,7 +590,7 @@ def test_consume_brief_decisions_crash_recovery(tmp_path):
 
     with (
         patch("lapis_pm.pm_core._DIRECTIVES_BASE", new=tmp_path),
-        patch("lapis_pm.brief.apply_decision", return_value=apply_result),
+            patch("lapis_pm.brief.apply_decision", return_value=apply_result),
         patch("lapis_pm.pm_core.episodic.write_observation"),
     ):
         result = _pm._consume_brief_decisions(target_id)
@@ -623,7 +623,7 @@ def test_consume_brief_decisions_only_processes_target_namespace(tmp_path):
 
     with (
         patch("lapis_pm.pm_core._DIRECTIVES_BASE", new=tmp_path),
-        patch("lapis_pm.pm_core.episodic.write_observation"),
+            patch("lapis_pm.pm_core.episodic.write_observation"),
     ):
         result = _pm._consume_brief_decisions("my-target")
 

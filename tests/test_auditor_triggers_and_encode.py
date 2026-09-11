@@ -142,9 +142,9 @@ def _patch_dispatch(res=None):
     res = res or _dispatch_result()
     return (
         patch("lapis_pm.pm_core._SHAPER.dispatch", return_value=res),
-        patch("lapis_pm.pm_core.steer.inject_overlay"),
+            patch("lapis_pm.pm_core.steer.inject_overlay"),
         patch("lapis_pm.pm_core._ensure_dispatch_owned"),
-        patch("lapis_pm.pm_core._check_calcification"),
+            patch("lapis_pm.pm_core._check_calcification"),
         patch("lapis_pm.pm_core._baseline_main_sha", return_value=MAIN_SHA),
     )
 

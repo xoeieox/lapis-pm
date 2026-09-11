@@ -234,7 +234,7 @@ def test_ac6_harness_exception_caught(tmp_path):
          patch(
              "lapis_pm.code_oracle_run.run_code_oracle_experiment",
              side_effect=RuntimeError("agent backend unreachable"),
-         ):
+            ):
         code, _, err = _run([
             "code-oracle-run",
             "--fixture-id", "lapis-pm-66a7d2ea",

@@ -102,7 +102,7 @@ def test_cmd_unbind_clears_outstanding_brief():
 
     with (
         patch("lapis_pm.cli.TargetStore", return_value=mock_store),
-        patch("lapis_pm.pm_core.clear_classified_prs"),
+            patch("lapis_pm.pm_core.clear_classified_prs"),
     ):
         rc = cmd_unbind(args)
 

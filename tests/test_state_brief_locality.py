@@ -156,7 +156,7 @@ class TestReadLocalityRendering:
             patch("agents_core.locality.summarize",
                   return_value=_summary(total=50, pct_local=0.0, by_cost_class={"paid-anthropic": 50})),
             patch("lapis_pm.state_brief._mem", return_value=mock_mem),
-        ):
+            ):
             result = state_brief._read_locality(datetime.now(tz=timezone.utc), period="weekly")
         assert result != []
         assert any("0 percent" in line for line in result)
@@ -167,7 +167,7 @@ class TestReadLocalityRendering:
             patch("agents_core.locality.is_ledger_healthy", return_value=(True, "last record 0.1h ago")),
             patch("agents_core.locality.summarize", return_value=_summary(total=0, pct_local=0.0)),
             patch("lapis_pm.state_brief._mem", return_value=mock_mem),
-        ):
+            ):
             result = state_brief._read_locality(datetime.now(tz=timezone.utc), period="weekly")
         assert len(result) == 1
         assert "no calls" in result[0].lower()

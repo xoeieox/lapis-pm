@@ -177,7 +177,7 @@ class TestAutoResolvePredicate:
             patch.dict("os.environ", {"PM_AUTO_RESOLVE": "conservative"}),
             patch("lapis_pm.auto_resolve.brief_gem") as mock_bg,
             patch("lapis_pm.auto_resolve._CLOSED_FORM_TRIGGERS", patched_triggers),
-        ):
+            ):
             mock_bg._held_path_check_live.return_value = (False, "")
             ok, reason = auto_resolve.should_auto_resolve(cls, target, "lapis-pm")
 
@@ -265,7 +265,7 @@ class TestActBriefAutoResolveHook:
             patch("lapis_pm.pm_core.episodic.write_observation"),
             patch("lapis_pm.pm_core._mem", return_value=MagicMock()),
             patch("lapis_pm.pm_core._mark_pr_classified"),
-        ):
+            ):
             mock_ts.return_value.get.return_value = target
 
             result = pm_core._act_brief("my-target", "advisory", True, payload)
@@ -298,7 +298,7 @@ class TestActBriefAutoResolveHook:
             patch("lapis_pm.pm_core.episodic.write_observation"),
             patch("lapis_pm.pm_core._mem", return_value=MagicMock()),
             patch("lapis_pm.pm_core._mark_pr_classified"),
-        ):
+            ):
             mock_ts.return_value.get.return_value = target
 
             result = pm_core._act_brief("my-target", "advisory-screen-issue", False, payload)

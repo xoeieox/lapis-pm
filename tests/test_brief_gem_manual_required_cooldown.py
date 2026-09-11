@@ -29,7 +29,7 @@ def test_first_call_notifies_high_and_writes_cooldown():
     mem = _mock_mem(cooldown_content=None)
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem),
-        patch("lapis_pm.brief_gem.send_notification") as mock_notify,
+            patch("lapis_pm.brief_gem.send_notification") as mock_notify,
         patch("lapis_pm.brief_gem.episodic.write_observation") as mock_obs,
     ):
         brief_gem._notify_and_observe_manual_required("tid", 42, "gem-1", "held path")
@@ -48,7 +48,7 @@ def test_repeat_calls_within_cooldown_suppress_pushover_not_observation():
     mem = _mock_mem(cooldown_content=recent)
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem),
-        patch("lapis_pm.brief_gem.send_notification") as mock_notify,
+            patch("lapis_pm.brief_gem.send_notification") as mock_notify,
         patch("lapis_pm.brief_gem.episodic.write_observation") as mock_obs,
     ):
         for _ in range(5):
@@ -66,7 +66,7 @@ def test_cooldown_lapsed_renotifies_at_normal_priority():
     mem = _mock_mem(cooldown_content=stale)
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem),
-        patch("lapis_pm.brief_gem.send_notification") as mock_notify,
+            patch("lapis_pm.brief_gem.send_notification") as mock_notify,
         patch("lapis_pm.brief_gem.episodic.write_observation"),
     ):
         brief_gem._notify_and_observe_manual_required("tid", 42, "gem-1", "held path")
@@ -82,7 +82,7 @@ def test_cooldown_read_error_fails_open_and_notifies():
     mem.set = MagicMock()
     with (
         patch("lapis_pm.pm_core._mem", return_value=mem),
-        patch("lapis_pm.brief_gem.send_notification") as mock_notify,
+            patch("lapis_pm.brief_gem.send_notification") as mock_notify,
         patch("lapis_pm.brief_gem.episodic.write_observation"),
     ):
         brief_gem._notify_and_observe_manual_required("tid", 42, "gem-1", "held path")

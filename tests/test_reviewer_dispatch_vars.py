@@ -75,12 +75,10 @@ def _call_reviewer(pr, cls=None, mode="same", cycle=1):
         patch.object(pm_core._SHAPER, "dispatch", side_effect=capture_dispatch),
         patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd",
               return_value="/srv/git/myrepo-working"),
-        patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
-        patch("lapis_pm.pm_core.episodic.write_dispatch"),
-        patch("lapis_pm.pm_core.append_dispatched"),
-        patch("lapis_pm.pm_core._increment_review_gate_counter", return_value=1),
-        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
-        patch("agents_core.forgejo.get_pr_diff", return_value="diff text"),
+            patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),
+            patch("lapis_pm.pm_core.episodic.write_dispatch"),
+            patch("lapis_pm.pm_core.append_dispatched"),        patch("lapis_pm.pm_core.load_dispatched", return_value=[]),
+            patch("agents_core.forgejo.get_pr_diff", return_value="diff text"),
     ):
         pm_core._act_dispatch_reviewer("tid", pr, cls, mode=mode, cycle=cycle)
 

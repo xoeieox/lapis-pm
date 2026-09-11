@@ -89,7 +89,7 @@ class TestDegradedBriefTimeout:
         with (
             patch.dict("os.environ", {"LAPIS_BRIEF_DRY_RUN": "1"}),
             patch("agents_core.llm.call_llm", side_effect=call_llm_mock),
-        ):
+            ):
             result = state_brief._generate_prose(
                 period="live",
                 buckets={
@@ -624,7 +624,7 @@ class TestReadArcClimate:
             patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
             patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
             patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
-        ):
+            ):
             result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
 
         assert len(result) == 1
@@ -643,7 +643,7 @@ class TestReadArcClimate:
             patch("lapis_pm.state_brief.room_path", return_value=tmp_path / "lapis_state"),
             patch("lapis_pm.deploy_inventory.read_status_json", return_value=None),
             patch("lapis_pm.state_brief._arc_weaver_signal", return_value=None),
-        ):
+            ):
             result = state_brief._read_arc_climate(datetime.now(tz=timezone.utc), period="weekly")
 
         assert result == []

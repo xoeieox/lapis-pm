@@ -5,7 +5,6 @@ Coverage:
   - mode derivation: hold → fresh-reviewer, otherwise → same-reviewer.
   - budget derivation: advisory→2, hold→4, unknown→2.
   - Real verdict surfaces (fixable/clean issue handling).
-  - paused reflects global kill-switch.
   - Deletes cache when _active_review_state returns None.
   - Idempotent delete: key already absent + state None → no error, no key.
   - Tag set is exactly {"lapis-pm", "review-state"}.
@@ -82,14 +81,17 @@ class TestPersistReviewStateCacheWrite:
         assert payload["last_issues"] is None
         assert "updated_at" in payload
 
-    def test_all_eight_fields_present(self):
-        """Payload must have exactly the eight schema fields (seven base + last_corroboration)."""
+    def test_all_nine_fields_present(self):
+        """Payload must have exactly the nine schema fields (seven base +
+        last_corroboration + panel_starvation). The former kill-switch
+        ``paused`` field was removed with the review-gate counter
+        (lapis-pm-review-gate-counter-removal-v0, spec D2/D4 rev 3)."""
         mem = _make_mem()
         target = _make_target("advisory")
         expected_fields = {
             "pr_number", "cycle", "budget", "mode",
             "last_verdict", "last_issues", "updated_at",
-            "last_corroboration",
+            "last_corroboration", "panel_starvation",
         }
 
         with (

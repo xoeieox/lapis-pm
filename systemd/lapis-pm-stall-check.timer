@@ -1,0 +1,12 @@
+[Unit]
+Description=Lapis PM - dedicated stall checker timer (10m cycle, attestation-contract-v0 leg 2, D6a)
+
+[Timer]
+# Independent of the tick's lifecycle: fires even while a tick pass is
+# hung or dead (the embedded rev-1 placement was structurally wrong - the
+# killed pass is the thing being detected).
+OnUnitActiveSec=600
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

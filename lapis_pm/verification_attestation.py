@@ -122,8 +122,41 @@ def _pr_failures_from_output(output: str) -> list[str]:
     return sorted(out)
 
 
-def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str], int]:
-    """Run the repo's suite in `worktree`. Returns (suite, failures, exit_code).
+def _collected_test_count(output: str) -> int:
+    """Best-effort count of collected tests from pytest -q output.
+
+    Reads the `= N failed, M passed ... =` summary line (the `N failed,`
+    prefix also matches the all-passed case where `failed` is absent from
+    the line only when N == 0, so both shapes are handled). Returns 0 when
+    no summary line is parseable (e.g. `bash smoke.sh` output) — the count
+    is informational scope evidence, not a gate.
+    """
+    import re as _re
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("= "):
+            continue
+        total = 0
+        # The collected count is the scope evidence: EVERY outcome bucket
+        # the summary line names (failed, passed, skipped, errored,
+        # xfailed, xpassed, deselected) counts as collected — not just
+        # failed+passed (a run of all-skipped tests collected tests).
+        for bucket in (
+            "failed", "passed", "skipped", "errored", "xfailed",
+            "xpassed", "deselected",
+        ):
+            m = _re.search(rf"(\d+)\s+{bucket}\b", line)
+            if m:
+                total += int(m.group(1))
+        if total:
+            return total
+    return 0
+
+
+def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str], int, int]:
+    """Run the repo's suite in `worktree`.
+
+    Returns (suite, failures, exit_code, collected_count).
 
     Suite selection (Design 2): `bash smoke.sh` if the file exists in the
     repo root, else `python3 -m pytest -q` — exactly the `pm-pr-review`
@@ -134,6 +167,10 @@ def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str], int]:
     code is returned so the caller can enforce the hard invariant: a suite
     that exits non-zero must NEVER yield an `attested` result (a red suite
     with no parseable FAILED lines is `inconclusive`, fail-safe).
+
+    `collected_count` is the D8 scope attestation (attestation-contract-v0
+    leg 2): the number of tests the run actually collected (0 when the
+    output carries no parseable summary, e.g. a smoke.sh run).
     """
     if (worktree / "smoke.sh").exists():
         suite = "bash smoke.sh"
@@ -149,7 +186,12 @@ def _run_suite_in_worktree(worktree: Path) -> tuple[str, list[str], int]:
         timeout=ATTESTATION_WALL_BUDGET_S,
     )
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    return suite, _pr_failures_from_output(output), int(proc.returncode or 0)
+    return (
+        suite,
+        _pr_failures_from_output(output),
+        int(proc.returncode or 0),
+        _collected_test_count(output),
+    )
 
 
 def _create_worktree(clone: str, ref: str, dest: Path) -> None:
@@ -206,26 +248,37 @@ def attest(
     Returns:
         {result: "attested" | "unattested" | "inconclusive",
          pr_failures: [str], preexisting: [str],
-         suite: str, ts: iso}
+         suite: str, ts: iso,
+         scope: {suite, collected, complete}}
 
     `attested`    — PR head introduces no new failures vs origin/main.
     `unattested`  — PR head introduces >=1 failure not on main.
     `inconclusive`— runner-control hit, worktree failure, suite timeout,
                     missing clone, or missing head SHA. Fail-safe: the
                     caller never grants machine verification on this.
+
+    D8 scope attestation (attestation-contract-v0 leg 2): every result
+    carries a `scope` field computed from the ACTUAL run (suite entrypoint
+    + collected test count + an explicit `complete` flag). A run that hit
+    its timeout writes `scope: incomplete-timeout` and its result is
+    `inconclusive`, NEVER green — a timed-out run must not read as
+    evidence of a green branch.
     """
     ts = _now_iso()
     if not head_sha:
         return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
-                "suite": "", "ts": ts, "reason": "missing_head_sha"}
+                "suite": "", "ts": ts, "reason": "missing_head_sha",
+                "scope": {"suite": "", "collected": 0, "complete": False}}
     if _runner_control_hit(changed_paths or []):
         return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
-                "suite": "", "ts": ts, "reason": "runner_control_intersection"}
+                "suite": "", "ts": ts, "reason": "runner_control_intersection",
+                "scope": {"suite": "", "collected": 0, "complete": False}}
 
     clone = _repo_clone_path(repo)
     if not Path(clone).is_dir():
         return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
-                "suite": "", "ts": ts, "reason": f"clone_missing:{clone}"}
+                "suite": "", "ts": ts, "reason": f"clone_missing:{clone}",
+                "scope": {"suite": "", "collected": 0, "complete": False}}
 
     base_ref = _base_ref(base_branch)
     head_ref = _head_branch_for(target_id or f"pr{pr_number}", slug)
@@ -238,19 +291,27 @@ def attest(
         try:
             _create_worktree(clone, head_ref, pr_wt)
             _create_worktree(clone, base_ref, main_wt)
-            suite, pr_failures, pr_rc = _run_suite_in_worktree(pr_wt)
-            _main_suite, main_failures, _main_rc = _run_suite_in_worktree(main_wt)
+            suite, pr_failures, pr_rc, pr_collected = _run_suite_in_worktree(pr_wt)
+            _main_suite, main_failures, _main_rc, _main_collected = (
+                _run_suite_in_worktree(main_wt)
+            )
         except subprocess.TimeoutExpired:
+            # D8: the timeout path is the `incomplete-timeout` scope — the
+            # run never completed, so it can NEVER read as green.
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
-                    "suite": "", "ts": ts, "reason": "wall_budget_exceeded"}
+                    "suite": "", "ts": ts, "reason": "wall_budget_exceeded",
+                    "scope": {"suite": "incomplete-timeout", "collected": 0,
+                              "complete": False}}
         except subprocess.CalledProcessError as e:
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
                     "suite": "", "ts": ts,
-                    "reason": f"worktree_failure:{type(e).__name__}"}
+                    "reason": f"worktree_failure:{type(e).__name__}",
+                    "scope": {"suite": "", "collected": 0, "complete": False}}
         except Exception as e:
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
                     "suite": "", "ts": ts,
-                    "reason": f"runner_error:{type(e).__name__}"}
+                    "reason": f"runner_error:{type(e).__name__}",
+                    "scope": {"suite": "", "collected": 0, "complete": False}}
 
         # Hard invariant (fail-safe): a suite that exits non-zero (red) must
         # NEVER yield `attested`. For repos whose suite entry point is
@@ -266,6 +327,8 @@ def attest(
                 "suite": suite,
                 "ts": ts,
                 "reason": "red_suite_unparseable_failures",
+                "scope": {"suite": suite, "collected": pr_collected,
+                          "complete": True},
             }
 
         pr_set = set(pr_failures)
@@ -279,6 +342,8 @@ def attest(
             "preexisting": preexisting,
             "suite": suite,
             "ts": ts,
+            "scope": {"suite": suite, "collected": pr_collected,
+                      "complete": True},
         }
     finally:
         # ALL exit paths (success, timeout, worktree failure, exception).
@@ -322,6 +387,11 @@ def write_cache(mem, target_id: str, pr_number: int, head_sha: str,
         "ts": result.get("ts", _now_iso()),
         "shadow": shadow,
     }
+    # D8: the scope attestation rides the same cache record (suite entrypoint
+    # + collected count + complete flag) so the brief/verdict surface can
+    # render it without re-running the suite.
+    if result.get("scope"):
+        payload["scope"] = result["scope"]
     if result.get("reason"):
         payload["reason"] = result["reason"]
     tags = ["lapis-pm", "pm:verification-attestation"]
@@ -362,7 +432,8 @@ def attest_main_baseline(
     clone = _repo_clone_path(repo)
     if not Path(clone).is_dir():
         return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
-                "suite": "", "ts": ts, "reason": f"clone_missing:{clone}"}
+                "suite": "", "ts": ts, "reason": f"clone_missing:{clone}",
+                "scope": {"suite": "", "collected": 0, "complete": False}}
 
     base_ref = _base_ref(base_branch)
     root = Path(tempfile.mkdtemp(prefix="lapis-attest-"))
@@ -371,18 +442,25 @@ def attest_main_baseline(
         os.chmod(str(root), 0o700)
         try:
             _create_worktree(clone, base_ref, main_wt)
-            suite, main_failures, main_rc = _run_suite_in_worktree(main_wt)
+            suite, main_failures, main_rc, main_collected = (
+                _run_suite_in_worktree(main_wt)
+            )
         except subprocess.TimeoutExpired:
+            # D8: timed-out baseline run is `incomplete-timeout`, never green.
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
-                    "suite": "", "ts": ts, "reason": "wall_budget_exceeded"}
+                    "suite": "", "ts": ts, "reason": "wall_budget_exceeded",
+                    "scope": {"suite": "incomplete-timeout", "collected": 0,
+                              "complete": False}}
         except subprocess.CalledProcessError as e:
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
                     "suite": "", "ts": ts,
-                    "reason": f"worktree_failure:{type(e).__name__}"}
+                    "reason": f"worktree_failure:{type(e).__name__}",
+                    "scope": {"suite": "", "collected": 0, "complete": False}}
         except Exception as e:
             return {"result": "inconclusive", "pr_failures": [], "preexisting": [],
                     "suite": "", "ts": ts,
-                    "reason": f"runner_error:{type(e).__name__}"}
+                    "reason": f"runner_error:{type(e).__name__}",
+                    "scope": {"suite": "", "collected": 0, "complete": False}}
 
         # Hard invariant: a red suite with no parseable failures is
         # inconclusive (fail-safe), never attested.
@@ -394,6 +472,8 @@ def attest_main_baseline(
                 "suite": suite,
                 "ts": ts,
                 "reason": "red_suite_unparseable_failures",
+                "scope": {"suite": suite, "collected": main_collected,
+                          "complete": True},
             }
 
         result = "unattested" if main_failures else "attested"
@@ -403,6 +483,8 @@ def attest_main_baseline(
             "preexisting": [],
             "suite": suite,
             "ts": ts,
+            "scope": {"suite": suite, "collected": main_collected,
+                      "complete": True},
         }
     finally:
         # ALL exit paths (success, timeout, worktree failure, exception).

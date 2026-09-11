@@ -18,7 +18,12 @@ Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/sit
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-TimeoutStartSec=300
+# D6b (attestation-contract-v0 leg 2): 300s killed the tick pass mid-run
+# (the tick-starvation class — the pass starved by its own unit timeout).
+# 1800s bounds a genuinely hung pass (the dedicated lapis-pm-stall-check
+# unit catches the stall; the cursor threshold is a ~3-7x-margin tripwire
+# for a dead unit).
+TimeoutStartSec=1800
 
 [Install]
 WantedBy=multi-user.target

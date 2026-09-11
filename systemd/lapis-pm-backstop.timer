@@ -1,0 +1,9 @@
+[Unit]
+Description=Lapis PM - demotion-backstop sweep timer (15m cycle, D4a cadence split)
+
+[Timer]
+OnUnitActiveSec=900
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

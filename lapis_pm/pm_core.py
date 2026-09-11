@@ -6713,7 +6713,10 @@ def _active_review_state(target_id: str, open_prs: list[dict]) -> dict | None:
 def _panel_health_summary(target_id: str, pr_number: int) -> dict | None:
     """Panel-health line for `lapis-pm status` (lapis-pm-panel-leg-survival-v0,
     Change 4): starved count over the last 5 reviewer verdicts for the active
-    PR, plus the union of legs_down across the starved ones.
+    PR, plus the union of legs_down across ALL recent verdicts (AMENDED
+    2026-09-10 — a second_node-only stretch renders
+    `panel: 0/N starved (legs: second_node)`; the starved count itself keeps
+    counting starved-only verdicts).
 
     Same episodic source and parsing rules as _last_review_verdict (tag
     `pm:reviewer:pr={N}:cycle=*:verdict=`, JSON body after the first newline,
@@ -6741,11 +6744,16 @@ def _panel_health_summary(target_id: str, pr_number: int) -> dict | None:
                 break
     if not verdicts:
         return None
-    # The starved count and the legs union are over the full stored verdict
-    # list (all cycles for the PR); `total` is the display window size (last 5).
+    # The starved COUNT is over the full stored verdict list (all cycles for
+    # the PR) and counts starved-only verdicts (a GATE leg down); `total` is
+    # the display window size (last 5). The legs union, however, is over ALL
+    # verdicts' legs_down — AMENDED 2026-09-10 (decision/reviewer-single-leg-
+    # local-phala-test-key): a second_node-only stretch must stay
+    # visible on `lapis-pm status` (e.g. `panel: 0/5 starved (legs:
+    # second_node)`) even though such verdicts are no longer starved.
     starved = [v for v in verdicts if _panel_starvation.verdict_is_starved(v)]
     legs = sorted({
-        leg for v in starved for leg in _verdict_legs_down(v)
+        leg for v in verdicts for leg in _verdict_legs_down(v)
     })
     return {"starved": len(starved), "total": min(5, len(verdicts)), "legs": legs}
 
@@ -7438,14 +7446,18 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
     issues = verdict_info.get("issues", [])
 
     # ---------------------------------------------------------------------------
-    # Panel-starvation gate (R1, ratified 2026-08-08 — closed, not open for
-    # relitigation). Any corroboration leg down (local witness, corroboration,
-    # second node) drops this verdict to advisory: it may inform, but it may
-    # never block (hold_brief / review_exhausted_brief) and may never
-    # auto-dispatch a fixer retry on its own authority. This is the exact
-    # failure class that shipped PR #220's false HIGH finding at
-    # confidence=0.9 with all three legs down — see
+    # Panel-starvation gate (R1, ratified 2026-08-08; AMENDED 2026-09-10,
+    # decision/reviewer-single-leg-local-phala-test-key). A GATE
+    # leg down (local witness OR corroboration — the two local legs) drops
+    # this verdict to advisory: it may inform, but it may never block
+    # (hold_brief / review_exhausted_brief) and may never auto-dispatch a
+    # fixer retry on its own authority. This is the exact failure class that
+    # shipped PR #220's false HIGH finding at confidence=0.9 with all three
+    # legs down — see
     # finding/reviewer-seat-false-high-finding-absence-from-diff-third-occurrence-2026-08-08.
+    # A second_node (Phala TEE) absence alone does NOT starve: the verdict
+    # stands on local legs, stays attenuated, and flags loudly on the brief —
+    # it falls through to the normal clean/fixable/needs-human routing below.
     # Checked before the audit gate: a starved verdict's issues never reach
     # the fixable/needs-human branching below.
     # ---------------------------------------------------------------------------
@@ -7841,29 +7853,46 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             # opening the verdict JSON. panel_starvation is additive — absent
             # on verdicts written before this landed, so guard with .get.
             _pstarv = verdict_info.get("panel_starvation") or {}
+            _legs_down_list = _pstarv.get("legs_down") or []
+            _raw_conf = _pstarv.get("confidence_raw", "?")
+            # DoD-1 (lapis-pm-reviewer-leg-repair-v0): the DEGRADED PANEL
+            # line carries the node2 error-class tail (the four named
+            # classes: node2_unavailable / node2_aci_unverified /
+            # node2_cap_refused / node2_client_import_error) so a genuine
+            # node2 down is distinguishable from a wiring bug on a PM
+            # surface (today only the episodic JSON did). Hoisted above the
+            # fork: the DEGRADED line and the second_node loud line share
+            # the read. Only the four allowlisted NODE2_ERROR_CLASSES
+            # constants may render (containment scan of the node2 notes —
+            # which are redacted at source); `unknown` when no class
+            # matches — never empty parens, never free-form notes text.
+            _n2_notes = (corr.get("node2_corroboration") or {}).get("notes") or ""
+            _n2_class = ""
+            for _ec in (
+                "node2_client_import_error", "node2_aci_unverified",
+                "node2_cap_refused", "node2_unavailable",
+            ):
+                if _ec in _n2_notes:
+                    _n2_class = _ec
+                    break
             if _pstarv.get("starved"):
-                _legs_down = ", ".join(_pstarv.get("legs_down") or []) or "unknown"
-                _raw_conf = _pstarv.get("confidence_raw", "?")
-                # DoD-1 (lapis-pm-reviewer-leg-repair-v0): the DEGRADED PANEL
-                # line carries the node2 error-class tail (the four named
-                # classes: node2_unavailable / node2_aci_unverified /
-                # node2_cap_refused / node2_client_import_error) so a genuine
-                # node2 down is distinguishable from a wiring bug on a PM
-                # surface (today only the episodic JSON did).
-                _n2_notes = (corr.get("node2_corroboration") or {}).get("notes") or ""
-                _n2_class = ""
-                for _ec in (
-                    "node2_client_import_error", "node2_aci_unverified",
-                    "node2_cap_refused", "node2_unavailable",
-                ):
-                    if _ec in _n2_notes:
-                        _n2_class = _ec
-                        break
+                _legs_down = ", ".join(_legs_down_list) or "unknown"
                 _n2_part = f"; node2={_n2_class}" if _n2_class else ""
                 parts.append(
                     f"DEGRADED PANEL (legs down: {_legs_down}{_n2_part}; raw "
                     f"confidence {_raw_conf} attenuated to {conf}) — advisory "
                     f"only, not gated"
+                )
+            elif "second_node" in _legs_down_list:
+                # AMENDED 2026-09-10 (decision/reviewer-single-leg-local-
+                # phala-test-key): not starved (both local gate
+                # legs up) but second_node (Phala TEE) absent — the loud
+                # line. The verdict stands on local legs only; the absence
+                # is flagged, not silently read as a healthy panel.
+                parts.append(
+                    f"second_node (Phala TEE) ABSENT ({_n2_class or 'unknown'}); "
+                    f"raw confidence {_raw_conf} attenuated to {conf} — "
+                    f"verdict stands on local legs only"
                 )
             else:
                 # DoD-1 (lapis-pm-reviewer-leg-repair-v0): a POSITIVE line

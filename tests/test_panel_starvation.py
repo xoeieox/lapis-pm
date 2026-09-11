@@ -11,6 +11,7 @@ from lapis_pm.panel_starvation import (
     attenuate_confidence,
     is_panel_starved,
     starved_legs,
+    verdict_is_starved,
 )
 
 
@@ -104,6 +105,69 @@ class TestStarvedLegs:
         v["local_reviewer_witness"] = {"agreement": "local_failed"}
         assert is_panel_starved(v) is True
         assert len(starved_legs(v)) == 1
+
+    def test_second_node_only_down_is_not_starved_amended_2026_09_10(self):
+        """AMENDED (2026-09-10): second_node-only absence does NOT starve —
+        the verdict stands on local legs. legs_down still lists second_node
+        (visibility + attenuation denominator unchanged)."""
+        v = _healthy_verdict()
+        v["corroboration_result"]["cross_node_divergence"] = "node2_unavailable"
+        assert is_panel_starved(v) is False
+        assert starved_legs(v) == ["second_node"]
+
+    def test_local_witness_only_down_is_starved(self):
+        v = _healthy_verdict()
+        v["local_reviewer_witness"] = {"agreement": "local_failed"}
+        assert is_panel_starved(v) is True
+        assert starved_legs(v) == ["local_witness"]
+
+    def test_corroboration_only_down_is_starved(self):
+        v = _healthy_verdict()
+        v["corroboration_result"] = {
+            "verdict": "uncertain",
+            "claim": "(substrate unavailable)",
+            "leg_status": "substrate_unavailable",
+            "cross_node_divergence": "agree",
+        }
+        assert is_panel_starved(v) is True
+        assert starved_legs(v) == ["corroboration"]
+
+    def test_second_node_and_local_witness_down_is_starved(self):
+        """A local gate leg down with second_node also down is starved (the
+        gate legs are local_witness + corroboration)."""
+        v = _healthy_verdict()
+        v["local_reviewer_witness"] = {"agreement": "local_failed"}
+        v["corroboration_result"]["cross_node_divergence"] = "node2_unavailable"
+        assert is_panel_starved(v) is True
+        assert set(starved_legs(v)) == {"local_witness", "second_node"}
+
+    def test_legacy_recompute_second_node_only_down_not_starved(self):
+        """Pre-annotation verdict (no panel_starvation block) with
+        second_node-only down computes NOT starved via the fresh
+        is_panel_starved fallback (annotation-first read preserved)."""
+        v = _healthy_verdict()
+        v["corroboration_result"]["cross_node_divergence"] = "node2_unavailable"
+        assert "panel_starvation" not in v
+        assert verdict_is_starved(v) is False
+
+    def test_saved_annotation_precedence_second_node_only_stays_starved(self):
+        """Annotation-first (many-eyes H1 / Consumer caveat): a SAVED verdict
+        carrying panel_starvation={starved: True, legs_down: ["second_node"]}
+        — written under the old any-leg-down rule — returns True from
+        verdict_is_starved. It stays advisory until the reviewer re-fires and
+        re-annotates; a future 'fix' that recomputes at gate time must fail
+        this test."""
+        v = {
+            "verdict": "fixable",
+            "issues": [],
+            "confidence": 0.5667,
+            "panel_starvation": {
+                "legs_down": ["second_node"],
+                "starved": True,
+                "confidence_raw": 0.85,
+            },
+        }
+        assert verdict_is_starved(v) is True
 
     def test_corroboration_truncated_leg_status_counts_as_down(self):
         """lapis-pm-corroboration-thinking-parse-and-truncation-loudness-v0
@@ -200,6 +264,40 @@ class TestApplyPanelStarvation:
         assert v["panel_starvation"]["confidence_raw"] == 0.9
         # Top-level confidence rewritten to the attenuated value.
         assert v["confidence"] == round(0.9 * 2 / 3, 4)
+
+    def test_second_node_only_down_writes_starved_false_with_attenuated_confidence(self):
+        """AMENDED (2026-09-10): apply_panel_starvation writes starved=False
+        for a second_node-only-down verdict; legs_down still carries
+        second_node and the confidence is still linearly attenuated (the
+        0.85 -> 0.5667 live case stays reproducible)."""
+        v = _healthy_verdict(confidence=0.85)
+        v["corroboration_result"]["cross_node_divergence"] = "node2_unavailable"
+        result = apply_panel_starvation(v)
+        assert result is v
+        assert v["panel_starvation"]["starved"] is False
+        assert v["panel_starvation"]["legs_down"] == ["second_node"]
+        assert v["panel_starvation"]["confidence_raw"] == 0.85
+        # Linear attenuation unchanged: 0.85 * 2/3.
+        assert v["confidence"] == round(0.85 * 2 / 3, 4)
+
+    def test_local_witness_only_down_writes_starved_true(self):
+        v = _healthy_verdict(confidence=0.9)
+        v["local_reviewer_witness"] = {"agreement": "local_failed"}
+        apply_panel_starvation(v)
+        assert v["panel_starvation"]["starved"] is True
+        assert v["panel_starvation"]["legs_down"] == ["local_witness"]
+
+    def test_corroboration_only_down_writes_starved_true(self):
+        v = _healthy_verdict(confidence=0.9)
+        v["corroboration_result"] = {
+            "verdict": "uncertain",
+            "claim": "(substrate unavailable)",
+            "leg_status": "substrate_unavailable",
+            "cross_node_divergence": "agree",
+        }
+        apply_panel_starvation(v)
+        assert v["panel_starvation"]["starved"] is True
+        assert v["panel_starvation"]["legs_down"] == ["corroboration"]
 
     def test_healthy_panel_confidence_unchanged_but_block_present(self):
         v = _healthy_verdict(confidence=0.8)

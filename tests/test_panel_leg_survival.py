@@ -550,10 +550,19 @@ class TestNode2ErrorClasses:
 # ---------------------------------------------------------------------------
 
 def _starved_verdict(legs=("local_witness", "corroboration", "second_node")):
+    # Carries the raw witness/corroboration blocks (all legs down) so the
+    # recompute fallback paths agree with the annotation.
     return {
         "verdict": "fixable",
         "issues": [{"severity": "high", "path": "foo.py", "note": "x"}],
         "confidence": 0.0,
+        "local_reviewer_witness": {"agreement": "local_failed"},
+        "corroboration_result": {
+            "verdict": "uncertain",
+            "claim": "(substrate unavailable)",
+            "leg_status": "substrate_unavailable",
+            "cross_node_divergence": "node2_unavailable",
+        },
         "panel_starvation": {
             "legs_down": list(legs),
             "starved": True,
@@ -563,11 +572,41 @@ def _starved_verdict(legs=("local_witness", "corroboration", "second_node")):
 
 
 def _healthy_verdict():
+    # Carries the raw witness/corroboration blocks (all legs up) so the
+    # recompute fallback paths agree with the annotation.
     return {
         "verdict": "fixable",
         "issues": [{"severity": "low", "path": "foo.py", "note": "nit"}],
         "confidence": 0.8,
+        "local_reviewer_witness": {"agreement": "agree"},
+        "corroboration_result": {
+            "verdict": "clean",
+            "claim": "identifiers checked",
+            "leg_status": "ok",
+            "cross_node_divergence": "agree",
+        },
         "panel_starvation": {"legs_down": [], "starved": False, "confidence_raw": 0.8},
+    }
+
+
+def _second_node_only_verdict():
+    """AMENDED 2026-09-10 shape: second_node down but NOT starved (both local
+    gate legs up) — the verdict stands on local legs with attenuated
+    confidence. Carries the raw witness/corroboration blocks (both local
+    legs up) so the recompute fallback paths agree with the annotation."""
+    return {
+        "verdict": "fixable",
+        "issues": [{"severity": "low", "path": "foo.py", "note": "nit"}],
+        "confidence": 0.5333,
+        "local_reviewer_witness": {"agreement": "agree"},
+        "corroboration_result": {
+            "verdict": "clean",
+            "claim": "identifiers checked",
+            "leg_status": "ok",
+            "cross_node_divergence": "node2_unavailable",
+        },
+        "panel_starvation": {"legs_down": ["second_node"], "starved": False,
+                             "confidence_raw": 0.8},
     }
 
 
@@ -801,33 +840,124 @@ class TestVoidFraming:
 
 
 # ---------------------------------------------------------------------------
+# AMENDED 2026-09-10 (lapis-pm-reviewer-single-leg-local-v0, D2 consumer
+# census site 2/3): the escalation-partition test. A no-op fixer_retry
+# against a saved second_node-only NOT-starved verdict is HEALTHY-partition:
+# it reaches _maybe_dispatch_auditor_noop (D6b) and does NOT raise the
+# _escalate_noop_retry_if_degraded HIGH brief. Both sides are asserted
+# explicitly so a future 'fix' that reverts the predicate change (a silent
+# Phala outage looking like a regression) fails the suite instead of
+# landing.
+# ---------------------------------------------------------------------------
+
+class TestEscalationPartitionSecondNodeOnly:
+
+    _rec = {"gpu_id": "task-1", "agent_type": "fixer_retry", "pr_number": 7,
+            "cycle": 1, "repo": "lapis-pm", "head_sha": "abc123"}
+
+    def _second_node_only_verdict(self):
+        return {
+            "verdict": "fixable",
+            "issues": [{"severity": "low", "path": "foo.py", "note": "nit"}],
+            "confidence": 0.5667,
+            "panel_starvation": {"legs_down": ["second_node"], "starved": False,
+                                 "confidence_raw": 0.85},
+        }
+
+    def test_noop_retry_second_node_only_reaches_auditor_noop(self):
+        """(a) healthy partition: the D6b no-op auditor dispatch fires for a
+        second_node-only NOT-starved verdict (a local-legs verdict's no-op
+        is auditable, not a panel-degradation episode)."""
+        verdict = self._second_node_only_verdict()
+        with (
+            patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=verdict),
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core._audit_dispatched_head", return_value=None),
+            patch("lapis_pm.pm_core._has_pending_auditor_for_pr", return_value=False),
+            patch("lapis_pm.pm_core._act_dispatch_auditor",
+                  return_value="action:auditor_dispatched:pr=7:mode=noop"),
+            patch("lapis_pm.pm_core._repo_owner", return_value=("lapis-pm", "Erah")),
+            patch("lapis_pm.pm_core.get_open_prs", return_value=[]),
+        ):
+            mock_mem.return_value.get.return_value = None
+            action = pm_core._maybe_dispatch_auditor_noop("tid", self._rec, 7)
+        assert action is not None
+        assert "auditor_dispatched" in action
+
+    def test_noop_retry_second_node_only_does_not_raise_high_escalation(self):
+        """(b) the _escalate_noop_retry_if_degraded HIGH brief is ABSENT for
+        the same second_node-only NOT-starved verdict (a persistent Phala
+        outage is no longer loud on THAT surface — by design, per the
+        2026-09-10 ruling; it is loud on the brief loud line + the mem
+        review-state node2_error_class + the status legs union)."""
+        verdict = self._second_node_only_verdict()
+        with (
+            patch("lapis_pm.pm_core._review_verdict_for_cycle", return_value=verdict),
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core.episodic.all_comments", return_value=[]),
+            patch("lapis_pm.pm_core.episodic.write_hold") as mock_hold,
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_synth,
+            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_outstanding,
+        ):
+            mock_mem.return_value.get.return_value = None
+            action = pm_core._escalate_noop_retry_if_degraded("tid", self._rec, 7)
+        assert action is None
+        mock_hold.assert_not_called()
+        mock_synth.assert_not_called()
+        mock_set_outstanding.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # DoD #6: status panel-health line
 # ---------------------------------------------------------------------------
 
 class TestPanelHealthLine:
 
     def test_summary_counts_starved_and_legs_union(self):
+        # AMENDED 2026-09-10: the starved count counts starved-only verdicts
+        # (a GATE leg down), while the legs union spans ALL verdicts'
+        # legs_down — the second_node-only (not-starved) verdict still shows
+        # up in the union.
         comments = [
             _verdict_comment("2026-09-01T09:00:00+00:00", 7, 1, _healthy_verdict()),
             _verdict_comment("2026-09-01T10:00:00+00:00", 7, 2, _starved_verdict(("local_witness",))),
-            _verdict_comment("2026-09-01T11:00:00+00:00", 7, 3, _starved_verdict(("second_node",))),
+            _verdict_comment("2026-09-01T11:00:00+00:00", 7, 3, _second_node_only_verdict()),
         ]
         with patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments):
             s = pm_core._panel_health_summary("tid", 7)
-        assert s == {"starved": 2, "total": 3, "legs": ["local_witness", "second_node"]}
+        assert s == {"starved": 1, "total": 3, "legs": ["local_witness", "second_node"]}
+
+    def test_summary_second_node_only_stretch_zero_starved_legs_visible(self):
+        """AMENDED 2026-09-10: a sustained Phala outage (second_node-only
+        verdicts, never starved) renders `panel: 0/N starved (legs:
+        second_node)` — absent-but-visible on the at-a-glance surface."""
+        comments = [
+            _verdict_comment("2026-09-01T10:00:00+00:00", 7, 1, _second_node_only_verdict()),
+            _verdict_comment("2026-09-01T11:00:00+00:00", 7, 2, _second_node_only_verdict()),
+            _verdict_comment("2026-09-01T12:00:00+00:00", 7, 3, _healthy_verdict()),
+        ]
+        with patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments):
+            s = pm_core._panel_health_summary("tid", 7)
+        assert s == {"starved": 0, "total": 3, "legs": ["second_node"]}
 
     def test_summary_window_is_last_five(self):
         # 6 verdicts: the display window is the last 5 (total==5, the first
         # verdict truncated out), while the starved count and legs union cover
         # the full stored history — 4 of 6 are starved, 2 healthy.
+        # 6 verdicts: the display window is the last 5 (total==5, the first
+        # verdict truncated out). AMENDED 2026-09-10: the starved count is
+        # starved-only (GATE legs down) — 3 of 6; the legs union spans ALL
+        # verdicts, so the second_node-only (not-starved) verdict's leg still
+        # shows.
         comments = []
         for i, legs in enumerate([("local_witness",), None, ("second_node",), None, ("corroboration",), ("local_witness",)], start=1):
-            v = _starved_verdict(legs) if legs else _healthy_verdict()
+            v = (_second_node_only_verdict() if legs == ("second_node",)
+                 else _starved_verdict(legs) if legs else _healthy_verdict())
             comments.append(_verdict_comment(f"2026-09-01T{10 + i:02d}:00:00+00:00", 7, i, v))
         with patch("lapis_pm.pm_core.episodic.all_comments", return_value=comments):
             s = pm_core._panel_health_summary("tid", 7)
         assert s["total"] == 5
-        assert s["starved"] == 4
+        assert s["starved"] == 3
         assert s["legs"] == ["corroboration", "local_witness", "second_node"]
 
     def test_summary_none_when_no_verdicts(self):
@@ -842,7 +972,7 @@ class TestPanelHealthLine:
 
         comments = [
             _verdict_comment("2026-09-01T10:00:00+00:00", 7, 1, _starved_verdict(("local_witness",))),
-            _verdict_comment("2026-09-01T11:00:00+00:00", 7, 2, _healthy_verdict()),
+            _verdict_comment("2026-09-01T11:00:00+00:00", 7, 2, _second_node_only_verdict()),
         ]
 
         class _FakeTarget:
@@ -877,7 +1007,8 @@ class TestPanelHealthLine:
                   return_value={"verdict": "fixable", "issues": [1]}),
             patch("lapis_pm.pm_core._active_reviewer_backoff", return_value=None),
             patch("lapis_pm.pm_core._panel_health_summary",
-                  return_value={"starved": 1, "total": 2, "legs": ["local_witness"]}),
+                  return_value={"starved": 1, "total": 2,
+                                "legs": ["local_witness", "second_node"]}),
         ):
             args = MagicMock()
             args.target_id = "tid-panel"
@@ -886,7 +1017,9 @@ class TestPanelHealthLine:
 
         out = capsys.readouterr().out
         assert rc == 0
-        assert "panel:         1/2 starved (legs: local_witness)" in out
+        # AMENDED 2026-09-10: the union carries the second_node-only
+        # (not-starved) verdict's leg too.
+        assert "panel:         1/2 starved (legs: local_witness, second_node)" in out
 
     def test_cli_no_panel_line_without_verdicts(self, capsys):
         """A target with no verdicts shows nothing new."""
@@ -1024,7 +1157,10 @@ class TestBriefSurfaces:
     def test_brief_degraded_panel_carries_node2_error_class(self):
         """DoD-1: the DEGRADED PANEL line carries the node2 error-class tail
         (a genuine node2 down is distinguishable from a wiring bug on a PM
-        surface)."""
+        surface). AMENDED 2026-09-10: the advisory DEGRADED wording applies
+        to a genuinely starved verdict (a local gate leg down) — the fixture
+        is re-pointed at that shape; a second_node-only-down verdict renders
+        the loud line instead (see the tests below)."""
         verdict_info = {
             "verdict": "fixable",
             "issues": [{"severity": "high", "path": "foo.py", "note": "x"}],
@@ -1037,8 +1173,8 @@ class TestBriefSurfaces:
                     "notes": "node2_aci_unverified: ReportVerificationError — node2 failed closed",
                 },
             },
-            "panel_starvation": {"legs_down": ["second_node"], "starved": True,
-                                 "confidence_raw": 0.9},
+            "panel_starvation": {"legs_down": ["local_witness", "second_node"],
+                                 "starved": True, "confidence_raw": 0.9},
         }
         text = self._render_reviewer_verdict_text(verdict_info)
         assert "DEGRADED PANEL" in text
@@ -1062,8 +1198,8 @@ class TestBriefSurfaces:
                     "notes": "node2_client_import_error: ImportError — node2 wiring defect",
                 },
             },
-            "panel_starvation": {"legs_down": ["second_node"], "starved": True,
-                                 "confidence_raw": 0.9},
+            "panel_starvation": {"legs_down": ["corroboration", "second_node"],
+                                 "starved": True, "confidence_raw": 0.9},
         }
         text = self._render_reviewer_verdict_text(verdict_info)
         assert "DEGRADED PANEL" in text
@@ -1088,3 +1224,63 @@ class TestBriefSurfaces:
         text = self._render_reviewer_verdict_text(verdict_info)
         assert "panel: 3/3 legs reporting" in text
         assert "DEGRADED PANEL" not in text
+
+    def test_brief_second_node_only_loud_line(self):
+        """AMENDED 2026-09-10 (D3 brief-surface): a second_node-only-down,
+        NOT-starved verdict renders the loud line with the error class +
+        raw/attenuated values, does NOT render "3/3 legs reporting", and
+        does NOT render the advisory DEGRADED line."""
+        verdict_info = {
+            "verdict": "fixable",
+            "issues": [{"severity": "low", "path": "foo.py", "note": "nit"}],
+            "confidence": 0.5667,
+            "corroboration_result": {
+                "verdict": "clean",
+                "drift_class": None,
+                "node2_corroboration": {
+                    "leg_status": "substrate_unavailable",
+                    "notes": "node2_unavailable: ConnectionError — Phala TEE unreachable",
+                },
+            },
+            "panel_starvation": {"legs_down": ["second_node"], "starved": False,
+                                 "confidence_raw": 0.85},
+        }
+        text = self._render_reviewer_verdict_text(verdict_info)
+        assert (
+            "second_node (Phala TEE) ABSENT (node2_unavailable); raw "
+            "confidence 0.85 attenuated to 0.5667 — verdict stands on "
+            "local legs only"
+        ) in text
+        assert "panel: 3/3 legs reporting" not in text
+        assert "DEGRADED PANEL" not in text
+
+    def test_brief_second_node_only_loud_line_unknown_fallback(self):
+        """AMENDED 2026-09-10 (D3, many-eyes M3): when no allowlisted
+        NODE2_ERROR_CLASSES constant matches the node2 notes, the loud line
+        renders the literal token `unknown` — never empty parens, never
+        free-form notes text."""
+        verdict_info = {
+            "verdict": "fixable",
+            "issues": [{"severity": "low", "path": "foo.py", "note": "nit"}],
+            "confidence": 0.5333,
+            "corroboration_result": {
+                "verdict": "clean",
+                "drift_class": None,
+                "node2_corroboration": {
+                    "leg_status": "substrate_unavailable",
+                    "notes": "something else entirely happened",
+                },
+            },
+            "panel_starvation": {"legs_down": ["second_node"], "starved": False,
+                                 "confidence_raw": 0.8},
+        }
+        text = self._render_reviewer_verdict_text(verdict_info)
+        assert (
+            "second_node (Phala TEE) ABSENT (unknown); raw "
+            "confidence 0.8 attenuated to 0.5333 — verdict stands on "
+            "local legs only"
+        ) in text
+        assert "panel: 3/3 legs reporting" not in text
+        assert "DEGRADED PANEL" not in text
+        # The notes text itself must never leak into the render.
+        assert "something else entirely happened" not in text

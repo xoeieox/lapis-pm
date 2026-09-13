@@ -96,12 +96,22 @@ def read_served_model_from_queue_yaml(task_id: str | None) -> str | None:
     try:
         import yaml
         from . import pm_core as _pm_core
-        candidates = (
-            _pm_core.CLAUDE_QUEUE_COMPLETED_DIR / f"{task_id}.yaml",
-            _pm_core.CLAUDE_QUEUE_FAILED_DIR / f"{task_id}.yaml",
-            _pm_core.COMPLETED_DIR / f"{task_id}.yaml",
-            _pm_core.FAILED_DIR / f"{task_id}.yaml",
-        )
+        # Namespace guard (cycle-1 review): prefer the claude_queue yamls for
+        # claude_-prefixed task ids — a legacy gpu_queue yaml that happens to
+        # share the name must not shadow the claude_queue record. The legacy
+        # names are consulted only when absent.
+        if task_id.startswith("claude_"):
+            candidates = (
+                _pm_core.CLAUDE_QUEUE_COMPLETED_DIR / f"{task_id}.yaml",
+                _pm_core.CLAUDE_QUEUE_FAILED_DIR / f"{task_id}.yaml",
+            )
+        else:
+            candidates = (
+                _pm_core.CLAUDE_QUEUE_COMPLETED_DIR / f"{task_id}.yaml",
+                _pm_core.CLAUDE_QUEUE_FAILED_DIR / f"{task_id}.yaml",
+                _pm_core.COMPLETED_DIR / f"{task_id}.yaml",
+                _pm_core.FAILED_DIR / f"{task_id}.yaml",
+            )
         for path in candidates:
             if not path.exists():
                 continue
@@ -206,7 +216,13 @@ def served_tag_for(record: dict) -> str | None:
     None (ABSENCE, not an error) for pre-Leg-1 yamls, crashed runs, and
     null-echo cases. The tag value is never the seat alias.
     """
-    served = record.get("served_model")
-    if not isinstance(served, str) or not served:
+    served = valid_served_token(record.get("served_model"))
+    if served is None:
+        return None
+    # Erah 2026-09-06 ruling: the seat alias is a role, never a model
+    # substance — even a corrupted/hand-edited record holding the alias must
+    # not emit a pm:served tag with it (re-validation, not just upstream
+    # discipline).
+    if served == BRIEF_SEAT_ALIAS:
         return None
     return f"pm:served={served}"

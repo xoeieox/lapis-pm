@@ -50,11 +50,6 @@ logger = logging.getLogger(__name__)
 
 _BRIEF_RETRIES = 1
 
-# Provenance label used when the local seat produced no text (unreachable /
-# skipped / no model reached). Never a model name that did not actually run.
-_BRIEF_PROV_UNAVAILABLE = "local-seat-unavailable"
-
-
 def _brief_provenance_label(served_model_out: list | None) -> str:
     """Return the deploy-log label ``<seat-alias>:<served-model>`` to record
     in the brief provenance line (L2.D4,
@@ -71,7 +66,7 @@ def _brief_provenance_label(served_model_out: list | None) -> str:
     return _provenance.deploy_log_label(served_model_out)
 
 
-def _brief_version_line(model_label: str = _BRIEF_PROV_UNAVAILABLE) -> str:
+def _brief_version_line(model_label: str) -> str:
     """One-line running-version provenance appended to every emitted brief.
 
     Sourced from the *running* module tree (not origin/main) so a stale deploy

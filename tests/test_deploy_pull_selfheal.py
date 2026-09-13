@@ -1331,6 +1331,57 @@ class TestPreOpRefHygiene:
         assert pushed == []
         assert pages == []
 
+    def test_diverged_path_salvage_ref_present_after_converge(
+            self, tmp_path, monkeypatch):
+        """C9 (reviewer fix, cycle-1 med-2): on the non-temp (diverged)
+        path with a pre-existing local salvage ref, the converge must
+        leave the salvage ref PRESENT carrying the unique commit - the
+        delete-then-recreate sequence could leave it missing (a
+        `branch <dst>` from a non-main checked-out branch fails rc=128),
+        which would break the losslessness verify (the post-op rev-list
+        would not include the salvage ref) and the PR push."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        # a unique local commit (the diverged shape).
+        (clone / "local.txt").write_text("local\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "local unique")
+        ref = "lapis/deploy-repair-agents-core-c904/salvage"
+        # a pre-existing local salvage ref from a resolved episode at the
+        # OLD HEAD (no unique commits relative to the new HEAD - the
+        # converge direction).
+        _git(clone, "branch", ref, "origin/main")
+
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-c904")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pr_numbers: list = []
+        monkeypatch.setattr(dps, "_push_and_open_pr",
+                            lambda p, r, e, i: (pr_numbers.append(54) or 54))
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_DIVERGED)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_DIVERGED)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core",
+                                     str(clone), {}, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions), actions
+        # the salvage ref is PRESENT post-op and carries the unique commit
+        # (losslessness: the unique commit is reachable via the ref)
+        probe = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{ref}"],
+            capture_output=True, text=True, timeout=30)
+        assert probe.returncode == 0, "salvage ref missing post-op"
+        assert "local unique" in _git(clone, "log", "-1", "--format=%s",
+                                      ref).stdout
+        assert _git(clone, "branch", "--show-current").stdout.strip() == "main"
+        # the PR push ran (the ref was present to push)
+        assert pr_numbers == [54]
+        assert len(pages) == 1
+
 
 # ---------------------------------------------------------------------------
 # Shape 4 (D5) - worker_failed hold
@@ -1694,6 +1745,11 @@ class TestOQ4Wiring:
         monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "merged")
         supersede = MagicMock()
         monkeypatch.setattr(dps, "_supersede_gem", supersede)
+        # the sweep's close-the-loop reads must not hit the network
+        # (bounded + idempotent: the PR-state read is the one Forgejo
+        # call, mocked above).
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 0)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
 
         # the production path: a successful pull for a critical repo. The
         # REAL pass_handled_failure runs (the wiring under test) - the
@@ -1719,18 +1775,27 @@ class TestOQ4Wiring:
 
             monkeypatch.setattr(dps, "read_ledger", scoped_read_ledger)
 
+            # The fake models the REAL _finish_success rev-parse sequence:
+            # `git -C <path> rev-parse HEAD` (the pre_head capture at pass
+            # start and the post_head capture inside _finish_success)
+            # returns the same HEAD (a no-advance pull), and the dirty
+            # check (`git -C <path> status --porcelain`) is clean. A
+            # rev-parse failure (rc != 0) would leave pre_head empty and
+            # skip the success-path seam entirely (the low fix pins the
+            # rev-parse-failure shape separately below).
             def fake_run(cmd, **kwargs):
                 if cmd[0] == "git" and "rev-parse" in cmd:
-                    return _git_cp(stdout="samehead1\n")
+                    return _git_cp(rc=0, stdout="samehead1\n")
                 if cmd[0] == "git" and "status" in cmd:
-                    return _git_cp(stdout="")
+                    return _git_cp(rc=0, stdout="")
                 if cmd[0] == "git" and "pull" in cmd:
                     return _git_cp(rc=0, stdout="Already up to date.")
-                return _git_cp(stdout="active")
+                return _git_cp(rc=0, stdout="active")
 
             t0 = time.time()
             with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                with patch.object(pm_core, "_deploy_pull_locked", return_value=None):
+                with patch.object(pm_core, "_deploy_pull_locked",
+                                  return_value=None):
                     advanced = pm_core._post_land_git_pull(
                         "agents-core", trigger="backstop-timer")
             elapsed = time.time() - t0
@@ -1790,6 +1855,79 @@ class TestOQ4Wiring:
         data = json.loads(ledger_path.read_text())
         assert data[sig]["status"] == "worker_failed"
 
+    def test_close_out_stall_transition_fires_one_high_page(self, tmp_path,
+                                                            monkeypatch):
+        """I2 alignment (reviewer fix, cycle-1 med-1): the close-out
+        sweep's `salvaged` -> `worker_failed` transition fires the SAME
+        one HIGH page the D5 block in _run_pass_locked fires (the sweep
+        is the named D5 observer on the SUCCESS path - the failure-path
+        D5 block only runs when a pull fails). Transition-gated: a second
+        sweep over the worker_failed entry re-pages nothing."""
+        path = "/srv/git/agents-core-working"
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_TIMEOUT_S", 0.2)
+        sig = dps.compute_signature(path, dps.CLASS_STALE_DIRTY)
+        e = _entry(path, "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged",
+                   gem_id="g1")
+        e["pr_number"] = 13
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({sig: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "open")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 2)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+        pages = _notify_spy(monkeypatch)
+
+        actions = dps.close_out_sweep("agents-core", path)
+        assert "worker_failed:close-out" in actions, actions
+        # exactly one HIGH page, the D5 command-shaped text, gem id in
+        # the text (L4)
+        assert len(pages) == 1
+        assert pages[0]["priority"] == sys.modules["agents_core.notify"].Priority.HIGH
+        assert "holding for PM" in pages[0]["message"]
+        assert "gem g1" in pages[0]["message"]
+        data = json.loads(ledger_path.read_text())
+        assert data[sig]["status"] == "worker_failed"
+
+        # idempotent: a second sweep over the worker_failed entry re-pages
+        # nothing (the page is transition-gated, I2)
+        pages.clear()
+        actions2 = dps.close_out_sweep("agents-core", path)
+        assert actions2 == []
+        assert pages == []
+
+    def test_close_out_closed_unmerged_pr_is_worker_failed_not_resolved(
+            self, tmp_path, monkeypatch):
+        """The dead-code fix (cycle-1 med-1): a CLOSED (unmerged) salvage
+        PR is the D5 signal (a) - the operator discarded the salvage - so
+        the sweep transitions `worker_failed` (one HIGH page), NOT
+        `resolved` (the pre-fix code resolved a closed PR and the
+        `elif state == "closed"` branch below it was unreachable)."""
+        path = "/srv/git/agents-core-working"
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_TIMEOUT_S", 0.2)
+        sig = dps.compute_signature(path, dps.CLASS_STALE_DIRTY)
+        e = _entry(path, "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged",
+                   gem_id="g1")
+        e["pr_number"] = 14
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({sig: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "closed")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 0)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+        pages = _notify_spy(monkeypatch)
+
+        actions = dps.close_out_sweep("agents-core", path)
+        assert "worker_failed:close-out" in actions, actions
+        assert not any(a.startswith("resolved:") for a in actions), actions
+        assert len(pages) == 1
+        assert pages[0]["priority"] == sys.modules["agents_core.notify"].Priority.HIGH
+        data = json.loads(ledger_path.read_text())
+        assert data[sig]["status"] == "worker_failed"
+
     def test_close_out_sweep_direct_bounded_idempotent(self, tmp_path, monkeypatch):
         """The sweep is bounded (path-scoped read, one PR-state read per
         salvaged entry) and idempotent (a second run over a resolved entry
@@ -1815,12 +1953,16 @@ class TestOQ4Wiring:
             dps, "_pr_state",
             lambda repo, pr: (pr_reads.append(pr) or "merged"),
         )
+        pages = _notify_spy(monkeypatch)
         actions = dps.close_out_sweep("agents-core", path)
         assert any(a.startswith("resolved:salvaged-merged:") for a in actions)
         assert pr_reads == [12]  # path-scoped: only this path's PR read
         data = json.loads(ledger_path.read_text())
         assert data[sig]["status"] == "resolved"
         assert data[other["signature"]]["status"] == "salvaged"  # untouched
+        # resolved is a close-out, not a page (I2: the sweep pages only on
+        # the worker_failed transition)
+        assert pages == []
         # idempotent: a second run is a no-op (no PR read, no write)
         pr_reads.clear()
         actions2 = dps.close_out_sweep("agents-core", path)
@@ -1828,3 +1970,63 @@ class TestOQ4Wiring:
         assert actions2 == []
         data2 = json.loads(ledger_path.read_text())
         assert data2[sig]["status"] == "resolved"
+
+    def test_success_pull_close_out_sweep_fires_when_revparse_fails(
+            self, monkeypatch, tmp_path):
+        """Low fix (cycle-1): the success-path close-out seam fires even
+        when the pre_head rev-parse FAILS (pre_head empty) - the OQ-4
+        option-3 contract is that the seam runs on EVERY successful pull
+        for a critical repo, and a rev-parse hiccup must not drop the
+        Close-Out Sweep (the salvaged -> resolved loop)."""
+        from lapis_pm import pm_core
+
+        path = "/srv/git/agents-core-working"
+        ledger_path = tmp_path / "ledger.json"
+        sig = dps.compute_signature(path, dps.CLASS_STALE_DIRTY)
+        e = _entry(path, "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged")
+        e["pr_number"] = 15
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({sig: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "merged")
+        supersede = MagicMock()
+        monkeypatch.setattr(dps, "_supersede_gem", supersede)
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 0)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+
+        calls: list = []
+        real_pass = dps.pass_handled_failure
+
+        def spy_pass(repo, path_, trigger, *, pull_rc, pull_stderr=""):
+            calls.append((repo, path_, pull_rc))
+            return real_pass(repo, path_, trigger, pull_rc=pull_rc,
+                             pull_stderr=pull_stderr)
+
+        monkeypatch.setattr(dps, "pass_handled_failure", spy_pass)
+        with patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure",
+                   side_effect=spy_pass):
+            # rev-parse FAILS (rc=128): pre_head stays empty. The pull
+            # itself succeeds; the close-out seam must still fire.
+            def fake_run(cmd, **kwargs):
+                if cmd[0] == "git" and "rev-parse" in cmd:
+                    return _git_cp(rc=128, stderr="fatal: not a git repository")
+                if cmd[0] == "git" and "status" in cmd:
+                    return _git_cp(rc=0, stdout="")
+                if cmd[0] == "git" and "pull" in cmd:
+                    return _git_cp(rc=0, stdout="Already up to date.")
+                return _git_cp(rc=0, stdout="active")
+
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_deploy_pull_locked",
+                                  return_value=None):
+                    advanced = pm_core._post_land_git_pull(
+                        "agents-core", trigger="backstop-timer")
+        assert advanced is False
+        assert ("agents-core", path, 0) in calls, calls
+        # the sweep transitioned the salvaged entry to resolved (merged
+        # PR) despite the rev-parse failure
+        data = json.loads(ledger_path.read_text())
+        assert data[sig]["status"] == "resolved"
+        supersede.assert_called_once()

@@ -1358,7 +1358,15 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                         )
                     except Exception:
                         pass
-            elif pre_head:
+            else:
+                # _finish_success is a no-op when pre_head is empty (a
+                # rev-parse failure at pass start) - the post rev-parse is
+                # still run (post_head == "" when it also fails, so no
+                # spurious deploy-log line). The close-out seam fires
+                # regardless: the OQ-4 option-3 contract is that the seam
+                # runs on EVERY successful pull for a critical repo, and a
+                # pre_head rev-parse failure must not drop the Close-Out
+                # Sweep (the salvaged -> resolved / worker_failed loop).
                 _finish_success(pre_head)
                 # OQ-4 option 3: the seam on the SUCCESS path - the machine's
                 # bounded + idempotent Close-Out Sweep (salvaged -> resolved

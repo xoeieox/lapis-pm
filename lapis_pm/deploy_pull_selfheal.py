@@ -895,16 +895,25 @@ def _salvage(path: str, repo: str, entry: dict, target_id: str) -> tuple[bool, d
     main/0/0/clean.
 
     C9 (pre-op ref hygiene, git 2.43 semantics live-verified 2026-09-02): a
-    crashed prior op can leave a stale `deploy-pull-salvage-tmp` (a
-    same-name `branch -m` onto it is a no-op, rc=0 - the post-rename crash
-    window converges), and a resolved prior episode can leave the LOCAL
-    `lapis/<target_id>/salvage` ref (the remote side is deleted on merge,
-    the local side never is). An existing-dst `branch -m` FAILS (rc=128) and
-    would wedge D4 into a silent per-cycle retry with no page (only the
-    `salvaged` transition pages) - so a pre-existing dst ref is handled
-    explicitly: force-updated when it carries no commits unique to it, else
-    the op aborts (the entry stays open with dispatch_error set - a named
-    state, never a silent retry loop).
+    crashed prior op can leave a stale `deploy-pull-salvage-tmp`, and a
+    resolved prior episode can leave the LOCAL `lapis/<target_id>/salvage`
+    ref (the remote side is deleted on merge, the local side never is).
+    A pre-existing dst ref is handled explicitly: force-updated when it
+    carries no commits unique to it, else the op aborts (the entry stays
+    open with dispatch_error set - a named state, never a silent retry
+    loop).
+
+    The park step (reviewer fix, cycle-1 med-2) uses `update-ref` as the
+    converge primitive, NOT `branch -m <src> <dst>`: an existing-dst
+    rename is refused (rc=128, live-verified on git 2.43 - refused even
+    when both refs are at the same commit), so the pre-op converge must
+    keep the dst ref present and the park step force-updates it to the
+    parked commit (temp-commit path: the temp ref's commit; non-temp
+    paths: HEAD) and deletes the source ref (temp ref / dead branch).
+    The delete-then-recreate alternative could leave the salvage ref
+    MISSING on the non-temp (diverged) path, which would break the
+    losslessness verify (the post-op rev-list would not include the
+    salvage ref) and the PR push.
     """
     cls = entry.get("class")
     salvage_ref = f"lapis/{target_id}/salvage"
@@ -922,18 +931,14 @@ def _salvage(path: str, repo: str, entry: dict, target_id: str) -> tuple[bool, d
             if uniq.returncode != 0 or (uniq.stdout or "").strip() != "0":
                 entry["dispatch_error"] = "salvage-ref-collision"
                 return False, info
+            # Converge the dst ref to HEAD WITHOUT deleting it (reviewer
+            # fix, cycle-1 med-2): the delete-then-recreate sequence could
+            # leave the salvage ref MISSING on the non-temp (diverged)
+            # path, which would break the losslessness verify and the PR
+            # push. A non-destructive `update-ref` converge keeps the ref
+            # present at HEAD; the park step below force-updates it to
+            # the parked commit (see the docstring).
             r = _git(path, "update-ref", f"refs/heads/{salvage_ref}", "HEAD")
-            if r.returncode != 0:
-                entry["dispatch_error"] = "salvage-ref-collision"
-                return False, info
-            # The dst ref now points at HEAD. The temp-commit path's
-            # `branch -m <tmp> <dst>` would fail (rc=128, existing dst) -
-            # so DELETE the converged dst ref: the temp-commit path's
-            # rename recreates it at the new commit (the work is on the
-            # temp ref, lossless); the non-temp path's `branch <dst>`
-            # recreates it at HEAD (a no-op move). The stale tmp-ref
-            # check below handles the crashed-prior-op shape.
-            r = _git(path, "branch", "-D", salvage_ref)
             if r.returncode != 0:
                 entry["dispatch_error"] = "salvage-ref-collision"
                 return False, info
@@ -992,30 +997,51 @@ def _salvage(path: str, repo: str, entry: dict, target_id: str) -> tuple[bool, d
         branch_res = _git(path, "branch", "--show-current")
         current = branch_res.stdout.strip()
         if temp_commit:
-            r = _git(path, "branch", "-m", _SALVAGE_TMP_REF, salvage_ref)
+            # The temp ref carries the new commit; the salvage ref
+            # (possibly the C9-converged one at HEAD) is force-updated to
+            # the temp ref's commit and the temp ref deleted. A
+            # `branch -m <tmp> <dst>` onto an EXISTING dst fails (rc=128 -
+            # live-verified on git 2.43: an existing-dst rename is refused
+            # even when both refs are at the same commit), so the
+            # update-ref is the converge primitive, not the rename.
+            r = _git(path, "update-ref", f"refs/heads/{salvage_ref}",
+                     f"refs/heads/{_SALVAGE_TMP_REF}")
+            if r.returncode != 0:
+                return False, info
         elif current != "main":
-            r = _git(path, "branch", "-m", current, salvage_ref)
+            # diverged: the unique local commit is on `current` (== HEAD).
+            # The salvage ref (possibly the C9-converged one at HEAD) is
+            # force-updated to HEAD and the dead branch deleted. A
+            # `branch -m <current> <dst>` onto an existing dst fails
+            # (rc=128), so the update-ref is the converge primitive here
+            # too (reviewer fix, cycle-1 med-2: the delete-then-recreate
+            # sequence could leave the ref missing on this path and break
+            # the losslessness verify + PR push).
+            r = _git(path, "update-ref", f"refs/heads/{salvage_ref}", "HEAD")
+            if r.returncode != 0:
+                return False, info
+            r = _git(path, "branch", "-D", current)
+            if r.returncode != 0:
+                return False, info
         else:
             # stale-dirty-on-clean-main with nothing to commit: nothing to
-            # park; the restore is a no-op move.
-            r = _git(path, "branch", salvage_ref)
-            if r.returncode != 0:
-                # branch may already exist (a prior attempt) - acceptable.
-                probe = _git(path, "rev-parse", "--verify", salvage_ref)
-                if probe.returncode != 0:
-                    return False, info
-        if r.returncode != 0 and not (temp_commit or current != "main"):
-            return False, info
-        if temp_commit or current != "main":
+            # park; the salvage ref (converged or fresh) sits at HEAD.
+            r = _git(path, "update-ref", f"refs/heads/{salvage_ref}", "HEAD")
             if r.returncode != 0:
                 return False, info
 
-        # restore: switch main (+ reset --hard origin/main when the temp-ref
-        # commit was made - the commit is safe on the salvage ref and main
-        # was never dirtied by it), then ff-only pull.
+        # restore: switch main FIRST (the temp ref cannot be deleted while
+        # it is the checked-out branch - `branch -D` refuses, rc=128; the
+        # commit is safe on the salvage ref and main was never dirtied by
+        # it), then delete the temp ref, reset --hard origin/main when the
+        # temp-ref commit was made, and ff-only pull.
         r = _git(path, "switch", "main")
         if r.returncode != 0:
             return False, info
+        if temp_commit:
+            r = _git(path, "branch", "-D", _SALVAGE_TMP_REF)
+            if r.returncode != 0:
+                return False, info
         if temp_commit:
             r = _git(path, "reset", "--hard", "origin/main")
             if r.returncode != 0:
@@ -1535,13 +1561,45 @@ def close_out_sweep(repo: str, path: str) -> list[str]:
                     continue
                 state = _pr_state(repo, pr)
                 if state in ("merged", "closed"):
-                    e["status"] = "resolved"
-                    changed = True
-                    actions.append(f"resolved:salvaged-{state}:{e.get('signature', '?')[:8]}")
-                    if e.get("gem_id"):
-                        _supersede_gem(e["gem_id"], f"salvage PR #{pr} {state} (close-out sweep)")
-                elif state == "closed":
-                    continue
+                    # PR merged -> resolved. PR closed WITHOUT merging
+                    # (the operator discarded the salvage) -> worker_failed:
+                    # the PR path stalled and the salvage work is parked on
+                    # the salvage branch, not landed. (This is the D5
+                    # signal (a) - closed-unmerged - and it is NOT a
+                    # resolved outcome.)
+                    if state == "merged":
+                        e["status"] = "resolved"
+                        changed = True
+                        actions.append(
+                            f"resolved:salvaged-{state}:{e.get('signature', '?')[:8]}"
+                        )
+                        if e.get("gem_id"):
+                            _supersede_gem(
+                                e["gem_id"],
+                                f"salvage PR #{pr} {state} (close-out sweep)",
+                            )
+                    else:
+                        e["status"] = "worker_failed"
+                        changed = True
+                        # I2 (exactly one HIGH page per transition): the
+                        # close-out sweep is the named D5 observer on the
+                        # SUCCESS path (the failure path's D5 block only
+                        # runs when a pull fails) - the `salvaged` ->
+                        # `worker_failed` transition fires the same one
+                        # HIGH page the D5 block fires (the page is
+                        # transition-gated: a worker_failed entry is never
+                        # re-processed by the sweep, so no re-page).
+                        # L4: the gem id rides in the page text.
+                        _send_page(
+                            message=(
+                                f"{repo}: deploy repair stalled - holding for PM "
+                                f"(target {e.get('target_id') or '?'}, PR #{pr}, "
+                                f"gem {e.get('gem_id') or '?'})"
+                            ),
+                            title=f"{repo}: deploy repair stalled",
+                            priority=_high_priority(),
+                        )
+                        actions.append("worker_failed:close-out")
                 else:
                     target_id = e.get("target_id") or ""
                     stalled = False
@@ -1552,6 +1610,15 @@ def close_out_sweep(repo: str, path: str) -> list[str]:
                     if stalled:
                         e["status"] = "worker_failed"
                         changed = True
+                        _send_page(
+                            message=(
+                                f"{repo}: deploy repair stalled - holding for PM "
+                                f"(target {target_id or '?'}, PR #{pr}, "
+                                f"gem {e.get('gem_id') or '?'})"
+                            ),
+                            title=f"{repo}: deploy repair stalled",
+                            priority=_high_priority(),
+                        )
                         actions.append("worker_failed:close-out")
             if changed:
                 write_ledger(ledger)

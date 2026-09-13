@@ -862,10 +862,23 @@ def merge_and_deploy(repo: str, pr_number: int, *, owner: str | None = None) -> 
 
 
 def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> None:
-    """Append one dated provenance line to the deploy log. Best-effort."""
-    model = getattr(brief, "_BRIEF_MODEL", "unknown")
+    """Append one dated provenance line to the deploy log. Best-effort.
+
+    L2.D4 (local-reviewer-identity-and-provenance-v0): the label is
+    ``<seat-alias>:<served-model>`` — the seat alias resolves statically to
+    the operator default (gravitywell; the brief composer passes no model
+    kwarg) and the served model is the seam-filtered locality-ledger
+    fallback, else the explicit not-reported marker. The dead _BRIEF_MODEL
+    import dies here; the old brief.py:unknown label shape is dead.
+    """
+    try:
+        from . import provenance as _provenance
+        label = _provenance.deploy_log_label()
+    except Exception:
+        # Fail-soft: the label must never raise up the deploy path.
+        label = "gravitywell:not-reported"
     ts = _now_iso()
-    line = f"- `{ts}` | {tree} | synced {old_sha}..{new_sha} | brief.py:{model} | {trigger}\n"
+    line = f"- `{ts}` | {tree} | synced {old_sha}..{new_sha} | brief.py:{label} | {trigger}\n"
     try:
         with open(_DEPLOY_LOG, "a") as f:
             f.write(line)
@@ -9473,6 +9486,25 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
         rec["status"] = "failed" if is_failure else "processed"
         rec["completed_at"] = _now_iso()
         changed = True
+        # L2.D2 (local-reviewer-identity-and-provenance-v0): stamp the ACTUAL
+        # served model onto the dispatch record from the completed queue task
+        # yaml (Leg 1's L1.D3 field). Null-tolerant best-effort: a missing
+        # yaml / missing field / null echo leaves served_model as None —
+        # NEVER the seat alias (Erah 2026-09-06 explicit-void adjudication).
+        # Must never fail verdict-encode (the idiom at 8082/8103/8121).
+        try:
+            from . import provenance as _provenance
+            rec["served_model"] = _provenance.read_served_model_from_queue_yaml(
+                rec.get("gpu_id")
+            )
+        except Exception as _prov_exc:
+            rec["served_model"] = None
+            episodic.write_observation(
+                target_id,
+                f"served-model provenance read skipped for {rec.get('gpu_id')}: "
+                f"{type(_prov_exc).__name__}",
+                extra_tags=["pm:served-provenance-skipped"],
+            )  # best-effort; never fail verdict-encode
         _close_slot_and_deposit(rec, target_id)
 
         snippet = text.strip()
@@ -9654,6 +9686,18 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 ]
                 if _rendered_sha:
                     result_tags.append(f"pm:reviewer-sha={_rendered_sha}")
+                # L2.D3 (local-reviewer-identity-and-provenance-v0): the
+                # verdict write-back comment gains a pm:served=<model> tag
+                # when the served model is known (stamped onto `rec` above).
+                # ABSENCE is expected, not an error (pre-Leg-1 yamls and the
+                # null-echo cases); the value is never the seat alias.
+                try:
+                    from . import provenance as _provenance
+                    _served_tag = _provenance.served_tag_for(rec)
+                    if _served_tag:
+                        result_tags.append(_served_tag)
+                except Exception as _served_exc:
+                    pass  # best-effort; tag absence is a non-error
                 if parse_recovered:
                     result_tags.append("pm:reviewer:parse-recovered")
                 episodic.write_result(

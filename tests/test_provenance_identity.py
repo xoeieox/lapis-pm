@@ -247,6 +247,89 @@ class TestServedModelFromQueueYaml:
         # though the record reaches the same encode loop.
         assert "served_model" not in rec_by_id["claude_20260912_120000_3000_scout"]
 
+    def test_encode_gpu_results_fixer_retry_path_stamps_served_model(
+            self, tmp_path, monkeypatch):
+        """End-to-end: the fixer_retry PR-advance completion path stamps
+        served_model onto the dispatch record from the queue yaml.
+
+        The fixer_retry path uses PR SHA/body-advance as the completion
+        signal (not the GPU output file), so it exercises a different
+        code path than the fixer GPU-output-file path. This test closes
+        the untested fixer_retry stamp gap flagged in cycle-1 review.
+        """
+        from unittest.mock import MagicMock
+
+        tid = "prov-tid-fr"
+        # Queue dirs
+        comp = tmp_path / "cq-comp"
+        comp.mkdir()
+        # fixer_retry task yaml with the served model echo
+        (comp / "claude_20260912_130000_1000_fixer_retry.yaml").write_text(
+            yaml.safe_dump({"id": "claude_20260912_130000_1000_fixer_retry",
+                            "model": "gravitywell-slot1",
+                            "served_model": "gravitywell-27b"}))
+        monkeypatch.setattr(pm_core, "CLAUDE_QUEUE_COMPLETED_DIR", comp)
+        monkeypatch.setattr(pm_core, "CLAUDE_QUEUE_FAILED_DIR", tmp_path / "cq-failed")
+        monkeypatch.setattr(pm_core, "COMPLETED_DIR", tmp_path / "gq-comp")
+        monkeypatch.setattr(pm_core, "FAILED_DIR", tmp_path / "gq-failed")
+        (tmp_path / "cq-failed").mkdir()
+        (tmp_path / "gq-comp").mkdir()
+        (tmp_path / "gq-failed").mkdir()
+
+        # fixer_retry record: pr_number is set (the advance signal), no
+        # output file needed (the advance-perceiver is the completion signal).
+        records = [
+            {"gpu_id": "claude_20260912_130000_1000_fixer_retry",
+             "spec_id": "spec-fr-1", "agent_type": "fixer_retry",
+             "intent": "fix retry x", "repo": "lapis-pm",
+             "ts": "2026-09-12T00:00:00",
+             "status": "pending", "retry_count": 1,
+             "pr_number": 42},
+        ]
+        saved: dict[str, list] = {}
+        loaded = {tid: records}
+
+        def fake_load(target_id):
+            return loaded.get(target_id, [])
+
+        def fake_save(target_id, recs):
+            saved[target_id] = recs
+
+        # Hermetic: no mem, no episodic, no forgejo, no slots, no confabulation
+        mem = MagicMock()
+        mem.get.return_value = None
+        monkeypatch.setattr(pm_core, "_mem", lambda: mem)
+        monkeypatch.setattr(pm_core, "load_dispatched", fake_load)
+        monkeypatch.setattr(pm_core, "save_dispatched", fake_save)
+        monkeypatch.setattr(pm_core, "append_dispatched", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "_close_slot_and_deposit", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "_read_fixer_verdict", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "_consume_fixer_verdict", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "_read_fixer_meta", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "_consume_fixer_meta", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "episodic", MagicMock())
+        monkeypatch.setattr(pm_core, "_check_calcification", lambda *a, **k: None)
+        monkeypatch.setattr(pm_core, "_tick_corr_cache", {})
+        # The advance-perceiver: return a completion timestamp so the
+        # fixer_retry PR-advance path is taken.
+        monkeypatch.setattr(
+            pm_core, "_fixer_completion_ts",
+            lambda tid, pr_num, dispatch_ts: "2026-09-12T01:00:00",
+        )
+
+        with patch("lapis_pm.episodic.write_result"), \
+             patch("lapis_pm.episodic.write_observation"), \
+             patch("lapis_pm.episodic.all_comments", return_value=[]):
+            total, failed = pm_core._encode_gpu_results(tid)
+
+        assert total == 1
+        rec = saved[tid][0]
+        # The fixer_retry PR-advance path stamped the served model from
+        # the queue yaml.
+        assert rec["served_model"] == "gravitywell-27b"
+        # The record is processed (the advance path flipped it).
+        assert rec["status"] == "processed"
+
     def test_stamp_scoped_to_dispatch_verified_agent_types(self, monkeypatch):
         """Cycle-1 review: the stamp scope is the dispatch-verified agent
         types (reviewer/reviewer_fresh/fixer/fixer_retry) — other agent

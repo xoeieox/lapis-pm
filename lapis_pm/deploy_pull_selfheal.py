@@ -133,6 +133,7 @@ Desk gem + the deploy-log provenance line, never a page storm."""
     VALUE = frozenset({
         "classify_pull_failure",   # D1 - mechanical, LLM-free
         "safe_zone_self_repair",   # D2 - git surgery under the classifier's proof
+        "salvage_and_restore",     # D4 - commit-not-discard salvage + PR (Slice 2)
         "ledger_write",            # D3 - the dedup authority
         "desk_gem_deposit",        # D3 - one gem per stuck condition
         "close_the_loop",          # D4.5 - healthy verification
@@ -144,15 +145,23 @@ class ERAH_GATE_CLASSES:
 pages repeatedly (decision/productive-autonomy-held-node-2026-07-27: escalate
 to Erah ONLY at invariant/ethical gates; the signal policy is
 decision/Erah-pushover-signal-policy-llm-first-responder-2026-09-02). In Slice
-1 only fetch_failed is an Erah gate (D4 salvage_pr_land_or_discard and D5
-worker_failed_hold are removed). Stall routing follows
+Slice 2 all three gates are live: D4 salvage_pr_land_or_discard (ratify the
+salvage PR or close it), D5 worker_failed_hold (PR path stalled; PM
+judgment), D6 fetch_failed (credentials/network). Stall routing follows
 decision/stalled-target-triage-to-agent-not-Erah-2026-06-24."""
     VALUE = frozenset({
-        "fetch_failed",  # D6 - credentials/network; a host actor cannot rotate a token
+        "salvage_pr_land_or_discard",  # D4 - ratify the salvage PR or close it
+        "worker_failed_hold",          # D5 - PR path stalled; PM judgment
+        "fetch_failed",                # D6 - credentials/network; a host actor
+                                       # cannot rotate a token
     })
 
 
 _GEM_OPTIONS = [
+    {"key": "salvage_now", "title": "Salvage now",
+     "sub": "skip the 20-minute window - the machine salvages local work to a "
+            "pushed salvage branch + PR and restores the tree to main",
+     "primary": True},
     {"key": "ack_watch", "title": "Known - keep watching",
      "sub": "suppress the machine action while this stays open"},
     {"key": "not_real", "title": "Not a real issue",
@@ -511,9 +520,9 @@ def build_gem_payload(*, repo: str, path: str, cls: str, evidence: dict,
         ]},
         {"label": "Diagnosis", "lines": state_dump},
         {"label": "Suggested direction", "lines": [
-            "the machine self-repairs safe-zone states automatically; this is an "
-            "unsafe state the windowed salvage machine (a later slice) will act "
-            "on - the operator may ack_watch or dismiss",
+            "after the 20-minute window the machine salvages local work to a "
+            "pushed salvage branch + PR and restores the tree to main - "
+            "click salvage_now to do it now",
         ]},
         {"label": "Stakes", "lines": [_stakes_line(repo, path, times_seen)]},
     ]
@@ -554,10 +563,37 @@ def emit_provenance(*, gem_id: str, signature: str, clone_path: str, model: str)
         logger.warning("[deploy-pull-selfheal] provenance deposit failed: %s", exc)
 
 
-# (D7 escalate surface REMOVED in Slice 1 - deploy-pull-selfheal-core-v0.
-# The station_escalate wrapper + repair_station imports + the _first_detection
-# call are gone; re-added in Slice 2 with the corrected import
-# (first lives in agents_core.repair_station.types, not .escalate).)
+def station_escalate(*, repo: str, path: str, cls: str, first_seen: str,
+                     times_seen: int) -> None:
+    """D7: write the non-load-bearing repair-station record (the 2026-08-01
+    reader gap: nothing reads intake yet; this is history for the future
+    reader). Never raises.
+
+    Slice-2 corrected import (C1): `first` lives in
+    agents_core.repair_station.types (the EscalationPolicy factory), NOT in
+    .escalate - the PR #314 head import (`from ...escalate import escalate,
+    first`) raised ImportError, which this wrapper's except clause would have
+    swallowed into a silent warning (the parent's dead-call bug)."""
+    try:
+        from agents_core.repair_station.escalate import escalate
+        from agents_core.repair_station.types import Tier, first
+        escalate(
+            station_id=f"deploy/pull-{repo}",
+            stable_pointer=str(_LEDGER_FILE),
+            error_signal={
+                "path": path, "class": cls,
+                "first_seen": first_seen, "times_seen": times_seen,
+            },
+            author_intent=(
+                "a mapped deploy clone is stuck and the machine owns it "
+                "until a human acts"
+            ),
+            escalation_policy=first(),
+            tier=Tier.NORMAL,
+            signature_fields=["path", "class"],
+        )
+    except Exception as exc:
+        logger.warning("[deploy-pull-selfheal] station escalate failed: %s", exc)
 
 
 def _send_page(message: str, title: str, priority) -> None:
@@ -754,6 +790,10 @@ def _first_detection(ledger: dict, signature: str, entry: dict, *, repo: str,
         entry["pr_number"] = None
         entry["salvage_branch"] = None
         entry["attempts"] = 0
+        # C6: a recurring fetch_failed episode re-arms the 20-minute page
+        # timer; the page flag must reset with it or the re-armed episode
+        # never re-pages (silent defeat of the D6 gate on recurrence).
+        entry["fetch_page_sent"] = False
 
     payload = build_gem_payload(
         repo=repo, path=entry["path"], cls=entry["class"],
@@ -772,6 +812,12 @@ def _first_detection(ledger: dict, signature: str, entry: dict, *, repo: str,
     ledger[signature] = entry
     emit_provenance(gem_id=gem_id, signature=signature,
                     clone_path=entry["path"], model="mechanical")
+    # D7 (Slice 2): the non-load-bearing station incident - read-only seam
+    # toward the station brain, never raises.
+    station_escalate(
+        repo=repo, path=entry["path"], cls=entry["class"],
+        first_seen=first_seen, times_seen=times_seen,
+    )
     return "deposited:recurred" if recurred else "deposited:new"
 
 
@@ -847,11 +893,70 @@ def _salvage(path: str, repo: str, entry: dict, target_id: str) -> tuple[bool, d
     The losslessness invariant (not the sequence): every commit reachable
     before the operation is reachable after, and the tree ends at
     main/0/0/clean.
+
+    C9 (pre-op ref hygiene, git 2.43 semantics live-verified 2026-09-02): a
+    crashed prior op can leave a stale `deploy-pull-salvage-tmp` (a
+    same-name `branch -m` onto it is a no-op, rc=0 - the post-rename crash
+    window converges), and a resolved prior episode can leave the LOCAL
+    `lapis/<target_id>/salvage` ref (the remote side is deleted on merge,
+    the local side never is). An existing-dst `branch -m` FAILS (rc=128) and
+    would wedge D4 into a silent per-cycle retry with no page (only the
+    `salvaged` transition pages) - so a pre-existing dst ref is handled
+    explicitly: force-updated when it carries no commits unique to it, else
+    the op aborts (the entry stays open with dispatch_error set - a named
+    state, never a silent retry loop).
     """
     cls = entry.get("class")
     salvage_ref = f"lapis/{target_id}/salvage"
     info = {"salvage_branch": salvage_ref, "temp_commit": False, "target_id": target_id}
     try:
+        # pre-op ref hygiene (C9) - before any branch surgery.
+        dst = _git(path, "rev-parse", "--verify", "--quiet", f"refs/heads/{salvage_ref}")
+        if dst.returncode == 0:
+            # A local salvage ref from a resolved episode. Converge only
+            # when it carries no commits unique to it (everything on it is
+            # already reachable from HEAD - `rev-list <ref>..HEAD` counts
+            # commits reachable from HEAD but not from <ref>) - otherwise
+            # abort (named state).
+            uniq = _git(path, "rev-list", "--count", f"HEAD..{salvage_ref}")
+            if uniq.returncode != 0 or (uniq.stdout or "").strip() != "0":
+                entry["dispatch_error"] = "salvage-ref-collision"
+                return False, info
+            r = _git(path, "update-ref", f"refs/heads/{salvage_ref}", "HEAD")
+            if r.returncode != 0:
+                entry["dispatch_error"] = "salvage-ref-collision"
+                return False, info
+            # The dst ref now points at HEAD. The temp-commit path's
+            # `branch -m <tmp> <dst>` would fail (rc=128, existing dst) -
+            # so DELETE the converged dst ref: the temp-commit path's
+            # rename recreates it at the new commit (the work is on the
+            # temp ref, lossless); the non-temp path's `branch <dst>`
+            # recreates it at HEAD (a no-op move). The stale tmp-ref
+            # check below handles the crashed-prior-op shape.
+            r = _git(path, "branch", "-D", salvage_ref)
+            if r.returncode != 0:
+                entry["dispatch_error"] = "salvage-ref-collision"
+                return False, info
+        # a stale temp ref from a crashed prior op: `switch -c` onto an
+        # existing ref FAILS (rc=128) - a same-name `branch -m` is a no-op
+        # (rc=0), so the post-rename crash window converges, but the op
+        # itself must converge or it wedges D4 into a silent per-cycle
+        # retry. Converge: delete the stale temp ref only when it carries
+        # no commits unique to it (a crashed mid-op ref at HEAD is the
+        # normal shape); otherwise abort (named state - the unique commits
+        # are preserved, the entry stays open).
+        tmp_probe = _git(path, "rev-parse", "--verify", "--quiet",
+                         f"refs/heads/{_SALVAGE_TMP_REF}")
+        if tmp_probe.returncode == 0:
+            uniq = _git(path, "rev-list", "--count", f"{_SALVAGE_TMP_REF}..HEAD")
+            if uniq.returncode != 0 or (uniq.stdout or "").strip() != "0":
+                entry["dispatch_error"] = "salvage-ref-collision"
+                return False, info
+            r = _git(path, "branch", "-D", _SALVAGE_TMP_REF)
+            if r.returncode != 0:
+                entry["dispatch_error"] = "salvage-ref-collision"
+                return False, info
+
         # capture the pre-op reachable-commit set (the losslessness check).
         pre = _git(path, "rev-list", "HEAD")
         if pre.returncode != 0:
@@ -935,7 +1040,21 @@ def _salvage(path: str, repo: str, entry: dict, target_id: str) -> tuple[bool, d
             return False, info
         ok, _ev = _verify_healthy(path)
         if not ok:
+            # M2 (named behavior): a tree that is ahead AND dirty classifies
+            # `diverged` (the classifier checks ahead > 0 before the dirty
+            # check) and this path never commits dirty files (the temp commit
+            # is stale_dirty-only) - so the first salvage attempt of a
+            # dirty+diverged tree fails its own verify HERE: no work lost, no
+            # PR opened, the entry stays open, and the next cycle
+            # re-classifies it `stale_dirty` and completes.
             return False, info
+        # C8: the losslessness verify is durable, not just in-memory - the
+        # pre/post reachable-set counts ride on `info` so the deploy-log
+        # line and the PR body record them (I6 post-hoc auditability).
+        info["losslessness"] = (
+            f"salvage verified: {len(pre_commits)}/{len(pre_commits)} "
+            f"pre-op commits reachable; tree at main 0/0"
+        )
         return True, info
     except (subprocess.TimeoutExpired, OSError) as exc:
         logger.warning("[deploy-pull-selfheal] D4 salvage errored at %s: %s", path, exc)
@@ -955,10 +1074,15 @@ def _push_and_open_pr(path: str, repo: str, entry: dict, info: dict) -> int | No
             return None
         from agents_core.forgejo import create_pr
         date = _now_iso()[:10]
+        # L3: the ledger entry never carries a `porcelain` key (the head's
+        # `entry.get("porcelain")` was a dead access) - the dump is the
+        # class + path plus the C8 losslessness record.
         state_dump = "\n".join(
-            [f"branch={entry.get('class')} path={path}"]
-            + (entry.get("porcelain") or [])[:20]
-        )
+            [
+                f"class={entry.get('class')} path={path}",
+                info.get("losslessness", ""),
+            ]
+        ).strip()
         body = (
             f"{state_dump}\n\n"
             "Opened automatically by deploy-pull selfheal "
@@ -1147,16 +1271,35 @@ def _run_pass_locked(repo: str, path: str, cls: str, evidence: dict,
             entry["times_seen"] = entry.get("times_seen", 1) + 1
             actions.append("bump:open")
 
-    # D6 - fetch_failed page REMOVED in Slice 1 (deploy-pull-selfheal-core-v0).
-    # The 20-minute fetch_failed HIGH page returns with D6 in Slice 2; this
-    # slice records the gem (D3) and holds (no page-emitting transitions - I2).
-    # D4 - windowed salvage dispatch REMOVED in Slice 1 (the salvage machinery,
-    # _salvage_entry / _salvage / _push_and_open_pr, is dead code here; D4
-    # returns with the salvage_now option in Slice 2).
+    # D6 - fetch_failed: no machine action; one HIGH page at 20 minutes
+    # (FETCH_FAILED_PAGE_AFTER_S), then silence (state-transition rule, I2).
+    # The gem + station incident were recorded at first detection (D3/D7).
+    if cls == CLASS_FETCH_FAILED and entry is not None:
+        if not entry.get("fetch_page_sent"):
+            try:
+                age = time.time() - _parse_iso(entry["first_seen"]).timestamp()
+            except (ValueError, TypeError):
+                age = 0
+            if age >= FETCH_FAILED_PAGE_AFTER_S:
+                _send_page(
+                    message=(
+                        f"{repo}: deploy pull fetch failed - credentials/network "
+                        f"suspected (gem {entry.get('gem_id')})"
+                    ),
+                    title=f"{repo}: deploy pull fetch failed",
+                    priority=_high_priority(),
+                )
+                entry["fetch_page_sent"] = True
+                actions.append("paged:fetch_failed")
+
+    # D4 - windowed salvage for open stale_dirty/diverged entries (the
+    # salvage_now gem option bypasses the window).
+    if cls in _SALVAGE_CLASSES and entry is not None and entry.get("status") == "open":
+        if _window_elapsed(entry, now=now) or _salvage_now_requested(entry, decisions):
+            actions.extend(_salvage_entry(ledger, entry, repo, path, evidence, trigger))
 
     # D4.5 - close the loop: cheap local verify on the success path for
-    # open entries (the salvaged branch is inert in this slice - status
-    # "salvaged" is never written here).
+    # open/salvaged entries.
     healthy, _ev = _verify_healthy(path)
     if healthy:
         for e in ledger.values():
@@ -1168,9 +1311,52 @@ def _run_pass_locked(repo: str, path: str, cls: str, evidence: dict,
                 actions.append(f"resolved:healthy:{e.get('signature', '?')[:8]}")
                 if e.get("gem_id"):
                     _supersede_gem(e["gem_id"], "tree verified healthy (close-the-loop)")
+            elif e.get("status") == "salvaged":
+                pr = e.get("pr_number")
+                if pr:
+                    state = _pr_state(repo, pr)
+                    if state in ("merged", "closed"):
+                        e["status"] = "resolved"
+                        actions.append(f"resolved:salvaged-{state}:{e.get('signature', '?')[:8]}")
+                        if e.get("gem_id"):
+                            _supersede_gem(e["gem_id"], f"salvage PR #{pr} {state}; tree healthy")
 
-    # D5 - PR-path-stall hold REMOVED in Slice 1 (the worker_failed hold + its
-    # HIGH page return with D5 in Slice 2; no salvaged status exists here).
+    # D5 - PR-path-stall hold (this pass is the named observer). A stalled
+    # salvage PR becomes `worker_failed` with exactly one HIGH page. Named
+    # signal preconditions (M3): signal (a) closed-unmerged is a live Forgejo
+    # read; signals (b) two-rejections and (c) review-gate-cap pause read
+    # pm/dispatched/<tid> / pm/pause-state/<tid> state that exists only if
+    # the deploy-repair-* target is actually dispatched/paused - if the
+    # advisory salvage PR is never dispatched, D5 effectively fires only on
+    # (a). All three reads are error-safe in the conservative direction
+    # (read error -> not stalled, no false worker_failed).
+    for e in ledger.values():
+        if e.get("path") != path or e.get("status") != "salvaged":
+            continue
+        pr = e.get("pr_number")
+        if not pr:
+            continue
+        target_id = e.get("target_id") or ""
+        state = _pr_state(repo, pr)
+        stalled = state == "closed"  # (a) closed-unmerged
+        if not stalled and target_id:
+            stalled = _rejection_count(target_id) >= 2  # (b) two rejections
+        if not stalled and target_id:
+            stalled = _target_paused_review_gate(target_id)  # (c) gate-cap pause
+        if stalled:
+            e["status"] = "worker_failed"
+            # L4: the gem id rides in the page text (ledger-only provenance
+            # is the named accepted state, I5).
+            _send_page(
+                message=(
+                    f"{repo}: deploy repair stalled - holding for PM "
+                    f"(target {target_id or '?'}, PR #{pr}, "
+                    f"gem {e.get('gem_id') or '?'})"
+                ),
+                title=f"{repo}: deploy repair stalled",
+                priority=_high_priority(),
+            )
+            actions.append("worker_failed")
 
     write_ledger(ledger)
     return actions
@@ -1280,7 +1466,11 @@ def _salvage_entry(ledger: dict, entry: dict, repo: str, path: str,
 
     ok, info = _salvage(path, repo, entry, target_id)
     if not ok:
-        entry["dispatch_error"] = "salvage-failed"
+        # _salvage may have set a more specific dispatch_error (e.g.
+        # `salvage-ref-collision` for a pre-existing ref carrying unique
+        # commits - the C9 named state); preserve it. The generic
+        # `salvage-failed` is the fallback for any other failure.
+        entry["dispatch_error"] = entry.get("dispatch_error") or "salvage-failed"
         entry["attempts"] = entry.get("attempts", 0) + 1
         actions.append("salvage:failed")
         return actions
@@ -1307,7 +1497,13 @@ def _salvage_entry(ledger: dict, entry: dict, repo: str, path: str,
         title=f"{repo}: deploy pull salvaged",
         priority=_high_priority(),
     )
-    _deploy_log_line(path, f"salvaged to PR #{pr_number} ({target_id}) | {trigger}")
+    # C8: the losslessness record (pre/post reachable-set counts) is durable
+    # in the deploy-log line, not just in-memory.
+    _deploy_log_line(
+        path,
+        f"salvaged to PR #{pr_number} ({target_id}); "
+        f"{info.get('losslessness', 'salvage verified')} | {trigger}",
+    )
     actions.append(f"salvaged:pr={pr_number}")
     return actions
 
@@ -1317,28 +1513,101 @@ def _high_priority():
     return Priority.HIGH
 
 
+def close_out_sweep(repo: str, path: str) -> list[str]:
+    """OQ-4 option-3 (Erah-approved 2026-09-02, Mirror-Council architecture):
+    the lightweight Close-Out Sweep the seam runs on a SUCCESSFUL pull
+    (`pull_rc == 0`). Bounded + idempotent: a path-scoped ledger read (no
+    ledger-wide scan), at most one Forgejo PR-state read per salvage entry
+    (5s timeout), and only the two named transitions - `salvaged` ->
+    `resolved` (the salvage PR merged/closed) and `salvaged` ->
+    `worker_failed` (the PR path stalled). No salvage surgery on success,
+    well inside the 120s unit budget. Never raises (I7)."""
+    actions: list[str] = []
+    try:
+        with file_lock(_LEDGER_LOCK_FILE, _LEDGER_LOCK_TIMEOUT_S):
+            ledger = read_ledger()
+            changed = False
+            for e in ledger.values():
+                if e.get("path") != path or e.get("status") != "salvaged":
+                    continue
+                pr = e.get("pr_number")
+                if not pr:
+                    continue
+                state = _pr_state(repo, pr)
+                if state in ("merged", "closed"):
+                    e["status"] = "resolved"
+                    changed = True
+                    actions.append(f"resolved:salvaged-{state}:{e.get('signature', '?')[:8]}")
+                    if e.get("gem_id"):
+                        _supersede_gem(e["gem_id"], f"salvage PR #{pr} {state} (close-out sweep)")
+                elif state == "closed":
+                    continue
+                else:
+                    target_id = e.get("target_id") or ""
+                    stalled = False
+                    if target_id:
+                        stalled = _rejection_count(target_id) >= 2
+                    if not stalled and target_id:
+                        stalled = _target_paused_review_gate(target_id)
+                    if stalled:
+                        e["status"] = "worker_failed"
+                        changed = True
+                        actions.append("worker_failed:close-out")
+            if changed:
+                write_ledger(ledger)
+    except Exception as exc:  # noqa: BLE001 - I7: best-effort, never raises
+        logger.warning("[deploy-pull-selfheal] close-out sweep failed for %s: %s",
+                       path, exc)
+    return actions
+
+
 def pass_handled_failure(repo: str, path: str, trigger: str, *,
                          pull_rc: int, pull_stderr: str = "") -> bool:
-    """Wiring for _post_land_git_pull's failure branch (D1-D6).
+    """Wiring for _post_land_git_pull (OQ-4 option-3: called on EVERY pull -
+    success AND failure - with the real `pull_rc`; the machine branches
+    internally).
 
-    Returns True when the selfheal pass owns this failure (the caller skips
-    the legacy generic notify): a self-repair succeeded, or the ledger
-    recorded/acted on the condition. Returns False when the pass could not
-    classify the failure (the legacy alert remains the fallback - I7).
-    Never raises (I7).
+    `pull_rc == 0`: the lightweight Close-Out Sweep (bounded, idempotent) -
+    closes the `salvaged` -> `resolved` / `worker_failed` loop the parent's
+    D4 step-5 success-path promise named. `pull_rc != 0`: the heavy D1-D7
+    salvage/recovery path.
+
+    Returns True when the selfheal pass owns this outcome (the caller skips
+    the legacy generic notify): a self-repair succeeded, the ledger
+    recorded/acted on the condition, or the pass is holding a state it owns
+    (C5). Returns False when the pass could not classify the failure (the
+    legacy alert remains the fallback - I7). Never raises (I7).
+
+    C5 (SECURITY fix, Erah-reclassified 2026-09-02): the `hold:` and `clean:`
+    action prefixes are in the True set - the pass owns those states. The
+    Slice-1 True set omitted them, so for a stuck tree in `hold:acked` /
+    `clean:unknown` the pass returned False and pm_core's legacy generic
+    notify fired EVERY cycle - a NORMAL Pushover carrying unredacted
+    `stderr[:300]` (on a `fetch_failed` root cause git echoes the tokenized
+    remote URL; both mapped deploy trees embed the Forgejo token in the URL)
+    into Pushover and the no-auth audit store
+    /srv/lapis/notify-audit/captured.jsonl (`send_notification` has no
+    message-level dedup) - a credential leak, not a page-budget nuisance.
+    Named known-leak exceptions (same treatment as the Slice-1 journal
+    line): the pm_core journal line (pm_core.py:1072, Slice-1 fix #6) and
+    the legacy page's `stderr[:300]` (pm_core.py:1206) remain unredacted.
     """
     try:
-        actions = run_pass(repo, path, trigger)
+        if pull_rc == 0:
+            actions = close_out_sweep(repo, path)
+        else:
+            actions = run_pass(repo, path, trigger)
     except Exception as exc:  # noqa: BLE001 - I7
         logger.warning("[deploy-pull-selfheal] pass_handled_failure errored: %s", exc)
         return False
     if "self_repaired" in actions:
         return True
-    # The pass owns the failure when it recorded or acted on the condition.
+    # The pass owns the outcome when it recorded or acted on the condition.
     for action in actions:
         if action.startswith(("deposited:", "bump:", "salvage", "salvaged:",
                               "paged:", "worker_failed", "defer:",
-                              "resolved:", "skip:ledger-lock-contended",
+                              "resolved:", "hold:", "clean:",
+                              "skip:ledger-lock-contended",
                               "skip:deposit-failed")):
             return True
     # classified:unknown with no ledger action - the legacy alert covers it.

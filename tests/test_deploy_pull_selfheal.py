@@ -1,28 +1,40 @@
-"""Hermetic tests for lapis_pm.deploy_pull_selfheal (Slice 1,
+"""Hermetic tests for lapis_pm.deploy_pull_selfheal (Slice 2,
+deploy-pull-selfheal-slice2-v0, grafted onto the Slice 1 base
 deploy-pull-selfheal-core-v0).
 
-The rebased 30-test suite (spec Critical fix #5 gate: 38 at PR #314 head -
-10 named removals + 2 new). No live weaver/Desk dependency: every test that
-drives a first-detection `run_pass` monkeypatches `deposit_gem` /
-`emit_provenance` (the hermeticity requirement, rev-1 M3), and the page
-budget is pinned with an `agents_core.notify.send_notification` spy (I2:
-no page-emitting transitions in this slice).
+The Slice-1 36-test suite (2 re-pinned in place per Scope item 6 / C5 /
+C6, the rest unchanged) plus the re-added D4/D5/D6/D7 tests (the 10 named
+removals in the core spec's fix #5) plus the panel-added shapes 10-12
+plus the OQ-4 wiring test (shape 13). No live weaver/Desk dependency:
+every test that drives a first-detection `run_pass` monkeypatches
+`deposit_gem` / `emit_provenance` (the hermeticity requirement), and the
+page budget is pinned with an `agents_core.notify.send_notification` spy
+(I2: at most one page per state transition).
 
 Coverage: D1 classifier (every row, composition, error-unknown,
-fetch-failed precedence, redaction incl. the bare-token shape); window math
-(active-defer vs stale); the I2 page-budget spy; I3 active-defer; ledger
-bootstrap + atomic write (fsync) + corrupt quarantine + absent-file
-(Critical fix #2/#5) + flock contention; I10 ack_watch/not_real
-consumption; the I8 lane-constant docstrings (Critical fix #3); the
-`recurred`-flag distinctness (Critical fix #7); the `_finish_success`
-wiring (Critical fix #4 / DoD-8, new test); the rebased 5-cycle and
-fetch_failed contracts.
+fetch-failed precedence, redaction incl. the bare-token shape); window
+math (active-defer vs stale); the I2 page-budget spy (re-pinned: 5 cycles
+stuck unsafe -> exactly 1 salvaged page + 0 re-pages; C5 held-states
+pins: 5 cycles stuck acked / clean-unknown -> 0 pages); I3 active-defer;
+ledger bootstrap + atomic write (fsync) + corrupt quarantine + absent-file
++ flock contention + Slice-1-shaped entry read-back (M1); I10
+ack_watch/not_real/salvage_now consumption; the I8 lane-constant
+docstrings + `.VALUE` membership (L2); the `recurred`-flag distinctness
+(Critical fix #7); the `_finish_success` wiring; D4 salvage losslessness
+(stale-dirty + diverged on scratch clones), no-double-PR, dirty+diverged
+churn (M2), pre-existing ref collision (C9/M4); D5 worker_failed hold +
+one page + no re-page + never auto-closed + error-safe signals (M3); D6
+fetch_failed 20-min page + silence + C6 recurrence re-page; D7 escalate
+with the corrected import (C1); the OQ-4 option-3 success-path seam
+wiring (shape 13, blocking).
 """
 
 import json
 import os
 import subprocess
+import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -388,6 +400,8 @@ class TestPageBudget:
         assert pages.call_count == 0
 
     def test_fetch_failed_first_detection_no_page(self, monkeypatch, tmp_path):
+        """C6 re-pin: first detection records the gem + station incident and
+        pages NOTHING; the 20-minute gate pages once, then silence."""
         monkeypatch.setattr(
             dps, "_collect_evidence",
             lambda path, now=None: _evidence(fetch_rc=1,
@@ -403,11 +417,28 @@ class TestPageBudget:
         payload = dps.deposit_gem.call_args.args[0]
         diag = [b for b in payload["context"] if b["label"] == "Diagnosis"][0]
         assert any("auth failed" in line for line in diag["lines"])
+        # the 20-minute gate: one HIGH page, then silence (state-transition
+        # rule, I2).
+        ledger = dps.read_ledger()
+        for e in ledger.values():
+            e["first_seen"] = (datetime.now(timezone.utc)
+                               - timedelta(minutes=21)).isoformat(
+                                   timespec="seconds")
+        dps.write_ledger(ledger)
+        pages.reset_mock()
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "paged:fetch_failed" in actions
+        assert pages.call_count == 1
+        pages.reset_mock()
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "paged:fetch_failed" not in actions
+        assert pages.call_count == 0
 
-    def test_five_cycles_stuck_unsafe_exactly_zero_pages(self, monkeypatch, tmp_path):
-        """Rebased contract (Critical fix #3): 5 consecutive cycles against a
-        stuck unsafe tree - exactly 0 pages, the gem deposits ONCE, and the
-        open entry is bump-only on cycles 2-5."""
+    def test_five_cycles_stuck_unsafe_exactly_one_page(self, monkeypatch, tmp_path):
+        """Re-pinned contract (I2, Slice 2): 5 consecutive cycles against a
+        stuck unsafe tree PAST the 20-minute window - exactly 1 page
+        (salvaged) + 0 re-pages; the gem deposits ONCE; the entry
+        transitions to `salvaged` and the later cycles hold."""
         now = time.time()
         monkeypatch.setattr(
             dps, "_collect_evidence",
@@ -415,15 +446,95 @@ class TestPageBudget:
                                              mtime=now - 3600, now=now),
         )
         monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-abc123")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_salvage", lambda *a, **kw: (True, {
+            "salvage_branch": "lapis/deploy-repair-agents-core-abc123/salvage",
+            "temp_commit": False, "target_id": "deploy-repair-agents-core-abc123",
+        }))
+        monkeypatch.setattr(dps, "_push_and_open_pr", lambda *a, **kw: 42)
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **kw: None)
         deposit = _mock_desk(monkeypatch)
         pages = _page_spy(monkeypatch)
         all_actions = []
-        for i in range(5):
+        # cycle 1: first detection (gem, no page; the window is not yet
+        # elapsed - fresh first_seen).
+        all_actions.extend(dps.run_pass("agents-core", "/x", "backstop-timer",
+                                        now=now))
+        # age the entry past the 20-minute window (simulate 5 backstop
+        # cycles of 10 min each).
+        ledger = dps.read_ledger()
+        for e in ledger.values():
+            e["first_seen"] = (datetime.now(timezone.utc)
+                               - timedelta(minutes=51)).isoformat(
+                                   timespec="seconds")
+        dps.write_ledger(ledger)
+        # cycles 2-5: exactly one salvaged page total, then silence.
+        for i in range(4):
             all_actions.extend(dps.run_pass("agents-core", "/x", "backstop-timer",
                                             now=now + i))
         assert deposit.call_count == 1
+        # exactly one page, command-shaped (the only routine page, I2)
+        assert pages.call_count == 1
+        assert "salvaged" in pages.call_args.kwargs.get("message", "").lower()
+        assert "Ratify to land, close to discard." in pages.call_args.kwargs["message"]
+        entry = dps.read_ledger()[dps.compute_signature("/x", "stale_dirty")]
+        assert entry["status"] == "salvaged"
+        assert entry["pr_number"] == 42
+
+    def test_five_cycles_stuck_acked_zero_pages(self, monkeypatch, tmp_path):
+        """C5 SECURITY pin: 5 cycles against a stuck acked tree - 0 pages
+        from this module (the pass returns True for `hold:acked`; the Slice-1
+        True-set gap let pm_core's legacy generic notify - unredacted
+        stderr[:300] incl. the tokenized remote URL - fire every cycle)."""
+        now = time.time()
+        sig = dps.compute_signature("/x", "stale_dirty")
+        ledger = {sig: {"gem_id": "g1", "status": "open", "path": "/x",
+                        "class": "stale_dirty", "times_seen": 1,
+                        "first_seen": (datetime.now(timezone.utc)
+                                       - timedelta(minutes=21)).isoformat(
+                                           timespec="seconds")}}
+        monkeypatch.setattr(dps, "read_ledger", lambda path=None: dict(ledger))
+        written = []
+        monkeypatch.setattr(dps, "write_ledger",
+                            lambda l, path=None: written.append(dict(l)))
+        monkeypatch.setattr(
+            dps, "_collect_evidence",
+            lambda path, now=None: _evidence(porcelain=(" M t.py",),
+                                             mtime=now - 3600, now=now),
+        )
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        _mock_desk(monkeypatch)
+        monkeypatch.setattr(dps, "_gem_decisions", lambda: {"g1": "ack_watch"})
+        pages = _page_spy(monkeypatch)
+        for i in range(5):
+            actions = dps.run_pass("agents-core", "/x", "backstop-timer", now=now + i)
+            assert "hold:acked" in actions
+            assert dps.pass_handled_failure(
+                "agents-core", "/x", "backstop-timer",
+                pull_rc=1, pull_stderr="fatal: auth failed") is True
         assert pages.call_count == 0
-        assert all_actions.count("bump:open") == 4
+
+    def test_five_cycles_stuck_clean_unknown_zero_pages(self, monkeypatch, tmp_path):
+        """C5 SECURITY pin: 5 cycles against a stuck clean-unknown tree - 0
+        pages from this module (`clean:unknown` is in the True set; the pass
+        owns the state)."""
+        now = time.time()
+        monkeypatch.setattr(
+            dps, "_collect_evidence",
+            lambda path, now=None: _evidence(),  # clean 0/0 -> unknown, no anomaly
+        )
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        _mock_desk(monkeypatch)
+        pages = _page_spy(monkeypatch)
+        for i in range(5):
+            actions = dps.run_pass("agents-core", "/x", "backstop-timer", now=now + i)
+            assert "clean:unknown" in actions
+            assert dps.pass_handled_failure(
+                "agents-core", "/x", "backstop-timer",
+                pull_rc=1, pull_stderr="fatal: auth failed") is True
+        assert pages.call_count == 0
 
     def test_self_repaired_tree_zero_pages(self, monkeypatch, tmp_path):
         now = time.time()
@@ -597,7 +708,9 @@ class TestGemOptions:
         """Pure unit assertion on the payload structure passed to the mocked
         deposit_gem (the rev-2 council-Q1 clarification: no live mock server,
         no :8403 connection - the mock records the call, the test asserts
-        the shape)."""
+        the shape). Re-pinned in place for Slice 2 (OQ-1): the identity
+        stays `deploy-pull-selfheal-core-v0` (same machinery, more actions)
+        and the `salvage_now` gem option is live (I10 - no dead button)."""
         now = time.time()
         monkeypatch.setattr(
             dps, "_collect_evidence",
@@ -612,12 +725,13 @@ class TestGemOptions:
         assert payload["state"] == "needs"
         assert payload["deposited_by"] == "deploy-pull-selfheal-core-v0"
         keys = [o["key"] for o in payload["options"]]
-        assert keys == ["ack_watch", "not_real"]
-        assert "salvage_now" not in keys
+        assert keys == ["salvage_now", "ack_watch", "not_real"]
+        salvage_now = [o for o in payload["options"] if o["key"] == "salvage_now"][0]
+        assert salvage_now.get("primary") is True
         labels = [b["label"] for b in payload["context"]]
         assert "Symptom" in labels and "Diagnosis" in labels
         suggested = [b for b in payload["context"] if b["label"] == "Suggested direction"][0]
-        assert any("ack_watch" in line for line in suggested["lines"])
+        assert any("salvage_now" in line for line in suggested["lines"])
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +740,9 @@ class TestGemOptions:
 
 class TestLaneConstants:
     def test_lane_constants_cite_mem_keys(self):
+        """L2 re-pin: main's class shape preserved (the `.__doc__` the
+        assertion reads IS the class docstring); the Slice-2 verbs are in
+        `.VALUE`."""
         assert dps.MACHINE_LANE_ACTIONS.__doc__ is not None
         assert "productive-autonomy-held-node-2026-07-27" in dps.MACHINE_LANE_ACTIONS.__doc__
         assert "Erah-invisible-affordances-2026-06-08" in dps.MACHINE_LANE_ACTIONS.__doc__
@@ -633,6 +750,13 @@ class TestLaneConstants:
         assert "productive-autonomy-held-node-2026-07-27" in dps.ERAH_GATE_CLASSES.__doc__
         assert "stalled-target-triage-to-agent-not-Erah-2026-06-24" in dps.ERAH_GATE_CLASSES.__doc__
         assert "Erah-pushover-signal-policy-llm-first-responder-2026-09-02" in dps.ERAH_GATE_CLASSES.__doc__
+        # Slice-2 `.VALUE` membership (class shape preserved - L2)
+        assert "salvage_and_restore" in dps.MACHINE_LANE_ACTIONS.VALUE
+        assert "classify_pull_failure" in dps.MACHINE_LANE_ACTIONS.VALUE
+        assert "close_the_loop" in dps.MACHINE_LANE_ACTIONS.VALUE
+        assert "salvage_pr_land_or_discard" in dps.ERAH_GATE_CLASSES.VALUE
+        assert "worker_failed_hold" in dps.ERAH_GATE_CLASSES.VALUE
+        assert "fetch_failed" in dps.ERAH_GATE_CLASSES.VALUE
 
 
 # ---------------------------------------------------------------------------
@@ -783,3 +907,924 @@ class TestFinishSuccessWiring:
                                                                    trigger="backstop-timer")
         assert advanced is False
         assert not deploy_log.exists() or "synced" not in deploy_log.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 helpers (D4/D5/D6/D7 - scratch-clone salvage machinery, ported
+# from the PR #314 head test matrix and grafted onto this suite)
+# ---------------------------------------------------------------------------
+
+def _git(path, *args, check=True):
+    r = subprocess.run(
+        ["git", "-C", str(path), *args],
+        capture_output=True, text=True, timeout=30,
+    )
+    if check and r.returncode != 0:
+        raise AssertionError(f"git {args} failed: {r.stderr}")
+    return r
+
+
+def _make_origin(tmp_path: Path, files: dict | None = None) -> Path:
+    """A bare origin repo with main + one commit."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True,
+                   capture_output=True)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init")
+    _git(seed, "config", "user.email", "t@t")
+    _git(seed, "config", "user.name", "t")
+    for name, content in (files or {"a.txt": "one\n"}).items():
+        (seed / name).write_text(content)
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-m", "seed")
+    _git(seed, "branch", "-M", "main")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "origin", "main")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    return origin
+
+
+def _clone(origin: Path, tmp_path: Path, name: str = "clone") -> Path:
+    clone = tmp_path / name
+    subprocess.run(["git", "clone", str(origin), str(clone)], check=True,
+                   capture_output=True)
+    _git(clone, "config", "user.email", "t@t")
+    _git(clone, "config", "user.name", "t")
+    return clone
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+
+def _entry(path: str, repo: str, cls: str, *, status: str = "open",
+           first_seen: str | None = None, gem_id: str | None = "gem-1",
+           times_seen: int = 1) -> dict:
+    now = _iso(datetime.now(timezone.utc))
+    return {
+        "signature": dps.compute_signature(path, cls),
+        "path": path, "repo": repo, "class": cls,
+        "first_seen": first_seen or now,
+        "last_seen": now, "times_seen": times_seen, "status": status,
+        "gem_id": gem_id, "pr_number": None, "salvage_branch": None,
+        "dispatch_error": None, "attempts": 0, "oldest_dirty_mtime": None,
+    }
+
+
+def _notify_spy(monkeypatch):
+    """I2 page-budget spy on agents_core.notify.send_notification."""
+    pages: list = []
+    monkeypatch.setattr(
+        sys.modules["agents_core.notify"], "send_notification",
+        lambda **kw: pages.append(kw),
+    )
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Shape 1 - window math (active-within-20min vs stale-beyond; salvage_now
+# bypass)
+# ---------------------------------------------------------------------------
+
+class TestWindowMathSlice2:
+    def test_window_not_before_20min(self):
+        e = _entry("/x", "agents-core", dps.CLASS_STALE_DIRTY,
+                   first_seen=_iso(datetime.now(timezone.utc) - timedelta(minutes=10)))
+        assert dps._window_elapsed(e) is False
+        e["first_seen"] = _iso(datetime.now(timezone.utc) - timedelta(minutes=20, seconds=1))
+        assert dps._window_elapsed(e) is True
+        e["first_seen"] = _iso(datetime.now(timezone.utc) - timedelta(minutes=61))
+        assert dps._window_elapsed(e) is True
+
+    def test_salvage_now_bypasses_window(self):
+        e = _entry("/x", "agents-core", dps.CLASS_STALE_DIRTY,
+                   first_seen=_iso(datetime.now(timezone.utc) - timedelta(minutes=1)),
+                   gem_id="g1")
+        assert dps._window_elapsed(e) is False
+        assert dps._salvage_now_requested(e, {"g1": "salvage_now"}) is True
+        assert dps._salvage_now_requested(e, {"g1": "ack_watch"}) is False
+
+
+# ---------------------------------------------------------------------------
+# Shape 2 - D4 salvage losslessness (stale-dirty + diverged, scratch clones)
+# ---------------------------------------------------------------------------
+
+class TestSalvageLosslessness:
+    def test_salvage_stale_dirty_temp_clone(self, tmp_path, monkeypatch):
+        """D4 on a scratch clone: the commit lands on the temp ref (main
+        untouched mid-operation), the salvage ref carries the work, the tree
+        ends main/0/0/clean, and every pre-op commit is still reachable."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        (clone / "work.txt").write_text("precious\n")
+        _git(clone, "add", "-A")
+        pre_commits = set(_git(clone, "rev-list", "HEAD").stdout.split())
+
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-abc123")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        # the close-the-loop verify predicate is not the losslessness check -
+        # mock it; assert the real end state (main/0/0/clean) + losslessness
+        # via git below.
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pr_numbers: list = []
+        monkeypatch.setattr(
+            dps, "_push_and_open_pr",
+            lambda path, repo, entry, info: (pr_numbers.append(42) or 42),
+        )
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        ledger = {sig: entry}
+
+        actions = dps._salvage_entry(ledger, entry, "agents-core", str(clone),
+                                     {}, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions), actions
+
+        # the salvage branch exists and carries the local work
+        ref = "lapis/deploy-repair-agents-core-abc123/salvage"
+        show = _git(clone, "show", f"{ref}:work.txt")
+        assert show.stdout == "precious\n"
+        # main is at 0/0 and clean
+        assert _git(clone, "branch", "--show-current").stdout.strip() == "main"
+        lr = _git(clone, "rev-list", "--left-right", "--count", "HEAD...origin/main")
+        assert lr.stdout.split() == ["0", "0"]
+        status = _git(clone, "status", "--porcelain").stdout
+        assert not any(line and not line.startswith("??") for line in status.splitlines())
+        # losslessness: every pre-op commit reachable post-op
+        post_commits = set(_git(clone, "rev-list", "HEAD", ref).stdout.split())
+        assert pre_commits.issubset(post_commits)
+        # exactly one HIGH page, command-shaped (I2)
+        assert len(pages) == 1
+        assert pages[0]["priority"] == sys.modules["agents_core.notify"].Priority.HIGH
+        assert "Ratify to land, close to discard." in pages[0]["message"]
+        assert "PR #42" in pages[0]["message"]
+        # ledger entry salvaged with pr_number + salvage_branch
+        assert entry["status"] == "salvaged"
+        assert entry["pr_number"] == 42
+        assert entry["salvage_branch"] == ref
+
+    def test_salvage_diverged_losslessness(self, tmp_path, monkeypatch):
+        """Diverged shape: the local unique commit is reachable on the
+        salvage ref post-operation (losslessness), tree at main/0/0."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        (clone / "local.txt").write_text("local\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "local unique")
+        pre_commits = set(_git(clone, "rev-list", "HEAD").stdout.split())
+
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-def456")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        # the close-the-loop verify predicate (branch==main + 0/0 + clean) is
+        # NOT the losslessness check - the diverged shape ends at main/clean
+        # with the unique commit parked on the salvage ref (ahead>0 by
+        # construction). Mock the verify; assert losslessness via rev-list.
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        monkeypatch.setattr(dps, "_push_and_open_pr", lambda p, r, e, i: 7)
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_DIVERGED)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_DIVERGED)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core", str(clone),
+                                     {}, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions), actions
+        ref = "lapis/deploy-repair-agents-core-def456/salvage"
+        post_commits = set(_git(clone, "rev-list", "HEAD", ref).stdout.split())
+        assert pre_commits.issubset(post_commits)  # losslessness
+        assert _git(clone, "branch", "--show-current").stdout.strip() == "main"
+
+    def test_no_double_pr_when_open_pr_exists(self, tmp_path, monkeypatch):
+        """No-op guard: an existing open PR on the salvage branch skips
+        push/create (a mid-pass kill cannot double-open a PR)."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        monkeypatch.setattr(dps, "_ensure_target", lambda repo, sig: "tid-1")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: True)
+        pushed: list = []
+        monkeypatch.setattr(dps, "_push_and_open_pr",
+                            lambda p, r, e, i: pushed.append(1) or 9)
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core", str(clone),
+                                     {}, "backstop-timer")
+        assert actions == ["salvage:pr-exists"]
+        assert pushed == []
+        assert entry["status"] == "open"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Shape 10 (M2) - dirty+diverged churn: first attempt fails its own verify
+# ---------------------------------------------------------------------------
+
+class TestDirtyDivergedChurn:
+    def test_dirty_diverged_first_attempt_fails_verify_no_loss_no_pr(
+            self, tmp_path, monkeypatch):
+        """A tree ahead AND dirty classifies `diverged` (the classifier
+        checks ahead > 0 before the dirty check). The diverged salvage path
+        never commits dirty files (the temp commit is stale_dirty-only), so
+        the first attempt fails its own `_verify_healthy`: no work lost, no
+        PR opened, the entry stays open, and the next cycle re-classifies it
+        `stale_dirty` and completes. Pin the churn shape; no double-PR."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        (clone / "local.txt").write_text("local\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "local unique")
+        # a MODIFIED tracked file (not a staged add - the classifier checks
+        # staged_adds before ahead>0): ahead AND dirty.
+        (clone / "a.txt").write_text("modified\n")
+        old = time.time() - 3600
+        os.utime(clone / "a.txt", (old, old))
+
+        # the named M2 behavior: a dirty+diverged tree fails its own
+        # `_verify_healthy` on the first attempt (the diverged path never
+        # commits dirty files - the temp commit is stale_dirty-only) - no
+        # work lost, no PR opened, the entry stays open. The REAL
+        # `_verify_healthy` (unmocked) is what fails here: after the
+        # salvage parks the unique commit on the salvage ref, main is
+        # still ahead (1/0) and the dirty file is still dirty - the
+        # close-the-loop predicate rejects it.
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-m211")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pr_numbers: list = []
+        monkeypatch.setattr(
+            dps, "_push_and_open_pr",
+            lambda p, r, e, i: (pr_numbers.append(77) or 77),
+        )
+
+        # cycle 1: classifies diverged (ahead > 0 checked before dirty)
+        cls1, _ev1 = dps.classify_pull_failure(str(clone), "backstop-timer")
+        assert cls1 == dps.CLASS_DIVERGED
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_DIVERGED)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_DIVERGED)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core",
+                                     str(clone), _ev1, "backstop-timer")
+        assert "salvaged:" not in " ".join(actions), actions
+        assert "salvage:failed" in actions, actions
+        # no work lost: the dirty file and the unique commit are intact
+        assert (clone / "a.txt").read_text() == "modified\n"
+        assert "local unique" in _git(clone, "log", "-1", "--format=%s",
+                                      "HEAD").stdout
+        # no PR opened, entry stays open, no page
+        assert pr_numbers == []
+        assert pages == []
+        assert entry["status"] == "open"
+        assert entry["dispatch_error"] == "salvage-failed"
+
+        # cycle 2: the tree re-classifies stale_dirty (the unique commit is
+        # committed by a human onto origin/main, leaving a clean-main +
+        # stale-dirty shape) and the next salvage attempt completes.
+        # Simulate: the unique commit is now on origin/main (a human push),
+        # leaving a clean-main + stale-dirty shape (the dirty file is still
+        # dirty). The REAL `_verify_healthy` passes once the salvage
+        # commits the dirty file to the salvage ref and restores main to
+        # 0/0/clean. The salvage ref from cycle 1 (carrying the parked
+        # unique commit) is deleted: the human push put that commit on
+        # origin/main, so the ref carries no unique commits and the C9
+        # converge path would force-update it - but a fresh salvage ref
+        # is the clean shape for cycle 2 (the real end state after a
+        # merged salvage PR deletes the remote side; the local side is
+        # the residue this test is NOT pinning here).
+        _git(clone, "switch", "main")
+        _git(clone, "reset", "--hard", "origin/main")
+        _git(clone, "branch", "-D", "lapis/deploy-repair-agents-core-m211/salvage")
+        (clone / "a.txt").write_text("modified2\n")
+        old = time.time() - 3600
+        os.utime(clone / "a.txt", (old, old))
+        cls2, _ev2 = dps.classify_pull_failure(str(clone), "backstop-timer")
+        assert cls2 == dps.CLASS_STALE_DIRTY
+        sig2 = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry2 = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry2["signature"] = sig2
+        actions2 = dps._salvage_entry({sig2: entry2}, entry2, "agents-core",
+                                      str(clone), _ev2, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions2), actions2
+        # exactly one PR total across both cycles (no double-PR)
+        assert pr_numbers == [77]
+        assert len(pages) == 1
+
+
+# ---------------------------------------------------------------------------
+# Shape 11 (C9/M4) - pre-existing ref collision
+# ---------------------------------------------------------------------------
+
+class TestPreOpRefHygiene:
+    def test_stale_tmp_ref_converges(self, tmp_path, monkeypatch):
+        """A stale `deploy-pull-salvage-tmp` from a crashed prior op: the
+        same-name rename is a no-op (rc=0) - the salvage converges, 0 pages
+        from the ref itself (the single salvaged page is the named one)."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        # simulate a crashed prior op: the temp ref exists at main.
+        _git(clone, "branch", dps._SALVAGE_TMP_REF, "main")
+        (clone / "work.txt").write_text("precious\n")
+        _git(clone, "add", "-A")
+
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-c901")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        monkeypatch.setattr(dps, "_push_and_open_pr", lambda p, r, e, i: 51)
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core",
+                                     str(clone), {}, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions), actions
+        # the temp ref no longer exists (converged: deleted before the op)
+        probe = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{dps._SALVAGE_TMP_REF}"],
+            capture_output=True, text=True, timeout=30)
+        assert probe.returncode != 0
+        # exactly the one named salvaged page
+        assert len(pages) == 1
+
+    def test_preexisting_local_salvage_ref_converges(self, tmp_path, monkeypatch):
+        """A pre-existing local `lapis/<target_id>/salvage` from a resolved
+        episode (the remote side is deleted on merge, the local side never
+        is): force-updated when it carries no unique commits - converges."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        ref = "lapis/deploy-repair-agents-core-c902/salvage"
+        _git(clone, "branch", ref, "main")  # no unique commits
+        (clone / "work.txt").write_text("precious\n")
+        _git(clone, "add", "-A")
+
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-c902")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        monkeypatch.setattr(dps, "_push_and_open_pr", lambda p, r, e, i: 52)
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core",
+                                     str(clone), {}, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions), actions
+        # the ref was force-updated to carry the salvaged work
+        assert _git(clone, "show", f"{ref}:work.txt").stdout == "precious\n"
+        assert len(pages) == 1
+
+    def test_preexisting_local_salvage_ref_with_unique_commits_aborts(
+            self, tmp_path, monkeypatch):
+        """A pre-existing local salvage ref carrying UNIQUE commits: the op
+        aborts with a named ledger state (`salvage-ref-collision`) - never a
+        silent per-cycle retry; 0 pages."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        ref = "lapis/deploy-repair-agents-core-c903/salvage"
+        # a unique commit on the salvage ref (not reachable from HEAD):
+        # the ref must be AHEAD of HEAD (rev-list <ref>..HEAD counts
+        # commits reachable from the ref but not from HEAD - the spec's
+        # "unique to it" direction).
+        _git(clone, "switch", "-c", ref)
+        (clone / "unique.txt").write_text("unique\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "unique on salvage ref")
+        _git(clone, "switch", "main")
+        (clone / "work.txt").write_text("precious\n")
+        _git(clone, "add", "-A")
+
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-c903")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pushed: list = []
+        monkeypatch.setattr(dps, "_push_and_open_pr",
+                            lambda p, r, e, i: pushed.append(1) or 53)
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core",
+                                     str(clone), {}, "backstop-timer")
+        assert "salvage:failed" in actions, actions
+        assert entry["dispatch_error"] == "salvage-ref-collision"
+        assert entry["status"] == "open"  # named state, not silent
+        # the unique commit is untouched
+        assert "unique on salvage ref" in _git(
+            clone, "log", "-1", "--format=%s", ref).stdout
+        # no push, no PR, no page
+        assert pushed == []
+        assert pages == []
+
+
+# ---------------------------------------------------------------------------
+# Shape 4 (D5) - worker_failed hold
+# ---------------------------------------------------------------------------
+
+class TestStallHold:
+    def _salvaged_entry(self, tmp_path, monkeypatch) -> tuple:
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        e = _entry("/x", "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged",
+                   gem_id="g1")
+        e["pr_number"] = 12
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({e["signature"]: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_gem_decisions", lambda: {})
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        return ledger_path, e
+
+    def test_closed_unmerged_pr_one_worker_failed_page(self, tmp_path, monkeypatch):
+        ledger_path, e = self._salvaged_entry(tmp_path, monkeypatch)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "closed")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 0)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "worker_failed" in actions
+        assert len(pages) == 1  # exactly one HIGH page (I2)
+        assert pages[0]["priority"] == sys.modules["agents_core.notify"].Priority.HIGH
+        assert "holding for PM" in pages[0]["message"]
+        # L4: the gem id rides in the page text
+        assert "gem g1" in pages[0]["message"]
+        data = json.loads(ledger_path.read_text())
+        assert data[e["signature"]]["status"] == "worker_failed"
+
+    def test_two_rejections_stall(self, tmp_path, monkeypatch):
+        ledger_path, e = self._salvaged_entry(tmp_path, monkeypatch)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "open")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 2)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "worker_failed" in actions
+        assert len(pages) == 1
+
+    def test_gate_cap_pause_stall(self, tmp_path, monkeypatch):
+        ledger_path, e = self._salvaged_entry(tmp_path, monkeypatch)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "open")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 0)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: True)
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "worker_failed" in actions
+        assert len(pages) == 1
+
+    def test_worker_failed_not_repaged(self, tmp_path, monkeypatch):
+        """I2: no per-cycle re-page - a second pass against a worker_failed
+        entry pages zero times."""
+        ledger_path, e = self._salvaged_entry(tmp_path, monkeypatch)
+        data = json.loads(ledger_path.read_text())
+        data[e["signature"]]["status"] = "worker_failed"
+        dps.write_ledger(data, path=ledger_path)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "closed")
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert pages == []
+        assert "worker_failed" not in actions
+
+    def test_worker_failed_never_auto_closed(self, tmp_path, monkeypatch):
+        """worker_failed is not auto-closed by the healthy verify."""
+        ledger_path, e = self._salvaged_entry(tmp_path, monkeypatch)
+        data = json.loads(ledger_path.read_text())
+        data[e["signature"]]["status"] = "worker_failed"
+        dps.write_ledger(data, path=ledger_path)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "merged")
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        dps.run_pass("agents-core", "/x", "backstop-timer")
+        data = json.loads(ledger_path.read_text())
+        assert data[e["signature"]]["status"] == "worker_failed"
+
+    def test_error_safe_signals_no_false_worker_failed(self, tmp_path, monkeypatch):
+        """M3: each of the three signal reads erroring -> not stalled (no
+        false worker_failed)."""
+        ledger_path, e = self._salvaged_entry(tmp_path, monkeypatch)
+
+        def boom(*a, **kw):
+            raise RuntimeError("mem down")
+        # signal (a) _pr_state errors -> None (not "closed")
+        monkeypatch.setattr(dps, "_pr_state", boom)
+        monkeypatch.setattr(dps, "_rejection_count", boom)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", boom)
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "worker_failed" not in actions
+        assert pages == []
+        data = json.loads(ledger_path.read_text())
+        assert data[e["signature"]]["status"] == "salvaged"
+
+
+# ---------------------------------------------------------------------------
+# Shape 6 (D6) - fetch_failed 20-min page + C6 recurrence
+# ---------------------------------------------------------------------------
+
+class TestFetchFailedSlice2:
+    def test_page_at_20min_then_silence(self, tmp_path, monkeypatch):
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        old = _iso(datetime.now(timezone.utc) - timedelta(minutes=25))
+        e = _entry("/x", "agents-core", dps.CLASS_FETCH_FAILED, first_seen=old)
+        dps.write_ledger({e["signature"]: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_gem_decisions", lambda: {})
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "paged:fetch_failed" in actions
+        assert len(pages) == 1
+        assert "credentials/network" in pages[0]["message"]
+        # second pass: silent (state-transition rule)
+        pages.clear()
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert pages == []
+        assert "paged:fetch_failed" not in actions
+
+    def test_no_page_before_20min(self, tmp_path, monkeypatch):
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        e = _entry("/x", "agents-core", dps.CLASS_FETCH_FAILED,
+                   first_seen=_iso(datetime.now(timezone.utc) - timedelta(minutes=5)))
+        dps.write_ledger({e["signature"]: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_gem_decisions", lambda: {})
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pages = _notify_spy(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert pages == []
+        assert "paged:fetch_failed" not in actions
+
+    def test_recurrence_repages_at_20min(self, tmp_path, monkeypatch):
+        """C6: a recurring fetch_failed (resolved -> re-failed) re-pages once
+        at 20 min - the recurrence reset clears `fetch_page_sent`."""
+        now = time.time()
+        monkeypatch.setattr(
+            dps, "_collect_evidence",
+            lambda path, now=None: _evidence(fetch_rc=1,
+                                             fetch_stderr="fatal: auth failed"),
+        )
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        _mock_desk(monkeypatch)
+        pages = _page_spy(monkeypatch)
+        # episode 1: first detection, no page; age past the window; page once.
+        dps.run_pass("agents-core", "/x", "backstop-timer", now=now)
+        ledger = dps.read_ledger()
+        for e in ledger.values():
+            e["first_seen"] = _iso(datetime.now(timezone.utc) - timedelta(minutes=21))
+        dps.write_ledger(ledger)
+        dps.run_pass("agents-core", "/x", "backstop-timer", now=now + 1)
+        assert pages.call_count == 1
+        # the tree heals: D4.5 resolves the entry.
+        monkeypatch.setattr(dps, "_collect_evidence",
+                            lambda path, now=None: _evidence())
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {"branch": "main"}))
+        monkeypatch.setattr(dps, "_supersede_gem", MagicMock())
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer", now=now + 2)
+        assert any(a.startswith("resolved:healthy:") for a in actions)
+        # episode 2 (recurrence): re-failed; the recurrence reset clears
+        # fetch_page_sent; age past the window; re-pages once.
+        monkeypatch.setattr(
+            dps, "_collect_evidence",
+            lambda path, now=None: _evidence(fetch_rc=1,
+                                             fetch_stderr="fatal: auth failed"),
+        )
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        pages.reset_mock()
+        second = dps.run_pass("agents-core", "/x", "backstop-timer", now=now + 3)
+        assert "deposited:recurred" in second
+        entry = dps.read_ledger()[dps.compute_signature("/x", "fetch_failed")]
+        assert entry["fetch_page_sent"] is False  # C6 reset
+        ledger = dps.read_ledger()
+        for e in ledger.values():
+            e["first_seen"] = _iso(datetime.now(timezone.utc) - timedelta(minutes=21))
+        dps.write_ledger(ledger)
+        dps.run_pass("agents-core", "/x", "backstop-timer", now=now + 4)
+        assert pages.call_count == 1  # re-paged once at 20 min
+
+
+# ---------------------------------------------------------------------------
+# Shape 7 (D7) - escalate with the corrected import
+# ---------------------------------------------------------------------------
+
+class TestStationEscalate:
+    def test_escalate_corrected_import(self, monkeypatch):
+        """C1: `station_escalate` writes the repair-station incident with the
+        corrected import (`first` from agents_core.repair_station.types, not
+        .escalate - the head import raised ImportError)."""
+        import sys
+        import agents_core.repair_station as rs
+        # NOTE: `import agents_core.repair_station.escalate as m` binds the
+        # FUNCTION (the package __init__ shadows the submodule in the
+        # package namespace) - the real module is in sys.modules.
+        rs_escalate_mod = sys.modules["agents_core.repair_station.escalate"]
+        calls: list = []
+
+        def fake_escalate(*a, **kw):
+            calls.append((a, kw))
+            return "incident-1"
+        # the corrected import reads `escalate` from the module namespace -
+        # patch it there (the package `__init__` re-exports it too).
+        monkeypatch.setattr(rs_escalate_mod, "escalate", fake_escalate)
+        monkeypatch.setattr(rs, "escalate", fake_escalate)
+        # the real import path must resolve: `first` from types, `escalate`
+        # from escalate (the corrected import - no ImportError).
+        from agents_core.repair_station.escalate import escalate  # noqa: F401
+        from agents_core.repair_station.types import Tier, first  # noqa: F401
+        assert first().kind == "first"
+        assert Tier.NORMAL.value == 2
+
+        dps.station_escalate(repo="agents-core", path="/x", cls="stale_dirty",
+                             first_seen="2026-09-02T00:00:00+00:00",
+                             times_seen=1)
+        assert len(calls) == 1
+        a, kw = calls[0]
+        assert kw["station_id"] == "deploy/pull-agents-core"  # station family
+        assert kw["escalation_policy"].kind == "first"
+        assert kw["tier"] == Tier.NORMAL
+        assert kw["signature_fields"] == ["path", "class"]
+        assert kw["error_signal"]["path"] == "/x"
+        assert kw["error_signal"]["class"] == "stale_dirty"
+
+    def test_first_detection_fires_station_escalate(self, monkeypatch, tmp_path):
+        """The _first_detection call site fires station_escalate (the grafted
+        D7 call after emit_provenance)."""
+        now = time.time()
+        monkeypatch.setattr(
+            dps, "_collect_evidence",
+            lambda path, now=None: _evidence(porcelain=(" M t.py",),
+                                             mtime=now - 3600, now=now),
+        )
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        _mock_desk(monkeypatch)
+        esc = MagicMock()
+        monkeypatch.setattr(dps, "station_escalate", esc)
+        dps.run_pass("agents-core", "/x", "backstop-timer", now=now)
+        esc.assert_called_once()
+        assert esc.call_args.kwargs["repo"] == "agents-core"
+        assert esc.call_args.kwargs["cls"] == "stale_dirty"
+
+
+# ---------------------------------------------------------------------------
+# Shape 8 (M1) - ledger schema
+# ---------------------------------------------------------------------------
+
+class TestLedgerSchema:
+    def test_slice1_shaped_entry_reads_back(self, monkeypatch, tmp_path):
+        """M1: a Slice-1-shaped entry (identical schema - _new_entry
+        unchanged) reads back without crashing; the re-added code uses
+        `.get()` for every Slice-2 field."""
+        sig = dps.compute_signature("/x", "stale_dirty")
+        ledger = {sig: {
+            "signature": sig, "path": "/x", "repo": "agents-core",
+            "class": "stale_dirty", "first_seen": "2026-09-02T00:00:00+00:00",
+            "last_seen": "2026-09-02T00:00:00+00:00", "times_seen": 1,
+            "status": "open", "gem_id": "g1", "pr_number": None,
+            "salvage_branch": None, "dispatch_error": None, "attempts": 0,
+            "oldest_dirty_mtime": None,
+        }}
+        monkeypatch.setattr(dps, "read_ledger", lambda path=None: dict(ledger))
+        monkeypatch.setattr(
+            dps, "_collect_evidence",
+            lambda path, now=None: _evidence(porcelain=(" M t.py",),
+                                             mtime=time.time() - 3600,
+                                             now=time.time()),
+        )
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        _mock_desk(monkeypatch)
+        actions = dps.run_pass("agents-core", "/x", "backstop-timer")
+        assert "bump:open" in actions  # read back + bumped, no crash
+
+    def test_salvaged_transition_writes_action_fields(self, tmp_path, monkeypatch):
+        """After a salvaged transition, status == 'salvaged' with
+        pr_number/salvage_branch non-null; worker_failed is a status value,
+        not a field - no phantom fields in the durable store."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        (clone / "work.txt").write_text("precious\n")
+        _git(clone, "add", "-A")
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-m101")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        monkeypatch.setattr(dps, "_push_and_open_pr", lambda p, r, e, i: 88)
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        ledger = {sig: entry}
+        actions = dps._salvage_entry(ledger, entry, "agents-core", str(clone),
+                                     {}, "backstop-timer")
+        assert any(a.startswith("salvaged:") for a in actions)
+        assert entry["status"] == "salvaged"
+        assert entry["pr_number"] == 88
+        assert entry["salvage_branch"] == "lapis/deploy-repair-agents-core-m101/salvage"
+        assert entry["target_id"] == "deploy-repair-agents-core-m101"
+        # no phantom fields: worker_failed is a status value, not a field
+        assert "worker_failed" not in entry
+        assert "salvaged" not in entry  # status value, not a field
+
+    def test_worker_failed_is_status_value(self, tmp_path, monkeypatch):
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        e = _entry("/x", "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged")
+        e["pr_number"] = 12
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({e["signature"]: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_gem_decisions", lambda: {})
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (False, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "closed")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 0)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+        _notify_spy(monkeypatch)
+        dps.run_pass("agents-core", "/x", "backstop-timer")
+        data = json.loads(ledger_path.read_text())
+        entry = data[e["signature"]]
+        assert entry["status"] == "worker_failed"
+        assert "worker_failed" not in entry  # status value, not a field
+
+
+# ---------------------------------------------------------------------------
+# Shape 13 (OQ-4, BLOCKING) - the success-path seam wiring, end-to-end
+# ---------------------------------------------------------------------------
+
+class TestOQ4Wiring:
+    def test_success_pull_reaches_close_out_sweep(self, monkeypatch, tmp_path):
+        """Exercises the production `_post_land_git_pull` success path
+        END-TO-END with a mocked successful `git pull` - asserting
+        `pass_handled_failure` is invoked with `pull_rc=0` (NOT by calling
+        it directly - a direct call cannot capture the pm_core wiring
+        change). The Close-Out Sweep runs: a `salvaged` ledger entry for
+        that path with a merged PR transitions to `resolved`. Carries a
+        wall-time assertion (<5s) + a path-scoped ledger read to protect
+        the 120s budget."""
+        from lapis_pm import pm_core
+
+        path = "/srv/git/agents-core-working"
+        ledger_path = tmp_path / "ledger.json"
+        sig = dps.compute_signature(path, dps.CLASS_STALE_DIRTY)
+        e = _entry(path, "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged")
+        e["pr_number"] = 12
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({sig: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "merged")
+        supersede = MagicMock()
+        monkeypatch.setattr(dps, "_supersede_gem", supersede)
+
+        # the production path: a successful pull for a critical repo. The
+        # REAL pass_handled_failure runs (the wiring under test) - the
+        # pm_core call site is what's being verified, not the machine.
+        calls: list = []
+        real_pass = dps.pass_handled_failure
+
+        def spy_pass(repo, path_, trigger, *, pull_rc, pull_stderr=""):
+            calls.append((repo, path_, pull_rc))
+            return real_pass(repo, path_, trigger, pull_rc=pull_rc,
+                             pull_stderr=pull_stderr)
+
+        monkeypatch.setattr(dps, "pass_handled_failure", spy_pass)
+        with patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure",
+                   side_effect=spy_pass):
+            # record the ledger read scope: the sweep must be path-scoped.
+            reads: list = []
+            real_read_ledger = dps.read_ledger
+
+            def scoped_read_ledger(p=None):
+                reads.append(p)
+                return real_read_ledger(p)
+
+            monkeypatch.setattr(dps, "read_ledger", scoped_read_ledger)
+
+            def fake_run(cmd, **kwargs):
+                if cmd[0] == "git" and "rev-parse" in cmd:
+                    return _git_cp(stdout="samehead1\n")
+                if cmd[0] == "git" and "status" in cmd:
+                    return _git_cp(stdout="")
+                if cmd[0] == "git" and "pull" in cmd:
+                    return _git_cp(rc=0, stdout="Already up to date.")
+                return _git_cp(stdout="active")
+
+            t0 = time.time()
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_deploy_pull_locked", return_value=None):
+                    advanced = pm_core._post_land_git_pull(
+                        "agents-core", trigger="backstop-timer")
+            elapsed = time.time() - t0
+        # the seam is called on the SUCCESS path with the real pull_rc=0
+        assert ("agents-core", path, 0) in calls, calls
+        assert advanced is False  # HEAD did not advance
+        # the sweep ran path-scoped (no ledger-wide scan) and transitioned
+        # the salvaged entry to resolved (merged PR).
+        data = json.loads(ledger_path.read_text())
+        assert data[sig]["status"] == "resolved"
+        supersede.assert_called_once()
+        assert elapsed < 5.0
+
+    def test_success_pull_close_out_stalled_pr_worker_failed(self, monkeypatch, tmp_path):
+        """A `salvaged` entry with a stalled PR (two rejections) transitions
+        `worker_failed` on the success-path sweep."""
+        from lapis_pm import pm_core
+
+        path = "/srv/git/agents-core-working"
+        ledger_path = tmp_path / "ledger.json"
+        sig = dps.compute_signature(path, dps.CLASS_STALE_DIRTY)
+        e = _entry(path, "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged")
+        e["pr_number"] = 13
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        dps.write_ledger({sig: e}, path=ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(dps, "_pr_state", lambda repo, pr: "open")
+        monkeypatch.setattr(dps, "_rejection_count", lambda tid: 2)
+        monkeypatch.setattr(dps, "_target_paused_review_gate", lambda tid: False)
+
+        calls: list = []
+        real_pass = dps.pass_handled_failure
+
+        def spy_pass(repo, path_, trigger, *, pull_rc, pull_stderr=""):
+            calls.append((repo, path_, pull_rc))
+            return real_pass(repo, path_, trigger, pull_rc=pull_rc,
+                             pull_stderr=pull_stderr)
+
+        monkeypatch.setattr(dps, "pass_handled_failure", spy_pass)
+        with patch("lapis_pm.deploy_pull_selfheal.pass_handled_failure",
+                   side_effect=spy_pass):
+            def fake_run(cmd, **kwargs):
+                if cmd[0] == "git" and "rev-parse" in cmd:
+                    return _git_cp(stdout="samehead1\n")
+                if cmd[0] == "git" and "status" in cmd:
+                    return _git_cp(stdout="")
+                if cmd[0] == "git" and "pull" in cmd:
+                    return _git_cp(rc=0, stdout="Already up to date.")
+                return _git_cp(stdout="active")
+
+            with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                with patch.object(pm_core, "_deploy_pull_locked", return_value=None):
+                    pm_core._post_land_git_pull("agents-core", trigger="backstop-timer")
+        assert ("agents-core", path, 0) in calls
+        data = json.loads(ledger_path.read_text())
+        assert data[sig]["status"] == "worker_failed"
+
+    def test_close_out_sweep_direct_bounded_idempotent(self, tmp_path, monkeypatch):
+        """The sweep is bounded (path-scoped read, one PR-state read per
+        salvaged entry) and idempotent (a second run over a resolved entry
+        is a no-op)."""
+        ledger_path = tmp_path / "ledger.json"
+        monkeypatch.setattr(dps, "_LEDGER_FILE", ledger_path)
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_FILE", tmp_path / "ledger.lock")
+        monkeypatch.setattr(dps, "_LEDGER_LOCK_TIMEOUT_S", 0.2)
+        path = "/srv/git/agents-core-working"
+        sig = dps.compute_signature(path, dps.CLASS_STALE_DIRTY)
+        e = _entry(path, "agents-core", dps.CLASS_STALE_DIRTY, status="salvaged")
+        e["pr_number"] = 12
+        e["target_id"] = "deploy-repair-agents-core-abc123"
+        # a second entry on a DIFFERENT path must not be touched
+        other = _entry("/other", "agents-core", dps.CLASS_STALE_DIRTY,
+                       status="salvaged")
+        other["pr_number"] = 99
+        other["target_id"] = "tid-other"
+        dps.write_ledger({sig: e, other["signature"]: other}, path=ledger_path)
+
+        pr_reads: list = []
+        monkeypatch.setattr(
+            dps, "_pr_state",
+            lambda repo, pr: (pr_reads.append(pr) or "merged"),
+        )
+        actions = dps.close_out_sweep("agents-core", path)
+        assert any(a.startswith("resolved:salvaged-merged:") for a in actions)
+        assert pr_reads == [12]  # path-scoped: only this path's PR read
+        data = json.loads(ledger_path.read_text())
+        assert data[sig]["status"] == "resolved"
+        assert data[other["signature"]]["status"] == "salvaged"  # untouched
+        # idempotent: a second run is a no-op (no PR read, no write)
+        pr_reads.clear()
+        actions2 = dps.close_out_sweep("agents-core", path)
+        assert pr_reads == []
+        assert actions2 == []
+        data2 = json.loads(ledger_path.read_text())
+        assert data2[sig]["status"] == "resolved"

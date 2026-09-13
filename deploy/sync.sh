@@ -191,19 +191,24 @@ else
 fi
 
 # ── Deploy log ─────────────────────────────────────────────────────────────
-# Append provenance line when code advances. Reads _BRIEF_MODEL from Python for
-# accuracy; falls back to "unknown" if the module is not importable.
+# Append provenance line when code advances. L2.D4
+# (local-reviewer-identity-and-provenance-v0): the label is
+# <seat-alias>:<served-model> from the provenance module (the seat alias
+# resolves statically to gravitywell; the served model is the same-call echo,
+# else the seam-filtered locality-ledger fallback, else not-reported). The
+# dead _BRIEF_MODEL import dies here; falls back to the void marker if the
+# module is not importable.
 DEPLOY_LOG="/srv/lapis/lapis-state/lapis-pm-deploy-log.md"
 if [[ "$CODE_CHANGED" -eq 1 && "$DRY_RUN" -eq 0 && -f "$DEPLOY_LOG" ]]; then
-    BRIEF_MODEL=$(python3 -c "
+    PROV_LABEL=$(python3 -c "
 import sys; sys.path.insert(0, '${REPO}')
-from lapis_pm.brief import _BRIEF_MODEL; print(_BRIEF_MODEL)
-" 2>/dev/null || echo "unknown")
+from lapis_pm import provenance; print(provenance.deploy_log_label())
+" 2>/dev/null || echo "gravitywell:not-reported")
     LOG_TS=$(python3 -c "
 from datetime import datetime, timezone
 print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
 " 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-    echo "- \`${LOG_TS}\` | ${REPO} | synced ${PRE_REV:0:8}..${POST_REV:0:8} | brief.py:${BRIEF_MODEL} | deploy-timer" >> "$DEPLOY_LOG"
+    echo "- \`${LOG_TS}\` | ${REPO} | synced ${PRE_REV:0:8}..${POST_REV:0:8} | brief.py:${PROV_LABEL} | deploy-timer" >> "$DEPLOY_LOG"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

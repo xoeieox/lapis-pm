@@ -1258,7 +1258,7 @@ def launder_intent(
 ) -> tuple[str, Literal["gw", "fallback", "mock"]]:
     """Rewrite task intent as a from-symptom, investigate-diagnose-fix-verify description.
 
-    Real mode: calls call_operator('gravitywell', ...) — zero paid, local 122B.
+    Real mode: calls call_operator('gravitywell', ...) — zero paid, local seat.
     Mock mode (AC2 testing / CI): returns a stub paraphrase without calling GW.
 
     Returns (paraphrased, status) where status is "gw", "fallback", or "mock".

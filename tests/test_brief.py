@@ -11,8 +11,10 @@ Required contract test (Deliverable 5):
 
 Routing contract (lapis-pm-prose-synthesis-local-repoint-v0):
   - synthesize() routes to call_gw_agent (the local seat), NOT call_claude_cli
-  - the provenance line records the actual served_model_out (or an explicit
-    'local-seat-unavailable' marker when the seat produced no text)
+  - the provenance line records the <seat-alias>:<served-model> label
+    (L2.D4, local-reviewer-identity-and-provenance-v0): the call's in-bounds
+    served_model_out, else the seam-filtered ledger fallback, else the
+    explicit not-reported marker — never the seat alias in the model slot
 
 Optional round-trip smoke test:
   - synthesize() returns a Brief and writes a pm:brief comment when
@@ -247,8 +249,14 @@ def test_synthesize_round_trip_returns_brief():
 # ---------------------------------------------------------------------------
 
 def test_brief_body_contains_version_line():
-    """Every emitted brief body carries the running-version provenance line,
-    stamped with the ACTUAL seat that produced the body (served_model_out)."""
+    """Every emitted brief body carries the running-version provenance line.
+
+    L2.D4 (local-reviewer-identity-and-provenance-v0): the label is
+    <seat-alias>:<served-model> — the seat alias resolves statically to the
+    operator default (gravitywell); the served model is this call's in-bounds
+    echo, else the seam-filtered ledger fallback, else not-reported. The
+    alias never occupies the model slot.
+    """
     fake_body = (
         "## State\nRunning.\n"
         "## Recent activity\n- tick\n"
@@ -276,6 +284,9 @@ def test_brief_body_contains_version_line():
         # Stub the git call so the test doesn't depend on the git tree
         patch("lapis_pm.brief.subprocess.run",
               return_value=subprocess.CompletedProcess([], 0, stdout="abc1234\n", stderr="")),
+        # L2.D4: the label uses the call's in-bounds echo (step 1) — stub the
+        # ledger fallback so the test is hermetic (no host /srv/lapis/locality read).
+        patch("lapis_pm.provenance._ledger_fallback_served", return_value=None),
     ):
         result = brief.synthesize(
             target_id="version-tid",
@@ -286,17 +297,36 @@ def test_brief_body_contains_version_line():
     body = written_body.get("body", result.body)
     assert "lapis_pm @" in body, f"Version line missing from brief body:\n{body}"
     assert "brief.py:" in body
-    # Provenance truth-integrity: the label is the ACTUAL seat that produced the text
-    assert "brief.py:gravitywell-slot1" in body, (
-        f"Provenance line must record the actual seat; got:\n{body}"
+    # L2.D4 (local-reviewer-identity-and-provenance-v0): the label is
+    # <seat-alias>:<served-model>. The seat alias resolves statically to the
+    # operator default (gravitywell); the served model is this call's
+    # in-bounds echo (gravitywell-slot1 here), else the seam-filtered
+    # ledger fallback, else the explicit not-reported marker. The alias
+    # NEVER occupies the model slot.
+    import re
+    m = re.search(r"brief\.py:([^\s,]+),", body)
+    assert m, f"Provenance label missing from brief body:\n{body}"
+    label = m.group(1)
+    assert label.startswith("gravitywell:"), (
+        f"Provenance label must be <seat-alias>:<served-model>; got {label!r}\n{body}"
+    )
+    model_slot = label.split(":", 1)[1]
+    assert model_slot == "gravitywell-slot1" or model_slot == "not-reported", (
+        f"Served-model slot must be the call's echo or not-reported; got {label!r}\n{body}"
+    )
+    assert model_slot != "gravitywell", (
+        f"Seat alias must never occupy the served-model slot; got {label!r}\n{body}"
     )
     # Starts with the synthesized content (version line is additive, not replacing)
     assert body.startswith(fake_body)
 
 
 def test_brief_fallback_body_records_seat_unavailable():
-    """The failure-fallback brief body carries the version line AND records the
-    explicit 'local-seat-unavailable' marker (never a model name that did not run)."""
+    """The failure-fallback brief body carries the version line with the
+    <seat-alias>:<served-model> label. L2.D4 (local-reviewer-identity-and-
+    provenance-v0): with no in-bounds echo from this call, the served-model
+    slot is the seam-filtered ledger fallback or the explicit not-reported
+    marker — NEVER the seat alias alone."""
     written_body = {}
 
     def capture_write_brief(target_id, body):
@@ -316,6 +346,9 @@ def test_brief_fallback_body_records_seat_unavailable():
             patch("lapis_pm.brief.episodic.write_brief_options"),
         patch("lapis_pm.brief.subprocess.run",
               return_value=subprocess.CompletedProcess([], 0, stdout="abc1234\n", stderr="")),
+        # L2.D4: no in-bounds echo from this call — the label is the ledger
+        # fallback or not-reported. Stub the fallback for hermeticity.
+        patch("lapis_pm.provenance._ledger_fallback_served", return_value=None),
     ):
         brief.synthesize(
             target_id="fallback-version-tid",
@@ -326,9 +359,20 @@ def test_brief_fallback_body_records_seat_unavailable():
     body = written_body.get("body", "")
     assert "lapis_pm @" in body, "Version line must appear even in fallback brief"
     assert "local seat returned no text" in body
-    # Provenance truth-integrity: explicit unavailable marker, not a model name
-    assert "brief.py:local-seat-unavailable" in body, (
-        f"Provenance line must record 'local-seat-unavailable' when the seat produced no text; got:\n{body}"
+    # L2.D4: the label is <seat-alias>:<served-model>. With no in-bounds echo
+    # from this call, the served-model slot is the seam-filtered ledger
+    # fallback (today's single distinct model) or the explicit not-reported
+    # marker — NEVER the seat alias alone.
+    import re
+    m = re.search(r"brief\.py:([^\s,]+),", body)
+    assert m, f"Provenance label missing from brief body:\n{body}"
+    label = m.group(1)
+    assert label.startswith("gravitywell:"), (
+        f"Provenance label must be <seat-alias>:<served-model>; got {label!r}\n{body}"
+    )
+    model_slot = label.split(":", 1)[1]
+    assert model_slot != "gravitywell", (
+        f"Seat alias must never occupy the served-model slot; got {label!r}\n{body}"
     )
 
 

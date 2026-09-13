@@ -50,34 +50,32 @@ logger = logging.getLogger(__name__)
 
 _BRIEF_RETRIES = 1
 
-# Provenance label used when the local seat produced no text (unreachable /
-# skipped / no model reached). Never a model name that did not actually run.
-_BRIEF_PROV_UNAVAILABLE = "local-seat-unavailable"
-
-
 def _brief_provenance_label(served_model_out: list | None) -> str:
-    """Return the model name to record in the brief provenance line.
+    """Return the deploy-log label ``<seat-alias>:<served-model>`` to record
+    in the brief provenance line (L2.D4,
+    local-reviewer-identity-and-provenance-v0).
 
-    Truth-integrity: the label must be the ACTUAL seat that produced the text
-    (captured from call_gw_agent's served_model_out), never a hardcoded model
-    name. If the seat produced no text, record an explicit
-    'local-seat-unavailable' marker so 'the local seat produced this' is
-    legible from 'the seat was down and we fell back'.
+    The seat alias resolves statically to the operator default (gravitywell;
+    this composer passes no ``model`` kwarg to call_gw_agent). The served
+    model is this call's in-bounds echo (captured from call_gw_agent's
+    served_model_out), else the seam-filtered locality-ledger fallback, else
+    the explicit not-reported marker. The seat alias is NEVER written into
+    the served-model slot (Erah 2026-09-06 explicit-void adjudication).
     """
-    if served_model_out:
-        return str(served_model_out[-1])
-    return _BRIEF_PROV_UNAVAILABLE
+    from . import provenance as _provenance
+    return _provenance.deploy_log_label(served_model_out)
 
 
-def _brief_version_line(model_label: str = _BRIEF_PROV_UNAVAILABLE) -> str:
+def _brief_version_line(model_label: str) -> str:
     """One-line running-version provenance appended to every emitted brief.
 
     Sourced from the *running* module tree (not origin/main) so a stale deploy
     is immediately visible in the brief: 'lapis_pm @ <old-sha>' vs origin.
 
-    model_label is the actual seat that produced the brief body (from
-    call_gw_agent's served_model_out) or the 'local-seat-unavailable' marker
-    when the seat produced no text.
+    model_label is the ``<seat-alias>:<served-model>`` provenance label for
+    the brief body (L2.D4): the seat alias resolves statically to the
+    operator default, the served model is this call's in-bounds echo, else
+    the seam-filtered ledger fallback, else not-reported.
     """
     repo_root = Path(__file__).parent.parent
     try:

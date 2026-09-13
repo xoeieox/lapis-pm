@@ -862,10 +862,23 @@ def merge_and_deploy(repo: str, pr_number: int, *, owner: str | None = None) -> 
 
 
 def _write_deploy_log(tree: str, old_sha: str, new_sha: str, trigger: str) -> None:
-    """Append one dated provenance line to the deploy log. Best-effort."""
-    model = getattr(brief, "_BRIEF_MODEL", "unknown")
+    """Append one dated provenance line to the deploy log. Best-effort.
+
+    L2.D4 (local-reviewer-identity-and-provenance-v0): the label is
+    ``<seat-alias>:<served-model>`` — the seat alias resolves statically to
+    the operator default (gravitywell; the brief composer passes no model
+    kwarg) and the served model is the seam-filtered locality-ledger
+    fallback, else the explicit not-reported marker. The dead _BRIEF_MODEL
+    import dies here; the old brief.py:unknown label shape is dead.
+    """
+    try:
+        from . import provenance as _provenance
+        label = _provenance.deploy_log_label()
+    except Exception:
+        # Fail-soft: the label must never raise up the deploy path.
+        label = "gravitywell:not-reported"
     ts = _now_iso()
-    line = f"- `{ts}` | {tree} | synced {old_sha}..{new_sha} | brief.py:{model} | {trigger}\n"
+    line = f"- `{ts}` | {tree} | synced {old_sha}..{new_sha} | brief.py:{label} | {trigger}\n"
     try:
         with open(_DEPLOY_LOG, "a") as f:
             f.write(line)
@@ -9305,6 +9318,42 @@ def _recover_reviewer_verdict(raw: str) -> dict | None:
     return None
 
 
+# L2.D2 (local-reviewer-identity-and-provenance-v0): the agent types whose
+# dispatch records carry the ACTUAL served model (stamped from the completed
+# queue task yaml). Scoped to the dispatch-verified agent types — other
+# agent types reaching a record-close site must NOT gain the field.
+_SERVED_MODEL_STAMP_AGENT_TYPES = frozenset(
+    set(_REVIEWER_AGENT_TYPES) | {"fixer", "fixer_retry"}
+)
+
+
+def _stamp_served_model(rec: dict, target_id: str) -> None:
+    """L2.D2: stamp ``served_model`` onto a terminal dispatch record from the
+    completed queue task yaml (Leg 1's L1.D3 field).
+
+    Null-tolerant best-effort: a missing yaml / missing field / null echo
+    leaves served_model as None — NEVER the seat alias (Erah 2026-09-06
+    explicit-void adjudication). Scoped to the dispatch-verified agent types
+    (reviewer/reviewer_fresh/fixer/fixer_retry). Must never fail
+    verdict-encode (the idiom at 8082/8103/8121).
+    """
+    if rec.get("agent_type") not in _SERVED_MODEL_STAMP_AGENT_TYPES:
+        return
+    try:
+        from . import provenance as _provenance
+        rec["served_model"] = _provenance.read_served_model_from_queue_yaml(
+            rec.get("gpu_id")
+        )
+    except Exception as _prov_exc:
+        rec["served_model"] = None
+        episodic.write_observation(
+            target_id,
+            f"served-model provenance read skipped for {rec.get('gpu_id')}: "
+            f"{type(_prov_exc).__name__}",
+            extra_tags=["pm:served-provenance-skipped"],
+        )  # best-effort; never fail verdict-encode
+
+
 def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
     """For each pending dispatch, check for completion and encode result.
 
@@ -9336,6 +9385,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     rec["completed_at"] = completion_ts
                     changed = True
                     total_encoded += 1
+                    _stamp_served_model(rec, target_id)
                     _close_slot_and_deposit(rec, target_id)
                     # Distinguish SHA vs description-only advance for episodic trail
                     body_prefix = f"pm:pr={pr_num}:body="
@@ -9369,6 +9419,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     rec["completed_at"] = _now_iso()
                     changed = True
                     total_encoded += 1
+                    _stamp_served_model(rec, target_id)
                     episodic.write_observation(
                         target_id,
                         f"Fixer retry for PR #{pr_num} job complete:"
@@ -9446,6 +9497,7 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                     rec["completed_at"] = _now_iso()
                     changed = True
                     total_encoded += 1
+                    _stamp_served_model(rec, target_id)
                     _close_slot_and_deposit(rec, target_id)
                     continue  # Skip confabulation + normal result encoding
 
@@ -9473,6 +9525,10 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
         rec["status"] = "failed" if is_failure else "processed"
         rec["completed_at"] = _now_iso()
         changed = True
+        # L2.D2: stamp the ACTUAL served model from the completed queue task
+        # yaml (scoped to the dispatch-verified agent types; null-tolerant,
+        # never the seat alias, never fails verdict-encode).
+        _stamp_served_model(rec, target_id)
         _close_slot_and_deposit(rec, target_id)
 
         snippet = text.strip()
@@ -9654,6 +9710,18 @@ def _encode_gpu_results(target_id: str) -> tuple[int, list[dict]]:
                 ]
                 if _rendered_sha:
                     result_tags.append(f"pm:reviewer-sha={_rendered_sha}")
+                # L2.D3 (local-reviewer-identity-and-provenance-v0): the
+                # verdict write-back comment gains a pm:served=<model> tag
+                # when the served model is known (stamped onto `rec` above).
+                # ABSENCE is expected, not an error (pre-Leg-1 yamls and the
+                # null-echo cases); the value is never the seat alias.
+                try:
+                    from . import provenance as _provenance
+                    _served_tag = _provenance.served_tag_for(rec)
+                    if _served_tag:
+                        result_tags.append(_served_tag)
+                except Exception as _served_exc:
+                    pass  # best-effort; tag absence is a non-error
                 if parse_recovered:
                     result_tags.append("pm:reviewer:parse-recovered")
                 episodic.write_result(
@@ -9986,6 +10054,10 @@ def _reconcile_dispatched_with_queue_ex(target_id: str) -> tuple[int, bool]:
             rec["completed_at"] = t["completed_at"]
         if t.get("failure_reason") is not None:
             rec["failure_reason"] = t["failure_reason"]
+        # L2.D2: stamp the served model at the terminal flip (scoped to the
+        # dispatch-verified agent types; the carve-outs above keep
+        # reviewer/fixer_retry processed-flips owned by _encode_gpu_results).
+        _stamp_served_model(rec, target_id)
         changed = True
         flipped += 1
 
@@ -10539,6 +10611,9 @@ def _act_lost_brief(
     # opened at dispatch and must close regardless of outcome. For initial fixer
     # records, the reconciler already called _close_slot_and_deposit; the call
     # here is idempotent and safe (keyed on slot_id, no double-deposit).
+    # L2.D2: stamp the served model on the terminal record (idempotent — the
+    # read is best-effort and the field is set from the queue yaml).
+    _stamp_served_model(original_rec, target_id)
     _close_slot_and_deposit(original_rec, target_id)
 
     spec_ref = (episodic.spec(target_id) or "")[:80] or "(spec not found)"

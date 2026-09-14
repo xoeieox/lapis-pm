@@ -1257,6 +1257,69 @@ class TestPreOpRefHygiene:
         # exactly the one named salvaged page
         assert len(pages) == 1
 
+    def test_stale_tmp_ref_ahead_of_head_aborts_never_deletes(
+            self, tmp_path, monkeypatch):
+        """C9 crash shape (signed directive, PR #343): a stale
+        `deploy-pull-salvage-tmp` carrying a commit UNIQUE TO IT (one
+        commit ahead of HEAD - the crashed-mid-op shape that committed
+        before dying) must ABORT with `dispatch_error=
+        salvage-ref-collision` and the entry open - NEVER `branch -D`:
+        deleting it would strand the unique commit and break the
+        losslessness invariant (I6: every pre-op reachable commit
+        reachable post-op). The hygiene check counts `HEAD..{tmp}` (the
+        commits reachable from the tmp ref but not from HEAD), so a
+        tmp ref ahead of HEAD is a collision; the at-HEAD shape (pinned
+        by `test_stale_tmp_ref_converges`) still converges."""
+        origin = _make_origin(tmp_path)
+        clone = _clone(origin, tmp_path)
+        # simulate a crashed prior op that committed before dying: the
+        # temp ref exists ONE COMMIT AHEAD of main with a unique commit.
+        _git(clone, "switch", "-c", dps._SALVAGE_TMP_REF)
+        (clone / "crashed-work.txt").write_text("crashed\n")
+        _git(clone, "add", "-A")
+        _git(clone, "commit", "-m", "crashed mid-op commit")
+        crashed_sha = _git(
+            clone, "rev-parse", f"refs/heads/{dps._SALVAGE_TMP_REF}").stdout.strip()
+        _git(clone, "switch", "main")
+        (clone / "work.txt").write_text("precious\n")
+        _git(clone, "add", "-A")
+
+        pages = _notify_spy(monkeypatch)
+        monkeypatch.setattr(dps, "_ensure_target",
+                            lambda repo, sig: "deploy-repair-agents-core-c904")
+        monkeypatch.setattr(dps, "_open_salvage_pr_exists", lambda repo, tid: False)
+        monkeypatch.setattr(dps, "_verify_healthy", lambda path: (True, {}))
+        monkeypatch.setattr(dps, "_deploy_log_line", lambda *a, **k: None)
+        pushed: list = []
+        monkeypatch.setattr(dps, "_push_and_open_pr",
+                            lambda p, r, e, i: pushed.append(1) or 54)
+
+        sig = dps.compute_signature(str(clone), dps.CLASS_STALE_DIRTY)
+        entry = _entry(str(clone), "agents-core", dps.CLASS_STALE_DIRTY)
+        entry["signature"] = sig
+        actions = dps._salvage_entry({sig: entry}, entry, "agents-core",
+                                     str(clone), {}, "backstop-timer")
+        # abort: named ledger state, entry stays open (never a silent
+        # per-cycle retry, never a delete).
+        assert "salvage:failed" in actions, actions
+        assert entry["dispatch_error"] == "salvage-ref-collision"
+        assert entry["status"] == "open"
+        # the stale tmp ref was NOT deleted - the unique commit is still
+        # reachable (losslessness I6).
+        probe = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{dps._SALVAGE_TMP_REF}"],
+            capture_output=True, text=True, timeout=30)
+        assert probe.returncode == 0
+        assert _git(clone, "rev-parse",
+                    f"refs/heads/{dps._SALVAGE_TMP_REF}").stdout.strip() == crashed_sha
+        assert "crashed mid-op commit" in _git(
+            clone, "log", "-1", "--format=%s",
+            f"refs/heads/{dps._SALVAGE_TMP_REF}").stdout
+        # no push, no PR, no page
+        assert pushed == []
+        assert pages == []
+
     def test_preexisting_local_salvage_ref_converges(self, tmp_path, monkeypatch):
         """A pre-existing local `lapis/<target_id>/salvage` from a resolved
         episode (the remote side is deleted on merge, the local side never

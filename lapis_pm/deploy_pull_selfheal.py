@@ -946,14 +946,22 @@ def _salvage(path: str, repo: str, entry: dict, target_id: str) -> tuple[bool, d
         # existing ref FAILS (rc=128) - a same-name `branch -m` is a no-op
         # (rc=0), so the post-rename crash window converges, but the op
         # itself must converge or it wedges D4 into a silent per-cycle
-        # retry. Converge: delete the stale temp ref only when it carries
-        # no commits unique to it (a crashed mid-op ref at HEAD is the
+        # retry. Converge: delete the stale temp ref ONLY when it carries
+        # no commits unique to ITSELF (a crashed mid-op ref at HEAD is the
         # normal shape); otherwise abort (named state - the unique commits
-        # are preserved, the entry stays open).
+        # are preserved, the entry stays open). Direction matters (C9
+        # crash shape, spec I6 losslessness): `HEAD..{tmp}` counts the
+        # commits reachable from the tmp ref but NOT from HEAD - those are
+        # the commits unique to the tmp ref. A tmp ref one commit ahead of
+        # HEAD (a crashed op that committed before dying) must ABORT, not
+        # be `branch -D`'d: deleting it would strand that commit and break
+        # the losslessness invariant (every pre-op reachable commit
+        # reachable post-op). The at-HEAD shape (0 unique commits) is the
+        # one that converges.
         tmp_probe = _git(path, "rev-parse", "--verify", "--quiet",
                          f"refs/heads/{_SALVAGE_TMP_REF}")
         if tmp_probe.returncode == 0:
-            uniq = _git(path, "rev-list", "--count", f"{_SALVAGE_TMP_REF}..HEAD")
+            uniq = _git(path, "rev-list", "--count", f"HEAD..{_SALVAGE_TMP_REF}")
             if uniq.returncode != 0 or (uniq.stdout or "").strip() != "0":
                 entry["dispatch_error"] = "salvage-ref-collision"
                 return False, info

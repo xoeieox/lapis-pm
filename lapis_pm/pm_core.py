@@ -1054,6 +1054,16 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
     is_critical_repo = repo in _POST_LAND_PULL_CRITICAL
     is_low_signal_repo = repo in _POST_LAND_PULL_LOW_SIGNAL
     any_advanced = False
+    # deploy-pull-selfheal-slice2-v0 (OQ-4 option 3, Erah-approved
+    # 2026-09-02, Mirror-Council architecture): the selfheal seam is called
+    # on EVERY pull for a critical repo - success AND failure - with the
+    # real pull_rc. The machine (deploy_pull_selfheal) branches internally:
+    # the heavy D1-D7 salvage/recovery path on failure, the lightweight
+    # bounded + idempotent Close-Out Sweep on success (closes the
+    # salvaged -> resolved / worker_failed loop). pm_core stays passive -
+    # one argument, one call site; the close-out logic lives in the
+    # selfheal module, not here.
+    from . import deploy_pull_selfheal as _dps
     for path in paths:
         # A locked clone (prior genuine divergence) is skipped entirely — no
         # re-attempted pull, no repeated quarantine dance. A human clears the
@@ -1070,7 +1080,6 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
             # The clear decision does NOT re-implement classification logic.
             locked_reclear = False
             try:
-                from . import deploy_pull_selfheal as _dps
                 _cls, _ev = _dps.classify_pull_failure(path, trigger)
                 _fetch_ok = _ev.get("fetch_rc") == 0
                 _clean = not any(
@@ -1259,7 +1268,6 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                     selfheal_handled = False
                     if is_critical_repo:
                         try:
-                            from . import deploy_pull_selfheal as _dps
                             selfheal_handled = _dps.pass_handled_failure(
                                 repo, path, trigger, pull_rc=result.returncode,
                                 pull_stderr=result.stderr or "",
@@ -1363,8 +1371,32 @@ def _post_land_git_pull(repo: str | None, trigger: str = "post-land-hook") -> bo
                         )
                     except Exception:
                         pass
-            elif pre_head:
+            else:
+                # _finish_success is a no-op when pre_head is empty (a
+                # rev-parse failure at pass start) - the post rev-parse is
+                # still run (post_head == "" when it also fails, so no
+                # spurious deploy-log line). The close-out seam fires
+                # regardless: the OQ-4 option-3 contract is that the seam
+                # runs on EVERY successful pull for a critical repo, and a
+                # pre_head rev-parse failure must not drop the Close-Out
+                # Sweep (the salvaged -> resolved / worker_failed loop).
                 _finish_success(pre_head)
+                # OQ-4 option 3: the seam on the SUCCESS path - the machine's
+                # bounded + idempotent Close-Out Sweep (salvaged -> resolved
+                # / worker_failed). Best-effort; never blocks the pull
+                # outcome (I7).
+                if is_critical_repo:
+                    try:
+                        _dps.pass_handled_failure(
+                            repo, path, trigger,
+                            pull_rc=0, pull_stderr="",
+                        )
+                    except Exception as _dps_exc:
+                        print(
+                            f"[post-land-pull] selfheal close-out sweep errored "
+                            f"for {path}: {_dps_exc}",
+                            file=sys.stderr,
+                        )
         except (subprocess.TimeoutExpired, OSError) as e:
             print(f"[post-land-pull] pull {path} errored: {e}", file=sys.stderr)
             if is_critical_repo:

@@ -44,6 +44,14 @@ read failure or when the file has no records in-window. Weekly-omitted
 (mirroring Climate/Locality's daily-omitted symmetry in reverse) — see
 _read_autodispatch.
 
+Daily briefs additionally render a "Night dead-man" bucket
+(night-deadman-floor-v0, Leg 1) — the S1 dead-man's artifact output
+(findings + ok-artifacts) from /data/slots/night-deadman/*.json. The
+ok-artifact absence is the I3 dead-deadman liveness proof (the F4 fix —
+the morning-plate reader detects a missing ok-artifact). Weekly-omitted
+(mirroring Climate/Locality's daily-omitted symmetry in reverse) — see
+_read_night_deadman.
+
 Temporal compression hierarchy (Gardener observations only):
   daily cadences (morning/afternoon/live) → single latest gardener/derived
   entry, capped at 10 observations ("weather today")
@@ -95,6 +103,7 @@ B_GARDENER = "Gardener Cross-Cutting Observations"
 B_CLIMATE = "Climate"
 B_LOCALITY = "Locality"
 B_AUTODISPATCH = "Bundle autodispatch enforce"
+B_NIGHT_DEADMAN = "Night dead-man"
 
 # Parses flat markdown bullets from gardener/writeback.py:derive_context output, e.g.
 # "- [Critical] <text>  (evidence: ...)". Info/Unclassified are filtered out upstream
@@ -348,6 +357,13 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
     except Exception:
         autodispatch_items = []
 
+    # --- Night dead-man (daily cadence only) ---
+    # A brief must never fail because the dead-man artifacts are unavailable.
+    try:
+        night_deadman_items = _read_night_deadman(start_ts, period=period)
+    except Exception:
+        night_deadman_items = []
+
     return {
         B_BUILT: built_items,
         B_RATIFICATIONS: ratification_items,
@@ -358,6 +374,7 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
         B_CLIMATE: climate_items,
         B_LOCALITY: locality_items,
         B_AUTODISPATCH: autodispatch_items,
+        B_NIGHT_DEADMAN: night_deadman_items,
     }
 
 
@@ -1191,6 +1208,90 @@ def _read_autodispatch(start_ts: datetime, *, period: str = "daily") -> list[str
             lines.append(f"FAULTED: {spec} — {ground_snippet}")
         else:
             lines.append(f"DEFERRED: {spec} — {action} — ground: {ground_snippet}")
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Night dead-man bucket (night-deadman-floor-v0, Leg 1)
+# ---------------------------------------------------------------------------
+#
+# Reads /data/slots/night-deadman/*.json — the S1 dead-man's artifact output
+# (findings + ok-artifacts). The I3 invariant: a dead dead-man must be the
+# loudest failure class. The ok-artifact is the dead-man's own liveness proof;
+# its absence is the timer-death / service-crash detector (the F4 fix — the
+# morning-plate reader detects a missing ok-artifact). Daily-cadence only,
+# mirroring Climate/Locality's weekly-only symmetry in reverse.
+
+_NIGHT_DEADMAN_DIR = Path("/data/slots/night-deadman")
+
+
+def _read_night_deadman(start_ts: datetime, *, period: str = "daily") -> list[str]:
+    """Night dead-man bucket: reads /data/slots/night-deadman/*.json since
+    start_ts and renders the dead-man's findings + ok-artifact status.
+
+    I3 dead-deadman liveness proof: the ok-artifact (ok-*.json) is written
+    by night_deadman.py when all checks pass. Its absence is the timer-death
+    / service-crash detector — the F4 fix names this reader as the mechanism
+    that detects a missing ok-artifact. A missing ok-artifact in the window
+    is rendered as a [CRITICAL] line; a present ok-artifact is rendered as a
+    [OK] line. Findings (violation pages) are rendered as [FINDING] lines.
+
+    Never raises; degrades to [] on any failure so a dead-man artifact
+    outage never blocks the brief. Daily-cadence only, mirroring
+    Climate/Locality's weekly-only symmetry in reverse.
+    """
+    if period == "weekly":
+        return []
+
+    try:
+        if not _NIGHT_DEADMAN_DIR.is_dir():
+            return []
+    except Exception:
+        return []
+
+    lines: list[str] = []
+    ok_artifact_found = False
+
+    try:
+        for path in sorted(_NIGHT_DEADMAN_DIR.glob("*.json")):
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                continue
+            if mtime < start_ts:
+                continue
+
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            # ok-artifact: the dead-man's own liveness proof
+            if path.name.startswith("ok-"):
+                ok_artifact_found = True
+                verdict = data.get("verdict", "ok")
+                ts = data.get("ts_utc", mtime.isoformat())
+                lines.append(f"[OK] dead-man all-clear {ts} — {verdict}")
+            else:
+                # findings: violation pages
+                verdict = data.get("verdict", "finding")
+                ts = data.get("ts_utc", mtime.isoformat())
+                severity = data.get("severity", "HIGH")
+                summary = data.get("summary", path.name)
+                lines.append(f"[FINDING] {severity} {ts} — {summary}")
+    except Exception:
+        return []
+
+    # I3: the ok-artifact absence is the timer-death / service-crash detector.
+    # If no ok-artifact was found in the window, the dead-man itself may be
+    # dead (timer-death or service-crash). This is the F4 fix — the
+    # morning-plate reader detects a missing ok-artifact.
+    if not ok_artifact_found:
+        lines.insert(0, "[CRITICAL] no ok-artifact in window — dead-man may be dead (timer-death or service-crash)")
 
     return lines
 

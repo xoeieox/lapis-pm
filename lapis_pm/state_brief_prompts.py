@@ -39,6 +39,15 @@ header + already-composed prose-ready lines. Omitted entirely for weekly
 cadence (mirroring Climate/Locality's daily-omitted symmetry in reverse) and
 omitted from daily output when there is nothing to report (no enforce
 records in-window); see state_brief._read_autodispatch.
+
+Daily briefs also render a "Night dead-man" bucket (night-deadman-floor-v0,
+Leg 1) the same way — the S1 dead-man's artifact output (findings +
+ok-artifacts) from /data/slots/night-deadman/*.json. The ok-artifact absence
+is the I3 dead-deadman liveness proof (the F4 fix — the morning-plate reader
+detects a missing ok-artifact). Omitted entirely for weekly cadence
+(mirroring Climate/Locality's daily-omitted symmetry in reverse) and omitted
+from daily output when there is nothing to report (no dead-man artifacts
+in-window); see state_brief._read_night_deadman.
 """
 
 from __future__ import annotations
@@ -53,12 +62,14 @@ BUCKET_ORDER = [
     "Climate",
     "Locality",
     "Bundle autodispatch enforce",
+    "Night dead-man",
 ]
 
 _GARDENER_BUCKET = "Gardener Cross-Cutting Observations"
 _CLIMATE_BUCKET = "Climate"
 _LOCALITY_BUCKET = "Locality"
 _AUTODISPATCH_BUCKET = "Bundle autodispatch enforce"
+_NIGHT_DEADMAN_BUCKET = "Night dead-man"
 
 DAILY_SYSTEM = """You are the Lapis PM state-brief narrator. Your job is to write
 clear, terse prose for Erah — the principal engineer — summarising the current
@@ -194,6 +205,15 @@ def format_bucket_sections(buckets: dict[str, list[str]], start_label: str, *, p
             items = buckets.get(name, [])
             if not items:
                 continue  # no enforce records in-window — no empty-section noise
+            body = "\n".join(f"- {item}" for item in items)
+            sections.append(f"## {name}\n{body}")
+            continue
+        if name == _NIGHT_DEADMAN_BUCKET:
+            if period == "weekly":
+                continue  # daily-only, mirroring Climate/Locality in reverse
+            items = buckets.get(name, [])
+            if not items:
+                continue  # no dead-man artifacts in-window — no empty-section noise
             body = "\n".join(f"- {item}" for item in items)
             sections.append(f"## {name}\n{body}")
             continue

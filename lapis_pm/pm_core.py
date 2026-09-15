@@ -665,6 +665,14 @@ _CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS: tuple[str, ...] = (
     "mini_1f916_night.py",
     "keeper_v0.py",
     "council_sweep.py",
+    # night-deadman-floor-v0 (Leg 1): the S1 dead-man script (BRIX-side,
+    # 01:15 + 07:15 timer lines). Its consumer is the night-deadman.timer
+    # (a systemd unit installed by the conductor leg), which sits outside
+    # night_plan.py's producer-import closure — so the BRIX_GW_RUNTIME
+    # family, NOT _CONDUCTOR_NIGHT_SCRIPTS. Unmanifested, it would NEVER
+    # deploy (the post-land-deploy sequencing invariant: an unmanifested
+    # file never deploys and rots silently).
+    "night_deadman.py",
 )
 
 # D4: host-reachability policy — never wake, always retry on the next land.

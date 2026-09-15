@@ -64,12 +64,12 @@ def _script_node(script: str, node_id: str = "n1", lane: str = "shell") -> dict:
 
 class TestDoD0AstCounts:
     def test_counts_match_baseline(self):
-        """The baseline counts (25/11/5 after the +3) re-verified by an AST
-        pass that handles BOTH Assign and AnnAssign (the :532 tuple is an
-        AnnAssign; a grep or Assign-only AST pass silently misses it)."""
+        """The baseline counts (25/12/5 after the +3 +1 dead-man) re-verified
+        by an AST pass that handles BOTH Assign and AnnAssign (the :532 tuple
+        is an AnnAssign; a grep or Assign-only AST pass silently misses it)."""
         counts = attestation.manifest_counts_ast()
         assert counts["_CONDUCTOR_NIGHT_SCRIPTS"] == 25
-        assert counts["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 11
+        assert counts["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 12
         assert counts["_CONDUCTOR_GW_HOST_SCRIPTS"] == 5
 
     def test_annotated_tuple_is_seen(self):
@@ -101,12 +101,20 @@ class TestDoD0AstCounts:
             assert s in pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
             assert s not in pm_core._CONDUCTOR_NIGHT_SCRIPTS
 
-    def test_brix_gw_runtime_is_exactly_eleven(self):
+    def test_night_deadman_in_brix_gw_runtime_family(self):
+        """night-deadman-floor-v0 (Leg 1): the S1 dead-man script is in the
+        BRIX_GW_RUNTIME family (NOT _CONDUCTOR_NIGHT_SCRIPTS, whose
+        exact-equality closure tests would fail on a naive append)."""
+        assert "night_deadman.py" in pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS
+        assert "night_deadman.py" not in pm_core._CONDUCTOR_NIGHT_SCRIPTS
+
+    def test_brix_gw_runtime_is_exactly_twelve(self):
         assert set(pm_core._CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS) == {
             "gw_topology.py", "gw_actuator.py", "gw_host_safety.py",
             "flip_controller.py", "gw-topology", "gw-night-pre.py",
             "gw-night-post.py", "scout-night-pre.py",
             "mini_1f916_night.py", "keeper_v0.py", "council_sweep.py",
+            "night_deadman.py",
         }
 
     def test_disjoint_from_night_scripts(self):
@@ -129,7 +137,7 @@ class TestDoD0AstCounts:
         assert real_path.is_file(), "pm_core source file must be on disk"
         # The on-disk read is the baseline (not the in-memory module).
         counts = attestation.manifest_counts_ast()
-        assert counts["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 11
+        assert counts["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 12
 
         # Simulate a source-file / imported-module disagreement: a file whose
         # AnnAssign tuple has a different length. The AST pass must count the

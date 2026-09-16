@@ -3139,7 +3139,7 @@ class TestConductorNightPlanDeploy:
             "idea_collider_night_batch", "podcast_engine", "kami_producer",
             "kami_batch", "kami_selector", "kami_sweep", "kami_adjudicator",
             "kami_small", "enlightenment_producer", "enlightenment_reader",
-            "research_headings", "gw_phase_models",
+            "research_headings", "gw_phase_models", "gw_seat_lane",
         ]
         for mod in fixture_modules:
             sys.modules.pop(mod, None)

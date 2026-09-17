@@ -2716,7 +2716,8 @@ def run_spec_review(
     back to "advisory" if not found. Only advisory/hold specs dispatch Facets and the
     reference leg.
 
-    facets_operator controls the Facets persona + synthesis model; default haiku.
+    facets_operator controls the Facets persona + synthesis model; default
+    gravitywell (2026-09-16 Claude-gone re-point — see the signature default).
 
     compare_opus is accepted for back-compat but is a no-op — the reference leg is
     opt-in now, so passing compare_opus=True has no additional effect. A

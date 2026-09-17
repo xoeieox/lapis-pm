@@ -2664,7 +2664,16 @@ def run_spec_review(
     # unconditionally below), so the default fast path spends no time on a leg that
     # provably cannot change the answer. Opt in explicitly to re-enable it.
     reference_reviewer: bool = False,
-    facets_operator: str = "haiku",
+    # 2026-09-16 Claude-gone re-point (lapis-pm-bundle-gate-facets-local-default-v0):
+    # was "haiku" — the ONE remaining paid default in the lapis-pm surface. All four
+    # facets-operator surfaces now agree on "gravitywell": this signature, the
+    # SpecReviewBrief dataclass (default "gravitywell"), the _build_brief param,
+    # and the manual CLI --facets-operator default. The bundle-autodispatch gate
+    # (bundle_autodispatch._run_gate) does not pass facets_operator explicitly —
+    # it inherits this default, which is what faulted on every nightly run since
+    # 2026-08-26 (haiku -> claude-haiku-4-5 -> `claude -p` on an expired Max
+    # OAuth -> call_claude_cli returned None).
+    facets_operator: str = "gravitywell",
     # Deprecated parameter — kept for back-compat; no-op (reference_reviewer is off by default)
     compare_opus: bool = False,
     # Deprecated alias for reference_reviewer — remove 90 days after merge (2026-09-05).

@@ -1226,6 +1226,15 @@ def _reconcile_one(
     _triage_bundle_items(spec_id, repo, spec_path, run_ts, results, deadline_monotonic)
 
     # GW liveness pre-check
+    #
+    # This is the bundle path's GW-down DEFER site (unit contract: "GW-local
+    # only. If GW is not serving, each spec is deferred (no paid fallback)").
+    # It fires BEFORE _run_gate, so the facets leg (run_spec_review,
+    # facets_operator default "gravitywell" since the 2026-09-16 Claude-gone
+    # re-point, lapis-pm-bundle-gate-facets-local-default-v0) can never start
+    # when GW is down — a gravitywell operator that would otherwise have to
+    # degrade to the dead haiku tier when GW is not serving never runs. No
+    # code change needed here; the pre-check IS the defer.
     if not _gw_serving():
         logger.warning(
             "[bundle-autodispatch] GW not serving for %s — deferring to human "

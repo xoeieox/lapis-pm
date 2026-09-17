@@ -555,6 +555,12 @@ _CONDUCTOR_NIGHT_SCRIPTS: tuple[str, ...] = (
     "research_headings.py",
     "night_producers.yaml",
     "night_task_menu.py", "night-task-menu.yaml", "night_plan_manager.py",   # Rung B menu (leftover) + Rung C.0 manager
+    "gw_seat_lane.py",  # night-roles-seat-declaration-v0 O1 (BLOCKER fix, rev 2): the
+                        # role-seat lane-check helper the fill pass + agora wave
+                        # executor import (LAZY/guarded on the conductor side).
+                        # Without this manifest entry the copy-sync never delivers
+                        # it to /data/agents/scripts and the gate silently does not
+                        # exist (or ImportErrors at the gate itself).
 )
 
 

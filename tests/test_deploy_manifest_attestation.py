@@ -64,11 +64,13 @@ def _script_node(script: str, node_id: str = "n1", lane: str = "shell") -> dict:
 
 class TestDoD0AstCounts:
     def test_counts_match_baseline(self):
-        """The baseline counts (25/12/5 after the +3 +1 dead-man) re-verified
-        by an AST pass that handles BOTH Assign and AnnAssign (the :532 tuple
-        is an AnnAssign; a grep or Assign-only AST pass silently misses it)."""
+        """The baseline counts (26/12/5 after the +3 +1 dead-man +1
+        gw_seat_lane — night-roles-seat-declaration-v0 O1 BLOCKER fix, rev 2)
+        re-verified by an AST pass that handles BOTH Assign and AnnAssign (the
+        :532 tuple is an AnnAssign; a grep or Assign-only AST pass silently
+        misses it)."""
         counts = attestation.manifest_counts_ast()
-        assert counts["_CONDUCTOR_NIGHT_SCRIPTS"] == 25
+        assert counts["_CONDUCTOR_NIGHT_SCRIPTS"] == 26
         assert counts["_CONDUCTOR_BRIX_GW_RUNTIME_SCRIPTS"] == 12
         assert counts["_CONDUCTOR_GW_HOST_SCRIPTS"] == 5
 
@@ -90,7 +92,7 @@ class TestDoD0AstCounts:
                         found["assign"] = len(node.value.elts)
         # The tuple is an AnnAssign — the Assign-only pass would miss it.
         assert "annassign" in found
-        assert found.get("annassign") == 25
+        assert found.get("annassign") == 26
         assert "assign" not in found
 
     def test_new_scripts_in_brix_gw_runtime_family(self):

@@ -40,7 +40,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from agents_core.room_paths import room_root
+# ``morning`` is not (yet) a key in the agents-core room_paths classmap —
+# ``room_path('morning')`` raises KeyError. We therefore resolve the morning
+# directory from the /room root. ``room_root`` is the deployed accessor, but a
+# hard module-level import would make the whole observability module (and thus
+# the D1 ledger wiring in ``run_night``) fail at import time if a deployed
+# agents-core does not export it. Guard it the same way
+# ``lapis_pm.spec_attestation._systems_root()`` does: fall back to the same
+# ``ROOM_ROOT`` env-var resolution ``room_paths`` itself uses, never a bare
+# hardcoded path.
+try:
+    from agents_core.room_paths import room_root as _room_root
+except (ImportError, AttributeError):  # pragma: no cover - deployment guard
+    _room_root = None
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +79,23 @@ RESURFACE_HOURS = 48.0
 
 # Morning digest target directory (D3): /srv/lapis/morning/YYYY-MM-DD.md
 MORNING_DIR_NAME = "morning"
+
+
+def _morning_root() -> Path:
+    """Resolve the /room root for the morning directory (deployment-guarded).
+
+    Prefers the deployed ``agents_core.room_paths.room_root`` accessor. If it
+    is unavailable (older/deployed agents-core without the export), fall back
+    to the same ``ROOM_ROOT`` env-var resolution ``room_paths`` itself uses —
+    never a bare hardcoded ``/room`` (that would defeat ROOM_ROOT relocation).
+    """
+    if _room_root is not None:
+        try:
+            return Path(_room_root())
+        except Exception:  # noqa: BLE001 - a broken accessor degrades, not crashes
+            log.warning("room_root() failed; falling back to ROOM_ROOT env resolution")
+    room_root = os.environ.get("ROOM_ROOT", "/room")
+    return Path(room_root)
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +693,7 @@ def emit_morning_digest(
     ``<room_root>/morning`` (tests use a temp dir).
     """
     if morning_dir is None:
-        morning_dir = room_root() / MORNING_DIR_NAME
+        morning_dir = _morning_root() / MORNING_DIR_NAME
     date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     morning_dir.mkdir(parents=True, exist_ok=True)
     out_path = morning_dir / f"{date_str}.md"

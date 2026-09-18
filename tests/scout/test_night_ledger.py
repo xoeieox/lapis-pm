@@ -520,3 +520,180 @@ def test_run_night_writes_ledger_row(tmp_path, monkeypatch):
     }
     # The run actually executed (not a no-op).
     assert result.total_units >= 0
+
+
+# ---------------------------------------------------------------------------
+# D1+D3 end-to-end: run_night produces BOTH a ledger row AND a morning digest
+# ---------------------------------------------------------------------------
+
+def _write_scaffold(sims_dir: Path, spec_id: str = "spec_a") -> None:
+    """Write a minimal scaffold YAML so run_night has work to dispatch."""
+    import yaml
+    data = {
+        "spec_id": spec_id,
+        "spec_version": "v0",
+        "description": "test",
+        "priority_profile": "full-pass-once",
+        "static_scaffold": {
+            "objective": "test",
+            "architecture_sketch": "test",
+            "scenario": {
+                "conditions": [],
+                "time_progression": {},
+                "external_state": {},
+                "utilization_pattern": "",
+            },
+        },
+        "generation_directive": "test",
+        "matrix": {
+            "optional_steps_included": [[]],
+            "external_state_severity": ["healthy"],
+            "concurrent_load": [1],
+            "runs_per_cell": 1,
+        },
+    }
+    (sims_dir / f"{spec_id}.yaml").write_text(yaml.dump(data))
+
+
+def test_run_night_produces_ledger_row_and_morning_digest(tmp_path, monkeypatch):
+    """DoD: one live night run produces a pm/night/run/<ts> row AND
+    /srv/lapis/morning/<date>.md. Exercises the D3/D4 wiring end-to-end from the
+    night-run entry point (run_night), not just the isolated composer."""
+    from unittest.mock import MagicMock
+
+    from lapis_pm.scout.night_queue import run_night
+
+    store = FakeMemStore()
+    sims_dir = tmp_path / "sims"
+    sims_dir.mkdir()
+    _write_scaffold(sims_dir)
+
+    log_root = tmp_path / "log"
+    queue_path = tmp_path / "queue" / "scout_candidates.jsonl"
+    morning_dir = tmp_path / "morning"
+
+    monkeypatch.setattr("httpx.get", lambda url, timeout: MagicMock(status_code=200))
+    monkeypatch.setattr("lapis_pm.scout.runner.simulate", lambda *a, **k: [])
+    # Point the /room root at a temp dir (the composer defaults to the real
+    # /room; the DoD requires the file to be written, not the exact production
+    # path). emit_morning_digest appends /morning to the room root.
+    monkeypatch.setattr(
+        "lapis_pm.scout.night_ledger._morning_root", lambda: tmp_path
+    )
+
+    result = run_night(
+        sims_dir=sims_dir,
+        once=True,
+        log_root=log_root,
+        mem_store=store,
+        queue_path=queue_path,
+    )
+
+    # D1: exactly one ledger row (run-summary).
+    assert len(store.keys()) == 1
+    key = store.keys()[0]
+    assert key.startswith("pm/night/run/")
+    row = json.loads(store.get(key)["content"])
+    assert row["phase"] == "summary"
+    assert row["run_id"] == key[len("pm/night/run/"):]
+    assert row["wall_seconds"] is not None
+
+    # D3: the morning digest file was written to /srv/lapis/morning/<date>.md.
+    date_str = row["run_id"][:8].replace("T", "-")
+    digest_path = morning_dir / f"{date_str}.md"
+    assert digest_path.exists(), (
+        f"morning digest not written at {digest_path}; "
+        f"morning_dir contents: {list(morning_dir.iterdir()) if morning_dir.exists() else 'missing'}"
+    )
+    digest_text = digest_path.read_text()
+    assert digest_text.startswith(f"# Morning — {date_str}")
+
+    # D4: the ledger row records the digest path (file is the source of truth).
+    assert row.get("digest_path") == str(digest_path)
+    # The run actually executed.
+    assert result.total_units >= 0
+
+
+def test_run_night_dispatched_run_not_mislabeled_blank(tmp_path, monkeypatch):
+    """D1: a run that actually dispatches work must record the scout lane as
+    ``dispatched`` (with candidate counts), NOT a blank page. A dispatched run
+    mislabeled as blank is the exact under-reporting the reviewer flagged."""
+    from unittest.mock import MagicMock
+
+    from lapis_pm.scout.night_queue import run_night
+
+    store = FakeMemStore()
+    sims_dir = tmp_path / "sims"
+    sims_dir.mkdir()
+    _write_scaffold(sims_dir)
+
+    log_root = tmp_path / "log"
+    queue_path = tmp_path / "queue" / "scout_candidates.jsonl"
+    morning_dir = tmp_path / "morning"
+
+    monkeypatch.setattr("httpx.get", lambda url, timeout: MagicMock(status_code=200))
+    monkeypatch.setattr("lapis_pm.scout.runner.simulate", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lapis_pm.scout.night_ledger._morning_root", lambda: tmp_path
+    )
+
+    result = run_night(
+        sims_dir=sims_dir,
+        once=True,
+        log_root=log_root,
+        mem_store=store,
+        queue_path=queue_path,
+    )
+
+    # The run dispatched at least one unit.
+    assert result.total_units >= 1
+
+    key = store.keys()[0]
+    row = json.loads(store.get(key)["content"])
+    # The scout lane is recorded as dispatched, not blank.
+    assert row["lane_status"]["scout"] == "dispatched"
+    assert row["lane_status"]["scout"] != "blank"
+    # Candidate counts reflect what actually ran.
+    assert row["candidate_counts"]["scout"] == result.total_units
+    # Every lane status carries a reason.
+    assert row["lane_reason"]["scout"]
+
+
+def test_run_night_noop_run_records_noop_not_blank(tmp_path, monkeypatch):
+    """D1: a run with no runnable units (no scaffolds) records the scout lane
+    as ``noop`` (with a reason), not a blank page — blank is reserved for a
+    lane that produced zero candidates while actually dispatching."""
+    from unittest.mock import MagicMock
+
+    from lapis_pm.scout.night_queue import run_night
+
+    store = FakeMemStore()
+    sims_dir = tmp_path / "sims"
+    sims_dir.mkdir()  # empty: no scaffold YAMLs
+
+    log_root = tmp_path / "log"
+    queue_path = tmp_path / "queue" / "scout_candidates.jsonl"
+    morning_dir = tmp_path / "morning"
+
+    monkeypatch.setattr("httpx.get", lambda url, timeout: MagicMock(status_code=200))
+    monkeypatch.setattr("lapis_pm.scout.runner.simulate", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "lapis_pm.scout.night_ledger._morning_root", lambda: tmp_path
+    )
+
+    result = run_night(
+        sims_dir=sims_dir,
+        once=True,
+        log_root=log_root,
+        mem_store=store,
+        queue_path=queue_path,
+    )
+
+    key = store.keys()[0]
+    row = json.loads(store.get(key)["content"])
+    # Nothing ran -> noop (not blank, not dispatched).
+    assert row["lane_status"]["scout"] == "noop"
+    assert row["lane_reason"]["scout"]
+    # The morning digest is still written (a no-op night still gets a digest).
+    date_str = row["run_id"][:8].replace("T", "-")
+    assert (morning_dir / f"{date_str}.md").exists()

@@ -646,6 +646,8 @@ def run_night(
     selected_path: Path | None = None,
     traces_root: Path | None = None,
     model: str = "gravitywell",
+    mem_store: Any | None = None,
+    queue_path: Path | None = None,
 ) -> NightRunResult:
     """Run the night-queue orchestrator.
 
@@ -677,6 +679,66 @@ def run_night(
 
     result = NightRunResult()
 
+    # Observability lane (genesis-constitution-heartbeat-v0, D1+D2): the night
+    # writes a run-open ledger row and bootstraps the candidate queue. The
+    # run_id is the ledger key's own <utc-ts> suffix (no UUID generator).
+    # Best-effort: a ledger failure never blocks the night run.
+    _ledger: Any = None
+    _mem_store: Any = mem_store
+    try:
+        from .night_ledger import (
+            RunLedger,
+            emit_run_ledger,
+            ensure_queue_file,
+            lane_records_for_run,
+            utc_run_ts,
+        )
+
+        _run_ts = utc_run_ts()
+        _lanes = ["scout"]
+        _dispatched: set[str] = set()
+        _skipped: dict[str, str] = {}
+        _noop: dict[str, str] = {}
+        _failed: dict[str, str] = {}
+        _candidate_counts: dict[str, int] = {}
+        _lane_records = lane_records_for_run(
+            _lanes,
+            dispatched=_dispatched,
+            skipped=_skipped,
+            noop=_noop,
+            failed=_failed,
+            candidate_counts=_candidate_counts,
+        )
+        _ledger = RunLedger.open(_run_ts, lanes=_lane_records)
+        ensure_queue_file(queue_path)
+        emit_run_ledger(_ledger, mem_store=_mem_store)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("night-ledger run-open failed (non-blocking): %s", exc)
+        _ledger = None
+
+    def _finish_ledger(
+        *,
+        wall_seconds: float,
+        lanes: list | None = None,
+        aborted: bool = False,
+        abort_reason: str = "",
+    ) -> None:
+        """Write the run-summary ledger row (D1). Best-effort, non-blocking."""
+        if _ledger is None:
+            return
+        try:
+            _ledger.summarize(
+                wall_seconds=wall_seconds,
+                lanes=lanes,
+                aborted=aborted,
+                abort_reason=abort_reason,
+            )
+            emit_run_ledger(_ledger, mem_store=_mem_store)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("night-ledger run-summary failed (non-blocking): %s", exc)
+
+    _t_start = time.time()
+
     run_tag = datetime.now().strftime("%Y%m%dT%H%M%S")
     if log_root is None:
         log_root = Path(f"/tmp/scout-night-{run_tag}")
@@ -696,6 +758,10 @@ def run_night(
     if not scaffold_paths:
         log.warning("No scaffold YAMLs found in %s", sims_dir)
         manifest.close()
+        _finish_ledger(
+            wall_seconds=time.time() - _t_start,
+            lanes=_lane_records,
+        )
         return result
 
     # Build scaffold objects (load once for selection + state building)
@@ -716,6 +782,10 @@ def run_night(
     if not scaffolds_loaded:
         log.warning("No valid scaffolds loaded.")
         manifest.close()
+        _finish_ledger(
+            wall_seconds=time.time() - _t_start,
+            lanes=_lane_records,
+        )
         return result
 
     # Resolve budget — supersedes until_epoch if provided
@@ -736,6 +806,10 @@ def run_night(
             budget.remaining_seconds() * -1,
         )
         manifest.close()
+        _finish_ledger(
+            wall_seconds=time.time() - _t_start,
+            lanes=_lane_records,
+        )
         return result
 
     # Load selected.yaml for priority lane
@@ -823,6 +897,10 @@ def run_night(
             len(plan.priority_lane), len(plan.relevance_lane), len(plan.parked),
         )
         manifest.close()
+        _finish_ledger(
+            wall_seconds=time.time() - _t_start,
+            lanes=_lane_records,
+        )
         return result
 
     scheduler = Scheduler(scaffold_states, quarantine, shuffle_seed=shuffle_seed)
@@ -1011,6 +1089,12 @@ def run_night(
             result.errored += 1
 
     manifest.close()
+    _finish_ledger(
+        wall_seconds=time.time() - _t_start,
+        lanes=_lane_records,
+        aborted=result.aborted,
+        abort_reason=result.abort_reason,
+    )
     return result
 
 

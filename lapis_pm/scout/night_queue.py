@@ -646,6 +646,8 @@ def run_night(
     selected_path: Path | None = None,
     traces_root: Path | None = None,
     model: str = "gravitywell",
+    mem_store: Any | None = None,
+    queue_path: Path | None = None,
 ) -> NightRunResult:
     """Run the night-queue orchestrator.
 
@@ -677,6 +679,162 @@ def run_night(
 
     result = NightRunResult()
 
+    # Observability lane (genesis-constitution-heartbeat-v0, D1+D2): the night
+    # writes a run-open ledger row and bootstraps the candidate queue. The
+    # run_id is the ledger key's own <utc-ts> suffix (no UUID generator).
+    # Best-effort: a ledger failure never blocks the night run.
+    _ledger: Any = None
+    _mem_store: Any = mem_store
+    try:
+        from .night_ledger import (
+            RunLedger,
+            emit_run_ledger,
+            ensure_queue_file,
+            lane_records_for_run,
+            utc_run_ts,
+        )
+
+        _run_ts = utc_run_ts()
+        # The scout lane is the single lane this orchestrator drives. Its
+        # final status is classified at run-summary time from what actually
+        # ran (D1: dispatched/skipped/noop/blank + reason, candidate counts).
+        # The run-open row records the lane's pre-run state (blank — nothing
+        # has dispatched yet); the run-summary row reflects the real outcome.
+        _lanes = ["scout"]
+        _dispatched: set[str] = set()
+        _skipped: dict[str, str] = {}
+        _noop: dict[str, str] = {}
+        _failed: dict[str, str] = {}
+        _candidate_counts: dict[str, int] = {}
+        # Mutable run-state, updated as the night progresses so the run-summary
+        # ledger row records what actually ran, not a static blank page.
+        _units_executed = 0
+        _run_errored = False
+        # Parked decisions from the selection plan (D3 re-surface source).
+        _parked: list[Any] = []
+        _lane_records = lane_records_for_run(
+            _lanes,
+            dispatched=_dispatched,
+            skipped=_skipped,
+            noop=_noop,
+            failed=_failed,
+            candidate_counts=_candidate_counts,
+        )
+        _ledger = RunLedger.open(_run_ts, lanes=_lane_records)
+        ensure_queue_file(queue_path)
+        emit_run_ledger(_ledger, mem_store=_mem_store)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("night-ledger run-open failed (non-blocking): %s", exc)
+        _ledger = None
+        _lanes = ["scout"]
+        _dispatched = set()
+        _skipped = {}
+        _noop = {}
+        _failed = {}
+        _candidate_counts = {}
+        _units_executed = 0
+        _run_errored = False
+        _parked = []
+        _lane_records = []
+
+    def _classify_lane() -> list:
+        """Classify the scout lane's final status from what actually ran.
+
+        D1: the run-summary must record the real outcome — dispatched (with
+        candidate counts) when work ran, skipped/noop/failed/blank otherwise.
+        Never label a dispatched run as a blank page, and never emit
+        dispatched when nothing ran (that is hallucinated activity).
+        """
+        nonlocal _dispatched, _skipped, _noop, _failed, _candidate_counts
+        _candidate_counts["scout"] = result.total_units
+        if result.aborted:
+            _failed["scout"] = result.abort_reason or "run aborted"
+        elif _units_executed > 0:
+            _dispatched.add("scout")
+        elif _run_errored:
+            _failed["scout"] = "all attempted units errored"
+        elif result.total_units == 0 and result.skipped_quarantine > 0:
+            _skipped["scout"] = "all units quarantined"
+        else:
+            _noop["scout"] = "no runnable units"
+        return lane_records_for_run(
+            _lanes,
+            dispatched=_dispatched,
+            skipped=_skipped,
+            noop=_noop,
+            failed=_failed,
+            candidate_counts=_candidate_counts,
+        )
+
+    def _finish_ledger(
+        *,
+        wall_seconds: float,
+        lanes: list | None = None,
+        aborted: bool = False,
+        abort_reason: str = "",
+    ) -> None:
+        """Write the run-summary ledger row (D1) + morning digest (D3+D4).
+
+        Best-effort, non-blocking: a ledger/digest failure never blocks the
+        night run. ``lanes`` defaults to the real lane classification (D1).
+        """
+        if _ledger is None:
+            return
+        if lanes is None:
+            lanes = _classify_lane()
+        try:
+            _ledger.summarize(
+                wall_seconds=wall_seconds,
+                lanes=lanes,
+                aborted=aborted,
+                abort_reason=abort_reason,
+            )
+            emit_run_ledger(_ledger, mem_store=_mem_store)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("night-ledger run-summary failed (non-blocking): %s", exc)
+            return
+
+        # D3+D4: serve the morning digest to /srv/lapis/morning/<date>.md and
+        # deliver it (loud, non-Pushover). Reads the just-written ledger row,
+        # re-surfaces parked decisions, writes the digest, and records the
+        # digest path on the ledger row. The digest file is the source of
+        # truth; the notify is the doorbell. Best-effort, non-blocking.
+        try:
+            from .night_ledger import (
+                read_run_ledger,
+                resurface_parked,
+                serve_morning,
+            )
+
+            row = read_run_ledger(_ledger.run_id, mem_store=_mem_store) or {}
+            # Parked decisions from the selection plan: re-surface any that
+            # are older than the 48h threshold. ParkedEntry carries no
+            # parked_at timestamp, so use the run's own start time as the
+            # "parked since" anchor — the night is when the decision parked.
+            _parked_dicts = [
+                {
+                    "spec_id": getattr(p, "spec_id", "unknown"),
+                    "reason": getattr(p, "reason", ""),
+                    "parked_at": _ledger.started_at,
+                }
+                for p in _parked
+            ]
+            resurfaced = resurface_parked(_parked_dicts)
+            # The digest is dated by the run's own UTC timestamp (the run_id),
+            # so a night run writes /srv/lapis/morning/<run-date>.md deterministically.
+            date_str = _ledger.run_id[:8].replace("T", "-")  # YYYY-MM-DD
+            serve_morning(
+                ledger=row,
+                resurfaced=resurfaced,
+                date_str=date_str,
+                mem_store=_mem_store,
+                run_id=_ledger.run_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("morning-digest serve failed (non-blocking): %s", exc)
+
+    _t_start = time.time()
+
     run_tag = datetime.now().strftime("%Y%m%dT%H%M%S")
     if log_root is None:
         log_root = Path(f"/tmp/scout-night-{run_tag}")
@@ -696,6 +854,7 @@ def run_night(
     if not scaffold_paths:
         log.warning("No scaffold YAMLs found in %s", sims_dir)
         manifest.close()
+        _finish_ledger(wall_seconds=time.time() - _t_start)
         return result
 
     # Build scaffold objects (load once for selection + state building)
@@ -716,6 +875,7 @@ def run_night(
     if not scaffolds_loaded:
         log.warning("No valid scaffolds loaded.")
         manifest.close()
+        _finish_ledger(wall_seconds=time.time() - _t_start)
         return result
 
     # Resolve budget — supersedes until_epoch if provided
@@ -736,6 +896,7 @@ def run_night(
             budget.remaining_seconds() * -1,
         )
         manifest.close()
+        _finish_ledger(wall_seconds=time.time() - _t_start)
         return result
 
     # Load selected.yaml for priority lane
@@ -822,8 +983,14 @@ def run_night(
             "Plan: %d priority, %d relevance, %d parked.",
             len(plan.priority_lane), len(plan.relevance_lane), len(plan.parked),
         )
+        # Capture parked decisions for the morning digest re-surface (D3).
+        _parked = list(plan.parked)
         manifest.close()
+        _finish_ledger(wall_seconds=time.time() - _t_start)
         return result
+
+    # Capture parked decisions for the morning digest re-surface (D3).
+    _parked = list(plan.parked)
 
     scheduler = Scheduler(scaffold_states, quarantine, shuffle_seed=shuffle_seed)
 
@@ -1010,7 +1177,18 @@ def run_night(
         else:
             result.errored += 1
 
+        # D1 ledger state: a unit that was actually executed (regardless of
+        # exit code) means the scout lane dispatched work.
+        _units_executed += 1
+        if exit_code != 0 and exit_code != 5:
+            _run_errored = True
+
     manifest.close()
+    _finish_ledger(
+        wall_seconds=time.time() - _t_start,
+        aborted=result.aborted,
+        abort_reason=result.abort_reason,
+    )
     return result
 
 

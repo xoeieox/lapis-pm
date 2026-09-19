@@ -19,6 +19,7 @@ Coverage (spec DoD):
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -527,17 +528,13 @@ class TestRunDeliberationStage:
     def _run_stage(self, run_leg, cls=None, target=None):
         cls = cls or _make_cls()
         target = target or _make_target()
-        patches = _stage_patches(_make_mem())
-        stack = pytest.MonkeyPatch()
-        for p in patches:
-            stack.setattr(p[0], p[1])
-        try:
+        with contextlib.ExitStack() as stack:
+            for p in _stage_patches(_make_mem()):
+                stack.enter_context(p)
             d.reset_tick_deliberation_count()
             return d.run_deliberation_stage(
                 target_id="my-target", pr_number=42, cls=cls,
                 target=target, run_leg=run_leg)
-        finally:
-            stack.undo()
 
     def test_happy_converged(self):
         def _leg_fn(text, ctx, *, seat, deadline_s):

@@ -382,10 +382,9 @@ class TestActBriefDeliberationGate:
         result, mock_merge, mock_b, mem = self._run(cls, target, run_stage=_stage)
         classified = [p for p in self._BASE if p[0].endswith("_mark_pr_classified")][0][1]
         classified.assert_called_once_with("my-target", 42)
-        # And the tick's classified-PR filter would exclude it next tick:
-        from lapis_pm import pm_core
-        assert 42 in pm_core._classified_pr_ids("my-target") or True  # mem mocked;
-        # the contract is the _mark_pr_classified call above.
+        # And the tick's classified-PR filter would exclude it next tick
+        # (mem mocked; the contract is the _mark_pr_classified call above).
+        assert 42 in pm_core._classified_pr_ids("my-target") or True
 
     def test_f_deadline_exceeded_cursor_advanced(self):
         """(f) deadline exceeded -> loud brief + cursor advanced + classified."""
@@ -398,7 +397,6 @@ class TestActBriefDeliberationGate:
             out.blockage_reason = "deadline exceeded (1500s)"
             return out
 
-        from lapis_pm import pm_core
         mock_cursor = MagicMock()
         result, mock_merge, mock_b, mem = self._run(
             cls, target, run_stage=_stage, cursor=mock_cursor)  # noqa: F841

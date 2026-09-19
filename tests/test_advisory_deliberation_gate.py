@@ -217,7 +217,6 @@ class TestActBriefDeliberationGate:
 
     def _run(self, cls, target, hold=False, trigger="advisory-clean",
              run_stage=None, mem=None, cursor=None):
-        from lapis_pm import pm_core
         mem = mem or _make_mem()
         mock_merge = MagicMock()
         mock_b = MagicMock()
@@ -402,7 +401,7 @@ class TestActBriefDeliberationGate:
         from lapis_pm import pm_core
         mock_cursor = MagicMock()
         result, mock_merge, mock_b, mem = self._run(
-            cls, target, run_stage=_stage, cursor=mock_cursor)
+            cls, target, run_stage=_stage, cursor=mock_cursor)  # noqa: F841
 
         assert "brief_emitted" in result
         mock_merge.assert_not_called()

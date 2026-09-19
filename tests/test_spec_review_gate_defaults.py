@@ -554,3 +554,94 @@ def test_lock_held_across_facets_and_council_default_path(advisory_spec, monkeyp
     assert lock_state_during_deliberation["value"] == "held", (
         "the lock must still be held across Facets+Council on the default path"
     )
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-bundle-gate-facets-local-default-v0 (2026-09-16 paid-tier-gone re-point)
+#
+# The run_spec_review signature default was the ONE remaining paid default in
+# the lapis-pm surface (facets_operator was the former paid-tier default, which
+# resolved to a paid-API operator on an expired paid-API OAuth session -> the
+# CLI call returned None), and it is the default the cr-bundle autodispatch
+# gate inherits (bundle_autodispatch._run_gate does not pass facets_operator
+# explicitly). It faulted on every nightly run since 2026-08-26. All four
+# facets-operator surfaces now agree on "gravitywell": this signature, the
+# SpecReviewBrief dataclass, the _build_brief param, and the manual CLI
+# --facets-operator default.
+# ---------------------------------------------------------------------------
+
+def test_run_spec_review_facets_operator_default_is_gravitywell():
+    """DoD test (a): the signature default is the local seat, not a paid tier."""
+    default = inspect.signature(run_spec_review).parameters["facets_operator"].default
+    assert default == "gravitywell"
+
+
+def test_bundle_gate_path_resolves_to_gravitywell(advisory_spec, monkeypatch):
+    """DoD test (b): the bundle path resolves to "gravitywell" at the
+    run_spec_review boundary. Spy the DeliberationRequest construction when
+    run_spec_review is invoked the way bundle_autodispatch._run_gate invokes it
+    (no explicit facets_operator — it inherits the signature default)."""
+    captured = []
+
+    def fake_run_deliberation(request):
+        captured.append(request)
+        return _happy_envelope()
+
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", fake_run_deliberation)
+    monkeypatch.setattr(
+        "lapis_pm.spec_review.swarm_serving", lambda: True
+    )
+
+    # Exactly the kwargs bundle_autodispatch._run_gate passes (bundle_autodispatch.py:
+    # _run_gate) — no facets_operator, so the default under test is what flows.
+    brief = run_spec_review(
+        advisory_spec,
+        council_voicing="gravitywell",
+        timeout_s=1800,
+        authority="advisory",
+        dispatch_facets=True,
+        sonnet_reviewer=False,
+        invoked_by="bundle_autodispatch",
+    )
+
+    assert len(captured) == 1, "the deliberation leg must have run exactly once"
+    assert captured[0].facets_operator == "gravitywell", (
+        "the bundle path must resolve the facets operator to the local seat, "
+        "never a paid tier"
+    )
+    assert brief.facets_operator == "gravitywell"
+
+
+def test_bundle_gate_path_gw_down_defers_not_degrades(advisory_spec, monkeypatch):
+    """Change item 4: the bundle path DEFERS when GW is not serving — it never
+    launches the facets leg that would degrade to the former paid-tier default.
+    The
+    defer site is bundle_autodispatch's GW-liveness pre-check (it fires before
+    _run_gate, which is pinned by TestGWUnreachable in
+    tests/test_bundle_autodispatch.py). This test pins the gate-side half of the
+    contract: with swarm_serving()==False and council_voicing="gravitywell"
+    (the bundle path's voicing), run_spec_review skips run_deliberation
+    entirely — no doomed deliberation, no paid fallback."""
+    run_deliberation_called = []
+
+    async def mock_run_deliberation(request):
+        run_deliberation_called.append(request)
+        return _happy_envelope()
+
+    monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_run_deliberation)
+    monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: False)
+
+    brief = run_spec_review(
+        advisory_spec,
+        council_voicing="gravitywell",
+        timeout_s=30,
+        dispatch_facets=True,
+    )
+
+    assert run_deliberation_called == [], (
+        "GW-down must skip the deliberation leg entirely (defer), never launch a "
+        "doomed deliberation that could fall back to a paid tier"
+    )
+    assert brief.council_status == "error"
+    assert brief.council_error_reason == "gw_not_serving"
+    assert brief.facets_deliberation is None

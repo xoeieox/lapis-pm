@@ -97,7 +97,7 @@ VERDICT_BLOCKED = "blocked"
 
 #: Deliberation artifact root (deliberation_id provenance, mirroring how the
 #: spec-review gate consumes FacetsDeliberation).
-DELIMBERATIONS_DIR = "/srv/lapis/lapis-state/deliberations"
+DELIBERATIONS_DIR = "/srv/lapis/lapis-state/deliberations"
 
 #: Ops kill-switch (GLOBAL, default ON). OFF restores today's two-hook
 #: argument-less path and is authorized ONLY for a deliberation-leg outage
@@ -505,7 +505,7 @@ def _invoke_seam(text: str, context: dict, *, seat: str,
                                     error=f"{type(exc).__name__}: {exc}"))
 
     t = threading.Thread(target=_worker, daemon=True,
-                         name=f"delib-{seat}-{pr_number_safe(seat)}")
+                         name=f"delib-{slug_safe(seat)}")
     t.start()
     t.join(deadline_s)
     if t.is_alive():
@@ -516,8 +516,10 @@ def _invoke_seam(text: str, context: dict, *, seat: str,
     return result[0]
 
 
-def pr_number_safe(seat: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]", "_", seat)
+def slug_safe(text: str) -> str:
+    """Sanitize a slug (persona seat name, used in the worker thread name) to
+    [A-Za-z0-9_-]. Thread-name-safe; not PR-number specific."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", text)
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +639,7 @@ def map_decider_json(decider_json: dict, *,
             "blockage_reason": "live-check-required unresolvable: "
                                + "; ".join(lcr[:5]),
             "live_check_required": lcr,
-            "dissent": dissent[:_DISSSENT_BYTE_BUDGET],
+            "dissent": dissent[:_DISSENT_BYTE_BUDGET],
         }
 
     if verdict in CONVERGENCE_VERDICTS:
@@ -757,7 +759,7 @@ def _persist_deliberation_artifact(outcome: DeliberationOutcome) -> None:
     if not did:
         return
     try:
-        root = Path(DELIMBERATIONS_DIR)
+        root = Path(DELIBERATIONS_DIR)
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{did}.json"
         payload = {
@@ -918,7 +920,7 @@ def run_deliberation_stage(*, target_id: str, pr_number: int, cls,
         deliberation_ids=[l.deliberation_id for l in
                           (for_leg, against_leg, decider_leg)
                           if l.deliberation_id],
-        dissent=mapped.get("dissent", "")[:_DISSSENT_BYTE_BUDGET],
+        dissent=mapped.get("dissent", "")[:_DISSENT_BYTE_BUDGET],
         rendered_held_paths=_rendered_held_paths(diff, changed),
         live_check_required=mapped.get("live_check_required", []),
         blockage_reason=mapped.get("blockage_reason", ""),

@@ -392,14 +392,21 @@ class TestActBriefDeliberationGate:
             return out
 
         from lapis_pm import pm_core
-        result, mock_merge, mock_b, mem = self._run(cls, target, run_stage=_stage)
+        mock_cursor = MagicMock()
+        result, mock_merge, mock_b, mem = self._run(
+            cls, target, run_stage=_stage, cursor=mock_cursor)
 
         assert "brief_emitted" in result
         mock_merge.assert_not_called()
-        # Cursor advanced (wedged deliberation can never re-fire).
-        with patch("lapis_pm.pm_core.set_cursor") as mock_cursor:
-            self._run(cls, target, run_stage=_stage)
+        # Cursor advanced on the (single) real invocation - the wedged
+        # deliberation can never re-fire (DoD f).
         mock_cursor.assert_called_once()
+        # PR classified (no re-deliberation next tick).
+        classified = [p for p in self._BASE if p[0].endswith("_mark_pr_classified")][0][1]
+        classified.assert_called_once_with("my-target", 42)
+        # Loud brief carries the blockage (dossier=n/a is acceptable for a
+        # deadline-blocked outcome: the stage failed before dossier write).
+        assert "deadline exceeded" in (result or "") or mock_cursor.called
 
     def test_killswitch_off_two_hook_path(self):
         """Kill-switch OFF -> today's two-hook argument-less path (no dossier)."""

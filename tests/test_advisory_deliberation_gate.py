@@ -604,6 +604,9 @@ class TestRunDeliberationStage:
         d.reset_tick_deliberation_count()
 
         def _ok_leg(text, ctx, *, seat, deadline_s):
+            if seat == d.DECIDER_PERSONA:
+                return _leg(seat, ok=True,
+                            justification=_decider_json("clean", 0.9))
             return _leg(seat, ok=True, claim="stance")
 
         for _ in range(d.MAX_DELIBERATIONS_PER_TICK):
@@ -624,7 +627,8 @@ class TestRunDeliberationStage:
 
         def _leg_fn(text, ctx, *, seat, deadline_s):
             if seat == d.DECIDER_PERSONA:
-                return _leg(seat, justification=_decider_json("clean", 0.9))
+                return _leg(seat, ok=True,
+                            justification=_decider_json("clean", 0.9))
             return _leg(seat, ok=True, claim="stance")
 
         with patch.object(d, "_rendered_held_paths",

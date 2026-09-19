@@ -202,12 +202,29 @@ def _machine_merged_unconfirmed(mem) -> dict[tuple[str, int], str]:
     row's `ts` (ISO-8601 UTC, string-compares cleanly); ties resolve to the
     human row (conservative: never render a stale marker when a human row of
     the same instant exists).
+
+    Row enumeration: `list_by_prefix` (agents_core.mem.MemoryStore:233) is
+    the primary path; a store lacking it degrades to the tag-based
+    `list_all(tag="lapis-pm")` scan the rest of the Notable-ratifications
+    section already uses, client-side filtered to the prefix. Either path
+    failing degrades to an empty map (no marker) - never blocks the brief.
     """
     unconfirmed: dict[tuple[str, int], str] = {}
+    rows = None
     try:
         rows = mem.list_by_prefix(_ADJUDICATION_PREFIX, limit=1000)
     except Exception:
-        return unconfirmed
+        rows = None
+    if rows is None:
+        # list_by_prefix unavailable (store API gap): fall back to the
+        # tag-based scan this section already depends on.
+        try:
+            rows = [
+                e for e in mem.list_all(tag="lapis-pm", limit=1000)
+                if e.get("key", "").startswith(_ADJUDICATION_PREFIX)
+            ]
+        except Exception:
+            return unconfirmed
     for entry in rows:
         k = entry.get("key", "")
         if not k.startswith(_ADJUDICATION_PREFIX):

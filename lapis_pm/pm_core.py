@@ -7807,7 +7807,11 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     # shadow mode records the would-be call and returns None. On any merge
     # exception it returns None — fall through to the normal brief path, never
     # swallow a brief.
-    if not hold and effective_trigger == "advisory-clean":
+    # advisory-deliberation-gate-v0 (D3): same pre-gate as the auto-resolve
+    # branch above - a non-converged deliberation outcome skips the merge.
+    if (not hold and effective_trigger == "advisory-clean"
+            and not (_delib_outcome is not None
+                     and not _delib_outcome.converged)):
         _precedent_action = _precedent_hook(target_id, cls, payload)
         if _precedent_action is not None:
             _mark_pr_classified(target_id, cls.pr_number)

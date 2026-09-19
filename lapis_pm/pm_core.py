@@ -4893,6 +4893,30 @@ def _notify_forgejo_unreachable() -> None:
         pass
 
 
+def _select_actionable_tip_pr(actionable_prs: list[dict]) -> dict:
+    """Select the tip-of-salvage-chain PR to drive (2026-09-19 re-pin fix).
+
+    The salvage chain opens a NEW, higher-numbered PR on each run and the
+    superseded PRs stay open. The prior rule picked the LOWEST-numbered open
+    PR (FIFO), which latched the daemon to the oldest (already-superseded)
+    PR and re-dispatched fixer_retry/reviewer against its stale branch
+    forever (finding/lapis-pm-daemon-pins-stale-salvage-pr-2026-09-19).
+
+    Forgejo assigns PR numbers monotonically at creation, so the newest PR in
+    the chain - the tip with the latest work - always has the highest number.
+    Selecting it makes the daemon drive the live tip and walk the chain
+    tip-downward as each PR is resolved/closed. A single open PR (the common
+    case) is unchanged: min == max == the only PR.
+
+    Caller contract: actionable_prs is non-empty and every entry has a
+    resolvable (non-None) 'number'. The empty-list case is handled by the
+    upstream `if not actionable_prs: noop:no_change` guard; the numberless-PR
+    case is excluded upstream (step 2). This helper therefore never returns
+    None and has no defensive branch.
+    """
+    return max(actionable_prs, key=lambda p: p.get("number"))
+
+
 def _classified_pr_ids(target_id: str) -> set[int]:
     """PR numbers that have already been classified (hold/advisory/merge) this target."""
     rec = _mem().get(_classified_prs_key(target_id))

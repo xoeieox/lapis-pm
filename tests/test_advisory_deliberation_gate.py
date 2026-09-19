@@ -256,6 +256,14 @@ class TestActBriefDeliberationGate:
                           side_effect=run_stage))
             for _path, _mock in self._BASE:
                 stack.enter_context(patch(_path, _mock))
+            if hold or trigger != "advisory-clean":
+                # Hold / screen-issue paths never reach the auto-resolve or
+                # precedent-hook branches (their own guards exclude them).
+                return (pm_core._act_brief("my-target", trigger, hold,
+                                           self._make_payload(cls)),
+                        mock_merge, mock_b, mem)
+            _ar_path, _ar_ret = self._AR_PATCH
+            stack.enter_context(patch(_ar_path, return_value=_ar_ret))
             return (pm_core._act_brief("my-target", trigger, hold,
                                        self._make_payload(cls)),
                     mock_merge, mock_b, mem)

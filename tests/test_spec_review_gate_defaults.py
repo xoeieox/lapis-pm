@@ -557,16 +557,17 @@ def test_lock_held_across_facets_and_council_default_path(advisory_spec, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# lapis-pm-bundle-gate-facets-local-default-v0 (2026-09-16 Claude-gone re-point)
+# lapis-pm-bundle-gate-facets-local-default-v0 (2026-09-16 paid-tier-gone re-point)
 #
 # The run_spec_review signature default was the ONE remaining paid default in
-# the lapis-pm surface (facets_operator="haiku" -> claude-haiku-4-5 -> `claude
-# -p` on an expired Max OAuth -> call_claude_cli returned None), and it is the
-# default the cr-bundle autodispatch gate inherits (bundle_autodispatch._run_gate
-# does not pass facets_operator explicitly). It faulted on every nightly run
-# since 2026-08-26. All four facets-operator surfaces now agree on
-# "gravitywell": this signature, the SpecReviewBrief dataclass, the _build_brief
-# param, and the manual CLI --facets-operator default.
+# the lapis-pm surface (facets_operator was the former paid-tier default, which
+# resolved to a paid-API operator on an expired paid-API OAuth session -> the
+# CLI call returned None), and it is the default the cr-bundle autodispatch
+# gate inherits (bundle_autodispatch._run_gate does not pass facets_operator
+# explicitly). It faulted on every nightly run since 2026-08-26. All four
+# facets-operator surfaces now agree on "gravitywell": this signature, the
+# SpecReviewBrief dataclass, the _build_brief param, and the manual CLI
+# --facets-operator default.
 # ---------------------------------------------------------------------------
 
 def test_run_spec_review_facets_operator_default_is_gravitywell():
@@ -613,7 +614,8 @@ def test_bundle_gate_path_resolves_to_gravitywell(advisory_spec, monkeypatch):
 
 def test_bundle_gate_path_gw_down_defers_not_degrades(advisory_spec, monkeypatch):
     """Change item 4: the bundle path DEFERS when GW is not serving — it never
-    launches the facets leg that would degrade to the dead haiku tier. The
+    launches the facets leg that would degrade to the former paid-tier default.
+    The
     defer site is bundle_autodispatch's GW-liveness pre-check (it fires before
     _run_gate, which is pinned by TestGWUnreachable in
     tests/test_bundle_autodispatch.py). This test pins the gate-side half of the

@@ -1230,11 +1230,13 @@ def _reconcile_one(
     # This is the bundle path's GW-down DEFER site (unit contract: "GW-local
     # only. If GW is not serving, each spec is deferred (no paid fallback)").
     # It fires BEFORE _run_gate, so the facets leg (run_spec_review,
-    # facets_operator default "gravitywell" since the 2026-09-16 Claude-gone
+    # facets_operator default "gravitywell" since the 2026-09-16 paid-tier-gone
     # re-point, lapis-pm-bundle-gate-facets-local-default-v0) can never start
     # when GW is down — a gravitywell operator that would otherwise have to
-    # degrade to the dead haiku tier when GW is not serving never runs. No
-    # code change needed here; the pre-check IS the defer.
+    # degrade to the former paid-tier default when GW is not serving never runs.
+    # No code change needed here; the pre-check IS the defer.
+    # exact former default + failure chain: gate transcript (spec-review run
+    # 2026-09-17-084741) + mem decision/dossier/q352-bundle-gate-reword-split-2026-09-18
     if not _gw_serving():
         logger.warning(
             "[bundle-autodispatch] GW not serving for %s — deferring to human "

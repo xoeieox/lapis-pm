@@ -2664,15 +2664,16 @@ def run_spec_review(
     # unconditionally below), so the default fast path spends no time on a leg that
     # provably cannot change the answer. Opt in explicitly to re-enable it.
     reference_reviewer: bool = False,
-    # 2026-09-16 Claude-gone re-point (lapis-pm-bundle-gate-facets-local-default-v0):
-    # was "haiku" — the ONE remaining paid default in the lapis-pm surface. All four
-    # facets-operator surfaces now agree on "gravitywell": this signature, the
-    # SpecReviewBrief dataclass (default "gravitywell"), the _build_brief param,
-    # and the manual CLI --facets-operator default. The bundle-autodispatch gate
-    # (bundle_autodispatch._run_gate) does not pass facets_operator explicitly —
-    # it inherits this default, which is what faulted on every nightly run since
-    # 2026-08-26 (haiku -> claude-haiku-4-5 -> `claude -p` on an expired Max
-    # OAuth -> call_claude_cli returned None).
+    # 2026-09-16 paid-tier-gone re-point (lapis-pm-bundle-gate-facets-local-default-v0):
+    # was the former paid-tier default — the ONE remaining paid default in the
+    # lapis-pm surface. All four facets-operator surfaces now agree on
+    # "gravitywell": this signature, the SpecReviewBrief dataclass (default
+    # "gravitywell"), the _build_brief param, and the manual CLI --facets-operator
+    # default. The bundle-autodispatch gate (bundle_autodispatch._run_gate) does not
+    # pass facets_operator explicitly — it inherits this default, which is what
+    # faulted on every nightly run since 2026-08-26 (the former paid-tier default
+    # resolved to a paid-API operator on an expired paid-API OAuth session ->
+    # the CLI call returned None).
     facets_operator: str = "gravitywell",
     # Deprecated parameter — kept for back-compat; no-op (reference_reviewer is off by default)
     compare_opus: bool = False,
@@ -2717,7 +2718,7 @@ def run_spec_review(
     reference leg.
 
     facets_operator controls the Facets persona + synthesis model; default
-    gravitywell (2026-09-16 Claude-gone re-point — see the signature default).
+    gravitywell (2026-09-16 paid-tier-gone re-point — see the signature default).
 
     compare_opus is accepted for back-compat but is a no-op — the reference leg is
     opt-in now, so passing compare_opus=True has no additional effect. A

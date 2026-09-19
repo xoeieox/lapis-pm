@@ -642,17 +642,29 @@ class TestRunDeliberationStage:
                             justification=_decider_json("clean", 0.9))
             return _leg(seat, ok=True, claim="stance")
 
-        # _run_stage's _stage_patches pins _fetch_diff to "" - re-patch it
-        # (the outermost patch wins) so the stage sees the real diff; the
-        # real authority renderer then produces the systemd-analyze line.
-        with patch.object(d, "_fetch_diff", return_value=diff), \
-                patch.object(d, "_rendered_held_paths",
-                             return_value=[
-                                 "OnCalendar=*-*-* 03:00:00 -> Next elapse: "
-                                 "Wed 2026-09-19 03:00:00 UTC; From now: "
-                                 "1h 2min 3s left"
-                             ]):
-            out = self._run_stage(_leg_fn, cls=cls)
+        # _run_stage's _stage_patches (entered innermost via ExitStack) pins
+        # _fetch_diff to "" and _rendered_held_paths to []. The outer
+        # patches here enter first, so the inner (stack) patches win at
+        # call time - re-patch _rendered_held_paths AGAIN inside the stack
+        # (i.e. after _stage_patches) so the stage sees the sentinel
+        # rendered line; the real authority renderer is asserted separately
+        # below (no mock) to prove the real path produces the line too.
+        _SENTINEL = [
+            "OnCalendar=*-*-* 03:00:00 -> Next elapse: "
+            "Wed 2026-09-19 03:00:00 UTC; From now: 1h 2min 3s left"
+        ]
+        with patch.object(d, "_fetch_diff", return_value=diff):
+            cls = _make_cls(changed_paths=["systemd/lapis-morph.timer"],
+                            diff=diff)
+            target = _make_target()
+            with contextlib.ExitStack() as stack:
+                for p in _stage_patches(_make_mem()):
+                    stack.enter_context(p)
+                stack.enter_context(patch.object(
+                    d, "_rendered_held_paths", return_value=_SENTINEL))
+                out = d.run_deliberation_stage(
+                    target_id="my-target", pr_number=42, cls=cls,
+                    target=target, run_leg=_leg_fn)
         mem = _make_mem()
         body = d.build_dossier(out, target_id="my-target", pr_number=42,
                                fork={"repo": "lapis-pm"})

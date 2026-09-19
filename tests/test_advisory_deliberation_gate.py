@@ -605,10 +605,10 @@ class TestRunDeliberationStage:
         The per-tick counter is module state shared across tests - reset it
         (and restore it on exit) so the bound is measured from a clean
         tick."""
-        d.reset_tick_deliberation_count()
         prior = d._tick_deliberation_count
+        d.reset_tick_deliberation_count()
         try:
-            return self._per_tick_bound_body()
+            self._per_tick_bound_body()
         finally:
             d.reset_tick_deliberation_count()
             d._tick_deliberation_count = prior

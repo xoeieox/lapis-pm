@@ -11578,13 +11578,32 @@ def tick(target_id: str, allow_auto_land: bool = True) -> TickResult:
         # held PR every 10 min. Classification is reset when the PR is closed
         # or the target is rebound with a fresh spec.
         classified_ids = _classified_pr_ids(target_id)
-        actionable_prs = [p for p in open_prs if p.get("number") not in classified_ids]
+        # Exclude numberless PRs from selection: under the tip rule (max) a
+        # missing 'number' would otherwise make a numberless PR the selection
+        # always (silent production failure). Consistent with the
+        # _persist_pr_head_record precedent of skipping PRs with no resolvable
+        # number - but loud here, naming the excluded head refs.
+        _no_number = [p for p in open_prs if p.get("number") is None]
+        if _no_number:
+            logger.warning(
+                "decide(): %s - excluding %d open PR(s) with no resolvable number from "
+                "selection: %s", target_id, len(_no_number),
+                [(p.get("head") or {}).get("ref") for p in _no_number],
+            )
+        actionable_prs = [
+            p for p in open_prs
+            if p.get("number") is not None and p.get("number") not in classified_ids
+        ]
         if not actionable_prs:
             decision_str = "noop:no_change"
         else:
-            # Pick the lowest-numbered PR (FIFO) so the same one drives action
-            # until resolved.
-            pr = min(actionable_prs, key=lambda p: p.get("number", 1 << 30))
+            # Pick the HIGHEST-numbered open PR (the tip of the salvage chain):
+            # salvage runs open a NEW, higher-numbered PR and the superseded
+            # ones stay open, so the lowest-numbered (FIFO) rule latched the
+            # daemon to the oldest, already-superseded PR and re-dispatched
+            # against its stale branch forever
+            # (finding/lapis-pm-daemon-pins-stale-salvage-pr-2026-09-19).
+            pr = _select_actionable_tip_pr(actionable_prs)
             pr_number_sel = pr.get("number", 0)
 
             # Eval-gate: for synapse PRs, run quality check before reviewer dispatch.

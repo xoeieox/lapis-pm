@@ -7746,11 +7746,14 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     if not hold and effective_trigger == "advisory-clean":
         _delib_outcome = _advisory_deliberation_gate(
             target_id, cls, payload, _target)
-        if _delib_outcome is not None and not _delib_outcome.converged:
-            # not_converged / blocked: DO NOT merge. The PR is already
-            # marked classified by the hook (no re-deliberation next tick);
-            # fall through to the advisory brief below, which carries the
-            # dossier (a ~2-min cold read, not a context-grind).
+        if _delib_outcome is not None and _delib_outcome.deferred:
+            # Per-tick queue bound: the PR is NOT marked classified
+            # (deliberation has not run) so the next tick re-enters the gate.
+            # But the merge branches below MUST NOT fire on a PR whose
+            # deliberation has not run (spec: a PR merges only if
+            # dossier.verdict==converged_clean AND the existing clauses
+            # still pass). Skip them; fall through to the loud advisory
+            # brief (which carries the deferral note) without merging.
             if _delib_outcome.deadline_exceeded:
                 # D3 crash-safety: on ANY timeout/kill the cursor advances so
                 # the wedged deliberation can never re-fire.

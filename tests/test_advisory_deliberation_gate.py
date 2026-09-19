@@ -194,7 +194,9 @@ class TestGateMapping:
 
     def test_evidence_capped(self):
         ev = [f"p{i}.py:{i}" for i in range(30)]
-        parsed, _ = d.parse_decider_response(_decider_json("clean", 0.9, evidence=ev))[0]
+        parsed, err = d.parse_decider_response(_decider_json("clean", 0.9,
+                                                             evidence=ev))
+        assert parsed is not None
         assert len(parsed["evidence"]) == d.MAX_EVIDENCE_CITATIONS
 
 

@@ -596,10 +596,20 @@ class TestRunDeliberationStage:
         assert "pm_authority" in out.blockage_reason
 
     def test_per_tick_bound_defers(self):
+        """The per-tick admission bound defers the (MAX+1)-th target.
+
+        The bound is checked BEFORE the legs run, so the deferral does not
+        consume a leg invocation; the leg stub is only exercised to prove
+        the bound (not the legs) is what deferred the outcome."""
         d.reset_tick_deliberation_count()
+
+        def _ok_leg(text, ctx, *, seat, deadline_s):
+            return _leg(seat, ok=True, claim="stance")
+
         for _ in range(d.MAX_DELIBERATIONS_PER_TICK):
-            self._run_stage(lambda *a, **k: _leg(k["seat"], claim="x"))
-        out = self._run_stage(lambda *a, **k: _leg(k["seat"], claim="x"))
+            out = self._run_stage(_ok_leg)
+            assert not out.deferred
+        out = self._run_stage(_ok_leg)
         assert out.deferred is True
         assert out.verdict == d.VERDICT_NOT_CONVERGED
 

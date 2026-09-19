@@ -690,10 +690,17 @@ def _dedupe_evidence(*lists: list[str]) -> list[str]:
 
 
 def _truncate_to_bytes(text: str, bound: int) -> str:
+    """Truncate `text` so the ENCODED result is at most `bound` bytes.
+
+    The ellipsis marker is accounted for in the budget (it is 3 UTF-8
+    bytes), so the returned string's encoding never exceeds `bound`.
+    """
     b = text.encode("utf-8")
     if len(b) <= bound:
         return text
-    return b[:bound].decode("utf-8", errors="ignore") + "…"
+    ellipsis = "…"
+    return (b[:bound - len(ellipsis.encode("utf-8"))]
+            .decode("utf-8", errors="ignore") + ellipsis)
 
 
 def build_dossier(outcome: DeliberationOutcome, *, target_id: str,

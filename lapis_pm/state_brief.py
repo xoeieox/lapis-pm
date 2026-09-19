@@ -161,6 +161,124 @@ def _mem():
     return node_identity.writable_store()
 
 
+# advisory-deliberation-gate-v0 (rev 4 patch): the "Unconfirmed by Human"
+# marker for machine-merged advisory PRs in the Notable-ratifications bucket.
+# Derived READ-ONLY from the adjudication rows' `source` fields — no new
+# store, no new write path. A source="deliberation-gate" row with no later
+# source="human" row for the same tid+pr renders the marker; a later human
+# `lapis-pm ratify confirm` (which writes its existing source="human"
+# adjudication row) discharges the debt and clears the marker. The marker is
+# data, not a gate: it never blocks or reverses a merge.
+_UNCONFIRMED_MARKER = "(Unconfirmed by Human)"
+_ADJUDICATION_PREFIX = "decision/adjudication/"
+
+
+def _parse_adjudication_row(rec: dict | None) -> dict | None:
+    """Parse the adjudication/v1 JSON out of a mem record (never raises).
+
+    Returns None on any parse failure (pre-adjudication rows, prose values,
+    malformed JSON) — those rows simply do not participate in the marker.
+    """
+    if not rec:
+        return None
+    val = rec.get("value") or rec.get("content") or ""
+    if not val:
+        return None
+    m = re.search(r"```json\s*(\{.*?\})\s*```", val, re.DOTALL)
+    raw = m.group(1) if m else val
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _machine_merged_unconfirmed(mem) -> dict[tuple[str, int], str]:
+    """Scan `decision/adjudication/<tid>-<pr>-*` rows and return the
+    (tid, pr) -> machine-row-ts map for machine merges with NO later human
+    ratification (the visible debt of attention).
+
+    Grouping is by tid+pr (the spec's rev-4 patch). "Later" is ordered by the
+    row's `ts` (ISO-8601 UTC, string-compares cleanly); ties resolve to the
+    human row (conservative: never render a stale marker when a human row of
+    the same instant exists).
+
+    Row enumeration: `list_by_prefix` (agents_core.mem.MemoryStore:233) is
+    the primary path; a store lacking it degrades to the tag-based
+    `list_all(tag="lapis-pm")` scan the rest of the Notable-ratifications
+    section already uses, client-side filtered to the prefix. Either path
+    failing degrades to an empty map (no marker) - never blocks the brief.
+    """
+    unconfirmed: dict[tuple[str, int], str] = {}
+    rows = None
+    try:
+        rows = mem.list_by_prefix(_ADJUDICATION_PREFIX, limit=1000)
+    except Exception:
+        rows = None
+    if rows is None:
+        # list_by_prefix unavailable (store API gap): fall back to the
+        # tag-based scan this section already depends on.
+        try:
+            rows = [
+                e for e in mem.list_all(tag="lapis-pm", limit=1000)
+                if e.get("key", "").startswith(_ADJUDICATION_PREFIX)
+            ]
+        except Exception:
+            return unconfirmed
+    for entry in rows:
+        k = entry.get("key", "")
+        if not k.startswith(_ADJUDICATION_PREFIX):
+            continue
+        rec = None
+        try:
+            rec = mem.get(k)
+        except Exception:
+            rec = None
+        data = _parse_adjudication_row(rec)
+        if not data:
+            continue
+        tid = str(data.get("target_id") or "")
+        pr_raw = data.get("pr")
+        try:
+            pr = int(pr_raw)
+        except (ValueError, TypeError):
+            continue
+        if not tid or pr <= 0:
+            continue
+        source = str(data.get("source") or "")
+        ts = str(data.get("ts") or "")
+        if source == "deliberation-gate":
+            # A machine merge: candidate for the marker.
+            unconfirmed.setdefault((tid, pr), ts)
+        elif source == "human":
+            # A human ratification: discharges the debt iff it is not older
+            # than the machine row (string compare on ISO-8601 UTC).
+            machine_ts = unconfirmed.get((tid, pr))
+            if machine_ts is not None and ts >= machine_ts:
+                del unconfirmed[(tid, pr)]
+    return unconfirmed
+
+
+def _unconfirmed_marker_for_key(key: str,
+                                unconfirmed: dict[tuple[str, int], str]) -> str | None:
+    """Return the marker string for a ratification item key, or None.
+
+    Applied to (1) the adjudication row's own key and (2) the deliberation
+    dossier key (`decision/dossier/<tid>-<pr>-<ts>`) — both surface the same
+    machine-merged PR in the Notable-ratifications bucket.
+    """
+    if not unconfirmed:
+        return None
+    m = re.match(
+        r"^decision/(?:adjudication|dossier)/([^/]+)-(\d+)-", key)
+    if not m:
+        return None
+    tid, pr = m.group(1), int(m.group(2))
+    if (tid, pr) in unconfirmed:
+        return _UNCONFIRMED_MARKER
+    return None
+
+
 def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, list[str]]:
     """Read all data sources and return buckets dict.
 
@@ -204,13 +322,24 @@ def _read_buckets(start_ts: datetime, *, period: str = "daily") -> dict[str, lis
     # --- Notable ratifications: decision/* keys since start ---
     decision_keys_raw = mem.list_all(tag="lapis-pm", since=since_str, limit=500)
     ratification_items: list[str] = []
+    # advisory-deliberation-gate-v0 (rev 4 patch): the "Unconfirmed by Human"
+    # marker. Machine-merged advisory PRs (adjudication rows with
+    # source="deliberation-gate") are rendered with the marker until a later
+    # human-source row (lapis-pm ratify confirm) exists for the same tid+pr.
+    # DATA, not a gate: rendering is read-only over the adjudication rows and
+    # no code path reads the marker to block or reverse a merge.
+    machine_merged = _machine_merged_unconfirmed(mem)
     for entry in decision_keys_raw:
         k = entry.get("key", "")
         if k.startswith("decision/"):
             rec = mem.get(k)
             val = rec.get("value", "") if rec else ""
             label = k.removeprefix("decision/")
-            ratification_items.append(f"{label}: {val[:120]}" if val else label)
+            item = f"{label}: {val[:120]}" if val else label
+            marker = _unconfirmed_marker_for_key(k, machine_merged)
+            if marker:
+                item = f"{item} {marker}"
+            ratification_items.append(item)
 
     # --- In flight: dispatched + chain keys (all time — not time-windowed) ---
     # Landed-beats-dispatched join: a pm/dispatched/<tid> is in-flight only if

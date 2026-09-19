@@ -7508,6 +7508,204 @@ def _act_merge(target_id: str, payload: dict) -> str:
     return f"action:auto_merge:pr={cls.pr_number}"
 
 
+def _advisory_deliberation_gate(target_id: str, cls: authority.PRClassification,
+                                payload: dict, _target):
+    """D3 pre-gate (advisory-deliberation-gate-v0 rev 5): run the adversarial
+    deliberation stage on the advisory-clean path, BEFORE the two machine-merge
+    branches (auto-resolve + precedent hook).
+
+    Arms (D3):
+      * kill-switch OFF (global ops break-glass) -> no-op (None): today's
+        two-hook argument-less path runs, as today.
+      * `converged_clean` -> persist the dossier + the
+        source="deliberation-gate" adjudication row; the existing merge
+        branches proceed (double-gate independence: their own
+        screen/authority/LOC/held-path clauses still apply).
+      * `not_converged` / `blocked` -> persist the dossier, mark the PR
+        classified (idempotency: no re-deliberation next tick), and return
+        the outcome so the caller emits a loud advisory brief carrying the
+        dossier (the silent path is the disease).
+
+    Never raises: a stage failure resolves to a `blocked` outcome (the
+    stage itself is fail-closed), and a hook-level exception degrades to a
+    loud-brief arm rather than silently skipping the gate.
+    """
+    try:
+        from . import deliberation as _delib
+    except Exception as exc:
+        logger.warning("deliberation-gate: module unavailable for %s: %s",
+                       target_id, exc)
+        return _delib_blocked_fallback(target_id, cls, exc)
+    if not _delib.gate_enabled():
+        # Global ops kill-switch OFF: today's two-hook path, as today.
+        return None
+    try:
+        outcome = _delib.run_deliberation_stage(
+            target_id=target_id, pr_number=cls.pr_number, cls=cls,
+            target=_target,
+        )
+    except Exception as exc:
+        # Defensive: the stage is fail-closed and never raises; a hook-level
+        # exception must not silently skip the gate - loud brief instead.
+        logger.warning("deliberation-gate: stage raised for %s PR #%s: %s",
+                       target_id, cls.pr_number, exc)
+        outcome = _delib.DeliberationOutcome(
+            target_id=target_id, pr_number=cls.pr_number,
+            verdict=_delib.VERDICT_BLOCKED,
+            blockage_reason=f"stage exception: {type(exc).__name__}: {exc}",
+        )
+    if outcome.deferred:
+        # Per-tick queue bound: defer to the next tick. The PR is NOT marked
+        # classified (deliberation has not run), so the next tick re-enters
+        # this gate; the bound is admission control, not a skip.
+        episodic.write_observation(
+            target_id,
+            f"advisory-deliberation-gate: deferred to next tick "
+            f"(per-tick bound) for PR #{cls.pr_number}",
+            extra_tags=["pm:deliberation-gate:deferred", f"pm:pr={cls.pr_number}"],
+        )
+        return outcome
+    _delib_outcome_finalize(target_id, cls, payload, _target, outcome, _delib)
+    return outcome
+
+
+def _delib_blocked_fallback(target_id: str, cls: authority.PRClassification,
+                            exc: Exception) -> "DeliberationOutcome":
+    """Hook-level fallback when the deliberation module itself is unavailable
+    (corrupt deploy). Fail-closed: a loud `blocked` brief, never a silent
+    merge on an argument-less path."""
+    try:
+        from . import deliberation as _delib
+    except Exception:
+        # The module import failed - construct the outcome via a local
+        # stand-in so the caller still emits a loud brief.
+        class _StandIn:
+            def __init__(self):
+                self.verdict = "blocked"
+                self.blockage_reason = f"deliberation module unavailable: {exc}"
+                self.dissent = ""
+                self.evidence = []
+                self.deliberation_ids = []
+                self.fork_class = None
+                self.rendered_held_paths = []
+                self.live_check_required = []
+                self.confidence = 0.0
+                self.decider_json = None
+                self.legs = []
+                self.dossier_key = None
+                self.deadline_exceeded = False
+                self.deferred = False
+                self.target_id = target_id
+                self.pr_number = cls.pr_number
+
+            @property
+            def deliberation_id(self):
+                return None
+
+            @property
+            def converged(self):
+                return False
+        outcome = _StandIn()
+        # Fail-closed loud-brief arm (spec: a failed deliberation is a loud
+        # brief, never a skipped gate). The module is unavailable so no
+        # dossier can be written (the brief renders dossier=n/a); still
+        # record the blockage episodically and mark the PR classified so
+        # the blocked state is observable and does not re-fire every tick.
+        try:
+            episodic.write_observation(
+                target_id,
+                f"advisory-deliberation-gate: blocked "
+                f"(deliberation module unavailable: {exc}) — NO merge; "
+                f"loud brief",
+                extra_tags=["pm:deliberation-gate:blocked",
+                            f"pm:pr={cls.pr_number}"],
+            )
+        except Exception as _obs_exc:
+            logger.warning(
+                "deliberation-gate: fallback observation failed for %s: %s",
+                target_id, _obs_exc)
+        _mark_pr_classified(target_id, cls.pr_number)
+        return outcome
+    outcome = _delib.DeliberationOutcome(
+        target_id=target_id, pr_number=cls.pr_number,
+        verdict=_delib.VERDICT_BLOCKED,
+        blockage_reason=f"deliberation module unavailable: {exc}",
+    )
+    _delib_outcome_finalize(target_id, cls, payload=None, _target=None,
+                            outcome=outcome, _delib=_delib)
+    return outcome
+
+
+def _delib_outcome_finalize(target_id: str, cls: authority.PRClassification,
+                            payload: dict | None, _target, outcome, _delib) -> None:
+    """Terminal-outcome bookkeeping for the deliberation gate (D3 arms).
+
+    * converged_clean: dossier + adjudication (source="deliberation-gate")
+      written; the merge branches proceed and mark the PR classified.
+    * not_converged / blocked: dossier written, PR marked classified
+      (idempotency - no re-deliberation next tick), loud observation.
+    Never raises.
+    """
+    try:
+        from . import precedent as _pc
+        mem = _mem()
+        fork = None
+        try:
+            fork = _pc._fork_from_options_sibling(mem, target_id)
+        except Exception:
+            fork = None
+        if fork is None:
+            try:
+                fork = _pc.derive_fork_class(cls, cls.screen_verdict or "clean",
+                                             repo=cls.repo)
+            except Exception:
+                fork = None
+        outcome.fork_class = fork
+        body = _delib.build_dossier(outcome, target_id=target_id,
+                                    pr_number=cls.pr_number, fork=fork)
+        try:
+            outcome.dossier_key = _delib.write_dossier(
+                mem, target_id=target_id, pr_number=cls.pr_number, body=body)
+        except Exception as exc:
+            logger.warning("deliberation-gate: dossier write failed for %s PR #%s: %s",
+                           target_id, cls.pr_number, exc)
+        if outcome.converged:
+            # Audit pair (Invariants): the adjudication row the doctrine's
+            # "auditable cold in ~2 min" bar requires, on BOTH merge branches
+            # (the caller's merge call is unchanged - double-gate
+            # independence).
+            _delib.write_gate_adjudication(
+                mem, target_id=target_id, pr_number=cls.pr_number,
+                repo=cls.repo or "", fork=fork,
+            )
+            episodic.write_observation(
+                target_id,
+                f"advisory-deliberation-gate: converged_clean "
+                f"(confidence={outcome.confidence:.2f}, "
+                f"deliberation_id={outcome.deliberation_id or 'n/a'}, "
+                f"dossier={outcome.dossier_key}) — machine merge authorized",
+                extra_tags=["pm:deliberation-gate:converged",
+                            f"pm:pr={cls.pr_number}"],
+            )
+        else:
+            # not_converged / blocked: loud brief arm. Mark classified so the
+            # PR is not re-deliberated next tick (idempotency), and name the
+            # blockage for the brief.
+            _mark_pr_classified(target_id, cls.pr_number)
+            episodic.write_observation(
+                target_id,
+                f"advisory-deliberation-gate: {outcome.verdict} "
+                f"(confidence={outcome.confidence:.2f}, "
+                f"blockage={outcome.blockage_reason or 'n/a'}, "
+                f"dossier={outcome.dossier_key}) — NO merge; loud brief",
+                extra_tags=[f"pm:deliberation-gate:{outcome.verdict}",
+                            f"pm:pr={cls.pr_number}"],
+            )
+    except Exception as exc:
+        logger.warning("deliberation-gate: finalize failed for %s PR #%s: %s",
+                       target_id, cls.pr_number, exc)
+
+
 def _auto_resolve_record(target_id: str, pr_number: int) -> None:
     """Write audit trail after a conservative auto-resolve (observation + mem key)."""
     episodic.write_observation(
@@ -7552,10 +7750,50 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     # Single TargetStore read shared by the auto-resolve and FC hook blocks below.
     _target = TargetStore().get(target_id)
 
+    # advisory-deliberation-gate-v0 (D3): the adversarial deliberation stage
+    # sits BETWEEN trigger derivation and the two machine-merge branches,
+    # gating BOTH on a deterministic dossier.verdict. Hold tier and
+    # advisory-screen-issue are out of scope (the stage sits strictly inside
+    # the not-hold advisory-clean path). Arms:
+    #   * None            -> kill-switch OFF: today's two-hook path, as today.
+    #   * converged_clean -> merge branches proceed (double-gate
+    #                        independence: their own clauses still apply).
+    #   * not_converged / blocked -> loud advisory brief with the dossier;
+    #                        the PR is marked classified (idempotency).
+    _delib_outcome = None
+    if not hold and effective_trigger == "advisory-clean":
+        _delib_outcome = _advisory_deliberation_gate(
+            target_id, cls, payload, _target)
+        if _delib_outcome is not None and not _delib_outcome.converged:
+            # not_converged / blocked / deferred: DO NOT merge. For
+            # not_converged / blocked the PR is already marked classified
+            # by the hook (no re-deliberation next tick); a deferred outcome
+            # is NOT marked classified (deliberation has not run) so the
+            # next tick re-enters the gate. Either way the merge branches
+            # below are skipped (spec: a PR merges only if
+            # dossier.verdict==converged_clean AND the existing clauses
+            # still pass); we fall through to the advisory brief, which
+            # carries the dossier (a ~2-min cold read, not a context-grind).
+            if _delib_outcome.deadline_exceeded:
+                # D3 crash-safety: on ANY timeout/kill the cursor advances so
+                # the wedged deliberation can never re-fire.
+                try:
+                    set_cursor(target_id, _now_iso())
+                except Exception as _cur_exc:
+                    logger.warning(
+                        "deliberation-gate: cursor advance failed for %s: %s",
+                        target_id, _cur_exc)
+
     # Conservative auto-resolve: merge unambiguous advisory-clean PRs without a gem.
     # Predicate is deterministic (no LLM). On any merge failure, falls through to
     # the normal brief/gem path — never swallows a brief.
-    if not hold and effective_trigger == "advisory-clean":
+    # advisory-deliberation-gate-v0 (D3): the gate verdict is a PRE-gate -
+    # a PR merges only if dossier.verdict==converged_clean AND these own
+    # clauses still pass (double-gate independence). A non-converged
+    # outcome (not_converged / blocked / deferred) skips the merge branch.
+    if (not hold and effective_trigger == "advisory-clean"
+            and not (_delib_outcome is not None
+                     and not _delib_outcome.converged)):
         from . import auto_resolve as _ar
         if _target is not None:
             _should, _merge_opt = _ar.should_auto_resolve(
@@ -7587,7 +7825,11 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     # shadow mode records the would-be call and returns None. On any merge
     # exception it returns None — fall through to the normal brief path, never
     # swallow a brief.
-    if not hold and effective_trigger == "advisory-clean":
+    # advisory-deliberation-gate-v0 (D3): same pre-gate as the auto-resolve
+    # branch above - a non-converged deliberation outcome skips the merge.
+    if (not hold and effective_trigger == "advisory-clean"
+            and not (_delib_outcome is not None
+                     and not _delib_outcome.converged)):
         _precedent_action = _precedent_hook(target_id, cls, payload)
         if _precedent_action is not None:
             _mark_pr_classified(target_id, cls.pr_number)
@@ -7675,6 +7917,20 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
             _scope = verdict_info.get("scope")
             if _scope:
                 reviewer_scope_text = str(_scope)
+
+    # advisory-deliberation-gate-v0: the deliberation dossier rides the loud
+    # brief (not_converged / blocked arms). Data, not a gate - it never
+    # blocks or reverses a merge; it is the ~2-min cold audit surface.
+    deliberation_text: str | None = None
+    if _delib_outcome is not None and not _delib_outcome.converged:
+        deliberation_text = (
+            f"advisory-deliberation-gate: {_delib_outcome.verdict} "
+            f"(confidence={_delib_outcome.confidence:.2f}) — "
+            f"NO machine merge. Blockage: "
+            f"{_delib_outcome.blockage_reason or 'n/a'}; "
+            f"dossier={_delib_outcome.dossier_key or 'n/a'}; "
+            f"deliberation_id={_delib_outcome.deliberation_id or 'n/a'}"
+        )
 
     # AC8: functional critic hook — fires when pm_verification == "agent-functional"
     functional_critic_text: str | None = None
@@ -7772,6 +8028,7 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
         reviewer_verdict_text=reviewer_verdict_text,
         reviewer_scope_text=reviewer_scope_text,
         functional_critic_text=functional_critic_text,
+        deliberation_text=deliberation_text,
         fork_class=_fork_class,
     )
     _mark_pr_classified(target_id, cls.pr_number)
@@ -11364,6 +11621,15 @@ def tick_all() -> list[TickResult]:
     land-eligible, the oldest-bound (earliest spec:bound comment) is chosen;
     others have auto-land suppressed and become eligible next tick.
     """
+    # advisory-deliberation-gate-v0 (D3): reset the per-tick deliberation
+    # counter at the start of the tick pass (admission control K=3).
+    try:
+        from . import deliberation as _delib
+        _delib.reset_tick_deliberation_count()
+    except Exception as _delib_reset_exc:
+        logger.warning("deliberation-gate: tick counter reset failed: %s",
+                       _delib_reset_exc)
+
     # Pre-perceive health probe — one probe per tick_all call, not per target.
     reachable, probe_reason = probe_forgejo_health()
     if not reachable:

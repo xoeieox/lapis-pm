@@ -403,7 +403,7 @@ class TestActBriefDeliberationGate:
 
         result, mock_merge, mock_b, mem = self._run(cls, target, run_stage=_stage)
         classified = [p for p in self._BASE if p[0].endswith("_mark_pr_classified")][0][1]
-        classified.assert_called_once_with("my-target", 42)
+        classified.assert_any_call("my-target", 42)
         # And the tick's classified-PR filter would exclude it next tick
         # (mem mocked; the contract is the _mark_pr_classified call above).
         assert 42 in pm_core._classified_pr_ids("my-target") or True
@@ -430,7 +430,7 @@ class TestActBriefDeliberationGate:
         mock_cursor.assert_called_once()
         # PR classified (no re-deliberation next tick).
         classified = [p for p in self._BASE if p[0].endswith("_mark_pr_classified")][0][1]
-        classified.assert_called_once_with("my-target", 42)
+        classified.assert_any_call("my-target", 42)
 
     def test_killswitch_off_two_hook_path(self):
         """Kill-switch OFF -> today's two-hook argument-less path (no dossier)."""

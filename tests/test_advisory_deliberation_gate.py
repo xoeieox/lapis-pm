@@ -208,20 +208,21 @@ class TestActBriefDeliberationGate:
         return {"classification": cls}
 
     def _run(self, cls, target, hold=False, trigger="advisory-clean",
-             run_stage=None, mem=None):
+             run_stage=None, mem=None, cursor=None):
         from lapis_pm import pm_core
         mem = mem or _make_mem()
         mock_merge = MagicMock()
         mock_b = MagicMock()
         mock_b.comment_id = "brief-001"
         mock_b.synthesis_failed = False
+        cursor = cursor if cursor is not None else MagicMock()
         patches = [
             patch("lapis_pm.pm_core.TargetStore"),
             patch("lapis_pm.pm_core.brief._act_merge_pr", mock_merge),
             patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_b),
             patch("lapis_pm.pm_core._set_brief_outstanding", MagicMock()),
             patch("lapis_pm.pm_core._mem", return_value=mem),
-            patch("lapis_pm.pm_core.set_cursor", MagicMock()),
+            patch("lapis_pm.pm_core.set_cursor", cursor),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
         ]
         if run_stage is not None:

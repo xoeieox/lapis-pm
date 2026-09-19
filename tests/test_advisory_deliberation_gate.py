@@ -222,34 +222,36 @@ class TestActBriefDeliberationGate:
              run_stage=None, mem=None, cursor=None):
         mem = mem or _make_mem()
         mock_merge = MagicMock()
-        mock_b = MagicMock()
-        mock_b.comment_id = "brief-001"
-        mock_b.synthesis_failed = False
+        mock_b = _brief_mock()
         cursor = cursor if cursor is not None else MagicMock()
-        patches = [
-            patch("lapis_pm.pm_core.TargetStore"),
-            patch("lapis_pm.pm_core.brief._act_merge_pr", mock_merge),
-            patch("lapis_pm.pm_core.brief.synthesize", return_value=mock_b),
-            patch("lapis_pm.pm_core._set_brief_outstanding", MagicMock()),
-            patch("lapis_pm.pm_core._mem", return_value=mem),
-            patch("lapis_pm.pm_core.set_cursor", cursor),
-            patch("lapis_pm.pm_core._last_review_verdict", return_value=None),
-        ]
-        if run_stage is not None:
-            patches.append(patch("lapis_pm.deliberation.run_deliberation_stage",
-                                 side_effect=run_stage))
-        patches.extend(self._BASE)
-        stack = pytest.MonkeyPatch()
-        for p in patches:
-            stack.setattr(p[0], p[1])
-        mock_ts = patches[0]
-        try:
+        with contextlib.ExitStack() as stack:
+            mock_ts = stack.enter_context(
+                patch("lapis_pm.pm_core.TargetStore"))
             mock_ts.return_value.get.return_value = target
-            result = pm_core._act_brief("my-target", trigger, hold,
-                                        self._make_payload(cls))
-            return result, mock_merge, mock_b, mem
-        finally:
-            stack.undo()
+            stack.enter_context(
+                patch("lapis_pm.pm_core.brief._act_merge_pr", mock_merge))
+            stack.enter_context(
+                patch("lapis_pm.pm_core.brief.synthesize",
+                      return_value=mock_b))
+            stack.enter_context(
+                patch("lapis_pm.pm_core._set_brief_outstanding",
+                      MagicMock()))
+            stack.enter_context(
+                patch("lapis_pm.pm_core._mem", return_value=mem))
+            stack.enter_context(
+                patch("lapis_pm.pm_core.set_cursor", cursor))
+            stack.enter_context(
+                patch("lapis_pm.pm_core._last_review_verdict",
+                      return_value=None))
+            if run_stage is not None:
+                stack.enter_context(
+                    patch("lapis_pm.deliberation.run_deliberation_stage",
+                          side_effect=run_stage))
+            for _path, _mock in self._BASE:
+                stack.enter_context(patch(_path, _mock))
+            return (pm_core._act_brief("my-target", trigger, hold,
+                                       self._make_payload(cls)),
+                    mock_merge, mock_b, mem)
 
     def _converged_outcome(self):
         return d.DeliberationOutcome(

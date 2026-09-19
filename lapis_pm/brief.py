@@ -271,6 +271,7 @@ def synthesize(
     reviewer_verdict_text: str | None = None,
     reviewer_scope_text: str | None = None,
     functional_critic_text: str | None = None,
+    deliberation_text: str | None = None,
     fork_class: dict | None = None,
 ) -> Brief:
     """Produce a brief, write it as a comment, optionally push to Pushover.
@@ -324,6 +325,12 @@ def synthesize(
         # a green verdict with no scope is a false signal.
         scope_block = f"Reviewer scope:\n{reviewer_scope_text}\n"
 
+    # advisory-deliberation-gate-v0: the deliberation dossier rides the loud
+    # brief (not_converged / blocked arms). Data, not a gate.
+    deliberation_block = ""
+    if deliberation_text:
+        deliberation_block = f"Deliberation gate:\n{deliberation_text}\n"
+
     user = (
         f"Thread: {target_id}\n"
         f"{trigger_block}\n"
@@ -331,6 +338,7 @@ def synthesize(
         f"Recent PM episodes (most relevant first):\n{episodes_block}\n"
         f"{verdict_block}"
         f"{scope_block}"
+        f"{deliberation_block}"
         f"{diff_block}"
         f"{issues_block}"
     )

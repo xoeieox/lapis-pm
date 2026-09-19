@@ -600,8 +600,32 @@ class TestRunDeliberationStage:
 
         The bound is checked BEFORE the legs run, so the deferral does not
         consume a leg invocation; the leg stub is only exercised to prove
-        the bound (not the legs) is what deferred the outcome."""
+        the bound (not the legs) is what deferred the outcome.
+
+        The per-tick counter is module state shared across tests - reset it
+        (and restore it on exit) so the bound is measured from a clean
+        tick."""
         d.reset_tick_deliberation_count()
+        prior = d._tick_deliberation_count
+        try:
+            return self._per_tick_bound_body()
+        finally:
+            d.reset_tick_deliberation_count()
+            d._tick_deliberation_count = prior
+
+    def _per_tick_bound_body(self):
+        def _ok_leg(text, ctx, *, seat, deadline_s):
+            if seat == d.DECIDER_PERSONA:
+                return _leg(seat, ok=True,
+                            justification=_decider_json("clean", 0.9))
+            return _leg(seat, ok=True, claim="stance")
+
+        for _ in range(d.MAX_DELIBERATIONS_PER_TICK):
+            out = self._run_stage(_ok_leg)
+            assert not out.deferred
+        out = self._run_stage(_ok_leg)
+        assert out.deferred is True
+        assert out.verdict == d.VERDICT_NOT_CONVERGED
 
         def _ok_leg(text, ctx, *, seat, deadline_s):
             if seat == d.DECIDER_PERSONA:

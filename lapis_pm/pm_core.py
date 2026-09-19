@@ -7746,14 +7746,16 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     if not hold and effective_trigger == "advisory-clean":
         _delib_outcome = _advisory_deliberation_gate(
             target_id, cls, payload, _target)
-        if _delib_outcome is not None and _delib_outcome.deferred:
-            # Per-tick queue bound: the PR is NOT marked classified
-            # (deliberation has not run) so the next tick re-enters the gate.
-            # But the merge branches below MUST NOT fire on a PR whose
-            # deliberation has not run (spec: a PR merges only if
+        if _delib_outcome is not None and not _delib_outcome.converged:
+            # not_converged / blocked / deferred: DO NOT merge. For
+            # not_converged / blocked the PR is already marked classified
+            # by the hook (no re-deliberation next tick); a deferred outcome
+            # is NOT marked classified (deliberation has not run) so the
+            # next tick re-enters the gate. Either way the merge branches
+            # below are skipped (spec: a PR merges only if
             # dossier.verdict==converged_clean AND the existing clauses
-            # still pass). Skip them; fall through to the loud advisory
-            # brief (which carries the deferral note) without merging.
+            # still pass); we fall through to the advisory brief, which
+            # carries the dossier (a ~2-min cold read, not a context-grind).
             if _delib_outcome.deadline_exceeded:
                 # D3 crash-safety: on ANY timeout/kill the cursor advances so
                 # the wedged deliberation can never re-fire.
@@ -7767,7 +7769,13 @@ def _act_brief(target_id: str, trigger: str, hold: bool, payload: dict) -> str:
     # Conservative auto-resolve: merge unambiguous advisory-clean PRs without a gem.
     # Predicate is deterministic (no LLM). On any merge failure, falls through to
     # the normal brief/gem path — never swallows a brief.
-    if not hold and effective_trigger == "advisory-clean":
+    # advisory-deliberation-gate-v0 (D3): the gate verdict is a PRE-gate -
+    # a PR merges only if dossier.verdict==converged_clean AND these own
+    # clauses still pass (double-gate independence). A non-converged
+    # outcome (not_converged / blocked / deferred) skips the merge branch.
+    if (not hold and effective_trigger == "advisory-clean"
+            and not (_delib_outcome is not None
+                     and not _delib_outcome.converged)):
         from . import auto_resolve as _ar
         if _target is not None:
             _should, _merge_opt = _ar.should_auto_resolve(

@@ -544,13 +544,22 @@ class TestActBriefDeliberationGate:
 # ---------------------------------------------------------------------------
 
 class TestRunDeliberationStage:
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_counter(self):
+        """The per-tick admission counter is module state shared across
+        tests; snapshot/restore it so each test starts at a clean tick."""
+        prior = d._tick_deliberation_count
+        d.reset_tick_deliberation_count()
+        yield
+        d.reset_tick_deliberation_count()
+        d._tick_deliberation_count = prior
+
     def _run_stage(self, run_leg, cls=None, target=None):
         cls = cls or _make_cls()
         target = target or _make_target()
         with contextlib.ExitStack() as stack:
             for p in _stage_patches(_make_mem()):
                 stack.enter_context(p)
-            d.reset_tick_deliberation_count()
             return d.run_deliberation_stage(
                 target_id="my-target", pr_number=42, cls=cls,
                 target=target, run_leg=run_leg)

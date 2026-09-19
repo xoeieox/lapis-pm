@@ -645,7 +645,13 @@ class TestRunDeliberationStage:
         # _run_stage's _stage_patches pins _fetch_diff to "" - re-patch it
         # (the outermost patch wins) so the stage sees the real diff; the
         # real authority renderer then produces the systemd-analyze line.
-        with patch.object(d, "_fetch_diff", return_value=diff):
+        with patch.object(d, "_fetch_diff", return_value=diff), \
+                patch.object(d, "_rendered_held_paths",
+                             return_value=[
+                                 "OnCalendar=*-*-* 03:00:00 -> Next elapse: "
+                                 "Wed 2026-09-19 03:00:00 UTC; From now: "
+                                 "1h 2min 3s left"
+                             ]):
             out = self._run_stage(_leg_fn, cls=cls)
         mem = _make_mem()
         body = d.build_dossier(out, target_id="my-target", pr_number=42,

@@ -3,7 +3,7 @@
 Coverage (spec DoD #1-#6, #8; rev 4 amendment supersedes the rev-3
 thinking-disable pins):
   #1 payload shape pinned (rev 4): witness + node1 bodies carry
-     max_tokens=16384 and carry NO chat_template_kwargs (thinking stays
+     max_tokens=65536 and carry NO chat_template_kwargs (thinking stays
      ON); the timeout constants are 300s (witness), 120s (node1),
      120s (node2).
   #2 node2 re-point pinned: new _NODE2_URL/_NODE2_MODEL constants; node2
@@ -72,8 +72,8 @@ VALID_WITNESS_RESP = {
 
 class TestThinkingOnPayload:
 
-    def test_witness_body_carries_16384_and_no_thinking_field(self):
-        """The witness request body carries max_tokens=16384 and NO
+    def test_witness_body_carries_65536_and_no_thinking_field(self):
+        """The witness request body carries max_tokens=65536 and NO
         chat_template_kwargs (rev 4: thinking stays ON), with temperature
         unchanged from baseline."""
         resp = MagicMock()
@@ -99,13 +99,13 @@ class TestThinkingOnPayload:
         assert result.agreement != "local_failed"
         assert captured, "no POST captured"
         body = captured[0]
-        assert body["max_tokens"] == 16384
+        assert body["max_tokens"] == 65536
         assert "chat_template_kwargs" not in body
         assert body["temperature"] == 0.1
 
-    def test_node1_body_carries_16384_and_no_thinking_field(self):
+    def test_node1_body_carries_65536_and_no_thinking_field(self):
         """The node1 corroboration body (shared _build_body) carries
-        max_tokens=16384 and NO chat_template_kwargs (rev 4: thinking stays
+        max_tokens=65536 and NO chat_template_kwargs (rev 4: thinking stays
         ON), with temperature unchanged."""
         adapter = LapisPMReviewerAdapter()
         substrates = [_IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], [])]
@@ -125,7 +125,7 @@ class TestThinkingOnPayload:
         assert result.leg_status == "ok"
         assert captured, "no POST captured"
         body = captured[0]
-        assert body["max_tokens"] == _MAX_TOKENS == 16384
+        assert body["max_tokens"] == _MAX_TOKENS == 65536
         assert "chat_template_kwargs" not in body
         assert body["temperature"] == 0.1
 
@@ -514,7 +514,7 @@ class TestNode2ErrorClasses:
 
     def test_node2_payload_carries_all_three_fields(self):
         """DoD-1: the node2 payload (extra_body) carries ALL THREE of
-        temperature 0.1 / max_tokens 16384 / the json_schema grammar (the
+        temperature 0.1 / max_tokens 65536 / the json_schema grammar (the
         client merges verbatim)."""
         substrates = [_IdentifierSubstrate("tick", [], [])]
         captured_extra: list[dict] = []
@@ -539,7 +539,7 @@ class TestNode2ErrorClasses:
         # All three payload fields ride extra_body (the client merges
         # verbatim into the POST body).
         assert body["temperature"] == 0.1
-        assert body["max_tokens"] == _MAX_TOKENS == 16384
+        assert body["max_tokens"] == _MAX_TOKENS == 65536
         assert "response_format" in body  # the json_schema grammar
         # model is NOT in extra_body (the client sets it on the body itself).
         assert "model" not in body

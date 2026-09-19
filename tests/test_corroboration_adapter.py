@@ -931,7 +931,7 @@ class TestThinkingModelParseAndTruncation:
         assert captured_bodies, "expected httpx.post to be called"
         body = captured_bodies[0]
         assert body["max_tokens"] > 512
-        assert body["max_tokens"] == 4096
+        assert body["max_tokens"] == 65536
         assert body.get("response_format", {}).get("type") == "json_schema"
         assert body["response_format"]["json_schema"]["strict"] is True
 

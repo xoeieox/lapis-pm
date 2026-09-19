@@ -55,6 +55,20 @@ def _default_model() -> str | None:
     return os.environ.get("LOCAL_LLM_MODEL")
 
 
+def _default_max_tokens() -> int:
+    """Reviewer-leg output budget (thinking tokens + the final JSON count
+    against it). Read at call time so tests can monkeypatch.setenv.
+
+    Erah ruling 2026-09-19: raised 16384 -> 65536 (1/4 of the seat's 262k
+    context). The 27B deliberates longer than 16384 on hard reviews: arm F1
+    (2026-09-01) measured 12,847 reasoning tokens on a SIMPLE production
+    shape, barely finishing at the 16,384 cap; a hard review (e.g. a 13-file
+    PR) exceeds it -> finish_reason=length -> the leg fails (json_valid:False).
+    Tunable via LAPIS_REVIEWER_MAX_TOKENS without a code change.
+    """
+    return int(os.environ.get("LAPIS_REVIEWER_MAX_TOKENS", "65536"))
+
+
 # ---------------------------------------------------------------------------
 # Lifted verbatim from scripts/reviewer_spike.py (PR #93 — authoritative)
 # ---------------------------------------------------------------------------
@@ -305,15 +319,18 @@ def run_local_reviewer_witness(
         body: dict = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            # 16,384 (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling
-            # 2026-09-01): thinking stays ON — the deliberation is the function
-            # the reviewer legs exist for. The 4096 budget starved the
-            # reasoning channel before the JSON ever started (arm A,
-            # 2026-09-01); arm F1 measured 12,847 reasoning tokens on the
-            # identical production shape at a 16,384 budget, finishing with
-            # finish_reason=stop and valid verdict JSON. Still a runaway guard
-            # (1/16 of the seat's 262k context), now correctly sized.
-            "max_tokens": 16384,
+            # max_tokens: _default_max_tokens() (Erah ruling 2026-09-19:
+            # raised 16384 -> 65536, tunable via LAPIS_REVIEWER_MAX_TOKENS).
+            # Thinking stays ON — the deliberation is the function the reviewer
+            # legs exist for. The prior 16,384 cap (lapis-pm-panel-leg-
+            # survival-v0 rev 4) starved the reasoning channel on HARD reviews:
+            # arm F1 (2026-09-01) measured 12,847 reasoning tokens on a SIMPLE
+            # production shape, barely finishing at the 16,384 cap; a hard
+            # review (e.g. a 13-file PR) exceeds it -> finish_reason=length ->
+            # the leg fails (json_valid:False). 65536 is 1/4 of the seat's
+            # 262k context — still a runaway guard, now sized for real
+            # deliberation.
+            "max_tokens": _default_max_tokens(),
         }
         if model is not None:
             body["model"] = model

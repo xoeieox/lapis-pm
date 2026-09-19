@@ -277,13 +277,17 @@ _CONNECT_TIMEOUT = 5  # seconds connect cap on POST (read budget preserved at _L
 # A runaway guard, not a size estimate: too-small silently corrupts every call by
 # starving a thinking model's reasoning channel before it reaches an answer (the
 # root cause this unit repairs), too-large only costs when a model actually reaches
-# it. 16,384 (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling 2026-09-01):
-# thinking stays ON; arm F1 measured 12,847 reasoning tokens on the worst-case
-# production shape at this budget, finishing with finish_reason=stop and valid
-# JSON. 1/16 of the seat's 262k context — still a guard, now correctly sized.
-# Shared body: node1 rides it and node2/Phala rides it too (16k is within that
-# substrate's capacity — arm E completed at 125 tokens).
-_MAX_TOKENS = 16384
+# it. 65,536 (Erah ruling 2026-09-19, tunable via LAPIS_REVIEWER_MAX_TOKENS):
+# thinking stays ON; the 27B deliberates longer than the prior 16,384 cap on
+# hard reviews — arm F1 (2026-09-01) measured 12,847 reasoning tokens on a
+# SIMPLE production shape at the 16,384 budget, barely finishing; a hard
+# review (e.g. a 13-file PR) exceeds it -> finish_reason=length -> failed leg.
+# 1/4 of the seat's 262k context — still a guard, now sized for real
+# deliberation. Shared body: node1 rides it and node2/Phala rides it too (the
+# budget is within the TEE substrate's capacity — arm E completed at 125
+# tokens). Read at import time (module constant); the daemon is timer-fired
+# (fresh process per tick) so a config change + env is picked up each tick.
+_MAX_TOKENS = int(os.environ.get("LAPIS_REVIEWER_MAX_TOKENS", "65536"))
 
 # Node 2 — Phala TEE through the SANCTIONED verifying client
 # (lapis-pm-reviewer-leg-repair-v0, D2; I2: no direct LLM API calls).
@@ -608,11 +612,11 @@ class LapisPMReviewerAdapter:
             body: dict = {
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
-                # max_tokens 16384 (lapis-pm-panel-leg-survival-v0 rev 4):
-                # thinking stays ON — the deliberation is the function the
-                # reviewer legs exist for (Erah ruling 2026-09-01). No
-                # chat_template_kwargs field: the rev-3 thinking-disable design
-                # is void; no leg sends it.
+                # max_tokens: _MAX_TOKENS (65536 default, tunable via
+                # LAPIS_REVIEWER_MAX_TOKENS; Erah ruling 2026-09-19): thinking
+                # stays ON — the deliberation is the function the reviewer legs
+                # exist for. No chat_template_kwargs field: the rev-3
+                # thinking-disable design is void; no leg sends it.
                 "max_tokens": _MAX_TOKENS,
             }
             if node_model:

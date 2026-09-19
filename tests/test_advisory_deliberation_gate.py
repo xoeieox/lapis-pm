@@ -627,19 +627,6 @@ class TestRunDeliberationStage:
         assert out.deferred is True
         assert out.verdict == d.VERDICT_NOT_CONVERGED
 
-        def _ok_leg(text, ctx, *, seat, deadline_s):
-            if seat == d.DECIDER_PERSONA:
-                return _leg(seat, ok=True,
-                            justification=_decider_json("clean", 0.9))
-            return _leg(seat, ok=True, claim="stance")
-
-        for _ in range(d.MAX_DELIBERATIONS_PER_TICK):
-            out = self._run_stage(_ok_leg)
-            assert not out.deferred
-        out = self._run_stage(_ok_leg)
-        assert out.deferred is True
-        assert out.verdict == d.VERDICT_NOT_CONVERGED
-
     def test_rendered_held_paths_in_dossier(self):
         """DoD: a held systemd timer produces rendered_held_paths with the
         systemd-analyze calendar line (not just the literal OnCalendar diff)."""

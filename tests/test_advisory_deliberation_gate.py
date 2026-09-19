@@ -346,9 +346,11 @@ class TestActBriefDeliberationGate:
         assert "brief_emitted" in result
         assert "advisory_clean" in result
         mock_merge.assert_not_called()
-        # PR marked classified (no re-deliberation next tick).
+        # PR marked classified (no re-deliberation next tick). Called at
+        # least once with the right args (the hook's finalize arm and the
+        # terminal brief path both mark it; idempotent).
         classified = [p for p in self._BASE if p[0].endswith("_mark_pr_classified")][0][1]
-        classified.assert_called_once_with("my-target", 42)
+        classified.assert_any_call("my-target", 42)
         # Dossier persisted.
         assert any(k.startswith("decision/dossier/") for k in mem._data)
         # No adjudication row (no merge happened).

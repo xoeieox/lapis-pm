@@ -846,7 +846,9 @@ def run_deliberation_stage(*, target_id: str, pr_number: int, cls,
                             "reached - deferred to next tick",
         )
 
-    invoker = run_leg or _invoke_seam
+    # `run_leg` is an injectable seam-invocation override (test hook); the
+    # default is the real Facets seam via _invoke_seam.
+    invoker = run_leg if run_leg is not None else _invoke_seam
 
     # --- FOR leg ---
     for_text = build_leg_text(side=FOR_PERSONA, target_id=target_id,

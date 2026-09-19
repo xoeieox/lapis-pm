@@ -611,18 +611,9 @@ class TestRunDeliberationStage:
         consume a leg invocation; the leg stub is only exercised to prove
         the bound (not the legs) is what deferred the outcome.
 
-        The per-tick counter is module state shared across tests - reset it
-        (and restore it on exit) so the bound is measured from a clean
+        The per-tick counter is module state shared across tests - the
+        autouse _isolate_tick_counter fixture starts each test at a clean
         tick."""
-        prior = d._tick_deliberation_count
-        d.reset_tick_deliberation_count()
-        try:
-            self._per_tick_bound_body()
-        finally:
-            d.reset_tick_deliberation_count()
-            d._tick_deliberation_count = prior
-
-    def _per_tick_bound_body(self):
         def _ok_leg(text, ctx, *, seat, deadline_s):
             if seat == d.DECIDER_PERSONA:
                 return _leg(seat, ok=True,

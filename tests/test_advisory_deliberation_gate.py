@@ -539,13 +539,15 @@ class TestRunDeliberationStage:
     def test_happy_converged(self):
         def _leg_fn(text, ctx, *, seat, deadline_s):
             if seat == d.DECIDER_PERSONA:
-                return _leg(seat, justification=_decider_json("clean", 0.9))
-            return _leg(seat, claim="stance", citations=[f"{seat}.py:1 x"])
+                return _leg(seat, justification=_decider_json("clean", 0.9),
+                            deliberation_id="del-decider")
+            return _leg(seat, claim="stance", citations=[f"{seat}.py:1 x"],
+                        deliberation_id=f"del-{seat}")
 
         out = self._run_stage(_leg_fn)
         assert out.verdict == d.VERDICT_CONVERGED
         assert out.confidence == 0.9
-        assert out.deliberation_id is not None
+        assert out.deliberation_id == "del-decider"
 
     def test_for_leg_failure_blocked(self):
         def _leg_fn(text, ctx, *, seat, deadline_s):

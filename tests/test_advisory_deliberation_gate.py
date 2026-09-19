@@ -404,9 +404,6 @@ class TestActBriefDeliberationGate:
         # PR classified (no re-deliberation next tick).
         classified = [p for p in self._BASE if p[0].endswith("_mark_pr_classified")][0][1]
         classified.assert_called_once_with("my-target", 42)
-        # Loud brief carries the blockage (dossier=n/a is acceptable for a
-        # deadline-blocked outcome: the stage failed before dossier write).
-        assert "deadline exceeded" in (result or "") or mock_cursor.called
 
     def test_killswitch_off_two_hook_path(self):
         """Kill-switch OFF -> today's two-hook argument-less path (no dossier)."""

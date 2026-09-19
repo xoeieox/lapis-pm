@@ -7606,6 +7606,24 @@ def _delib_blocked_fallback(target_id: str, cls: authority.PRClassification,
             def converged(self):
                 return False
         outcome = _StandIn()
+        # Fail-closed loud-brief arm (spec: a failed deliberation is a loud
+        # brief, never a skipped gate). The module is unavailable so no
+        # dossier can be written (the brief renders dossier=n/a); still
+        # record the blockage episodically and mark the PR classified so
+        # the blocked state is observable and does not re-fire every tick.
+        try:
+            episodic.write_observation(
+                target_id,
+                f"advisory-deliberation-gate: blocked "
+                f"(deliberation module unavailable: {exc}) — NO merge; "
+                f"loud brief",
+                extra_tags=["pm:deliberation-gate:blocked",
+                            f"pm:pr={cls.pr_number}"],
+            )
+        except Exception as _obs_exc:
+            logger.warning(
+                "deliberation-gate: fallback observation failed for %s: %s",
+                target_id, _obs_exc)
         _mark_pr_classified(target_id, cls.pr_number)
         return outcome
     outcome = _delib.DeliberationOutcome(

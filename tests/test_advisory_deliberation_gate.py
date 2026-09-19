@@ -215,6 +215,13 @@ class TestActBriefDeliberationGate:
         ("lapis_pm.pm_core._mark_pr_classified", MagicMock()),
     ]
 
+    # The auto-resolve predicate is deterministic (no LLM) and reads the
+    # real store; the DoD (a) contract is that the MERGE fires on a
+    # converged_clean dossier, so pin the predicate to pass and prove the
+    # merge is driven by the gate, not by incidental screen state.
+    _AR_PATCH = ("lapis_pm.auto_resolve.should_auto_resolve",
+                 (True, ""))
+
     def _make_payload(self, cls):
         return {"classification": cls}
 

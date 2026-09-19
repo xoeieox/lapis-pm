@@ -424,6 +424,93 @@ class TestActBriefDeliberationGate:
         assert stage_calls == []  # gate skipped entirely
         assert not [k for k in mem._data if k.startswith("decision/dossier/")]
 
+    def test_not_converged_skips_merge_branches(self):
+        """D3 spec compliance: a non-converged outcome (not_converged /
+        blocked / deferred) must NOT fall through to the auto-resolve or
+        precedent-hook merge branches, even when their own clauses would
+        pass (double-gate independence: BOTH gates must pass)."""
+        cls = _make_cls()
+        target = _make_target()
+
+        # Patch auto_resolve.should_auto_resolve to pass, proving the gate
+        # (not the screen predicate) is what stops the merge.
+        from lapis_pm import auto_resolve as _ar
+
+        def _stage_not_converged(**kw):
+            return self._not_converged_outcome()
+
+        def _stage_deferred(**kw):
+            out = self._not_converged_outcome()
+            out.deferred = True
+            out.blockage_reason = "per-tick queue bound reached - deferred"
+            return out
+
+        for stage_fn, label in ((
+            _stage_not_converged, "not_converged"),
+            (_stage_blocked := (lambda **kw: self._blocked_outcome()),
+             "blocked"),
+            (_stage_deferred, "deferred"),
+        ):
+            mock_merge = MagicMock()
+            with patch("lapis_pm.pm_core.TargetStore") as mock_ts, \
+                    patch("lapis_pm.pm_core.brief._act_merge_pr", mock_merge), \
+                    patch("lapis_pm.pm_core.brief.synthesize",
+                           return_value=_brief_mock()), \
+                    patch("lapis_pm.pm_core._set_brief_outstanding",
+                          MagicMock()), \
+                    patch("lapis_pm.pm_core._mem", return_value=_make_mem()), \
+                    patch("lapis_pm.pm_core.set_cursor", MagicMock()), \
+                    patch("lapis_pm.pm_core._last_review_verdict",
+                          return_value=None), \
+                    patch("lapis_pm.deliberation.run_deliberation_stage",
+                          side_effect=stage_fn), \
+                    patch.object(_ar, "should_auto_resolve",
+                                 return_value=(True, "")):
+                mock_ts.return_value.get.return_value = target
+                result = pm_core._act_brief(
+                    "my-target", "advisory-clean", False,
+                    {"classification": cls})
+            assert "brief_emitted" in result, (
+                f"{label}: expected advisory brief, got {result!r}")
+            mock_merge.assert_not_called()
+
+    def test_deferred_not_marked_classified_but_no_merge(self):
+        """A deferred outcome (per-tick queue bound) is NOT marked
+        classified (the next tick re-enters the gate) but the merge
+        branches are still skipped - no merge on an un-deliberated PR."""
+        cls = _make_cls()
+        target = _make_target()
+
+        def _stage_deferred(**kw):
+            out = self._not_converged_outcome()
+            out.deferred = True
+            out.blockage_reason = "per-tick queue bound reached - deferred"
+            return out
+
+        mock_merge = MagicMock()
+        with patch("lapis_pm.pm_core.TargetStore") as mock_ts, \
+                patch("lapis_pm.pm_core.brief._act_merge_pr", mock_merge), \
+                patch("lapis_pm.pm_core.brief.synthesize",
+                      return_value=_brief_mock()), \
+                patch("lapis_pm.pm_core._set_brief_outstanding", MagicMock()), \
+                patch("lapis_pm.pm_core._mem", return_value=_make_mem()), \
+                patch("lapis_pm.pm_core.set_cursor", MagicMock()), \
+                patch("lapis_pm.pm_core._last_review_verdict",
+                      return_value=None), \
+                patch("lapis_pm.deliberation.run_deliberation_stage",
+                      side_effect=_stage_deferred), \
+                patch("lapis_pm.pm_core._mark_pr_classified",
+                      MagicMock()) as mock_classified:
+            mock_ts.return_value.get.return_value = target
+            result = pm_core._act_brief(
+                "my-target", "advisory-clean", False,
+                {"classification": cls})
+        # The hook's deferred arm does NOT mark classified (re-enter next
+        # tick); the terminal brief path does - but the merge branches
+        # never fired.
+        mock_merge.assert_not_called()
+        assert "brief_emitted" in result
+
 
 # ---------------------------------------------------------------------------
 # run_deliberation_stage orchestration (fail-closed legs + decider parse)

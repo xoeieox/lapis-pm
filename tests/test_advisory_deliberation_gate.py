@@ -26,7 +26,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lapis_pm import deliberation as d
+from lapis_pm import pm_core
 from lapis_pm import state_brief as sb
+
+
+def _brief_mock():
+    b = MagicMock()
+    b.comment_id = "brief-001"
+    b.synthesis_failed = False
+    return b
 
 
 # ---------------------------------------------------------------------------

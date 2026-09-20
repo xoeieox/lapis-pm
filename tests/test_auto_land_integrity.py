@@ -31,6 +31,7 @@ surfaces are monkeypatched.
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -82,6 +83,21 @@ def _patch_target_store(store_get: dict[str, MagicMock] | None = None):
     return patch("lapis_pm.pm_core.TargetStore", return_value=mock_store)
 
 
+def _patch_mem():
+    """Patch _mem() at the level production actually gates on.
+
+    _is_auto_land_eligible's first gate is ``_mem().get(_landed_key(tid))``
+    (pm_core.py:5426). Patching ``pm_core._mem`` and setting
+    ``mem.get.return_value`` is the wrong MagicMock level: the patched
+    function's return value is a fresh MagicMock on each call whose
+    ``.get`` is not the mock's ``.get`` attribute. Patch ``_mem`` so it
+    RETURNS a mock store whose ``.get`` returns None (no pm/landed entry).
+    """
+    mock_store = MagicMock()
+    mock_store.get.return_value = None
+    return patch("lapis_pm.pm_core._mem", return_value=mock_store)
+
+
 # ---------------------------------------------------------------------------
 # T1-T4, T11, T12 — _is_auto_land_eligible (AC3)
 # ---------------------------------------------------------------------------
@@ -108,13 +124,12 @@ class TestEligibilityPoisonedStreams:
         open_prs = [_pr(933, f"lapis/{tid}/fix")]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             patch("lapis_pm.pm_core.get_open_prs", return_value=open_prs),
             _patch_target_store({tid: _target(tid, pm_repo="lapis-test")}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._orphan_provenance_pr_ids(tid) == {963}
             assert pm_core._is_auto_land_eligible(tid) is False
 
@@ -130,12 +145,11 @@ class TestEligibilityPoisonedStreams:
         ]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             _patch_target_store({tid: _target(tid, pm_repo="lapis-test")}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._orphan_provenance_pr_ids(tid) == set()
             assert pm_core._is_auto_land_eligible(tid) is False
 
@@ -155,7 +169,7 @@ class TestEligibilityPoisonedStreams:
         ]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             patch("lapis_pm.pm_core._repo_owner", return_value=("coderag", "lapis")),
             patch("lapis_pm.pm_core._forgejo_get_pr",
@@ -168,7 +182,6 @@ class TestEligibilityPoisonedStreams:
                                               data={"pr_count": 1})}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._is_auto_land_eligible(tid) is True
 
     def test_t4_multi_pr_one_poisoned_reduces_set(self):
@@ -190,7 +203,7 @@ class TestEligibilityPoisonedStreams:
         ]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             patch("lapis_pm.pm_core._repo_owner", return_value=("agents-core", "lapis")),
             patch("lapis_pm.pm_core._forgejo_get_pr",
@@ -203,7 +216,6 @@ class TestEligibilityPoisonedStreams:
                                               data={"pr_count": 1})}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._orphan_provenance_pr_ids(tid) == {317}
             assert pm_core._is_auto_land_eligible(tid) is True
 
@@ -223,12 +235,11 @@ class TestEligibilityPoisonedStreams:
         ]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             _patch_target_store({tid: _target(tid, pm_repo="lapis-test")}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._orphan_provenance_pr_ids(tid) == {99}
             assert pm_core._is_auto_land_eligible(tid) is False
 
@@ -250,12 +261,11 @@ class TestEligibilityPoisonedStreams:
         ]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             _patch_target_store({tid: _target(tid, pm_repo="lapis-test")}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._orphan_provenance_pr_ids(tid) == {963}
             assert pm_core._is_auto_land_eligible(tid) is False
 
@@ -269,14 +279,14 @@ class TestEligibilityPoisonedStreams:
         tid = "adopted-after-poison-target"
         comments = [
             _comment(["pm:observation", "pm:orphan-untraceable",
-                      "pm:orphan-pr=963", "pm:brief=cid-2"],
+                      "pm:orphan-pr=963", "pm:pr=963", "pm:brief=cid-2"],
                      ts="2026-09-12T09:00:00"),
             _comment(["pm:observation", "pm:pr-merged:963"],
                      ts="2026-09-12T10:00:00"),
         ]
         with (
             patch("lapis_pm.pm_core.episodic") as ep,
-            patch("lapis_pm.pm_core._mem") as mem,
+            _patch_mem(),
             patch("lapis_pm.pm_core._has_pending_dispatch", return_value=False),
             patch("lapis_pm.pm_core._repo_owner", return_value=("coderag", "lapis")),
             patch("lapis_pm.pm_core._forgejo_get_pr",
@@ -290,7 +300,6 @@ class TestEligibilityPoisonedStreams:
                                                     "pr_count": 1})}),
         ):
             ep.all_comments.return_value = comments
-            mem.get.return_value = None
             assert pm_core._orphan_provenance_pr_ids(tid) == set()
             assert pm_core._is_auto_land_eligible(tid) is True
 
@@ -520,6 +529,7 @@ class TestPreSelectionDivert:
 
 class TestUntraceableOrphanObservationTags:
 
+    @contextlib.contextmanager
     def _patched(self, ep, brief_mod, tid="orphan-target",
                  pr_number=963, head="backstop/deviant"):
         """Common patch set for _reconcile_orphan_prs with one untraceable PR."""
@@ -527,6 +537,7 @@ class TestUntraceableOrphanObservationTags:
               "body": "no markers here", "created_at": "2026-09-12T09:00:00Z"}
         b = MagicMock()
         b.comment_id = "cid-963"
+        brief_mod.synthesize.return_value = b
         with (
             patch("lapis_pm.pm_core.brief", brief_mod),
             patch("lapis_pm.pm_core.episodic", ep),
@@ -557,7 +568,7 @@ class TestUntraceableOrphanObservationTags:
 
         # Exactly one observation written; tags carry pm:orphan-pr, not pm:pr.
         assert ep.write_observation.call_count == 1
-        _, args, call_kwargs = ep.write_observation.call_args
+        call_kwargs = ep.write_observation.call_args.kwargs
         tags = call_kwargs["extra_tags"]
         assert "pm:orphan-untraceable" in tags
         assert "pm:orphan-pr=963" in tags
@@ -582,7 +593,7 @@ class TestUntraceableOrphanObservationTags:
             pm_core._reconcile_orphan_prs(tid, target, "lapis-test", [pr])
 
         assert ep.write_observation.call_count == 1
-        _, args, call_kwargs = ep.write_observation.call_args
+        call_kwargs = ep.write_observation.call_args.kwargs
         tags = call_kwargs["extra_tags"]
         assert "pm:orphan-adopted" in tags
         assert "pm:pr=970" in tags
@@ -669,7 +680,11 @@ class TestEncodeMergedPrsGate:
             ep.all_comments.return_value = base_stream + [skip_comment]
             new_obs = pm_core._encode_merged_prs(tid, "lapis/testrepo")
 
-        assert new_obs == 0
+        # new_obs counts only newly written pm:pr-merged observations: the
+        # skip observation is NOT a merge observation, so even though one
+        # observation (314's) was written, new_obs == 1 and the skip count
+        # below is what the de-dup contract pins.
+        assert new_obs == 1
         # Only the clean PR (314) was encoded; the skip was NOT re-emitted.
         written_tags = [
             c.kwargs.get("extra_tags") or c.args[2]

@@ -26,6 +26,14 @@ Decision taxonomy (see README.md § "Tick Decision Taxonomy"):
           | action:directive_brief:cid=CID | action:abandon_brief:cid=CID | ...
   Skip:   skipped=True reason=(target not found|target not pm_bound|paused
           |forgejo_unreachable|ratelimit|cursor_locked)
+
+  Pre-selection skips (lapis-pm-auto-land-integrity-v0, AC4): internal to
+  tick_all's auto-land slot selection — a slot-eligible target may be
+  excluded from winning the slot when tick() would divert it before the
+  auto-land branch (non-productive noop/skip diverts). Named reasons are
+  `divert:open-own-pr`, `divert:open-adopted-pr`, `divert:lost-fixers-retry`,
+  `divert:lost-fixers-brief`. These are journal log lines only (logger.info),
+  NOT per-target decision strings — no new decision tags exist.
 """
 
 from __future__ import annotations
@@ -5212,9 +5220,28 @@ def _encode_merged_prs(target_id: str, repo: str) -> int:
         return 0
     seen = _seen_pr_ids(target_id)
     already_noted = _merged_pr_numbers_observed(target_id)
+    # AC2 (lapis-pm-auto-land-integrity-v0): defense-in-depth — refuse to
+    # encode a pm:pr-merged observation for a PR whose stream provenance says
+    # the target does not own it. Even if a future writer regresses AC1, the
+    # merge observation (the load-bearing one) is gated here.
+    orphan_prov = _orphan_provenance_pr_ids(target_id)
     new_obs = 0
     repo_name, owner = _repo_owner(repo)
     for pr_num in sorted(seen - already_noted):
+        if pr_num in orphan_prov:
+            # One named skip observation per (target, N) — de-duped by exact
+            # tag (the established one-shot pattern, cf.
+            # pm:auto-land:waiting:count={pr_count}) so it does not spam
+            # every tick and each distinct N is auditable.
+            skip_tag = f"pm:encode-skipped:orphan-provenance:pr={pr_num}"
+            if not _has_tag_in_stream(target_id, skip_tag):
+                episodic.write_observation(
+                    target_id,
+                    f"skipped pm:pr-merged encoding for PR #{pr_num}: "
+                    "orphan-provenance in stream (target does not own this PR)",
+                    extra_tags=["pm:encode-skipped", skip_tag],
+                )
+            continue
         try:
             pr_data = _forgejo_get_pr(repo_name, pr_num, owner=owner)
         except Exception:
@@ -5247,6 +5274,82 @@ def _has_auto_land_waiting_comment(target_id: str, pr_count: int) -> bool:
     return False
 
 
+def _has_tag_in_stream(target_id: str, tag: str) -> bool:
+    """Return True if any comment in the target's stream carries *tag* exactly."""
+    for c in episodic.all_comments(target_id):
+        if tag in c.tags:
+            return True
+    return False
+
+
+def _orphan_provenance_pr_ids(target_id: str) -> set[int]:
+    """PR numbers N whose stream provenance says the target does NOT own N.
+
+    (lapis-pm-auto-land-integrity-v0, AC3) A comment carries orphan
+    provenance when its tags include EITHER:
+      (i) ``pm:orphan-untraceable`` AND (``pm:pr=N`` (legacy shape written by
+          the pre-AC1 untraceable-orphan branch) OR ``pm:orphan-pr=N`` (the
+          AC1 post-fix shape — required so streams written across the fix
+          boundary stay excluded)), OR
+      (ii) ``pm:reconcile-verify-failure`` AND ``pm:pr=N`` (the second
+          not-owned write site: TargetStore read failure leaves ownership
+          UNVERIFIED, and the tag asserted it anyway).
+
+    Ownership-transfer carve-out: N is then DROPPED when the target has since
+    ratified ownership of N — ``target.data["adopted_pr_number"] == N``, or a
+    comment tagged ``pm:orphan-adopted`` + ``pm:pr=N`` with ts later than the
+    poison comment (the episodic store is append-only; a poison comment
+    outlives any later human-ratified adoption, and a ratified transfer must
+    beat the poison or the target wedges ineligible forever).
+
+    Own stream only. Cost: one full all_comments scan per call (O(stream-
+    length); measured streams 17-171 lines today — millisecond-scale).
+    """
+    # Pass 1: collect adoption timestamps (pm:orphan-adopted + pm:pr=N).
+    adopt_ts: dict[int, str] = {}
+    for c in episodic.all_comments(target_id):
+        if "pm:orphan-adopted" not in c.tags:
+            continue
+        for t in c.tags:
+            if t.startswith("pm:pr="):
+                try:
+                    n = int(t.split("=", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+                # Latest adoption ts wins (string compare on ISO works).
+                prev = adopt_ts.get(n)
+                if prev is None or c.ts > prev:
+                    adopt_ts[n] = c.ts
+
+    # Pass 2: collect poison (n, ts) pairs; a poison comment is excluded when
+    # a later ratified adoption of the same N exists (ownership transfer
+    # beats poison).
+    out: set[tuple[int, str]] = set()
+    for c in episodic.all_comments(target_id):
+        if not ("pm:orphan-untraceable" in c.tags
+                or "pm:reconcile-verify-failure" in c.tags):
+            continue
+        for t in c.tags:
+            if t.startswith("pm:pr=") or t.startswith("pm:orphan-pr="):
+                try:
+                    n = int(t.split("=", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+                if adopt_ts.get(n, "") > c.ts:
+                    continue
+                out.add((n, c.ts))
+    if not out:
+        return set()
+
+    # Pass 3: adopted_pr_number carve-out (needs TargetStore).
+    try:
+        target = TargetStore().get(target_id)
+        adopted = target.data.get("adopted_pr_number") if target else None
+    except Exception:
+        adopted = None
+    return {n for n, _ts in out if not (adopted is not None and n == adopted)}
+
+
 def _reconcile_surviving_head_branch(target_id: str, repo: str) -> None:
     """Delete a merged PR's surviving head branch so auto-land can proceed.
 
@@ -5260,7 +5363,10 @@ def _reconcile_surviving_head_branch(target_id: str, repo: str) -> None:
     """
     if not repo:
         return
-    merged = _merged_pr_numbers_observed(target_id)
+    # AC3 extension (lapis-pm-auto-land-integrity-v0): probe the most-recently
+    # merged OWN PR — the orphan-provenance reduction keeps a poisoned number
+    # from being probed as if it were the target's.
+    merged = _merged_pr_numbers_observed(target_id) - _orphan_provenance_pr_ids(target_id)
     if not merged:
         return
     pr_num = max(merged)
@@ -5292,7 +5398,13 @@ def _is_pr_merged(target_id: str, pr_num: int) -> bool:
     try:
         repo_name, owner = _repo_owner(target.pm_repo)
         pr_data = _forgejo_get_pr(repo_name, pr_num, owner=owner)
-        return (pr_data.get("state") or "") == "merged"
+        # AC5 (lapis-pm-auto-land-integrity-v0): the Forgejo API NEVER returns
+        # state == "merged" — merged PRs are state "closed" with merged_at set
+        # (verified live on 7 merged PRs 2026-09-12). The old predicate
+        # therefore always returned False for live-merged PRs, and any merge
+        # known only via the live check failed the final eligibility gate.
+        # merged_at is an ISO timestamp set by Forgejo only on merge.
+        return bool(pr_data.get("merged_at"))
     except Exception:
         return False
 
@@ -5315,8 +5427,16 @@ def _is_auto_land_eligible(target_id: str) -> bool:
         return False
     if _has_pending_dispatch(target_id):
         return False
-    seen = _seen_pr_ids(target_id)
-    merged = _merged_pr_numbers_observed(target_id)
+    # AC3 (lapis-pm-auto-land-integrity-v0): reduce the seen/merged sets by
+    # the orphan-provenance set before EVERY gate below (max(seen) ==
+    # max(merged), len(merged) >= pr_count, branch-deletion max(merged), and
+    # the final _is_pr_merged call). A poisoned stream (pm:pr=N /
+    # pm:reconcile-verify-failure for a not-owned N) must not falsify
+    # eligibility, and an empty reduced merged set falls out of the existing
+    # `if not merged or not seen` gate below — no new branch.
+    orphan_prov = _orphan_provenance_pr_ids(target_id)
+    seen = _seen_pr_ids(target_id) - orphan_prov
+    merged = _merged_pr_numbers_observed(target_id) - orphan_prov
     if not merged or not seen:
         return False
     # Guard: a newer (higher-numbered) open PR must not exist
@@ -5357,6 +5477,92 @@ def _is_auto_land_eligible(target_id: str) -> bool:
     return _is_pr_merged(target_id, max(merged))
 
 
+def _diverts_before_auto_land(
+    target_id: str,
+    target,
+    open_prs_for_repo: list[dict],
+    forgejo_ok: bool,
+) -> str | None:
+    """Return a named reason if tick() would divert this target before the
+    auto-land branch, else None.
+
+    (lapis-pm-auto-land-integrity-v0, AC4) Pre-selection must predict the
+    decide path: a target that would consume its slot on a non-productive
+    noop/skip (open own PR, lost-fixers) must not win the single auto-land
+    slot and starve genuinely landable targets. Mirrors the paused-exclusion
+    precedent — pre-selection already accepts "must predict the decide path".
+
+    Conditions (ANY → divert; rev-2: the failed-dispatch condition was DROPPED
+    — a pre-selection slot winner has no pending dispatch by construction, so
+    the failed branch is unreachable inside its own tick, and the stale-record
+    form would be a permanent false positive):
+      (a) an open own/adopted PR (diverts at the `elif open_prs:` branch):
+          head ref on the target's canonical prefix (_branch_belongs), OR
+          number == adopted_pr_number, OR head == adopted_head_branch
+          (superset: tick's _perceive_prs matches adopted PRs by NUMBER).
+      (b) a lost-fixers state that tick() would actually classify as lost:
+          the SAME classifier tick() uses (_find_lost_fixer_dispatches) with
+          the same inputs — load_dispatched records, target-scoped open PRs
+          (same filter as _perceive_prs), the cycle's forgejo_ok, and
+          merged_pr_nums computed exactly as tick() computes it. Raw
+          _lost_all_records membership is NOT the condition: the classifier
+          has escape hatches and records persist indefinitely.
+
+    Fail-soft: forgejo_ok=False → no divert info (returns None); this helper
+    never raises out of tick_all.
+    """
+    # (a) open own/adopted PR.
+    adopted_num = target.data.get("adopted_pr_number") if target else None
+    adopted_head = (target.data.get("adopted_head_branch") or "") if target else ""
+    for pr in open_prs_for_repo:
+        head = (pr.get("head") or {}).get("ref") or ""
+        if _branch_belongs(target_id, head):
+            return "divert:open-own-pr"
+        if adopted_num is not None and pr.get("number") == adopted_num:
+            return "divert:open-adopted-pr"
+        if adopted_head and head == adopted_head:
+            return "divert:open-adopted-pr"
+
+    # (b) lost-fixers classification — only meaningful when Forgejo was
+    # reachable (the classifier itself returns ([], []) when not).
+    if not forgejo_ok:
+        return None
+    try:
+        records = load_dispatched(target_id)
+    except Exception:
+        return None
+    target_open_prs = [
+        pr for pr in open_prs_for_repo
+        if _branch_belongs(target_id, (pr.get("head") or {}).get("ref") or "")
+        or (adopted_num is not None and pr.get("number") == adopted_num)
+    ]
+    # merged_pr_nums exactly as tick() computes it (~11470-11480): one
+    # _is_pr_merged call per distinct fixer_retry pr_number.
+    merged_pr_nums: set[int] = set()
+    retry_pr_nums = sorted({
+        r.get("pr_number") for r in records
+        if r.get("agent_type") == "fixer_retry" and r.get("pr_number") is not None
+    })
+    for pn in retry_pr_nums:
+        try:
+            if _is_pr_merged(target_id, pn):
+                merged_pr_nums.add(pn)
+        except Exception:
+            pass
+    try:
+        needs_retry, needs_brief = _find_lost_fixer_dispatches(
+            target_id, records, target_open_prs, forgejo_ok,
+            merged_pr_nums=merged_pr_nums,
+        )
+    except Exception:
+        return None
+    if needs_retry:
+        return "divert:lost-fixers-retry"
+    if needs_brief:
+        return "divert:lost-fixers-brief"
+    return None
+
+
 def _spec_bound_ts(target_id: str) -> str:
     """Return ts of the spec:bound comment (proxy for bind time); used for sorting."""
     for c in episodic.all_comments(target_id):
@@ -5374,7 +5580,11 @@ def _act_auto_land(target_id: str) -> str:
     """
     from . import land as land_module
 
-    merged = _merged_pr_numbers_observed(target_id)
+    # AC3 extension (lapis-pm-auto-land-integrity-v0): the landed attribution
+    # (pm/landed entry, audit comment, close_resolved_debt resolved_by_pr)
+    # must name the target's OWN most-recently-merged PR — the
+    # orphan-provenance reduction keeps a poisoned number out of the record.
+    merged = _merged_pr_numbers_observed(target_id) - _orphan_provenance_pr_ids(target_id)
     pr_num = max(merged) if merged else 0
     merged_at = _merged_at_for_pr(target_id, pr_num)
     landed_at = _now_iso()
@@ -6982,10 +7192,17 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
             )
             _set_brief_outstanding(target_id, b)
 
+            # AC1 (lapis-pm-auto-land-integrity-v0): the untraceable-orphan
+            # observation must NOT assert ownership via pm:pr=N — that tag is
+            # the "this target owns/saw this PR" assertion that _seen_pr_ids
+            # reconstructs, and a not-owned PR recorded here poisons the
+            # auto-land eligibility sets (the 2026-09-12 kami-rag starvation).
+            # pm:orphan-pr=N is the non-ownership namespace; AC3's
+            # _orphan_provenance_pr_ids reads it to exclude N from eligibility.
             episodic.write_observation(
                 target_id,
                 f"Orphan PR #{pr_number} on {head} not traceable; raised brief {b.comment_id}",
-                extra_tags=["pm:orphan-untraceable", f"pm:pr={pr_number}", f"pm:brief={b.comment_id}"],
+                extra_tags=["pm:orphan-untraceable", f"pm:orphan-pr={pr_number}", f"pm:brief={b.comment_id}"],
             )
 
 
@@ -11851,11 +12068,61 @@ def tick_all() -> list[TickResult]:
     # target that meets every other auto-land condition would otherwise sort
     # first by oldest bind, win the single slot, and immediately noop:paused —
     # starving every other land-eligible target for as long as it stays paused.
+    #
+    # AC4 (lapis-pm-auto-land-integrity-v0): the same "pre-selection must
+    # predict the decide path" rule is extended to the non-productive divert
+    # branches that precede auto-land in practice: a target with an open
+    # own/adopted PR (diverts at `elif open_prs:`) or a lost-fixers state
+    # tick() would classify as lost (diverts at the _lost_needs_retry /
+    # _lost_needs_brief branches) must not win the slot and consume it on a
+    # noop/skip every cycle (the 2026-09-12 kami-rag slot-hog regression).
+    # Open PRs are fetched ONCE PER DISTINCT REPO for the pre-selection phase
+    # (ADDITIVE — pre-selection fetched ZERO open PRs before this change;
+    # tick()'s per-target fetches inside the loop below are unchanged).
+    # Fail-soft: on Forgejo fetch failure treat as "no divert info" (keep
+    # today's behavior for that target) and log one warning per cycle.
     eligible_ids = sorted(
         [t.id for t in bound if not t.paused and _is_auto_land_eligible(t.id)],
         key=_spec_bound_ts,
     )
-    auto_land_chosen = eligible_ids[0] if eligible_ids else None
+    auto_land_chosen = None
+    if eligible_ids:
+        _open_prs_by_repo: dict[str, tuple[list[dict], bool]] = {}
+
+        def _fetch_open_prs_cached(repo: str) -> tuple[list[dict], bool]:
+            if repo in _open_prs_by_repo:
+                return _open_prs_by_repo[repo]
+            try:
+                repo_name, owner = _repo_owner(repo)
+                prs = get_open_prs(repo_name, owner=owner)
+                result = (prs or [], True)
+            except Exception as e:
+                logger.warning(
+                    "auto-land pre-selection: open-PR fetch failed for repo %s "
+                    "(affected targets: %s); keeping today's selection behavior: %s",
+                    repo, ",".join(eligible_ids), e,
+                )
+                result = ([], False)
+            _open_prs_by_repo[repo] = result
+            return result
+
+        for _tid in eligible_ids:
+            _t = next((t for t in bound if t.id == _tid), None)
+            if _t is None:
+                continue
+            _repo = _t.pm_repo or ""
+            _prs, _ok = _fetch_open_prs_cached(_repo) if _repo else ([], False)
+            _reason = _diverts_before_auto_land(_tid, _t, _prs, _ok)
+            if _reason is not None:
+                # Observability (AC4): one journal line per cycle naming the
+                # diverted target and the named reason. Internal to selection
+                # — NOT a per-target decision string (no new decision tags).
+                logger.info(
+                    "auto-land pre-selection: %s excluded (%s)", _tid, _reason
+                )
+                continue
+            auto_land_chosen = _tid
+            break
 
     results: list[TickResult] = []
     for t in bound:

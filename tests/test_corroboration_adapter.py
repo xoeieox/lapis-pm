@@ -918,7 +918,7 @@ class TestThinkingModelParseAndTruncation:
 
         captured_bodies: list[dict] = []
 
-        def capture_post(url, *, json=None, timeout=None):
+        def capture_post(url, *, json=None, timeout=None, **kw):
             captured_bodies.append(json)
             return MagicMock(status_code=200, json=lambda: llm_resp, raise_for_status=lambda: None)
 
@@ -959,7 +959,7 @@ class TestThinkingModelParseAndTruncation:
 
         call_count = [0]
 
-        def side_effect(url, *, json=None, timeout=None):
+        def side_effect(url, *, json=None, timeout=None, **kw):
             call_count[0] += 1
             return bad_resp if call_count[0] == 1 else good_resp
 

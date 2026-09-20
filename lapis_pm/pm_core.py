@@ -286,6 +286,15 @@ REVIEWER_INFRA_FAIL_REASONS = frozenset({
     # non-run, not a failure — see lapis-pm-reviewer-seat-dead-token-infra-
     # classify-v0 (Unit B).
     "seat_no_tool_calls",
+    # Emitted by the doorman 409 branch (agents_core/gw_agent.py:2630-2637,
+    # the agents-core-doorman-flashnext-handover-v0 D4 repair): another lease
+    # class (creative_occupied / flashnext_occupied) holds the GPU lane, so
+    # the reviewer was refused GPU admission and never ran. Infra non-run,
+    # not a review failure — must not count against the reviewer-attempt
+    # ceiling (design intent: an infra-caused wedge must surface as an infra
+    # pause, never as a "clear-reviewer-attempts" ceiling pause — see
+    # _reviewer_attempt_ceiling_check's docstring).
+    "gw_seat_occupied",
 })
 
 # Forgejo health gate constants

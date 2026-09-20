@@ -366,18 +366,39 @@ class TestIsPrMergedFailConservative:
             assert pm_core._is_pr_merged("t", 106) is False
 
     def test_forgejo_merged_state_returns_true(self):
-        """(e2) Live Forgejo state == 'merged' -> True."""
+        """(e2) Live Forgejo merged_at set -> True.
+
+        AC5 (lapis-pm-auto-land-integrity-v0): the Forgejo API NEVER returns
+        state == "merged" — merged PRs are state "closed" with merged_at set.
+        The old fixture ({"state": "merged"}, no merged_at) pinned the exact
+        broken predicate; the merged_at semantics are the fix.
+        """
         target = MagicMock()
         target.pm_repo = "owner/repo"
         with (
             patch("lapis_pm.pm_core._merged_pr_numbers_observed", return_value=set()),
             patch("lapis_pm.pm_core._forgejo_get_pr",
-                  return_value={"state": "merged"}),
+                  return_value={"state": "closed",
+                                "merged_at": "2026-09-11T12:00:00Z"}),
             patch("lapis_pm.pm_core.TargetStore") as mock_store,
             patch("lapis_pm.pm_core._repo_owner", return_value=("repo", "owner")),
         ):
             mock_store.return_value.get.return_value = target
             assert pm_core._is_pr_merged("t", 106) is True
+
+    def test_forgejo_closed_without_merged_at_returns_false(self):
+        """(e2b, AC5) state closed but merged_at None -> False (not merged)."""
+        target = MagicMock()
+        target.pm_repo = "owner/repo"
+        with (
+            patch("lapis_pm.pm_core._merged_pr_numbers_observed", return_value=set()),
+            patch("lapis_pm.pm_core._forgejo_get_pr",
+                  return_value={"state": "closed", "merged_at": None}),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store,
+            patch("lapis_pm.pm_core._repo_owner", return_value=("repo", "owner")),
+        ):
+            mock_store.return_value.get.return_value = target
+            assert pm_core._is_pr_merged("t", 106) is False
 
     def test_forgejo_open_state_returns_false(self):
         """(e3) Live Forgejo state == 'open' -> False."""

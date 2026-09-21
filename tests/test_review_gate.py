@@ -82,6 +82,10 @@ CLS_AUTO_CLEAN = authority.PRClassification(
 )
 
 ISSUES = [{"severity": "low", "path": "src/foo.py", "note": "missing docstring"}]
+# cr-bundle item df1ac58425: MED issue for the advisory exhaustion tests —
+# the LOW-only sweep-later fork (advisory_brief) must not fire, so the
+# exhausted path escalates with the loud review_exhausted_brief.
+MED_ISSUES = [{"severity": "med", "path": "src/foo.py", "note": "missing test coverage"}]
 
 
 def _make_review_comment(pr_number: int, cycle: int, verdict: str,

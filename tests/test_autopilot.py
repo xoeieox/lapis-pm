@@ -37,6 +37,8 @@ from pathlib import Path
 
 import pytest
 
+from unittest.mock import patch
+
 from lapis_pm import autopilot
 from lapis_pm import node_identity
 from lapis_pm import pm_core

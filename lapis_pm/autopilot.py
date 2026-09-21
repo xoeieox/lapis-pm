@@ -530,12 +530,15 @@ def perceive(target_id: str, *, fetcher=None, now: datetime | None = None) -> Ta
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
 
-    # Pause state + reason.
+    # Pause state + reason. The TARGET STORE's ``target.paused`` flag is the
+    # daemon's pause source of truth (tick() returns ``noop:paused`` from
+    # it); the mem ``pm/pause-state`` key is a MIRROR the daemon writes
+    # during transitions (pm_core.tick's state-transition write), not the
+    # source of truth. Perceive reads BOTH (the target store is primary).
     st.pause_state = pm_core.get_pause_state(target_id)
     st.paused = st.pause_state == "paused"
     try:
-        from agents_core.targets import TargetStore
-        target = TargetStore().get(target_id)
+        target = pm_core.TargetStore().get(target_id)
         if target is not None:
             st.paused = st.paused or bool(target.paused)
             st.paused_reason = target.paused_reason

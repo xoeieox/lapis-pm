@@ -7373,11 +7373,6 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
             )
             _set_brief_outstanding(target_id, b)
 
-            # R3: record the sink key AFTER raising the brief so the next
-            # encountering target (or re-tick) skips. Written only for the
-            # true-untraceable case; the R2 path above writes its own.
-            _record_orphan_pr_sink(repo, pr_number, head, None)
-
             # AC1 (lapis-pm-auto-land-integrity-v0): the untraceable-orphan
             # observation must NOT assert ownership via pm:pr=N — that tag is
             # the "this target owns/saw this PR" assertion that _seen_pr_ids

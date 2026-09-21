@@ -1,0 +1,13 @@
+[Unit]
+Description=Lapis PM - pipeline autopilot (the prodder) timer — 10m cadence (lapis-pm-pipeline-autopilot-v0)
+
+[Timer]
+# The existing 10-minute cadence (the spec: "systemd timer at the existing
+# 10-minute cadence"). Independent of the tick's lifecycle: fires even while a
+# tick pass is hung or dead (the prodder perceives the stalled pipeline and
+# pushes its successor — the missing loop the 2026-09-19 census showed).
+OnUnitActiveSec=600
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

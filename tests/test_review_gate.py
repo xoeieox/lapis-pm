@@ -929,6 +929,10 @@ class TestCycleKProgression:
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+            # The "fixer pushed nothing" guard compares the cycle-3 dispatch
+            # ts against the SHA stream; the fixer's commit (sha3) landed
+            # after it, so the guard passes.
+            patch("lapis_pm.pm_core._pr_advanced_since", return_value=True),
             patch("lapis_pm.pm_core._collect_review_history", return_value=[
                 {"cycle": 1, "verdict": "fixable", "issues": ISSUES},
                 {"cycle": 2, "verdict": "fixable", "issues": ISSUES},

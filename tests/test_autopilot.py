@@ -191,23 +191,48 @@ class TestPauseClassificationMatrix:
         assert autopilot.classify(perceived) == autopilot.STATE_LIMBO
 
     def test_seeded_infra_pause_unblocked_end_to_end(self, mem_store,
-                                                     monkeypatch):
+                                                     monkeypatch, tmp_path):
         """The Canary Test DoD: the seeded infra-pause is unblocked
         end-to-end (state written, no human typing a lapis-pm command). In
         ``on`` mode the sweep clears the paused cycle's record + writes the
         un-pause state; the daemon tick performs the single-leg dispatch next
-        tick under its pending-leg guards (autopilot never dispatches)."""
+        tick under its pending-leg guards (autopilot never dispatches).
+
+        The end-to-end assertion is on the DAEMON-VISIBLE SOURCE OF TRUTH
+        (fixer_retry, reviewer 2026-09-21): the TARGET STORE's
+        ``target.paused`` flag is False after the unblock — NOT merely the
+        mem ``pm/pause-state`` mirror (``content == "active"``). The daemon's
+        tick gates on ``target.paused`` (tick() returns ``noop:paused`` from
+        it); the mem key is a mirror the daemon writes during transitions.
+        An unblock that only flipped the mirror would be a no-op in
+        production."""
         tid, pr = "canary-unblock", 45
         _seed_pr_head(mem_store, tid, pr, "d" * 40)
         _seed_infra_pause(mem_store, tid, pr, reason="gw_seat_occupied")
-        # The target is paused (the daemon auto-paused it).
+        # The target is paused (the daemon auto-paused it): BOTH the mem
+        # mirror and the target-store flag (the daemon's pause source of
+        # truth).
         mem_store.set(pm_core._pause_key(tid), "paused",
                       tags=["lapis-pm", "pause-state"])
+        from agents_core.targets import TargetStore
+        store = TargetStore(tmp_path)
+        target = store.create(target_id=tid, title="canary unblock")
+        target.set_paused(True, reason="reviewer-infra-budget: seeded")
+        target.save()
+        assert target.paused is True
         monkeypatch.setenv(autopilot.AUTOPILOT_ENV, "on")
-        result = autopilot.run_sweep([tid], fetcher=_fetcher_27b(),
-                                     page_sender=lambda **kw: True)
+        with patch("lapis_pm.pm_core.TargetStore",
+                   lambda: TargetStore(tmp_path)):
+            result = autopilot.run_sweep([tid], fetcher=_fetcher_27b(),
+                                         page_sender=lambda **kw: True)
         assert result["mode"] == "on"
-        # The un-pause state is written (the daemon tick reads it next tick).
+        # THE DAEMON-VISIBLE SOURCE OF TRUTH: the target-store paused flag is
+        # False after the unblock (the tick no longer returns noop:paused).
+        reloaded = TargetStore(tmp_path).get(tid)
+        assert reloaded is not None
+        assert reloaded.paused is False
+        # The mem pause-state mirror is also written (the autopilot's own
+        # perception reads it; the daemon writes it during transitions).
         assert mem_store.get(pm_core._pause_key(tid))["content"] == "active"
         # The paused cycle's record is cleared (the counter is gone).
         assert (pm_core._reviewer_attempt_state(tid, pr, 1)["infra_count"]

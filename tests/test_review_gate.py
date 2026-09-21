@@ -914,9 +914,15 @@ class TestCycleKProgression:
         cr-bundle item df1ac58425: the advisory budget is 3, so exhaustion
         requires one full fixer round-trip (reviewer 1 → fixer → reviewer 2)
         plus a follow-up review (reviewer 3) before the loud brief fires."""
-        # Cycle 3 reviewer dispatch record
+        # Cycle 3 reviewer dispatch record. The SHA observation must postdate
+        # the cycle-3 dispatch ts — _pr_advanced_since compares against the
+        # most recent reviewer dispatch (the "fixer pushed nothing" guard),
+        # not cycle 2's.
         reviewer_rec = self._reviewer_dispatch_record(cycle=3, ts="2026-01-01T11:00:00")
         sha_obs = self._sha_observation(42, "sha3", "2026-01-01T11:30:00")
+        # A fixer commit landed after the cycle-2 dispatch (what the guard
+        # actually compares against); kept in the comment stream too.
+        fixer_sha_obs = self._sha_observation(42, "sha2", "2026-01-01T10:30:00")
 
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),

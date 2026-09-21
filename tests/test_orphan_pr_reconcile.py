@@ -544,6 +544,211 @@ class TestReconciliation:
         assert "pm:reconcile-verify-failure" in call_args.kwargs.get("extra_tags", [])
 
 
+class TestOrphanPrAttribution:
+    """Tests for slug-tid orphan attribution (lapis-pm-orphan-pr-attribution-v0).
+
+    R1: slug tid bound (any repo) -> silent skip + pm:orphan-owned-by observation.
+    R2: slug tid unbound -> NO brief; exactly one pm/orphan-pr/<repo>/pr-<n>
+        mem sink key, idempotent across targets and ticks.
+    R3: no lapis/<tid>/ slug -> current single-encountering-target brief,
+        idempotent via the same sink key.
+    R4: traceable-to-self auto-adopt unchanged.
+
+    Hermetic: stubbed TargetStore + stubbed brief.synthesize + a REAL
+    MemoryStore on a tmp_path db (the spec's "real mem keys in a temp dir").
+    """
+
+    def _mem_store(self, tmp_path):
+        from agents_core.mem import MemoryStore
+        return MemoryStore(db_path=tmp_path / "mem.db")
+
+    def test_unbound_slug_tid_no_brief_single_sink_idempotent(self, tmp_path):
+        """R2: orphan PR whose slug tid is UNBOUND raises zero briefs on any
+        encountering target; exactly one pm/orphan-pr/<repo>/pr-<n> mem key;
+        a second target's tick and a re-tick both find the key and do nothing."""
+        ms = self._mem_store(tmp_path)
+        target = MagicMock()
+        target.data = {}
+        pr = {
+            "number": 1036,
+            "body": "No markers",
+            "head": {"ref": "lapis/room-rag-scan-dirs-heredoc-fix-v0/lab"},
+        }
+        store = MagicMock()
+        store.load_all.return_value = []  # no bound targets at all -> unbound tid
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore", return_value=store),
+            patch("lapis_pm.pm_core._mem", return_value=ms),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            # First encountering target
+            pm_core._reconcile_orphan_prs("target-A", target, "conductor", [pr])
+            # Second target encountering the same PR
+            target_b = MagicMock()
+            target_b.data = {}
+            pm_core._reconcile_orphan_prs("target-B", target_b, "conductor", [pr])
+            # Re-tick of the first target
+            pm_core._reconcile_orphan_prs("target-A", target, "conductor", [pr])
+
+        # Zero briefs on any encountering target
+        mock_brief.assert_not_called()
+        mock_set_brief.assert_not_called()
+        # No pm:orphan-owned-by observation (the tid is UNBOUND, not bound)
+        mock_obs.assert_not_called()
+        # Not adopted
+        target.save.assert_not_called()
+
+        # Exactly one sink key, PR-scoped (not target-scoped)
+        key = "pm/orphan-pr/conductor/pr-1036"
+        row = ms.get(key)
+        assert row is not None, "sink key must be written exactly once"
+        import json as _json
+        payload = _json.loads(row["content"])
+        assert payload["repo"] == "conductor"
+        assert payload["pr_number"] == 1036
+        assert payload["head"] == "lapis/room-rag-scan-dirs-heredoc-fix-v0/lab"
+        assert payload["slug_tid"] == "room-rag-scan-dirs-heredoc-fix-v0"
+        assert payload["adoption_command"] == (
+            "lapis-pm bind room-rag-scan-dirs-heredoc-fix-v0 "
+            "--adopt-pr 1036 --repo conductor"
+        )
+        assert payload["first_seen"]
+        # The R2 path never writes pm/outstanding-brief/*
+        assert ms.get("pm/outstanding-brief/target-A") is None
+        assert ms.get("pm/outstanding-brief/target-B") is None
+
+    def test_bound_slug_tid_silent_skip_observation_no_brief_no_sink(self, tmp_path):
+        """R1: orphan PR whose slug tid is BOUND (different repo, and same
+        repo variant) -> silent skip with the pm:orphan-owned-by observation,
+        no brief, no sink key."""
+        ms = self._mem_store(tmp_path)
+        target = MagicMock()
+        target.data = {}
+        pr = {
+            "number": 55,
+            "body": "No markers",
+            "head": {"ref": "lapis/other-bound-target/forced"},
+        }
+        owner = MagicMock()
+        owner.id = "other-bound-target"
+        owner.pm_bound = True
+        owner.pm_repo = "lapis-pm"  # same repo variant; also covers cross-repo
+                                    # because R1 is repo-agnostic by design
+        store = MagicMock()
+        store.load_all.return_value = [owner]
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore", return_value=store),
+            patch("lapis_pm.pm_core._mem", return_value=ms),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            pm_core._reconcile_orphan_prs("encountering-target", target, "conductor", [pr])
+
+        mock_brief.assert_not_called()
+        mock_set_brief.assert_not_called()
+        target.save.assert_not_called()
+        # Exactly one pm:orphan-owned-by observation on the encountering target
+        mock_obs.assert_called_once()
+        call = mock_obs.call_args
+        assert call.args[0] == "encountering-target"
+        tags = call.kwargs.get("extra_tags", [])
+        assert "pm:orphan-owned-by" in tags
+        assert "pm:orphan-owned-by=other-bound-target" in tags
+        # No sink key for the bound-tid case
+        assert ms.get("pm/orphan-pr/conductor/pr-55") is None
+
+    def test_no_lapis_prefix_single_brief_idempotent(self, tmp_path):
+        """R3: PR with NO lapis/ prefix branch -> exactly one encountering
+        target raises the orphan-pr-untraceable brief (first tick only; second
+        tick / second target skipped by the sink-key guard)."""
+        ms = self._mem_store(tmp_path)
+        target = MagicMock()
+        target.data = {}
+        pr = {
+            "number": 77,
+            "body": "No markers",
+            "head": {"ref": "some/random/branch"},
+        }
+        store = MagicMock()
+        store.load_all.return_value = []
+        brief_obj = MagicMock()
+        brief_obj.comment_id = "cid-77"
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore", return_value=store),
+            patch("lapis_pm.pm_core._mem", return_value=ms),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_obj) as mock_brief,
+            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            # First encountering target: raises the brief
+            pm_core._reconcile_orphan_prs("target-A", target, "conductor", [pr])
+            # Second target: skipped by the sink key
+            target_b = MagicMock()
+            target_b.data = {}
+            pm_core._reconcile_orphan_prs("target-B", target_b, "conductor", [pr])
+            # Re-tick of the first target: skipped by the sink key
+            pm_core._reconcile_orphan_prs("target-A", target, "conductor", [pr])
+
+        # Exactly ONE brief, on the first encountering target
+        mock_brief.assert_called_once()
+        assert mock_brief.call_args.kwargs["trigger"] == "orphan-pr-untraceable"
+        assert mock_brief.call_args.args[0] == "target-A"
+        mock_set_brief.assert_called_once()
+        # Sink key written (PR-scoped), slug_tid None for the no-prefix case
+        import json as _json
+        row = ms.get("pm/orphan-pr/conductor/pr-77")
+        assert row is not None
+        payload = _json.loads(row["content"])
+        assert payload["slug_tid"] is None
+        assert payload["adoption_command"] is None
+        # The second target never adopted / never briefed
+        target_b.save.assert_not_called()
+
+    def test_traceable_to_self_auto_adopt_unchanged(self, tmp_path):
+        """R4 regression guard: traceable-to-self PR auto-adopt path is
+        untouched — adoption is recorded, no brief, no sink key."""
+        ms = self._mem_store(tmp_path)
+        target = MagicMock()
+        target.data = {}
+        pr = {
+            "number": 42,
+            "body": "<!-- lapis-tid: my-target -->\nPR description",
+            "head": {"ref": "hotfix/deviant-branch"},
+        }
+        store = MagicMock()
+        store.load_all.return_value = []
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=True),
+            patch("lapis_pm.pm_core.TargetStore", return_value=store),
+            patch("lapis_pm.pm_core._mem", return_value=ms),
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+        ):
+            pm_core._reconcile_orphan_prs("my-target", target, "my-repo", [pr])
+
+        assert target.data["adopted_head_branch"] == "hotfix/deviant-branch"
+        assert target.data["adopted_pr_number"] == 42
+        target.save.assert_called_once()
+        mock_brief.assert_not_called()
+        assert ms.get("pm/orphan-pr/my-repo/pr-42") is None
+        # The auto-adopt observation is the only observation
+        mock_obs.assert_called_once()
+        assert "pm:orphan-adopted" in mock_obs.call_args.kwargs.get("extra_tags", [])
+
+
 class TestTemplateMarkers:
     """Test that the fixer template includes HTML comment traceability markers.
 

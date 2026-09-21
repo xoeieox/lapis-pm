@@ -8534,8 +8534,8 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     try:
         from agents_core.forgejo import get_pr_diff as _get_diff
         diff_text = _get_diff(repo, pr_number)
-        if len(diff_text) > authority.DIFF_INLINE_CAP:
-            diff_text = diff_text[:authority.DIFF_INLINE_CAP] + "\n\n... (diff truncated)"
+        if len(diff_text) > authority.DIFF_INLINE_CAP_REVIEWER:
+            diff_text = diff_text[:authority.DIFF_INLINE_CAP_REVIEWER] + "\n\n... (diff truncated)"
     except Exception:
         diff_text = "(diff unavailable)"
 

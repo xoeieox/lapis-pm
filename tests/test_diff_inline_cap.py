@@ -1,9 +1,12 @@
-"""Tests for DIFF_INLINE_CAP constant — lapis-pm-reviewer-full-context-v0.
+"""Tests for DIFF_INLINE_CAP constants — lapis-pm-reviewer-full-context-v0.
 
 Asserts:
-  - DIFF_INLINE_CAP == 200_000 in authority.py
-  - Both pm_core.py and authority.py use the named constant (no bare integer literal)
-  - The cap is actually applied in the reviewer dispatch path
+  - DIFF_INLINE_CAP_REVIEWER == 200_000 (reviewer dispatch path cap)
+  - DIFF_INLINE_CAP_SCREEN == 60_000 (authority.screen() inline cap — no
+    clone fallback, so it retains the pre-200k value; cr-bundle item 4a082d29b0)
+  - DIFF_INLINE_CAP is the reviewer cap (back-compat alias)
+  - Both pm_core.py and authority.py use the named constants (no bare integer literal)
+  - The caps are actually applied at their respective dispatch sites
 """
 
 from __future__ import annotations
@@ -11,7 +14,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from lapis_pm.authority import DIFF_INLINE_CAP
+from lapis_pm.authority import (
+    DIFF_INLINE_CAP,
+    DIFF_INLINE_CAP_REVIEWER,
+    DIFF_INLINE_CAP_SCREEN,
+)
 
 
 AUTHORITY_PY = Path(__file__).parent.parent / "lapis_pm" / "authority.py"

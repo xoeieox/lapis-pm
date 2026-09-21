@@ -1445,7 +1445,8 @@ class TestAuditGateDeltaClassification:
     # Test 8: Telemetry writes
     # -----------------------------------------------------------------------
     def test_cycle2_telemetry_writes_per_resolution_and_rollup(self, tmp_path):
-        """Cycle 2: 2 valid resolutions → 2 prior-resolution observations + 1 rollup."""
+        """Cycle 3 (advisory budget=3, cr-bundle item df1ac58425): 2 valid
+        resolutions → 2 prior-resolution observations + 1 rollup."""
         current_verdict = {
             "verdict": "fixable",
             "issues": [
@@ -1496,7 +1497,7 @@ class TestAuditGateDeltaClassification:
         # Rollup contains cycle info
         rollup_content = rollup_obs[0][0]
         assert "audit-gate:" in rollup_content
-        assert "cycle=2" in rollup_content
+        assert "cycle=3" in rollup_content
 
     # -----------------------------------------------------------------------
     # Test 9: Cycle 2 — prior cycle 1 was clean (issues=[]) → audit gate no-op

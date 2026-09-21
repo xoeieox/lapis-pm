@@ -7305,6 +7305,51 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
                 # PR belongs to another bound target; skip silently
                 continue
 
+            # R1 (lapis-pm-orphan-pr-attribution-v0): slug-tid resolution
+            # before attribution. If the head ref names a tid (lapis/<tid>/...)
+            # that is not us, the PR's owner is the slug tid — never the
+            # encountering target.
+            slug_tid = _parse_slug_tid(head)
+            if slug_tid is not None and slug_tid != target_id:
+                try:
+                    owner = _resolve_bound_target_for_slug(slug_tid, target_id)
+                except Exception as e:
+                    _emit_reconcile_verify_failure(target_id, pr_number, e)
+                    continue
+                if owner is not None:
+                    # R1 bound-anywhere: the PR belongs to that owner's
+                    # lineage. Skip silently with a one-line episodic
+                    # observation on the ENCOUNTERING target (no brief).
+                    try:
+                        episodic.write_observation(
+                            target_id,
+                            f"Orphan PR #{pr_number} on {head} owned by bound target "
+                            f"{slug_tid}; skipping (pm:orphan-owned-by).",
+                            extra_tags=[
+                                "pm:orphan-owned-by",
+                                f"pm:orphan-owned-by={slug_tid}",
+                                f"pm:pr={pr_number}",
+                            ],
+                        )
+                    except Exception as obs_err:
+                        logger.warning("orphan-owned-by observation failed: %s", obs_err)
+                    continue
+                # R2 unbound-tid: do NOT raise a brief on the encountering
+                # target. Emit EXACTLY ONE portfolio-level observation
+                # (mem sink key) keyed on the PR; later targets/ticks find
+                # the key and skip. When the slug tid is later bound, the
+                # owner's next tick auto-adopts via _branch_belongs.
+                _record_orphan_pr_sink(repo, pr_number, head, slug_tid)
+                continue
+
+            # R3: true untraceable (no parseable lapis/<tid>/ slug). Keep the
+            # current single-encountering-target brief, but ALSO honor the
+            # R2 mem-key idempotency so only the FIRST encountering target
+            # raises it.
+            if _orphan_pr_sink_seen(repo, pr_number):
+                # An earlier target/tick already surfaced this PR; skip.
+                continue
+
             # Not traceable to any target: check for outstanding brief idempotency guard
             # to avoid re-synthesizing brief.synthesize() on every tick
             existing_brief = get_outstanding_brief(target_id)
@@ -7327,6 +7372,11 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
                 notify=NotifyPriority.NORMAL
             )
             _set_brief_outstanding(target_id, b)
+
+            # R3: record the sink key AFTER raising the brief so the next
+            # encountering target (or re-tick) skips. Written only for the
+            # true-untraceable case; the R2 path above writes its own.
+            _record_orphan_pr_sink(repo, pr_number, head, None)
 
             # AC1 (lapis-pm-auto-land-integrity-v0): the untraceable-orphan
             # observation must NOT assert ownership via pm:pr=N — that tag is

@@ -7137,9 +7137,7 @@ def _resolve_bound_target_for_slug(slug_tid: str, self_target_id: str) -> object
 
     R1 (lapis-pm-orphan-pr-attribution-v0): extends _pr_owned_by_bound_sibling's
     coverage from "bound to THIS repo" to "bound anywhere" for slug-matched
-    PRs. The TargetStore load already happens in the sibling check, so this
-    adds no new store read in the common case (the caller passes the same
-    store when it has one).
+    PRs.
     """
     store = TargetStore()
     for t in store.load_all():

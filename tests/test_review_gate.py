@@ -1261,9 +1261,10 @@ class TestAuditGateDeltaClassification:
     def test_cycle2_one_still_present_carried_to_fixer_retry(self):
         """Cycle 2: one prior still_present → dispatch_fixer_retry with 1 issue.
 
-        Budget is patched to 3 (default advisory=2 would exhaust at cycle 2).
-        The test verifies audit-gate carries the still_present issue and that it
-        has prior_index=1.
+        The advisory budget is 3 (cr-bundle item df1ac58425), so cycle 2 can
+        still dispatch a fixer retry without patching the budget. The test
+        verifies audit-gate carries the still_present issue and that it has
+        prior_index=1.
         """
         carried_issue = {
             "severity": "med", "path": "src/validator.py",
@@ -1287,10 +1288,6 @@ class TestAuditGateDeltaClassification:
             reviewer_count=2, fixer_count=1,
             current_verdict=current_verdict,
             prior_verdict=_PRIOR_VERDICT_3,
-        )
-        # Patch budget to 3 so cycle 2 can still dispatch a fixer retry
-        stack.enter_context(
-            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
         )
         with stack:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")

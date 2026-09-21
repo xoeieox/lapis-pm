@@ -938,7 +938,10 @@ class TestCycleKProgression:
             # after it, so the guard passes.
             patch("lapis_pm.pm_core._pr_advanced_since", return_value=True),
             # MED issue: the LOW-only sweep-later fork must not fire — the
-            # exhausted path escalates with the loud brief.
+            # exhausted path escalates with the loud brief. (This class has
+            # no autouse healthy-panel fixture, so assume a healthy panel:
+            # a starved verdict would be dropped to advisory_brief.)
+            patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False),
             patch("lapis_pm.pm_core._last_review_verdict",
                   return_value={"verdict": "fixable", "issues": MED_ISSUES, "confidence": 0.8}),
             patch("lapis_pm.pm_core._collect_review_history", return_value=[

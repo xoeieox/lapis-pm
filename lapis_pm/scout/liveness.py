@@ -113,12 +113,24 @@ def _any_target_references_key(key: str) -> bool:
 
 
 def _data_references_key(data: dict[str, Any], key: str) -> bool:
-    for field_name in ("tags", "description", "spec_from", "covers", "derived_from"):
+    """Return True only if a STRUCTURED field names the decision key exactly.
+
+    cr-bundle-lapis-pm-2026-09-21 item 4fd83ffdba: the previous version
+    substring-matched the bare key against `description`, `tags`, `covers`,
+    and `derived_from` (and `spec_from`), so a short key like "auth" or "v0"
+    false-positived against prose and permanently parked scaffolds whose
+    underlying work was never implemented. The match is now narrowed to the
+    structured list fields `covers` and `derived_from` with exact element
+    equality (also accepting the full canonical form `decision:<key>`, since
+    a ref written in canonical form is an unambiguous reference). Free-text
+    fields (`description`, `tags`, `spec_from`) are deliberately NOT scanned.
+    """
+    for field_name in ("covers", "derived_from"):
         val = data.get(field_name)
-        if isinstance(val, str) and key in val:
-            return True
+        if isinstance(val, str):
+            val = [val]
         if isinstance(val, list):
             for item in val:
-                if isinstance(item, str) and key in item:
+                if isinstance(item, str) and item in (key, f"decision:{key}"):
                     return True
     return False

@@ -59,7 +59,19 @@ HELD_PATTERNS = [
 ]
 
 MAX_AUTO_LOC = 400
-DIFF_INLINE_CAP = 200_000
+# Two caps, two cost profiles (cr-bundle-lapis-pm-2026-09-21 item 4a082d29b0):
+#   DIFF_INLINE_CAP_REVIEWER — the reviewer dispatch path (pm_core._dispatch_
+#     reviewer): the reviewer gets a git-clone fallback for context beyond the
+#     inline window, so the larger window is cheap insurance.
+#   DIFF_INLINE_CAP_SCREEN — authority.screen(): an inline LLM call with NO
+#     clone fallback, run on every kill-switch / auto-merge classify; it
+#     retains the pre-200k value because the larger window is unnecessary
+#     there and has no fallback to lean on.
+# DIFF_INLINE_CAP is kept as an alias of the reviewer cap for import
+# compatibility (tests/test_diff_inline_cap.py pins the name and value).
+DIFF_INLINE_CAP_REVIEWER = 200_000
+DIFF_INLINE_CAP_SCREEN = 60_000
+DIFF_INLINE_CAP = DIFF_INLINE_CAP_REVIEWER
 DIFF_PATH_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 DIFF_PATH_RE_OLD = re.compile(r"^--- a/(.+)$", re.MULTILINE)
 DIFF_HUNK_LINE_RE = re.compile(r"^[+-](?![+-])", re.MULTILINE)
@@ -192,8 +204,8 @@ def screen(repo: str, pr_number: int, spec_summary: str, diff_text: str) -> dict
     Used only for auto-merge authority targets.
     Returns parsed JSON or fallback dict.
     """
-    if len(diff_text) > DIFF_INLINE_CAP:
-        diff_text = diff_text[:DIFF_INLINE_CAP] + "\n\n... (diff truncated)"
+    if len(diff_text) > DIFF_INLINE_CAP_SCREEN:
+        diff_text = diff_text[:DIFF_INLINE_CAP_SCREEN] + "\n\n... (diff truncated)"
     user = (
         f"PR #{pr_number} in {repo}.\n\n"
         f"Spec context:\n{spec_summary}\n\n"

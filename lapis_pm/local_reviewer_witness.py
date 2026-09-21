@@ -71,6 +71,19 @@ def _default_max_tokens() -> int:
 
 # ---------------------------------------------------------------------------
 # Lifted verbatim from scripts/reviewer_spike.py (PR #93 — authoritative)
+#
+# Verdict taxonomy (cr-bundle-lapis-pm-2026-09-21 item 5eb29b2087): the
+# 3-value reduced schema below (clean | fixable | needs-human) is the
+# reviewer-DISPATCH output contract (see pm_core._dispatch_reviewer's
+# user_prompt and authority.SCREEN_SYSTEM) — the same taxonomy the recorded
+# Claude verdicts this witness compares against are stored in. The 4-value
+# recorded-review contract (clean | issues-noted | fix-eligible |
+# needs-human) lives at the emit boundary: clean -> clean, fixable ->
+# issues-noted (fixer-eligible when any issue is med/high), needs-human ->
+# needs-human. This witness is observational-only (it never displaces
+# Claude's verdict and feeds no auto-merge gate), so the mapping is
+# documented, not implemented here; if the witness output is ever wired into
+# the emit pipeline, apply the mapping at the emit boundary.
 # ---------------------------------------------------------------------------
 
 REVIEWER_PROMPT_TEMPLATE = """You are reviewing PR #{pr_number} in repo `{repo}`.

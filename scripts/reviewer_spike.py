@@ -37,6 +37,35 @@ from lapis_pm import episodic  # noqa: E402
 from agents_core.forgejo import get_pr_diff  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Verdict taxonomy — cr-bundle-lapis-pm-2026-09-21 item 5eb29b2087
+# ---------------------------------------------------------------------------
+# This spike (and the local_reviewer_witness module that lifted these
+# constants verbatim, PR #94) uses the REDUCED 3-value taxonomy that the
+# actual reviewer dispatch emits (see the user_prompt in
+# pm_core._dispatch_reviewer and authority.SCREEN_SYSTEM):
+#     "clean" | "fixable" | "needs-human"
+#
+# The 4-value taxonomy (clean | issues-noted | fix-eligible | needs-human)
+# named in the original review finding is the *recorded-PR review contract*
+# (reviewer verdict tags / code-reviewer findings), NOT the reviewer-dispatch
+# output contract. The spike and witness compare against recorded Claude
+# reviewer verdicts, which are stored in the 3-value dispatch taxonomy
+# (pm:reviewer:pr=N:cycle=K:verdict=clean|fixable|needs-human), so the
+# 3-value schema is the correct one for this comparison.
+#
+# Mapping layer at the emit boundary (the downstream emit pipeline's
+# 4-value contract):
+#   clean        -> clean
+#   fixable      -> issues-noted        (issues listed; fixer-eligible when
+#                                       any issue severity is med/high)
+#   needs-human  -> needs-human
+# The witness is observational-only (it never displaces Claude's verdict and
+# feeds no auto-merge gate), so the mapping is documentation, not code: the
+# emit pipeline consumes Claude's recorded verdict, not the witness output.
+# If the witness is ever wired into the emit pipeline, implement the mapping
+# there (at the emit boundary), NOT by changing this schema.
+
 REVIEWER_PROMPT_TEMPLATE = """You are reviewing PR #{pr_number} in repo `{repo}`.
 
 ## Spec context
@@ -132,6 +161,8 @@ def _clean_model_output(content: str) -> str:
     return content
 
 
+# 3-value reviewer-dispatch taxonomy (see the mapping-layer note above this
+# template for the relationship to the 4-value recorded-review contract).
 REVIEWER_JSON_SCHEMA = {
     "type": "object",
     "properties": {

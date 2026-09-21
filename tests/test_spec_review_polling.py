@@ -17,6 +17,14 @@ Every test in this file gets its production queue/council paths redirected
 to `tmp_path` by the `_isolated_queues` fixture below (function-scoped,
 autouse) — closes review/debt/lapis-pm/bbc4b922d5. No test may write under
 `/room`.
+
+The isolation is behavioural, not nominal: `test_no_test_artifact_reaches_the_live_room_root`
+asserts that a poll run driven by this file's fixture resolves the completed
+queue under `tmp_path` and leaves the live production roots untouched, so a
+regression that makes the patch silently ineffective (e.g. a future
+import-time rebinding or a renamed constant) fails loudly instead of letting
+test artifacts reappear in the live queue where a concurrent queue runner
+could consume them.
 """
 from __future__ import annotations
 
@@ -178,3 +186,69 @@ def test_parse_error_and_claims_checked_pass_through(_isolated_queues):
 
     assert result["claims_checked"] == claims_checked
     assert result["parse_error"] == parse_error
+
+
+# ---------------------------------------------------------------------------
+# 6. bbc4b922d5 isolation is effective (meta-test)
+# ---------------------------------------------------------------------------
+
+def test_no_test_artifact_reaches_the_live_room_root(_isolated_queues):
+    """The `_isolated_queues` patch must actually redirect `_find_reviewer_output`
+    to tmp_path, and a poll run must not touch the live production roots.
+
+    This is the missing coverage for review/debt/lapis-pm/bbc4b922d5: the
+    fixture above patches the production module's constants, but nothing
+    previously asserted the patch is effective — a regression (renamed
+    constant, import-time rebinding, a new queue root added to the module)
+    would let this file's `-output.md` artifacts land under the live
+    /srv/lapis/claude-queue and /srv/lapis/council roots, where a concurrently running
+    queue runner could consume them as real task output. The assertions here
+    pin the behavioural contract:
+
+    1. `_find_reviewer_output` resolves the task's output file under the
+       tmp_path-completed dir (not the live root).
+    2. A full `_poll_reference_until_terminal` run reads it from there and
+       returns "processed".
+    3. The live production roots (`_CLAUDE_QUEUE_COMPLETED`'s original
+       /room value and `_COUNCIL_DIR`'s original /room value) contain no
+       artifact for the task id.
+    """
+    # Capture the LIVE production roots before the fixture's patch took
+    # effect — the fixture patched the module globals, so re-importing the
+    # module would show the patched values; the original /room values are
+    # what a regression would silently write to.
+    import agents_core.room_paths as _rp
+    live_completed = _rp.room_path("claude_queue.completed")
+    live_council = _rp.room_path("council")
+
+    tid = "poll-test-room-isolation"
+    completed_dir = _isolated_queues["claude_completed"]
+
+    # 1. Resolution goes to tmp_path, not the live root.
+    resolved = spec_review._find_reviewer_output(tid)
+    assert resolved is None  # no file yet
+    p = _write_output(completed_dir, tid, verdict="clean")
+    resolved = spec_review._find_reviewer_output(tid)
+    assert resolved is not None
+    assert resolved.parent == completed_dir
+    assert str(resolved).startswith(str(_isolated_queues["claude_completed"].parent.parent))
+
+    # 2. The poll reads the tmp_path artifact and reports processed.
+    result = spec_review._poll_reference_until_terminal(
+        spec_reviewer_task_id=tid,
+        timeout_s=60,
+        start_time=time.time(),
+    )
+    assert result is not None
+    assert result["status"] == "processed"
+    assert result["run_id"] == tid
+
+    # 3. The live production roots hold no artifact for this task id.
+    assert not (live_completed / f"{tid}-output.md").exists(), (
+        "test artifact leaked into the live claude-queue completed root "
+        f"({live_completed}) — bbc4b922d5 regression"
+    )
+    assert not (live_council / f"{tid}.yaml").exists(), (
+        "test artifact leaked into the live council root "
+        f"({live_council}) — bbc4b922d5 regression"
+    )

@@ -223,8 +223,17 @@ _SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
 _SYNTH_FAIL_THRESHOLD = 3
 
 # Cycle budgets per authority level (number of reviewer dispatches before exhausted)
+#
+# cr-bundle-lapis-pm-2026-09-21 item df1ac58425: advisory was 2, which with
+# same-reviewer mode exhausted after a single fixer-fix-reviewer round-trip
+# (reviewer 1 -> fixer -> reviewer 2 -> parked), silently parking multi-issue
+# advisory targets (observed: kami-proposal-adjudicator-v0 acceptance-#6).
+# 3 gives at least one full fixer round-trip plus a follow-up review before
+# the loud budget-exhausted brief fires (_act_brief_review_exhausted —
+# NotifyPriority.HIGH + episodic hold — so the stall surfaces to Erah rather
+# than waiting silently). Hold stays at 4.
 _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
-    "advisory": 2,
+    "advisory": 3,
     "hold": 4,
 }
 
@@ -3930,7 +3939,11 @@ def _persist_review_state_cache(target_id: str, target, open_prs: list[dict]) ->
         return
 
     authority_level = target.pm_authority or "advisory"
-    budget = _REVIEW_CYCLE_BUDGETS.get(authority_level, 2)
+    # cr-bundle-lapis-pm-2026-09-21 item df1ac58425: default 2 -> 3 so an
+    # unknown authority level gets the same at-least-one-fixer-round-trip
+    # budget as advisory (the loud budget-exhausted brief is the backstop,
+    # not silent parking).
+    budget = _REVIEW_CYCLE_BUDGETS.get(authority_level, 3)
     mode = _REVIEWER_MODES.get(authority_level, "same-reviewer")
     verdict = state.get("verdict")
     has_real_verdict = verdict and verdict != "pending"
@@ -7620,7 +7633,10 @@ def _decide_for_pr(target_id: str, repo: str, pr: dict, pm_authority: str,
 
     reviewer_count = _reviewer_cycle_count(target_id, pr_number)
     fixer_count = _fixer_retry_count(target_id, pr_number)
-    budget = _REVIEW_CYCLE_BUDGETS.get(pm_authority, 2)
+    # cr-bundle-lapis-pm-2026-09-21 item df1ac58425: default 2 -> 3 (see the
+    # _REVIEW_CYCLE_BUDGETS comment); exhaustion is loud via
+    # review_exhausted_brief, never a silent park.
+    budget = _REVIEW_CYCLE_BUDGETS.get(pm_authority, 3)
     mode = "fresh" if pm_authority == "hold" else "same"
 
     if reviewer_count == fixer_count:
@@ -8720,8 +8736,8 @@ def _act_dispatch_reviewer(target_id: str, pr: dict, cls: authority.PRClassifica
     try:
         from agents_core.forgejo import get_pr_diff as _get_diff
         diff_text = _get_diff(repo, pr_number)
-        if len(diff_text) > authority.DIFF_INLINE_CAP:
-            diff_text = diff_text[:authority.DIFF_INLINE_CAP] + "\n\n... (diff truncated)"
+        if len(diff_text) > authority.DIFF_INLINE_CAP_REVIEWER:
+            diff_text = diff_text[:authority.DIFF_INLINE_CAP_REVIEWER] + "\n\n... (diff truncated)"
     except Exception:
         diff_text = "(diff unavailable)"
 

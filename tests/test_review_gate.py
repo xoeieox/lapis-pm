@@ -82,6 +82,10 @@ CLS_AUTO_CLEAN = authority.PRClassification(
 )
 
 ISSUES = [{"severity": "low", "path": "src/foo.py", "note": "missing docstring"}]
+# cr-bundle item df1ac58425: MED issue for the advisory exhaustion tests —
+# the LOW-only sweep-later fork (advisory_brief) must not fire, so the
+# exhausted path escalates with the loud review_exhausted_brief.
+MED_ISSUES = [{"severity": "med", "path": "src/foo.py", "note": "missing test coverage"}]
 
 
 def _make_review_comment(pr_number: int, cycle: int, verdict: str,
@@ -371,17 +375,22 @@ class TestDecideForPr:
         assert d.payload["cycle"] == 1  # reviewer cycle that returned fixable
 
     def test_fixable_cycles_at_budget_returns_exhausted_brief(self):
-        """Reviewed (cycle 2) fixable + cycles >= budget + MED issue → review_exhausted_brief."""
+        """Reviewed (cycle 3) fixable + cycles >= budget + MED issue → review_exhausted_brief.
+
+        Advisory budget is 3 (cr-bundle item df1ac58425): one full
+        fixer-fix-reviewer round-trip plus a follow-up review before the
+        loud budget-exhausted brief fires."""
         med_issues = [{"severity": "med", "path": "src/foo.py", "note": "missing test coverage"}]
         verdict = {"verdict": "fixable", "issues": med_issues, "confidence": 0.8}
         history = [{"cycle": 1, "verdict": "fixable", "issues": med_issues},
-                   {"cycle": 2, "verdict": "fixable", "issues": med_issues}]
+                   {"cycle": 2, "verdict": "fixable", "issues": med_issues},
+                   {"cycle": 3, "verdict": "fixable", "issues": med_issues}]
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
             patch("lapis_pm.pm_core._collect_review_history", return_value=history),
         ):
@@ -397,8 +406,8 @@ class TestDecideForPr:
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
             ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
@@ -427,13 +436,13 @@ class TestDecideForPr:
         """MED issue present + budget exhausted + advisory → review_exhausted_brief."""
         med_issues = [{"severity": "med", "path": "src/bar.py", "note": "missing test"}]
         verdict = {"verdict": "fixable", "issues": med_issues, "confidence": 0.8}
-        history = [{"cycle": 2, "verdict": "fixable", "issues": med_issues}]
+        history = [{"cycle": 3, "verdict": "fixable", "issues": med_issues}]
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
             patch("lapis_pm.pm_core._collect_review_history", return_value=history),
         ):
@@ -444,13 +453,13 @@ class TestDecideForPr:
         """HIGH issue present + budget exhausted + advisory → review_exhausted_brief."""
         high_issues = [{"severity": "high", "path": "src/baz.py", "note": "security hole"}]
         verdict = {"verdict": "fixable", "issues": high_issues, "confidence": 0.8}
-        history = [{"cycle": 2, "verdict": "fixable", "issues": high_issues}]
+        history = [{"cycle": 3, "verdict": "fixable", "issues": high_issues}]
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
             patch("lapis_pm.pm_core._collect_review_history", return_value=history),
         ):
@@ -464,13 +473,13 @@ class TestDecideForPr:
             {"severity": "med", "path": "src/bar.py", "note": "missing test"},
         ]
         verdict = {"verdict": "fixable", "issues": mixed_issues, "confidence": 0.8}
-        history = [{"cycle": 2, "verdict": "fixable", "issues": mixed_issues}]
+        history = [{"cycle": 3, "verdict": "fixable", "issues": mixed_issues}]
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
             patch("lapis_pm.pm_core._collect_review_history", return_value=history),
         ):
@@ -480,13 +489,13 @@ class TestDecideForPr:
     def test_fixable_budget_exhausted_empty_issues_advisory_returns_exhausted_brief(self):
         """Empty issues list + budget exhausted + advisory → review_exhausted_brief (defensive)."""
         verdict = {"verdict": "fixable", "issues": [], "confidence": 0.8}
-        history = [{"cycle": 2, "verdict": "fixable", "issues": []}]
+        history = [{"cycle": 3, "verdict": "fixable", "issues": []}]
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=verdict),
             patch("lapis_pm.pm_core._collect_review_history", return_value=history),
         ):
@@ -903,29 +912,48 @@ class TestCycleKProgression:
 
         assert d.kind == "noop_no_change"
 
-    def test_budget_exhaustion_after_cycle2_fixable(self):
-        """reviewer=2 fixer=2 SHA advanced → review_exhausted_brief (advisory budget=2)."""
-        # Cycle 2 reviewer dispatch record
-        reviewer_rec = self._reviewer_dispatch_record(cycle=2, ts="2026-01-01T11:00:00")
-        sha_obs = self._sha_observation(42, "sha2", "2026-01-01T11:30:00")
+    def test_budget_exhaustion_after_cycle3_fixable(self):
+        """reviewer=3 fixer=2 SHA advanced → review_exhausted_brief (advisory budget=3).
+
+        cr-bundle item df1ac58425: the advisory budget is 3, so exhaustion
+        requires one full fixer round-trip (reviewer 1 → fixer → reviewer 2)
+        plus a follow-up review (reviewer 3) before the loud brief fires."""
+        # Cycle 3 reviewer dispatch record. The SHA observation must postdate
+        # the cycle-3 dispatch ts — _pr_advanced_since compares against the
+        # most recent reviewer dispatch (the "fixer pushed nothing" guard),
+        # not cycle 2's.
+        reviewer_rec = self._reviewer_dispatch_record(cycle=3, ts="2026-01-01T09:00:00")
+        sha_obs = self._sha_observation(42, "sha3", "2026-01-01T11:30:00")
 
         with (
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
             patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core.load_dispatched", return_value=[reviewer_rec]),
             patch("lapis_pm.pm_core.episodic.all_comments", return_value=[sha_obs]),
+            # The "fixer pushed nothing" guard compares the cycle-3 dispatch
+            # ts against the SHA stream; the fixer's commit (sha3) landed
+            # after it, so the guard passes.
+            patch("lapis_pm.pm_core._pr_advanced_since", return_value=True),
+            # MED issue: the LOW-only sweep-later fork must not fire — the
+            # exhausted path escalates with the loud brief. (This class has
+            # no autouse healthy-panel fixture, so assume a healthy panel:
+            # a starved verdict would be dropped to advisory_brief.)
+            patch("lapis_pm.panel_starvation.verdict_is_starved", return_value=False),
+            patch("lapis_pm.pm_core._last_review_verdict",
+                  return_value={"verdict": "fixable", "issues": MED_ISSUES, "confidence": 0.8}),
             patch("lapis_pm.pm_core._collect_review_history", return_value=[
-                {"cycle": 1, "verdict": "fixable", "issues": ISSUES},
-                {"cycle": 2, "verdict": "fixable", "issues": ISSUES},
+                {"cycle": 1, "verdict": "fixable", "issues": MED_ISSUES},
+                {"cycle": 2, "verdict": "fixable", "issues": MED_ISSUES},
+                {"cycle": 3, "verdict": "fixable", "issues": MED_ISSUES},
             ]),
             ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
 
         assert d.kind == "review_exhausted_brief"
-        assert len(d.payload["history"]) == 2
+        assert len(d.payload["history"]) == 3
 
     def test_same_reviewer_mode_preserved_at_cycle2_advisory(self):
         """Advisory: cycle 2 reviewer uses mode=same (same-reviewer context)."""
@@ -1251,9 +1279,10 @@ class TestAuditGateDeltaClassification:
     def test_cycle2_one_still_present_carried_to_fixer_retry(self):
         """Cycle 2: one prior still_present → dispatch_fixer_retry with 1 issue.
 
-        Budget is patched to 3 (default advisory=2 would exhaust at cycle 2).
-        The test verifies audit-gate carries the still_present issue and that it
-        has prior_index=1.
+        The advisory budget is 3 (cr-bundle item df1ac58425), so cycle 2 can
+        still dispatch a fixer retry without patching the budget. The test
+        verifies audit-gate carries the still_present issue and that it has
+        prior_index=1.
         """
         carried_issue = {
             "severity": "med", "path": "src/validator.py",
@@ -1277,10 +1306,6 @@ class TestAuditGateDeltaClassification:
             reviewer_count=2, fixer_count=1,
             current_verdict=current_verdict,
             prior_verdict=_PRIOR_VERDICT_3,
-        )
-        # Patch budget to 3 so cycle 2 can still dispatch a fixer retry
-        stack.enter_context(
-            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
         )
         with stack:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
@@ -1386,9 +1411,6 @@ class TestAuditGateDeltaClassification:
             current_verdict=current_verdict,
             prior_verdict=_PRIOR_VERDICT_2,
         )
-        stack.enter_context(
-            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
-        )
         with stack:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "dispatch_fixer_retry"
@@ -1419,8 +1441,8 @@ class TestAuditGateDeltaClassification:
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=current_verdict),
             patch("lapis_pm.pm_core._review_verdict_for_cycle") as mock_rvfc,
             patch("lapis_pm.pm_core.episodic.write_observation"),
@@ -1434,7 +1456,8 @@ class TestAuditGateDeltaClassification:
     # Test 8: Telemetry writes
     # -----------------------------------------------------------------------
     def test_cycle2_telemetry_writes_per_resolution_and_rollup(self, tmp_path):
-        """Cycle 2: 2 valid resolutions → 2 prior-resolution observations + 1 rollup."""
+        """Cycle 3 (advisory budget=3, cr-bundle item df1ac58425): 2 valid
+        resolutions → 2 prior-resolution observations + 1 rollup."""
         current_verdict = {
             "verdict": "fixable",
             "issues": [
@@ -1458,8 +1481,8 @@ class TestAuditGateDeltaClassification:
             patch("lapis_pm.pm_core.authority.classify", return_value=CLS_STATIC_PASS),
             patch("lapis_pm.pm_core.episodic.spec_summary", return_value="spec"),            patch("lapis_pm.pm_core._has_pending_reviewer_for_pr", return_value=False),
             patch("lapis_pm.pm_core._has_pending_fixer_for_pr", return_value=False),
-            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=2),
-            patch("lapis_pm.pm_core._fixer_retry_count", return_value=1),
+            patch("lapis_pm.pm_core._reviewer_cycle_count", return_value=3),
+            patch("lapis_pm.pm_core._fixer_retry_count", return_value=2),
             patch("lapis_pm.pm_core._last_review_verdict", return_value=current_verdict),
             patch("lapis_pm.pm_core._review_verdict_for_cycle",
                   return_value=_PRIOR_VERDICT_2),
@@ -1485,7 +1508,7 @@ class TestAuditGateDeltaClassification:
         # Rollup contains cycle info
         rollup_content = rollup_obs[0][0]
         assert "audit-gate:" in rollup_content
-        assert "cycle=2" in rollup_content
+        assert "cycle=3" in rollup_content
 
     # -----------------------------------------------------------------------
     # Test 9: Cycle 2 — prior cycle 1 was clean (issues=[]) → audit gate no-op
@@ -1502,9 +1525,6 @@ class TestAuditGateDeltaClassification:
             reviewer_count=2, fixer_count=1,
             current_verdict=current_verdict,
             prior_verdict=prior_clean,
-        )
-        stack.enter_context(
-            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
         )
         with stack:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")

@@ -3,7 +3,7 @@
 Coverage:
   - Writes cache when _active_review_state returns a dict.
   - mode derivation: hold → fresh-reviewer, otherwise → same-reviewer.
-  - budget derivation: advisory→2, hold→4, unknown→2.
+  - budget derivation: advisory→3, hold→4, unknown→3.
   - Real verdict surfaces (fixable/clean issue handling).
   - Deletes cache when _active_review_state returns None.
   - Idempotent delete: key already absent + state None → no error, no key.
@@ -75,7 +75,7 @@ class TestPersistReviewStateCacheWrite:
         payload = json.loads(raw)
         assert payload["pr_number"] == 18
         assert payload["cycle"] == 1
-        assert payload["budget"] == 2
+        assert payload["budget"] == 3
         assert payload["mode"] == "same-reviewer"
         assert payload["last_verdict"] is None   # verdict=pending → None
         assert payload["last_issues"] is None
@@ -146,9 +146,9 @@ class TestModeDerivation:
 class TestBudgetDerivation:
 
     @pytest.mark.parametrize("authority,expected_budget", [
-        ("advisory", 2),
+        ("advisory", 3),   # cr-bundle item df1ac58425: 2 -> 3 (loud brief on exhaustion)
         ("hold", 4),
-        ("unknown-authority", 2),  # falls back to default 2
+        ("unknown-authority", 3),  # falls back to default 3
     ])
     def test_budget_per_authority(self, authority, expected_budget):
         mem = _make_mem()

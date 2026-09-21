@@ -1759,6 +1759,6 @@ def _bounded_target_ids() -> list[str]:
     sweep is a no-op, not a crash)."""
     try:
         from agents_core.targets import TargetStore
-        return [t.id for t in TargetStore().load_all() if t.pm_bound]
+        return [t.id for t in pm_core.TargetStore().load_all() if t.pm_bound]
     except Exception:
         return []

@@ -7110,6 +7110,87 @@ def _pr_owned_by_bound_sibling(pr: dict, self_target_id: str, repo: str) -> bool
 _RECONCILE_VERIFY_FAIL_KEY = "pm/reconcile-verify-fail-last-alert/{}"
 _RECONCILE_VERIFY_FAIL_COOLDOWN_SECS = 3600
 
+# R2 (lapis-pm-orphan-pr-attribution-v0): single-sink mem key for orphan PRs
+# whose slug tid is unbound (or unparseable). Keyed on the PR, not the
+# encountering target, so every target and every tick sees the same key and
+# only the first encounter writes it. Never touches pm/outstanding-brief/*.
+_ORPHAN_PR_SINK_KEY = "pm/orphan-pr/{}/pr-{}"
+
+
+def _parse_slug_tid(branch: str) -> str | None:
+    """Parse the slug target id out of a 'lapis/<tid>/...' head ref.
+
+    Returns the tid (the first path segment after the 'lapis/' prefix), or
+    None when the branch does not carry a parseable slug tid. Generalizes the
+    _branch_belongs prefix logic to any tid.
+    """
+    if not branch.startswith("lapis/"):
+        return None
+    rest = branch[len("lapis/"):]
+    if not rest or rest.startswith("/"):
+        return None
+    return rest.split("/", 1)[0]
+
+
+def _resolve_bound_target_for_slug(slug_tid: str, self_target_id: str) -> object | None:
+    """Return the bound Target whose id matches slug_tid (any repo), else None.
+
+    R1 (lapis-pm-orphan-pr-attribution-v0): extends _pr_owned_by_bound_sibling's
+    coverage from "bound to THIS repo" to "bound anywhere" for slug-matched
+    PRs. The TargetStore load already happens in the sibling check, so this
+    adds no new store read in the common case (the caller passes the same
+    store when it has one).
+    """
+    store = TargetStore()
+    for t in store.load_all():
+        if t.id == slug_tid and t.id != self_target_id and t.pm_bound:
+            return t
+    return None
+
+
+def _orphan_pr_sink_key(repo: str, pr_number) -> str:
+    """Build the R2 single-sink mem key for an orphan PR (PR-scoped, not target-scoped)."""
+    repo_name, _owner = _repo_owner(repo)
+    return _ORPHAN_PR_SINK_KEY.format(repo_name, pr_number)
+
+
+def _orphan_pr_sink_seen(repo: str, pr_number) -> bool:
+    """True if the R2/R3 sink key already exists (written by a prior target/tick)."""
+    try:
+        return _mem().get(_orphan_pr_sink_key(repo, pr_number)) is not None
+    except Exception:
+        # mem read failure: fail open (allow first-encounter behavior) rather
+        # than silently swallowing the orphan.
+        return False
+
+
+def _record_orphan_pr_sink(repo: str, pr_number, head: str, slug_tid: str | None) -> None:
+    """Write the EXACTLY-ONCE R2 sink key for an orphan PR (idempotent).
+
+    Content per spec: repo, PR number, head sha/ref, slug tid, the adoption
+    command, first-seen ts. A later tick or a later target finds the key and
+    skips. Non-fatal on write failure (an orphan-surfacing failure must not
+    break the tick).
+    """
+    key = _orphan_pr_sink_key(repo, pr_number)
+    try:
+        if _mem().get(key) is not None:
+            return  # already recorded by an earlier target/tick
+        payload = {
+            "repo": repo,
+            "pr_number": pr_number,
+            "head": head,
+            "slug_tid": slug_tid,
+            "adoption_command": (
+                f"lapis-pm bind {slug_tid} --adopt-pr {pr_number} --repo {repo}"
+                if slug_tid else None
+            ),
+            "first_seen": _now_iso(),
+        }
+        _mem().set(key, json.dumps(payload), tags=["lapis-pm", "pm:orphan-pr-sink"])
+    except Exception as e:
+        logger.warning("orphan-pr sink write failed for %s: %s", key, e)
+
 
 def _emit_reconcile_verify_failure(target_id: str, pr_number: int, err: Exception) -> None:
     """Emit a deduped verification-failure signal when TargetStore read fails.

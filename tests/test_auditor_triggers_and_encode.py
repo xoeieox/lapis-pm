@@ -912,3 +912,191 @@ def test_reconcile_failed_flip_clears_marker(mem_store, episodic_store,
     # The record flipped to failed.
     records = pm_core.load_dispatched(TID)
     assert records[0]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# D1/D2 (lapis-pm-auditor-empty-repo-fix-v0): thread the target repo through
+# the dispatch chain + the loud-refusal guard
+# ---------------------------------------------------------------------------
+
+# A RAW Forgejo-shaped PR dict: NO top-level "repo" key (the real bug — the
+# repo lives nested under base.repo/head.repo, never at the top level).
+RAW_FORGEJO_PR = {
+    "number": PR,
+    "title": f"[SALVAGE] fixer-reception test (PR #{PR})",
+    "head": {"ref": SALVAGE_REF, "sha": HEAD_SHA},
+    "body": (
+        "Salvage of a gate-rejected fixer run.\n"
+        "<!-- lapis-gpu-id: gpu-1 -->\n"
+        "<!-- lapis-tid: aud-test-target -->\n"
+        "<!-- lapis-salvage: true -->\n"
+    ),
+    "base": {"repo": {"name": "conductor"}},
+    "head_repo": {"name": "conductor"},
+}
+
+
+def _forgejo_raw_pr() -> dict:
+    """A raw Forgejo PR dict (no top-level "repo" key)."""
+    return json.loads(json.dumps(RAW_FORGEJO_PR))
+
+
+def test_t1_act_dispatch_auditor_threads_explicit_repo(mem_store, episodic_store):
+    """T1 (D1): _act_dispatch_auditor with a raw Forgejo-shaped pr dict (NO
+    top-level "repo" key; head.ref present) + explicit repo="conductor" ->
+    the appended record carries repo=="conductor".
+
+    Environment-independent form (spec T1 / M3): Shaper.resolve_repo_cwd does
+    a LIVE Path.is_dir() check and falls back to _DEFAULT_CWD when the host
+    lacks the clone, so the shaper seam is patched to a known path and the
+    dispatch is asserted to have received it — a raw "resolves to the
+    conductor clone path" assertion would false-negative on any host without
+    /srv/git/conductor-working."""
+    pr = _forgejo_raw_pr()
+    assert "repo" not in pr  # the raw Forgejo shape
+    known_cwd = "/srv/git/conductor-working"
+    with patch(
+        "lapis_pm.pm_core.Shaper.resolve_repo_cwd",
+        side_effect=lambda repo: known_cwd if repo == "conductor" else "/data/agents",
+    ), _patch_dispatch()[0] as disp:
+        action = pm_core._act_dispatch_auditor(TID, pr, mode="salvage",
+                                               repo="conductor")
+    assert action == f"action:auditor_dispatched:pr={PR}:mode=salvage"
+    assert disp.call_count == 1
+    # The appended record carries the real repo (the raw pr dict had no
+    # top-level "repo" key — the explicit param won).
+    assert pm_core.load_dispatched(TID)[-1]["repo"] == "conductor"
+
+
+def test_t1_act_dispatch_auditor_repo_cwd_resolves(mem_store, episodic_store):
+    """T1 (D1, vars_ half): with the shaper seam patched to a known path,
+    the dispatch's vars_ repo_cwd equals the path resolved for the explicit
+    repo — captured via a spy on steer.inject_overlay."""
+    pr = _forgejo_raw_pr()
+    known_cwd = "/srv/git/conductor-working"
+    captured: dict = {}
+
+    def _spy(tid, vars_, agent_type):
+        captured["vars_"] = vars_
+        return None
+
+    with patch(
+        "lapis_pm.pm_core.Shaper.resolve_repo_cwd",
+        side_effect=lambda repo: known_cwd if repo == "conductor" else "/data/agents",
+    ), patch("lapis_pm.pm_core._SHAPER.dispatch",
+             return_value=_dispatch_result()), \
+         patch("lapis_pm.pm_core.steer.inject_overlay", side_effect=_spy), \
+         patch("lapis_pm.pm_core._ensure_dispatch_owned"), \
+         patch("lapis_pm.pm_core._check_calcification"), \
+         patch("lapis_pm.pm_core._baseline_main_sha", return_value=MAIN_SHA):
+        pm_core._act_dispatch_auditor(TID, pr, mode="salvage", repo="conductor")
+    assert captured["vars_"]["repo"] == "conductor"
+    assert captured["vars_"]["repo_cwd"] == known_cwd
+    # The record carries the real repo.
+    assert pm_core.load_dispatched(TID)[-1]["repo"] == "conductor"
+
+
+def test_t2_salvage_forwards_repo_through_gate_chain(mem_store, episodic_store):
+    """T2 (D1): _maybe_dispatch_auditor_salvage forwards the encode-loop repo
+    through the gate chain to _act_dispatch_auditor (mock the shaper + record
+    append; assert the received repo)."""
+    pr = _forgejo_raw_pr()
+    captured: dict = {}
+
+    def _spy_act(target_id, pr, mode="salvage", repo=None):
+        captured["repo"] = repo
+        captured["mode"] = mode
+        return f"action:auditor_dispatched:pr={pr['number']}:mode={mode}"
+
+    with patch("lapis_pm.pm_core._act_dispatch_auditor", side_effect=_spy_act), \
+         patch("lapis_pm.pm_core._SHAPER.dispatch",
+               return_value=_dispatch_result()), \
+         patch("lapis_pm.pm_core.steer.inject_overlay"), \
+         patch("lapis_pm.pm_core._ensure_dispatch_owned"), \
+         patch("lapis_pm.pm_core._check_calcification"), \
+         patch("lapis_pm.pm_core._baseline_main_sha", return_value=MAIN_SHA), \
+         patch("lapis_pm.pm_core.Shaper.resolve_repo_cwd",
+               return_value="/srv/git/conductor-working"):
+        action = pm_core._maybe_dispatch_auditor_salvage(TID, "conductor", pr)
+    assert action == f"action:auditor_dispatched:pr={PR}:mode=salvage"
+    # The encode-loop repo was forwarded through the gate chain.
+    assert captured["repo"] == "conductor"
+    assert captured["mode"] == "salvage"
+
+
+def test_t3_noop_pr_dict_repo_key_contract(mem_store, episodic_store):
+    """T3 (D1): D6b fallback contract — a pr dict CARRYING the repo key, no
+    explicit param -> record repo equals the pr's repo (guards the
+    pr.get("repo") shape against the D1 refactor)."""
+    pr = _forgejo_raw_pr()
+    pr["repo"] = "conductor"  # the D6b pr dict shape carries the repo key
+    with patch(
+        "lapis_pm.pm_core.Shaper.resolve_repo_cwd",
+        return_value="/srv/git/conductor-working",
+    ), _patch_dispatch()[0] as disp:
+        action = pm_core._act_dispatch_auditor(TID, pr, mode="noop")
+    assert action == f"action:auditor_dispatched:pr={PR}:mode=noop"
+    assert disp.call_count == 1
+    # No explicit repo param was passed — the pr's repo key was used.
+    assert pm_core.load_dispatched(TID)[-1]["repo"] == "conductor"
+
+
+def test_t4_empty_repo_guard_refuses_loudly(mem_store, episodic_store):
+    """T4 (D2): repo empty via BOTH param and pr -> returns the
+    noop:auditor_empty_repo:pr=N string, writes the pm:auditor-empty-repo
+    observation, appends NO dispatch record, and does not record budget."""
+    pr = _forgejo_raw_pr()  # no top-level "repo" key
+    pr.pop("repo", None)
+    with patch("lapis_pm.pm_core._SHAPER.dispatch",
+               return_value=_dispatch_result()) as disp, \
+         patch("lapis_pm.pm_core.steer.inject_overlay") as inject, \
+         patch("lapis_pm.pm_core._ensure_dispatch_owned") as ensure, \
+         patch("lapis_pm.pm_core._check_calcification"), \
+         patch("lapis_pm.pm_core._baseline_main_sha", return_value=MAIN_SHA):
+        action = pm_core._act_dispatch_auditor(TID, pr, mode="salvage",
+                                               repo="")
+    # The loud-refusal string (same shape as the budget-exhausted noop).
+    assert action == f"noop:auditor_empty_repo:pr={PR}"
+    # No dispatch, no overlay, no owned-check (the guard returns first).
+    assert disp.call_count == 0
+    assert inject.call_count == 0
+    assert ensure.call_count == 0
+    # NO dispatch record appended.
+    assert pm_core.load_dispatched(TID) == []
+    # NO budget recorded.
+    assert pm_core._audit_budget_used(TID) == 0
+    # The pm:auditor-empty-repo observation is written, naming the missing
+    # field, the pr number, the mode, and the target_id — and NOT capturing
+    # stack frames, exception text, or the raw pr dict.
+    obs = [c for c in episodic_store.all_comments(TID)
+           if "pm:auditor-empty-repo" in c.tags]
+    assert len(obs) == 1
+    content = obs[0].content
+    assert "repo" in content
+    assert f"PR #{PR}" in content
+    assert "salvage" in content
+    assert TID in content
+    # No raw pr dict / stack / exception capture (the message is a fixed
+    # string naming the missing field, pr, mode, and target_id only).
+    assert "Traceback" not in content
+    assert "Exception" not in content
+    assert json.dumps(RAW_FORGEJO_PR) not in content
+
+
+def test_t4_guard_via_gates_chain_empty_repo(mem_store, episodic_store):
+    """T4 (D2, via the gate chain): the guard fires through
+    _maybe_dispatch_auditor_salvage_gates when both the param and the pr
+    lack a repo — the refusal string propagates (non-None) so the D6b
+    caller sets its once-per-pr+cycle marker (by design per spec D2)."""
+    pr = _forgejo_raw_pr()  # no top-level "repo" key
+    with _patch_dispatch()[0] as disp:
+        action = pm_core._maybe_dispatch_auditor_salvage_gates(
+            TID, pr, mode="salvage", repo=""
+        )
+    assert action == f"noop:auditor_empty_repo:pr={PR}"
+    assert disp.call_count == 0
+    assert pm_core.load_dispatched(TID) == []
+    assert pm_core._audit_budget_used(TID) == 0
+    obs = [c for c in episodic_store.all_comments(TID)
+           if "pm:auditor-empty-repo" in c.tags]
+    assert len(obs) == 1

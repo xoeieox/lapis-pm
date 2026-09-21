@@ -6616,7 +6616,9 @@ def _render_audit_brief(audit_json: dict, pr_number: int, head_sha: str | None) 
     return "\n".join(lines)
 
 
-def _act_dispatch_auditor(target_id: str, pr: dict, mode: str = "salvage") -> str:
+def _act_dispatch_auditor(
+    target_id: str, pr: dict, mode: str = "salvage", repo: str | None = None
+) -> str:
     """D6: dispatch the auditor agent via the existing dispatch machinery.
 
     mode: "salvage" (D6a — a new salvage-shaped PR) or "noop" (D6b — a
@@ -6627,11 +6629,43 @@ def _act_dispatch_auditor(target_id: str, pr: dict, mode: str = "salvage") -> st
     The auditor is NOT a reviewer cycle: it never touches the
     reviewer-attempt counters or the review budget (spec Invariant 6). It
     does consume the per-target audit budget (D6a gate iii).
+
+    repo: the target's real repo name, threaded through the dispatch chain
+    (D1, lapis-pm-auditor-empty-repo-fix-v0). The raw Forgejo PR dict has no
+    top-level "repo" key (it lives nested under base.repo/head.repo), so the
+    caller must pass it explicitly; the pr.get("repo") fallback preserves the
+    D6b contract (the no-op trigger builds its pr dict WITH a "repo" key).
     """
     pr_number = pr["number"]
-    repo = pr.get("repo") or ""
+    repo = repo or pr.get("repo") or ""
     pr_ref = (pr.get("head") or {}).get("ref") or ""
     head_sha = _pr_head_sha(pr)
+
+    # D2 loud-refusal guard (lapis-pm-auditor-empty-repo-fix-v0): if the repo
+    # is still empty after resolution, refuse LOUDLY and NAMED at the dispatch
+    # boundary instead of dispatching a doomed session that would die at the
+    # worktree probe (the measured cost of this bug was eight days of silence
+    # plus three misdiagnoses). No dispatch record, no budget consumed — the
+    # guard returns before _record_audit_budget. On the noop (D6b) entry the
+    # non-None refusal string sets the once-per-pr+cycle marker — identical
+    # behavior to the budget-exhausted return below (by design per spec D2);
+    # no marker is set on the salvage path.
+    if not repo:
+        episodic.write_observation(
+            target_id,
+            f"Refusing auditor dispatch for PR #{pr_number} ({mode}): the "
+            f"repo field is empty (missing field: repo; mode: {mode}; "
+            f"target_id: {target_id}). The dispatch chain dropped the target's "
+            f"repo — an empty repo resolves to the default cwd and the "
+            f"worktree probe fails against the wrong remote. No dispatch "
+            f"record was appended and no audit budget was consumed.",
+            extra_tags=[
+                f"pm:pr={pr_number}",
+                "pm:auditor-empty-repo",
+                f"pm:audit-mode={mode}",
+            ],
+        )
+        return f"noop:auditor_empty_repo:pr={pr_number}"
 
     # Gate (iii): the per-target audit budget (at most N per 12h).
     if not _audit_budget_has_room(target_id):
@@ -6719,7 +6753,9 @@ def _maybe_dispatch_auditor_salvage(target_id: str, repo: str, pr: dict) -> str 
     dispatch, or None when a gate held (the caller counts it as a noop)."""
     if not _is_salvage_pr(pr):
         return None
-    return _maybe_dispatch_auditor_salvage_gates(target_id, pr, mode="salvage")
+    return _maybe_dispatch_auditor_salvage_gates(
+        target_id, pr, mode="salvage", repo=repo
+    )
 
 
 def _maybe_dispatch_auditor_noop(target_id: str, rec: dict, pr_num) -> str | None:
@@ -6781,7 +6817,9 @@ def _maybe_dispatch_auditor_noop(target_id: str, rec: dict, pr_num) -> str | Non
         "title": title,
     }
 
-    action = _maybe_dispatch_auditor_salvage_gates(target_id, pr, mode="noop")
+    action = _maybe_dispatch_auditor_salvage_gates(
+        target_id, pr, mode="noop", repo=repo
+    )
     if action is None:
         return None
     _mem().set(
@@ -6798,10 +6836,16 @@ def _maybe_dispatch_auditor_noop(target_id: str, rec: dict, pr_num) -> str | Non
     return action
 
 
-def _maybe_dispatch_auditor_salvage_gates(target_id: str, pr: dict, mode: str) -> str | None:
+def _maybe_dispatch_auditor_salvage_gates(
+    target_id: str, pr: dict, mode: str, repo: str | None = None
+) -> str | None:
     """The D6a gate sequence (i)/(ii)/(iii) shared by the salvage trigger
     and the no-op trigger (D6b applies the same three gates; the no-op path
-    skips the salvage-shape check because a no-op PR is not salvage-shaped)."""
+    skips the salvage-shape check because a no-op PR is not salvage-shaped).
+
+    repo: the target's real repo name, forwarded to _act_dispatch_auditor
+    (D1, lapis-pm-auditor-empty-repo-fix-v0) — the raw Forgejo PR dict has no
+    top-level "repo" key, so the caller threads it here."""
     pr_number = pr.get("number")
     if pr_number is None:
         return None
@@ -6812,7 +6856,7 @@ def _maybe_dispatch_auditor_salvage_gates(target_id: str, pr: dict, mode: str) -
     if _has_pending_auditor_for_pr(target_id, pr_number):
         return None
     try:
-        return _act_dispatch_auditor(target_id, pr, mode=mode)
+        return _act_dispatch_auditor(target_id, pr, mode=mode, repo=repo)
     except Exception as exc:
         logger.warning("auditor dispatch failed for PR #%s (%s): %s",
                        pr_number, mode, exc)

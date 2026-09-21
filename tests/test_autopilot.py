@@ -548,19 +548,34 @@ class TestProvenance:
     the perceived trigger state, the action taken, the rationale, and an
     executor label via provenance.deploy_log_label()."""
 
-    def test_unblock_writes_provenance_row(self, mem_store, monkeypatch):
+    def test_unblock_writes_provenance_row(self, mem_store, monkeypatch,
+                                           tmp_path):
         """An executed unblock writes a provenance row (perceived state,
-        action, rationale, executor)."""
+        action, rationale, executor). The target-store flag is also cleared
+        (the daemon-visible source of truth) — the test patches
+        ``pm_core.TargetStore`` to a hermetic tmp store so the unblock's
+        target-store write is exercised, not skipped by the fail-soft
+        exception path."""
         tid, pr = "prov-unblock", 50
         _seed_pr_head(mem_store, tid, pr, "h" * 40)
         _seed_infra_pause(mem_store, tid, pr, reason="gw_not_serving")
         mem_store.set(pm_core._pause_key(tid), "paused",
                       tags=["lapis-pm", "pause-state"])
+        from agents_core.targets import TargetStore
+        store = TargetStore(tmp_path)
+        target = store.create(target_id=tid, title="prov unblock")
+        target.set_paused(True, reason="reviewer-infra-budget: seeded")
+        target.save()
         monkeypatch.setenv(autopilot.AUTOPILOT_ENV, "on")
-        state = autopilot.perceive(
-            tid, fetcher=_fetcher_27b())
-        res = autopilot.unblock_infra_pause(mem_store, state, execute=True)
+        with patch("lapis_pm.pm_core.TargetStore",
+                   lambda: TargetStore(tmp_path)):
+            state = autopilot.perceive(tid, fetcher=_fetcher_27b())
+            res = autopilot.unblock_infra_pause(mem_store, state,
+                                                execute=True)
         assert res["executed"] is True
+        # The daemon-visible source of truth is cleared (the tick no longer
+        # returns noop:paused).
+        assert TargetStore(tmp_path).get(tid).paused is False
         # The provenance row is on the action key.
         key = autopilot._action_key(tid, "unblock", "h" * 40)
         row = json.loads(mem_store.get(key)["content"])

@@ -146,9 +146,9 @@ class TestModeDerivation:
 class TestBudgetDerivation:
 
     @pytest.mark.parametrize("authority,expected_budget", [
-        ("advisory", 2),
+        ("advisory", 3),   # cr-bundle item df1ac58425: 2 -> 3 (loud brief on exhaustion)
         ("hold", 4),
-        ("unknown-authority", 2),  # falls back to default 2
+        ("unknown-authority", 3),  # falls back to default 3
     ])
     def test_budget_per_authority(self, authority, expected_budget):
         mem = _make_mem()

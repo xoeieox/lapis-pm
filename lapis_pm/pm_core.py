@@ -223,8 +223,17 @@ _SYNTH_FAIL_KEY = "pm/brief/synth-fail-count/{}"
 _SYNTH_FAIL_THRESHOLD = 3
 
 # Cycle budgets per authority level (number of reviewer dispatches before exhausted)
+#
+# cr-bundle-lapis-pm-2026-09-21 item df1ac58425: advisory was 2, which with
+# same-reviewer mode exhausted after a single fixer-fix-reviewer round-trip
+# (reviewer 1 -> fixer -> reviewer 2 -> parked), silently parking multi-issue
+# advisory targets (observed: kami-proposal-adjudicator-v0 acceptance-#6).
+# 3 gives at least one full fixer round-trip plus a follow-up review before
+# the loud budget-exhausted brief fires (_act_brief_review_exhausted —
+# NotifyPriority.HIGH + episodic hold — so the stall surfaces to Erah rather
+# than waiting silently). Hold stays at 4.
 _REVIEW_CYCLE_BUDGETS: dict[str, int] = {
-    "advisory": 2,
+    "advisory": 3,
     "hold": 4,
 }
 

@@ -294,6 +294,17 @@ REVIEWER_INFRA_FAIL_REASONS = frozenset({
     # non-run, not a failure — see lapis-pm-reviewer-seat-dead-token-infra-
     # classify-v0 (Unit B).
     "seat_no_tool_calls",
+    # D3 sub-deliverable (lapis-pm-pipeline-autopilot-v0, spec BLOCKER B1):
+    # gw_seat_occupied (doorman 409) is the dominant infra-noise class in the
+    # 2026-09-19 census (state/pipeline-fire-27b-2026-09-19) — the exact class
+    # that parks targets nobody un-parks. A 409 wedge is a non-run (the seat
+    # was busy, the reviewer never ran), not a failure, so it must classify as
+    # infra (bounded against the more generous infra budget) instead of
+    # counting against the reviewer-attempt ceiling. The autopilot's extended
+    # taxonomy (lapis_pm.autopilot.AUTOPILOT_INFRA_FAIL_REASONS) is the
+    # superset of this set + gw_seat_occupied; a divergence row is written
+    # when the two disagree (they no longer do, since this extension landed).
+    "gw_seat_occupied",
 })
 
 # Forgejo health gate constants

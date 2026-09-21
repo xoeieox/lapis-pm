@@ -51,11 +51,20 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
 def run_checks() -> int:
-    """Run the tick-coverage + directive-outcome stall checks.
+    """Run the tick-coverage + directive-outcome stall checks + the autopilot
+    prodder liveness backstop (D5).
 
     Returns the number of pages emitted (0 = nothing to page). Never
     raises — a checker failure is logged, not paged (the checker's own
     death is caught by the next healthy tick pass's detectors).
+
+    D5 (lapis-pm-pipeline-autopilot-v0): the BRIX-side liveness backstop —
+    the 10-min stall-check/backstop timer checks the autopilot heartbeat
+    freshness (pm/autopilot/heartbeat) and pages/records when stale. This
+    catches a DEAD PRODDER while GW sleeps (the GW-side watchdog auto-suspends
+    with GW, so a dead prodder would otherwise be uncaught while GW is
+    down). This is the Nzinga loud-trace requirement: a dead prodder is paged
+    by the stall-check timer, not only by the GW-side watchdog.
     """
     from datetime import datetime
     from agents_core.targets import TargetStore
@@ -71,6 +80,19 @@ def run_checks() -> int:
         pages += pm_core._check_directive_stalls(store, now)
     except Exception as e:
         print(f"[stall-check] directive-outcome check failed: {e}", file=sys.stderr)
+    # D5: the autopilot prodder liveness backstop. A stale/absent heartbeat
+    # pages once (the repeated-action guard dedups). Never raises.
+    try:
+        from . import autopilot
+        liveness = autopilot.check_prodder_liveness(pm_core._mem(), now=now)
+        if liveness.get("action") == "prodder_stalled":
+            pages += 1
+            print(f"[stall-check] autopilot prodder liveness: "
+                  f"{liveness.get('action')} (age={liveness.get('age_s', 'n/a')}s)",
+                  flush=True)
+    except Exception as e:
+        print(f"[stall-check] autopilot liveness check failed: {e}",
+              file=sys.stderr)
     if pages:
         print(f"[stall-check] pages={pages}", flush=True)
     else:

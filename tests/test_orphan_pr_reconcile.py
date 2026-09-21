@@ -422,6 +422,111 @@ class TestReconciliation:
         assert target.data["adopted_pr_number"] == 50
         target.save.assert_called_once()
 
+    def test_store_failure_emits_verify_fail_signal_r2_r3_paths(self):
+        """Store read failure on the R1 slug-tid path emits the verify-fail
+        signal (not an orphan brief, not a sink write), and the R3 sink guard
+        fails open (brief still raised) when the mem read itself fails.
+
+        Regression guard: the R1/R2/R3 additions must not bypass the
+        _emit_reconcile_verify_failure policy that the sibling-check path
+        already honors (the store-failure test above covers that path only).
+        """
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 99,
+            "body": "Genuine orphan (no markers)",
+            "head": {"ref": "lapis/unknown/forced"},
+        }
+
+        store_error = RuntimeError("TargetStore read failed")
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore") as mock_store_class,
+            patch("agents_core.notify.send_notification") as mock_notify,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+            patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+            patch("lapis_pm.pm_core._now_iso") as mock_now_iso,
+        ):
+            mock_store = MagicMock()
+            mock_store.load_all.side_effect = store_error
+            mock_store_class.return_value = mock_store
+
+            # Mock mem to avoid cooldown; first call returns None (no prior alert)
+            mock_mem_instance = MagicMock()
+            mock_mem_instance.get.return_value = None
+            mock_mem.return_value = mock_mem_instance
+
+            mock_now_iso.return_value = "2026-06-16T12:00:00+00:00"
+
+            pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
+
+        # Should emit verify-fail notification (NotifyPriority.NORMAL)
+        mock_notify.assert_called_once()
+        notify_call = mock_notify.call_args
+        message = notify_call.kwargs.get("message")
+        assert "target-A" in message
+        assert "TargetStore read failed" in message
+        assert notify_call.kwargs.get("priority") == pm_core.NotifyPriority.NORMAL
+
+        # Should write episodic observation with pm:reconcile-verify-failure tag
+        mock_obs.assert_called_once()
+        obs_call = mock_obs.call_args
+        assert obs_call.args[0] == "target-A"  # target_id
+        assert "pm:reconcile-verify-failure" in obs_call.kwargs.get("extra_tags", [])
+        assert "pm:pr=99" in obs_call.kwargs.get("extra_tags", [])
+
+        # Should NOT synthesize orphan brief and NOT write the orphan sink key
+        # (the verify-fail cooldown key pm/reconcile-verify-fail-last-alert/*
+        # is expected and is the only mem write allowed here).
+        mock_brief.assert_not_called()
+        for c in mock_mem_instance.set.call_args_list:
+            assert not str(c.args[0]).startswith("pm/orphan-pr/"), (
+                "store failure must not write the R2/R3 orphan sink key"
+            )
+
+    def test_r3_sink_guard_fails_open_on_mem_error(self):
+        """When the R3 sink-key read raises (mem failure), the guard fails
+        OPEN: the first encountering target still raises the brief rather
+        than silently swallowing the orphan."""
+        target = MagicMock()
+        target.data = {}
+
+        pr = {
+            "number": 88,
+            "body": "No markers",
+            "head": {"ref": "some/random/branch"},
+        }
+        store = MagicMock()
+        store.load_all.return_value = []
+        brief_obj = MagicMock()
+        brief_obj.comment_id = "cid-88"
+        brief_obj.synthesis_failed = False
+
+        with (
+            patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
+            patch("lapis_pm.pm_core.TargetStore", return_value=store),
+            patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
+            patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_obj) as mock_brief,
+            patch.object(pm_core, "_set_brief_outstanding") as mock_set_brief,
+            patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
+            patch("lapis_pm.pm_core._mem") as mock_mem,
+        ):
+            mock_mem_instance = MagicMock()
+            mock_mem_instance.get.side_effect = RuntimeError("mem down")
+            mock_mem_instance.set.side_effect = RuntimeError("mem down")
+            mock_mem.return_value = mock_mem_instance
+
+            pm_core._reconcile_orphan_prs("target-A", target, "conductor", [pr])
+
+        # Fail-open: the brief is still raised on the first encountering target
+        mock_brief.assert_called_once()
+        assert mock_brief.call_args.kwargs["trigger"] == "orphan-pr-untraceable"
+        mock_set_brief.assert_called_once()
+
     def test_store_failure_emits_verify_fail_signal(self):
         """Store read failure emits verify-fail notification, not orphan brief."""
         target = MagicMock()
@@ -590,7 +695,7 @@ class TestOrphanPrAttribution:
             patch("lapis_pm.pm_core._mem", return_value=ms),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
-            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+            patch.object(pm_core, "_set_brief_outstanding") as mock_set_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
         ):
             # First encountering target
@@ -655,7 +760,7 @@ class TestOrphanPrAttribution:
             patch("lapis_pm.pm_core._mem", return_value=ms),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
             patch("lapis_pm.pm_core.brief.synthesize") as mock_brief,
-            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+            patch.object(pm_core, "_set_brief_outstanding") as mock_set_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
         ):
             pm_core._reconcile_orphan_prs("encountering-target", target, "conductor", [pr])
@@ -689,6 +794,7 @@ class TestOrphanPrAttribution:
         store.load_all.return_value = []
         brief_obj = MagicMock()
         brief_obj.comment_id = "cid-77"
+        brief_obj.synthesis_failed = False
 
         with (
             patch("lapis_pm.pm_core._is_pr_traceable_to_target", return_value=False),
@@ -696,7 +802,7 @@ class TestOrphanPrAttribution:
             patch("lapis_pm.pm_core._mem", return_value=ms),
             patch("lapis_pm.pm_core.get_outstanding_brief", return_value=None),
             patch("lapis_pm.pm_core.brief.synthesize", return_value=brief_obj) as mock_brief,
-            patch("lapis_pm.pm_core._set_brief_outstanding") as mock_set_brief,
+            patch.object(pm_core, "_set_brief_outstanding") as mock_set_brief,
             patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs,
         ):
             # First encountering target: raises the brief

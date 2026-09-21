@@ -327,6 +327,52 @@ def test_act_acknowledge_and_clear_returns_detail():
     assert "clear" in result.lower()
 
 
+def test_act_adopt_pr_updates_pm_state_and_fires_no_fixer():
+    """cr-bundle item 61a1ca3a4f: _act_adopt_pr (the orphan-adopt action
+    handler) updates the target's PM dispatch state (adopted_head_branch +
+    adopted_pr_number) and emits the pm:orphan-adopted observation — and
+    fires NO new fixer (the whole point of the action kind: link the
+    deviant-branch PR to the target instead of redispatching)."""
+    from lapis_pm.brief import _act_adopt_pr
+
+    mock_target = MagicMock()
+    mock_target.pm_repo = "lapis/test-repo"
+    with (
+        patch("agents_core.targets.TargetStore") as MockStore,
+        patch("agents_core.forgejo.get_pr") as mock_get_pr,
+        patch("lapis_pm.brief.episodic.write_observation") as mock_obs,
+    ):
+        MockStore.return_value.get.return_value = mock_target
+        mock_get_pr.return_value = {
+            "number": 77,
+            "head": {"ref": "lapis/other-target/deviant-branch"},
+        }
+        result = _act_adopt_pr("test-tid", 77)
+
+    # PM dispatch state updated with the adopted PR's branch + number
+    assert mock_target.data["adopted_head_branch"] == "lapis/other-target/deviant-branch"
+    assert mock_target.data["adopted_pr_number"] == 77
+    mock_target.save.assert_called_once()
+    # Owner split from the lapis/repo-format pm_repo (owner passed to get_pr)
+    mock_get_pr.assert_called_once_with("test-repo", 77, owner="lapis")
+    # Observation emitted with the non-ownership orphan namespace
+    mock_obs.assert_called_once()
+    obs_tags = mock_obs.call_args.kwargs.get("extra_tags") or mock_obs.call_args[2].get("extra_tags")
+    assert "pm:orphan-adopted" in obs_tags
+    # No fixer fired: the handler has no force_dispatch path
+    assert "adopted PR #77" in result
+
+
+def test_act_adopt_pr_raises_without_pr_number():
+    """cr-bundle item 61a1ca3a4f: a None pr_number is a hard error — the
+    action handler cannot adopt what it cannot name."""
+    from lapis_pm.brief import _act_adopt_pr
+
+    with patch("agents_core.targets.TargetStore"):
+        with pytest.raises(ValueError, match="pr_number"):
+            _act_adopt_pr("test-tid", None)
+
+
 def test_act_force_dispatch_retry_calls_force_dispatch():
     from lapis_pm.brief import _act_force_dispatch_retry
     with patch("lapis_pm.pm_core.force_dispatch", return_value="task-xyz") as mock_fd:

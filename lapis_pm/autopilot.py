@@ -35,6 +35,25 @@ daemon's own kill-switches).
 Night-lane: unit-tests-only. No live reach, no seat stop, no systemd
 enablement — the unit is versioned in-repo; PM enables post-land (spec
 Post-land host op section).
+
+Named pre-activation gaps (sweep-later / pre-activation follow-ups, NOT
+defects this cycle):
+  * ``emit_dossier`` emits a SYNTHETIC v0 dossier skeleton (verdict echo +
+    confidence 0.0 + empty evidence/dissent) — the real machine-ratify
+    substrate (two grounded arguers + a fresh-context decider on the named
+    substrate, the daemon's deliberation machinery) is a follow-up. Shadow
+    mode never executes merges, so the synthetic dossier is UNREACHABLE
+    pre-activation (a dossier only matters once the daemon tick reads the
+    adjudication row and merges, which requires ``LAPIS_PM_AUTOPILOT=on``
+    AND a post-activation merge). Named here so the gap is visible, not
+    silently assumed closed.
+  * ``check_prodder_liveness`` routes the dead-prodder page through the
+    ``infra_absent`` escalation class (a REALITY-UNKNOWN + non-27B state)
+    rather than the dedicated ``prodder_stalled`` class — the class label
+    is cosmetic (the page text is the fixed-format (target, action-kind,
+    state code) render, which names the target ``autopilot`` + the
+    heartbeat staleness), but the allow-listed class is the wrong one.
+    Sweep-later.
 """
 
 from __future__ import annotations

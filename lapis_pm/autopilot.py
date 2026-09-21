@@ -142,13 +142,27 @@ HEARTBEAT_KEY = "pm/autopilot/heartbeat"
 #: pages/records (D5). The 10-min tick cadence makes 30 min a safe tripwire.
 HEARTBEAT_STALE_S = 1800
 
-# The three pm/reviewer- prefixes the per-(target, pr, cycle) counter clear
-# touches (D3). Deliberately NOT the target-granular clear_reviewer_attempts
-# wipe — a mixed target would lose a sibling PR's real-verdict budget (spec H5).
-_REVIEWER_STATE_PREFIXES = (
-    "pm/reviewer-attempts/{target_id}/pr={pr_number}/cycle={cycle}",
-    "pm/reviewer-attempt-ceiling/{target_id}/pr={pr_number}/cycle={cycle}",
-    "pm/reviewer-infra-budget/{target_id}/pr={pr_number}/cycle={cycle}",
+# The three pm/reviewer- key CONSTRUCTORS the per-(target, pr, cycle) counter
+# clear touches (D3). Deliberately NOT the target-granular
+# clear_reviewer_attempts wipe — a mixed target would lose a sibling PR's
+# real-verdict budget (spec H5).
+#
+# DRY (fixer_retry, reviewer 2026-09-21): the key shapes are the daemon's own
+# constructors — pm_core._reviewer_attempt_key (the attempts counter,
+# pm/reviewer-attempts/<tid>/pr=<pr>/cycle=<cycle>, NO /recorded suffix),
+# pm_core._reviewer_attempt_ceiling_marker_key and
+# pm_core._reviewer_infra_budget_marker_key (the ceiling / infra-budget pause
+# markers, which DO carry the /recorded suffix). The autopilot must NOT
+# hardcode its own copy of these shapes: the live keys are
+# pm/reviewer-attempt-ceiling/<tid>/pr=<pr>/cycle=<cycle>/recorded and
+# pm/reviewer-infra-budget/<tid>/pr=<pr>/cycle=<cycle>/recorded, and a
+# hardcoded template that drifts from the daemon's constructors silently
+# fails to delete the markers (the unblock would clear the counter but leave
+# the pause marker, re-pausing the target on the next tick).
+_REVIEWER_STATE_KEY_CONSTRUCTORS = (
+    pm_core._reviewer_attempt_key,
+    pm_core._reviewer_attempt_ceiling_marker_key,
+    pm_core._reviewer_infra_budget_marker_key,
 )
 
 

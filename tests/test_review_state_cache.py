@@ -75,7 +75,7 @@ class TestPersistReviewStateCacheWrite:
         payload = json.loads(raw)
         assert payload["pr_number"] == 18
         assert payload["cycle"] == 1
-        assert payload["budget"] == 2
+        assert payload["budget"] == 3
         assert payload["mode"] == "same-reviewer"
         assert payload["last_verdict"] is None   # verdict=pending → None
         assert payload["last_issues"] is None

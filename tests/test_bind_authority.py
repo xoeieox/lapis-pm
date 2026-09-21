@@ -110,8 +110,11 @@ class TestHoldReviewBehavior:
         """hold authority must have a 4-cycle budget."""
         assert pm_core._REVIEW_CYCLE_BUDGETS.get("hold") == 4
 
-    def test_advisory_cycle_budget_is_2(self):
-        assert pm_core._REVIEW_CYCLE_BUDGETS.get("advisory") == 2
+    def test_advisory_cycle_budget_is_3(self):
+        """Advisory budget is 3 (cr-bundle item df1ac58425): at least one
+        full fixer-fix-reviewer round-trip before the loud budget-exhausted
+        brief fires; was 2, which parked multi-issue advisory targets."""
+        assert pm_core._REVIEW_CYCLE_BUDGETS.get("advisory") == 3
 
     def test_hold_uses_fresh_reviewer_mode(self):
         """hold authority must map to fresh-reviewer mode in pm_core._REVIEWER_MODES."""

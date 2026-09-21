@@ -341,14 +341,21 @@ class TestReconciliation:
         mock_set_brief.assert_not_called()
 
     def test_genuine_orphan_still_raises_brief(self):
-        """Genuinely orphaned PR still raises brief when no sibling owns it."""
+        """Genuinely orphaned PR (no parseable lapis/<tid>/ slug) still raises
+        a brief when no sibling owns it.
+
+        NOTE: a PR on a deviant branch whose slug tid is UNBOUND no longer
+        raises a brief (R2, lapis-pm-orphan-pr-attribution-v0) — it is
+        surfaced once via the pm/orphan-pr/<repo>/pr-<n> sink key instead.
+        This test uses a no-slug branch, the R3 true-untraceable case.
+        """
         target = MagicMock()
         target.data = {}
 
         pr = {
             "number": 999,
             "body": "<!-- lapis-tid: ghost-target -->\nNo sibling owns this",
-            "head": {"ref": "lapis/ghost-target/forced"}
+            "head": {"ref": "some/other/deviant-branch"}
         }
 
         # Mock a sibling target for a different target
@@ -376,7 +383,7 @@ class TestReconciliation:
 
             pm_core._reconcile_orphan_prs("target-A", target, "lapis-pm", [pr])
 
-        # Should create a brief (genuine orphan)
+        # Should create a brief (genuine orphan, R3 true-untraceable)
         mock_brief.assert_called_once()
         call_args = mock_brief.call_args
         assert call_args.kwargs["trigger"] == "orphan-pr-untraceable"

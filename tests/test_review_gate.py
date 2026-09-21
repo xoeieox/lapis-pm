@@ -1393,9 +1393,6 @@ class TestAuditGateDeltaClassification:
             current_verdict=current_verdict,
             prior_verdict=_PRIOR_VERDICT_2,
         )
-        stack.enter_context(
-            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
-        )
         with stack:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")
         assert d.kind == "dispatch_fixer_retry"
@@ -1509,9 +1506,6 @@ class TestAuditGateDeltaClassification:
             reviewer_count=2, fixer_count=1,
             current_verdict=current_verdict,
             prior_verdict=prior_clean,
-        )
-        stack.enter_context(
-            patch("lapis_pm.pm_core._REVIEW_CYCLE_BUDGETS", {"advisory": 3})
         )
         with stack:
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")

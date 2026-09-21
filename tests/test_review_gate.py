@@ -933,12 +933,14 @@ class TestCycleKProgression:
             # ts against the SHA stream; the fixer's commit (sha3) landed
             # after it, so the guard passes.
             patch("lapis_pm.pm_core._pr_advanced_since", return_value=True),
+            # MED issue: the LOW-only sweep-later fork must not fire — the
+            # exhausted path escalates with the loud brief.
             patch("lapis_pm.pm_core._last_review_verdict",
-                  return_value={"verdict": "fixable", "issues": ISSUES, "confidence": 0.8}),
+                  return_value={"verdict": "fixable", "issues": MED_ISSUES, "confidence": 0.8}),
             patch("lapis_pm.pm_core._collect_review_history", return_value=[
-                {"cycle": 1, "verdict": "fixable", "issues": ISSUES},
-                {"cycle": 2, "verdict": "fixable", "issues": ISSUES},
-                {"cycle": 3, "verdict": "fixable", "issues": ISSUES},
+                {"cycle": 1, "verdict": "fixable", "issues": MED_ISSUES},
+                {"cycle": 2, "verdict": "fixable", "issues": MED_ISSUES},
+                {"cycle": 3, "verdict": "fixable", "issues": MED_ISSUES},
             ]),
             ):
             d = pm_core._decide_for_pr("tid", "myrepo", PR_TEMPLATE, "advisory")

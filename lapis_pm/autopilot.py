@@ -891,11 +891,39 @@ def unblock_infra_pause(mem, state: TargetState, *, execute: bool = True,
         return {"action": "aborted_head_moved", "key": key, "executed": False}
 
     # Clear ONLY the paused cycle's record + write the un-pause state.
+    #
+    # The UN-PAUSE has TWO parts (fixer_retry, reviewer 2026-09-21):
+    #   1. The TARGET STORE's ``target.paused`` flag — the daemon's pause
+    #      source of truth. The daemon's tick gates on it (tick() returns
+    #      ``noop:paused`` from ``target.paused``); the mem
+    #      ``pm/pause-state`` key is a MIRROR the daemon writes during
+    #      transitions, not its pause source of truth. ``cmd_resume``
+    #      (lapis-pm resume) un-pauses via exactly this primitive:
+    #      ``TargetStore().get(target_id) -> set_paused(False) -> save()``.
+    #      An unblock that only flipped the mem mirror would be a no-op in
+    #      production (the tick would still read ``target.paused == True``
+    #      and return ``noop:paused``).
+    #   2. The mem ``pm/pause-state`` mirror — kept for the autopilot's own
+    #      perception (perceive reads both; the mirror keeps the two in
+    #      agreement after the unblock).
     cleared = 0
     if execute and state.pr_number is not None:
         cleared = clear_reviewer_state_for_cycle(
             mem, state.target_id, state.pr_number, state.cycle)
-        # Write the un-pause state (the daemon tick reads it next tick).
+        # Part 1: clear the target-store paused flag (the daemon-visible
+        # source of truth) via the same primitive cmd_resume uses.
+        # Fail-soft: an absent target (store read error / unbound) must not
+        # crash the sweep — the mem mirror write below still runs, and the
+        # next perceive re-classifies.
+        try:
+            target = pm_core.TargetStore().get(state.target_id)
+            if target is not None and target.paused:
+                target.set_paused(False)
+                target.save()
+        except Exception:
+            pass
+        # Part 2: the mem pause-state mirror (the autopilot's own
+        # perception reads it; the daemon writes it during transitions).
         mem.set(pm_core._pause_key(state.target_id), "active",
                 tags=["lapis-pm", "pause-state"])
 

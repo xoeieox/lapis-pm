@@ -464,9 +464,30 @@ def _mechanical_bind_idempotent(
             "[bundle-autodispatch] wrote .autodispatch-pending for mechanical "
             "item %s (debt_id=%s, ts=%s)", target_id, debt_id, run_ts,
         )
-        bound_ok = _bind(target_id, repo, spec_path)
-        ticked_ok = bound_ok and _tick(target_id, repo)
-        verified_ok = ticked_ok and _verify_dispatched(target_id)
+        # R6 (rev 3): FAIL-CLOSED around the bind/tick/verify sequence. A
+        # crash mid-sequence (after the pending marker is written, after
+        # bind, before the done rename) must NOT propagate — it leaves the
+        # pending marker for the next run to resolve (no orphaned
+        # half-bind, no duplicate dispatch while the marker is live) and
+        # the run exits cleanly (the item lands in results["failed"] as a
+        # genuine failure, exactly like a returned False).
+        try:
+            bound_ok = _bind(target_id, repo, spec_path)
+            ticked_ok = bound_ok and _tick(target_id, repo)
+            verified_ok = ticked_ok and _verify_dispatched(target_id)
+        except Exception as exc:
+            logger.error(
+                "[bundle-autodispatch] !!! %s: crash mid bind/tick/verify "
+                "sequence (%s) — leaving .autodispatch-pending for the next "
+                "run to resolve; failing closed (debt_id=%s)",
+                target_id, exc, debt_id,
+            )
+            results["failed"].append({
+                "spec": target_id, "reason": "mechanical_bind_failed",
+                "source_bundle": source_bundle, "debt_id": debt_id,
+                "outcome": OUTCOME_FAILED_MECHANICAL_BIND,
+            })
+            return
         if verified_ok:
             pending.rename(_mechanical_item_done_marker(spec_path))
             results["bound"].append({
@@ -565,9 +586,28 @@ def _mechanical_bind_idempotent(
             f"debt_id={debt_id} ts={run_ts} force_rebind=True\n",
             encoding="utf-8",
         )
-        bound_ok = _bind(target_id, repo, spec_path, force=True)
-        ticked_ok = bound_ok and _tick(target_id, repo)
-        verified_ok = ticked_ok and _verify_dispatched(target_id)
+        # R6 (rev 3): the same fail-closed crash handler as branch 1 — a
+        # crash mid-sequence leaves the pending marker for the next run to
+        # resolve and the run exits cleanly (the item lands in
+        # results["failed"], never an unhandled abort).
+        try:
+            bound_ok = _bind(target_id, repo, spec_path, force=True)
+            ticked_ok = bound_ok and _tick(target_id, repo)
+            verified_ok = ticked_ok and _verify_dispatched(target_id)
+        except Exception as exc:
+            logger.error(
+                "[bundle-autodispatch] !!! %s: crash mid force re-bind "
+                "bind/tick/verify sequence (%s) — leaving "
+                ".autodispatch-pending for the next run to resolve; "
+                "failing closed (debt_id=%s)",
+                target_id, exc, debt_id,
+            )
+            results["failed"].append({
+                "spec": target_id, "reason": "mechanical_bind_failed",
+                "source_bundle": source_bundle, "debt_id": debt_id,
+                "outcome": OUTCOME_FAILED_MECHANICAL_BIND,
+            })
+            return
         if verified_ok:
             pending.rename(_mechanical_item_done_marker(spec_path))
             results["bound"].append({

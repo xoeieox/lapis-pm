@@ -2354,7 +2354,7 @@ class TestIdempotentBindReplay:
         from lapis_pm import bundle_triage as bt_mod
 
         root = tmp_path / "_repo"
-        (root / "tests").mkdir(parents=True)
+        (root / "tests").mkdir(parents=True, exist_ok=True)
         (root / "tests" / "test_mod.py").write_text("def test_x(): pass\n")
         monkeypatch.setattr(bt_mod, "_repo_root", lambda repo: root)
         monkeypatch.setattr(
@@ -2659,9 +2659,17 @@ class TestMechanicalBindExplicitOutcome:
         }
 
     def _run_branch(self, tmp_path, monkeypatch, patch_ctx) -> dict:
+        """Run _mechanical_bind_idempotent under the given patch objects.
+        *patch_ctx* is a SEQUENCE of patch context managers (a tuple does
+        not itself support the context manager protocol — enter them all
+        via ExitStack)."""
+        import contextlib
+
         spec_path = self._spec_path(tmp_path)
         results: dict = {"bound": [], "failed": [], "skipped": []}
-        with patch_ctx:
+        with contextlib.ExitStack() as stack:
+            for ctx in patch_ctx:
+                stack.enter_context(ctx)
             bad._mechanical_bind_idempotent(
                 REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
                 source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
@@ -3013,6 +3021,13 @@ class TestMechanicalBindPendingMarker:
 
         # --- Run 3: the done marker is now live. The same debt_id must
         # NEVER be dispatched again — no bind/tick/verify, terminal skip.
+        # The run-2 re-bind refreshed the spec binding to the freshly
+        # cooked spec (the episodic stub still carries the prior-night
+        # bound spec, whose fingerprint matches the fresh cook), so the
+        # in-flight classification reads the target as in-flight (open
+        # PR) -> the done-marker duplicate-dispatch guard fires.
+        _stub_episodic(monkeypatch, bound_spec=spec_path.read_text(encoding="utf-8"))
+        _stub_in_flight(monkeypatch, pr_open=True)
         results3: dict = {"bound": [], "failed": [], "skipped": []}
         with (
             patch.object(bad, "_target_yaml_exists", return_value=True),

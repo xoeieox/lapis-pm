@@ -7260,11 +7260,21 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
     For each open PR whose branch does NOT match lapis/<target_id>/:
     - If traceable via markers, auto-adopt (set adopted_head_branch + adopted_pr_number)
     - If owned by another bound target, skip silently
-    - If not traceable to any target, raise a brief with adopt|close|ignore options
+    - If the slug tid (lapis/<tid>/...) names a BOUND target (any repo),
+      skip silently with a pm:orphan-owned-by observation (R1,
+      lapis-pm-orphan-pr-attribution-v0)
+    - If the slug tid names an UNBOUND target, do NOT raise a brief on the
+      encountering target; write the single-sink mem key
+      pm/orphan-pr/<repo>/pr-<n> exactly once (R2)
+    - If no slug tid is parseable (true untraceable), raise a brief with
+      adopt|close|ignore options on the FIRST encountering target only —
+      the sink key idempotency stops later targets (R3)
 
     Brief idempotency: if an outstanding brief already exists for this target
     and references this PR, skip re-synthesis to avoid LLM budget waste and
-    episodic spam.
+    episodic spam. The R2/R3 sink key (pm/orphan-pr/<repo>/pr-<n>) is
+    PR-scoped, never target-scoped, and the R2 path never writes
+    pm/outstanding-brief/*.
     """
     for pr in all_open_prs:
         pr_number = pr.get("number")

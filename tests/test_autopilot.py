@@ -246,6 +246,127 @@ class TestPauseClassificationMatrix:
 
 
 # ---------------------------------------------------------------------------
+# D3 - the per-(target, pr, cycle) counter clear deletes the REAL key shapes
+# (fixer_retry, reviewer 2026-09-21): the attempts counter has NO /recorded
+# suffix; the ceiling / infra-budget pause markers DO. The clear must use the
+# daemon's own key constructors (DRY) — a hardcoded template that drifts
+# silently fails to delete the markers.
+# ---------------------------------------------------------------------------
+
+class TestClearReviewerStateRealKeyShapes:
+    """The per-(target, pr, cycle) counter clear deletes the keys in the REAL
+    shapes (verified live against the deployed daemon): the attempts counter
+    is ``pm/reviewer-attempts/<tid>/pr=<pr>/cycle=<cycle>`` (NO /recorded
+    suffix — the attempts template is CORRECT as written), while the ceiling
+    and infra-budget pause markers carry the ``/recorded`` suffix
+    (``pm/reviewer-attempt-ceiling/<tid>/pr=<pr>/cycle=<cycle>/recorded`` and
+    ``pm/reviewer-infra-budget/<tid>/pr=<pr>/cycle=<cycle>/recorded`` — the
+    daemon's own constructors, pm_core._reviewer_attempt_ceiling_marker_key /
+    _reviewer_infra_budget_marker_key). The clear seeds keys in the real
+    shapes and asserts they are ACTUALLY DELETED (seed a key, call clear,
+    assert absent — not just infra_count==0)."""
+
+    def test_key_shapes_match_the_daemon_constructors(self):
+        """The clear's key shapes are the daemon's own constructors (DRY —
+        no hardcoded template that can drift)."""
+        tid, pr, cycle = "shape-1", 348, 2
+        attempts_key = pm_core._reviewer_attempt_key(tid, pr, cycle)
+        ceiling_key = pm_core._reviewer_attempt_ceiling_marker_key(tid, pr, cycle)
+        infra_key = pm_core._reviewer_infra_budget_marker_key(tid, pr, cycle)
+        # The attempts counter has NO /recorded suffix (the live key shape,
+        # e.g. pm/reviewer-attempts/lapis-pm-test-gate-hermeticity-v0/pr=348/
+        # cycle=2).
+        assert attempts_key == (
+            f"pm/reviewer-attempts/{tid}/pr={pr}/cycle={cycle}")
+        assert not attempts_key.endswith("/recorded")
+        # The ceiling / infra-budget markers DO carry the /recorded suffix.
+        assert ceiling_key == (
+            f"pm/reviewer-attempt-ceiling/{tid}/pr={pr}/cycle={cycle}"
+            f"/recorded")
+        assert infra_key == (
+            f"pm/reviewer-infra-budget/{tid}/pr={pr}/cycle={cycle}/recorded")
+        # The clear uses the daemon's own constructors (DRY).
+        assert autopilot._REVIEWER_STATE_KEY_CONSTRUCTORS == (
+            pm_core._reviewer_attempt_key,
+            pm_core._reviewer_attempt_ceiling_marker_key,
+            pm_core._reviewer_infra_budget_marker_key,
+        )
+
+    def test_clear_deletes_all_three_real_keys(self, mem_store):
+        """Seed all three keys in the REAL shapes (including /recorded), call
+        the clear, and assert each is ACTUALLY DELETED (absent) — not just
+        that infra_count read back as 0."""
+        tid, pr, cycle = "clear-1", 349, 1
+        attempts_key = pm_core._reviewer_attempt_key(tid, pr, cycle)
+        ceiling_key = pm_core._reviewer_attempt_ceiling_marker_key(tid, pr, cycle)
+        infra_key = pm_core._reviewer_infra_budget_marker_key(tid, pr, cycle)
+        # Seed the attempts counter (NO /recorded suffix).
+        mem_store.set(attempts_key, json.dumps({
+            "count": 3, "infra_count": 3,
+            "last_reason": "ERROR: (reason=gw_seat_occupied)",
+            "last_infra_reason": "gw_seat_occupied"}),
+            tags=["lapis-pm", "reviewer-attempts"])
+        # Seed the ceiling + infra-budget pause markers (/recorded suffix).
+        mem_store.set(ceiling_key, json.dumps({"paused": True}),
+                      tags=["lapis-pm", "reviewer-attempt-ceiling"])
+        mem_store.set(infra_key, json.dumps({"paused": True}),
+                      tags=["lapis-pm", "reviewer-infra-budget"])
+        # All three are present before the clear.
+        assert mem_store.get(attempts_key) is not None
+        assert mem_store.get(ceiling_key) is not None
+        assert mem_store.get(infra_key) is not None
+
+        cleared = autopilot.clear_reviewer_state_for_cycle(
+            mem_store, tid, pr, cycle)
+        assert cleared == 3
+
+        # Each key is ACTUALLY DELETED (absent) — the real shapes, including
+        # the /recorded markers, are gone.
+        assert mem_store.get(attempts_key) is None
+        assert mem_store.get(ceiling_key) is None
+        assert mem_store.get(infra_key) is None
+        # The counter reads back as the default (infra_count == 0) — but the
+        # load-bearing assertion is the key absence above, not this.
+        assert pm_core._reviewer_attempt_state(tid, pr, cycle)["infra_count"] == 0
+
+    def test_clear_does_not_touch_a_sibling_pr(self, mem_store):
+        """The clear is per-(target, pr, cycle): a SIBLING PR's keys (a
+        different pr_number) are NOT touched (spec H5 — a mixed target would
+        lose a sibling PR's real-verdict budget)."""
+        tid, pr, cycle = "sibling-1", 350, 1
+        # The target's own cycle keys (seeded).
+        mem_store.set(pm_core._reviewer_attempt_key(tid, pr, cycle),
+                      json.dumps({"count": 3, "infra_count": 3}),
+                      tags=["lapis-pm", "reviewer-attempts"])
+        mem_store.set(
+            pm_core._reviewer_infra_budget_marker_key(tid, pr, cycle),
+            json.dumps({"paused": True}),
+            tags=["lapis-pm", "reviewer-infra-budget"])
+        # A sibling PR's keys (must survive the clear).
+        sibling_pr = pr + 1
+        sibling_attempts = pm_core._reviewer_attempt_key(tid, sibling_pr, cycle)
+        sibling_marker = (
+            pm_core._reviewer_infra_budget_marker_key(tid, sibling_pr, cycle))
+        mem_store.set(sibling_attempts,
+                      json.dumps({"count": 5, "infra_count": 1}),
+                      tags=["lapis-pm", "reviewer-attempts"])
+        mem_store.set(sibling_marker, json.dumps({"paused": True}),
+                      tags=["lapis-pm", "reviewer-infra-budget"])
+
+        autopilot.clear_reviewer_state_for_cycle(mem_store, tid, pr, cycle)
+
+        # The target's own keys are gone...
+        assert mem_store.get(
+            pm_core._reviewer_attempt_key(tid, pr, cycle)) is None
+        assert mem_store.get(
+            pm_core._reviewer_infra_budget_marker_key(tid, pr, cycle)) is None
+        # ...but the sibling PR's keys survive (the real-verdict budget is
+        # preserved).
+        assert mem_store.get(sibling_attempts) is not None
+        assert mem_store.get(sibling_marker) is not None
+
+
+# ---------------------------------------------------------------------------
 # D6 - the actor-model invariant (grep-verified)
 # ---------------------------------------------------------------------------
 

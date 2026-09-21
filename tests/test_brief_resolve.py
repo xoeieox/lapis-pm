@@ -103,6 +103,14 @@ def _stop_synth_patches(patches):
         ["A", "B"],
         ["merge_pr", "acknowledge_and_clear"],
     ),
+    # cr-bundle-lapis-pm-2026-09-21 item 61a1ca3a4f: the orphan-adopt trigger
+    # (Leg 2 happy path of the fixer-dispatch-integrity arc) was previously
+    # untested — only advisory-screen-issue and advisory-clean were covered.
+    (
+        "orphan-pr-untraceable",
+        ["A", "B", "C"],
+        ["adopt_pr", "acknowledge_and_clear", "acknowledge_and_clear"],
+    ),
 ])
 def test_synthesize_emits_sibling_for_closed_form_triggers(
     trigger, expected_option_ids, expected_action_kinds

@@ -7365,6 +7365,8 @@ def _reconcile_orphan_prs(target_id: str, target, repo: str, all_open_prs: list[
             existing_brief = get_outstanding_brief(target_id)
             if existing_brief:
                 # A brief already exists; skip synthesis to avoid LLM waste
+                # (do NOT record the sink key — a different PR may be the
+                # one that owns this target's brief).
                 continue
 
             # Not traceable: surface an outstanding brief with closed-form options

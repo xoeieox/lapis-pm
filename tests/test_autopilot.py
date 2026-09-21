@@ -778,7 +778,6 @@ class TestGwSeatOccupiedTaxonomy:
         # classifies it infra (it's in the extended set); the daemon now
         # also classifies it infra (the set was extended). To exercise the
         # divergence path, we patch the daemon's classifier to disagree.
-        from unittest.mock import patch
         with patch.object(pm_core, "_classify_reviewer_infra_reason",
                           return_value=None):
             key = autopilot.write_divergence_row(

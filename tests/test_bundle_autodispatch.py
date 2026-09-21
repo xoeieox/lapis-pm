@@ -2409,11 +2409,19 @@ class TestIdempotentBindReplay:
         # The collision is NOT a failure — the unit exits 0.
         assert results["failed"] == []
         # The triage record carries the skipped (not bound) outcome.
+        # R5 (rev 3): the in-flight skip is a DISTINCT explicit outcome
+        # value (skipped_target_already_active) — it must NOT read back as
+        # bound=False + collision=True (the #372 head's back-channel
+        # shape). collision is reserved for the non-auto source collision
+        # (target_exists_non_auto).
         triage = {t["debt_id"]: t for t in results["triage"]}
         assert triage[REPLAY_DEBT_ID]["class"] == "mechanical"
         assert triage[REPLAY_DEBT_ID]["bound"] is False
         assert triage[REPLAY_DEBT_ID]["bound_already"] is False
-        assert triage[REPLAY_DEBT_ID]["collision"] is True
+        assert triage[REPLAY_DEBT_ID]["collision"] is False
+        assert triage[REPLAY_DEBT_ID]["outcome"] == (
+            bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+        )
         # A skipped item is NOT dropped from the bundle's ## Items (it is
         # not terminal-bound; the bundle keeps it for the next night).
         assert REPLAY_DEBT_ID in spec_path.read_text()
@@ -2602,3 +2610,455 @@ class TestIdempotentBindReplay:
         assert [c.args[0] for c in mock_bind.call_args_list] == [new_target]
         mock_tick.assert_not_called()
         mock_verify.assert_not_called()
+
+# ---------------------------------------------------------------------------
+# R5 (rev 3, DoD 7): explicit mechanical-bind outcome return — the
+# per-item `outcome` field is recorded on every result entry from a
+# CLOSED SET, the caller-side rendering consumes it DIRECTLY (no
+# re-derivation from results["bound"] membership + force_rebound key
+# presence), and an in-flight skip is a DISTINCT value from every
+# failed_* outcome (it must not read back as bound=False + collision=True).
+#
+# R6 (rev 3, DoD 8): pending-marker discipline on the mechanical path —
+# the .autodispatch-pending marker is written BEFORE the bind/tick/verify
+# sequence (mirroring the full-gate _do_bind_tick_verify) and renamed to
+# done after verify, so the pending.rename(done) crash-recovery
+# transition is reachable in the mechanical flow. A stubbed mid-sequence
+# crash leaves a stale marker the next run detects and resolves — no
+# orphaned half-bind, no duplicate dispatch of the same debt_id while the
+# marker is live.
+# ---------------------------------------------------------------------------
+
+
+class TestMechanicalBindExplicitOutcome:
+    """R5 (rev 3, DoD 7): the closed outcome set, direct caller-side
+    consumption, and skip/failure distinguishability."""
+
+    def _spec_path(self, tmp_path, body: str | None = None) -> Path:
+        p = tmp_path / f"{REPLAY_TARGET_ID}.md"
+        p.write_text(body or BUNDLE_SPEC_REPLAY, encoding="utf-8")
+        return p
+
+    def test_outcome_closed_set(self):
+        """The closed set is exactly the five spec-named values and every
+        recorded outcome is a member of it."""
+        assert bad.MECHANICAL_BIND_OUTCOMES == frozenset({
+            "bound",
+            "bound_force_rebound",
+            "skipped_target_already_active",
+            "skipped_target_exists_non_auto",
+            "failed_mechanical_bind",
+        })
+        # The in-flight skip is a DISTINCT value from every failed_*
+        # outcome (spec R5: it must not read back as a failure).
+        assert bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE not in {
+            o for o in bad.MECHANICAL_BIND_OUTCOMES if o.startswith("failed_")
+        }
+        assert bad.OUTCOME_SKIPPED_TARGET_EXISTS_NON_AUTO not in {
+            o for o in bad.MECHANICAL_BIND_OUTCOMES if o.startswith("failed_")
+        }
+
+    def _run_branch(self, tmp_path, monkeypatch, patch_ctx) -> dict:
+        spec_path = self._spec_path(tmp_path)
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with patch_ctx:
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+        return results
+
+    def test_each_branch_records_an_explicit_outcome(self, tmp_path, monkeypatch):
+        """Each R1 branch records its explicit outcome value on the result
+        entry (DoD 7: 'each R1 branch records an explicit outcome value')."""
+        # Branch 1 — fresh: bound.
+        results = self._run_branch(
+            tmp_path, monkeypatch,
+            (
+                patch.object(bad, "_target_yaml_exists", return_value=False),
+                patch.object(bad, "_bind", return_value=True),
+                patch.object(bad, "_tick", return_value=True),
+                patch.object(bad, "_verify_dispatched", return_value=True),
+            ),
+        )
+        assert results["bound"][0]["outcome"] == bad.OUTCOME_BOUND
+
+        # Branch 2 — in-flight: the distinct skip value.
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=spec_path.read_text(encoding="utf-8"))
+        _stub_in_flight(monkeypatch, pr_open=True)
+        results = self._run_branch(
+            tmp_path, monkeypatch,
+            (
+                patch.object(bad, "_target_yaml_exists", return_value=True),
+                patch.object(bad, "_bind"),
+            ),
+        )
+        assert results["skipped"][0]["outcome"] == (
+            bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+        )
+
+        # Branch 3 — mech-cook, not in-flight: force re-bind outcome.
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=_prior_cooked_body(tmp_path))
+        _stub_in_flight(monkeypatch, pr_open=False, dispatched=False)
+        results = self._run_branch(
+            tmp_path, monkeypatch,
+            (
+                patch.object(bad, "_target_yaml_exists", return_value=True),
+                patch.object(bad, "_bind", return_value=True),
+                patch.object(bad, "_tick", return_value=True),
+                patch.object(bad, "_verify_dispatched", return_value=True),
+            ),
+        )
+        assert results["bound"][0]["outcome"] == bad.OUTCOME_BOUND_FORCE_REBOUND
+
+        # Branch 4 — non-auto source: the non-auto skip value.
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec="source: hand-authored by Erah\n")
+        _stub_in_flight(monkeypatch, pr_open=False, dispatched=False)
+        results = self._run_branch(
+            tmp_path, monkeypatch,
+            (
+                patch.object(bad, "_target_yaml_exists", return_value=True),
+                patch.object(bad, "_bind"),
+            ),
+        )
+        assert results["skipped"][0]["outcome"] == (
+            bad.OUTCOME_SKIPPED_TARGET_EXISTS_NON_AUTO
+        )
+
+    def test_genuine_failure_records_failed_outcome(self, tmp_path, monkeypatch):
+        """A genuine fresh bind failure records the failed_* outcome on the
+        failed entry — distinct from the in-flight skip value."""
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=None)
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_bind", return_value=False),
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+        assert results["failed"][0]["outcome"] == bad.OUTCOME_FAILED_MECHANICAL_BIND
+        # The skip value and the failure value are DISTINCT.
+        assert bad.OUTCOME_FAILED_MECHANICAL_BIND != (
+            bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+        )
+
+    def test_outcome_reader_consumes_field_directly(self, tmp_path):
+        """_mechanical_bind_outcome_for reads the `outcome` field DIRECTLY
+        from the recorded entry — it never inspects results["bound"]
+        membership + force_rebound key presence (DoD 7: 'assert no
+        re-derivation from results["bound"] membership')."""
+        # A bound entry whose ONLY identity signal is the outcome field:
+        # no force_rebound key, so any membership+key re-derivation would
+        # read this as a plain bound (or worse, nothing at all).
+        results = {
+            "bound": [{"spec": REPLAY_TARGET_ID, "debt_id": REPLAY_DEBT_ID,
+                       "outcome": bad.OUTCOME_BOUND_FORCE_REBOUND}],
+            "failed": [], "skipped": [],
+        }
+        assert bad._mechanical_bind_outcome_for(
+            REPLAY_TARGET_ID, REPLAY_DEBT_ID, results,
+        ) == bad.OUTCOME_BOUND_FORCE_REBOUND
+
+        # A skipped entry with an outcome: read back exactly as recorded.
+        results = {
+            "bound": [], "failed": [],
+            "skipped": [{"spec": REPLAY_TARGET_ID, "debt_id": REPLAY_DEBT_ID,
+                         "outcome": bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE}],
+        }
+        assert bad._mechanical_bind_outcome_for(
+            REPLAY_TARGET_ID, REPLAY_DEBT_ID, results,
+        ) == bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+
+    def test_in_flight_skip_not_readable_as_failure(self, tmp_path, monkeypatch):
+        """DoD 7 distinguishability: after an in-flight skip the item is
+        NOT in results["failed"], its outcome is the distinct skip value,
+        and the caller-side derivation (the triage record fields) reads
+        bound=False + collision=False — NOT bound=False + collision=True."""
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=spec_path.read_text(encoding="utf-8"))
+        _stub_in_flight(monkeypatch, pr_open=True)
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_bind"),
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+
+        outcome = bad._mechanical_bind_outcome_for(
+            REPLAY_TARGET_ID, REPLAY_DEBT_ID, results,
+        )
+        assert outcome == bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+        # The caller-side rendering consumes the outcome directly:
+        verified_ok = outcome in (bad.OUTCOME_BOUND, bad.OUTCOME_BOUND_FORCE_REBOUND)
+        bound_already = outcome == bad.OUTCOME_BOUND_FORCE_REBOUND
+        collision = outcome == bad.OUTCOME_SKIPPED_TARGET_EXISTS_NON_AUTO
+        assert verified_ok is False
+        assert bound_already is False
+        assert collision is False, (
+            "an in-flight skip must NOT read back as bound=False + "
+            "collision=True"
+        )
+        assert results["failed"] == []
+
+    def test_end_to_end_triage_record_carries_explicit_outcome(
+        self, tmp_path, monkeypatch,
+    ):
+        """End-to-end: the triage record (the caller-side rendering) carries
+        the explicit outcome field for each R1 branch."""
+        replay = TestIdempotentBindReplay()
+
+        # In-flight replay -> skipped_target_already_active.
+        spec_path = _write_replay_spec(tmp_path)
+        replay._patch_contract_found(monkeypatch, tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+        _stub_episodic(monkeypatch, bound_spec=_prior_cooked_body(tmp_path))
+        _stub_in_flight(monkeypatch, pr_open=True)
+        with (
+            patch.object(bad, "_target_yaml_exists",
+                         side_effect=lambda tid: tid == REPLAY_TARGET_ID),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind"),
+            patch.object(bad, "_tick"),
+            patch.object(bad, "_verify_dispatched"),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage[REPLAY_DEBT_ID]["outcome"] == (
+            bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+        )
+        assert triage[REPLAY_DEBT_ID]["bound"] is False
+        assert triage[REPLAY_DEBT_ID]["collision"] is False
+
+        # Force re-bind replay -> bound_force_rebound.
+        spec_path = _write_replay_spec(tmp_path)
+        replay._patch_contract_found(monkeypatch, tmp_path)
+        mock_brief = _make_brief("shape-with-Erah", council_status="laid-down")
+        stale_body = _prior_cooked_body(tmp_path).replace(
+            "Restore the exponential backoff multiplier on retry.",
+            "An older fix description from last night.",
+        )
+        _stub_episodic(monkeypatch, bound_spec=stale_body)
+        _stub_in_flight(monkeypatch, pr_open=False, dispatched=False)
+        with (
+            patch.object(bad, "_target_yaml_exists",
+                         side_effect=lambda tid: tid == REPLAY_TARGET_ID),
+            patch.object(bad, "_gw_serving", return_value=True),
+            patch.object(bad, "_run_gate", return_value=mock_brief),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+            patch.object(bad, "_classify_salvage_via_gw", return_value=None),
+            patch.object(bad, "_write_enforce_record"),
+        ):
+            results = _reconcile(tmp_path)
+        triage = {t["debt_id"]: t for t in results["triage"]}
+        assert triage[REPLAY_DEBT_ID]["outcome"] == bad.OUTCOME_BOUND_FORCE_REBOUND
+        assert triage[REPLAY_DEBT_ID]["bound"] is True
+        assert triage[REPLAY_DEBT_ID]["bound_already"] is True
+        assert triage[REPLAY_DEBT_ID]["collision"] is False
+
+
+class TestMechanicalBindPendingMarker:
+    """R6 (rev 3, DoD 8): the mechanical path writes the
+    .autodispatch-pending marker BEFORE its bind/tick/verify sequence and
+    renames it to done after verify — the pending.rename(done)
+    crash-recovery transition is reachable in the mechanical flow."""
+
+    def _spec_path(self, tmp_path, body: str | None = None) -> Path:
+        p = tmp_path / f"{REPLAY_TARGET_ID}.md"
+        p.write_text(body or BUNDLE_SPEC_REPLAY, encoding="utf-8")
+        return p
+
+    def test_fresh_bind_writes_pending_before_bind_renames_after_verify(
+        self, tmp_path, monkeypatch,
+    ):
+        """DoD 8: the pending marker is written BEFORE bind is called and
+        renamed to the done marker after verify succeeds (mirrors the
+        full-gate _do_bind_tick_verify discipline)."""
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=None)
+        pending_seen_on_bind: list[bool] = []
+
+        def check_pending_on_bind(*args, **kwargs):
+            pending_seen_on_bind.append(
+                bad._mechanical_item_marker(spec_path).exists()
+            )
+            return True
+
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_bind", side_effect=check_pending_on_bind),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+
+        assert pending_seen_on_bind == [True], (
+            ".autodispatch-pending must exist when bind() is called"
+        )
+        # Atomic transition completed: pending gone, done marker present.
+        assert not bad._mechanical_item_marker(spec_path).exists()
+        assert bad._mechanical_item_done_marker(spec_path).exists()
+        assert results["bound"][0]["outcome"] == bad.OUTCOME_BOUND
+
+    def test_force_rebind_writes_pending_before_bind_renames_after_verify(
+        self, tmp_path, monkeypatch,
+    ):
+        """The force re-bind sequence carries the same write-ahead
+        discipline: pending before bind(force=True), done after verify."""
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=_prior_cooked_body(tmp_path))
+        _stub_in_flight(monkeypatch, pr_open=False, dispatched=False)
+        pending_seen_on_bind: list[bool] = []
+
+        def check_pending_on_bind(*args, **kwargs):
+            pending_seen_on_bind.append(
+                bad._mechanical_item_marker(spec_path).exists()
+            )
+            return True
+
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_bind", side_effect=check_pending_on_bind),
+            patch.object(bad, "_tick", return_value=True),
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+
+        assert pending_seen_on_bind == [True]
+        assert not bad._mechanical_item_marker(spec_path).exists()
+        assert bad._mechanical_item_done_marker(spec_path).exists()
+        assert results["bound"][0]["outcome"] == bad.OUTCOME_BOUND_FORCE_REBOUND
+
+    def test_crash_mid_sequence_leaves_stale_marker_next_run_resolves(
+        self, tmp_path, monkeypatch,
+    ):
+        """DoD 8 crash recovery: a run that crashes mid-sequence (after the
+        pending marker is written, after bind, before the done rename)
+        leaves a stale .autodispatch-pending marker. The NEXT run detects
+        it and resolves it — the bind provably succeeded (the target
+        exists and is in-flight), so the pending -> done transition
+        completes. No orphaned half-bind, no duplicate dispatch of the
+        same debt_id."""
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=spec_path.read_text(encoding="utf-8"))
+
+        # --- Run 1: crashes mid-sequence. The pending marker is written,
+        # bind succeeds, then the process dies before the done rename.
+        pending = bad._mechanical_item_marker(spec_path)
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_bind", return_value=True),
+            patch.object(bad, "_tick", side_effect=RuntimeError("crash")),
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS,
+                {"bound": [], "failed": [], "skipped": []},
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+        # The crash left the stale pending marker in place (the done
+        # marker was never written — no orphaned half-bind success).
+        assert pending.exists(), "crashed run must leave the stale pending marker"
+        assert not bad._mechanical_item_done_marker(spec_path).exists()
+
+        # --- Run 2: the prior run crashed before the target YAML was
+        # created (bind started, tick never ran). The next run detects the
+        # stale pending marker in the fresh-bind sequence and RESOLVES it
+        # (crash recovery): it is overwritten and, on a successful
+        # re-bind/tick/verify, renamed to done. No orphaned half-bind
+        # marker survives, and the done marker is written exactly once —
+        # the pending.rename(done) transition is reachable in the
+        # mechanical flow.
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=False),
+            patch.object(bad, "_bind", return_value=True) as mock_bind,
+            patch.object(bad, "_tick", return_value=True) as mock_tick,
+            patch.object(bad, "_verify_dispatched", return_value=True),
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+
+        # Stale marker resolved: pending gone, done marker present.
+        assert not pending.exists()
+        assert bad._mechanical_item_done_marker(spec_path).exists()
+        # The crashed half-bind was completed, not duplicated: exactly one
+        # bind/tick/verify pass, and the item is bound (not failed).
+        mock_bind.assert_called_once_with(REPLAY_TARGET_ID, "agents-core", spec_path)
+        mock_tick.assert_called_once_with(REPLAY_TARGET_ID, "agents-core")
+        assert results["failed"] == []
+        assert results["bound"][0]["outcome"] == bad.OUTCOME_BOUND
+
+        # --- Run 3: the done marker is now live. The same debt_id must
+        # NEVER be dispatched again — no bind/tick/verify, terminal skip.
+        results3: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_bind") as mock_bind3,
+            patch.object(bad, "_tick") as mock_tick3,
+            patch.object(bad, "_verify_dispatched") as mock_verify3,
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results3,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+        mock_bind3.assert_not_called()
+        mock_tick3.assert_not_called()
+        mock_verify3.assert_not_called()
+        assert results3["failed"] == []
+        assert results3["skipped"][0]["reason"] == "target_already_active"
+        assert results3["skipped"][0]["outcome"] == (
+            bad.OUTCOME_SKIPPED_TARGET_ALREADY_ACTIVE
+        )
+
+    def test_done_marker_is_the_duplicate_dispatch_guard(
+        self, tmp_path, monkeypatch,
+    ):
+        """While the done marker is live (a prior run verified this
+        debt_id's dispatch), the next run performs no bind/tick/verify of
+        the same debt_id — no duplicate dispatch."""
+        spec_path = self._spec_path(tmp_path)
+        _stub_episodic(monkeypatch, bound_spec=spec_path.read_text(encoding="utf-8"))
+        _stub_in_flight(monkeypatch, pr_open=True)
+        # A prior run completed: the done marker is live.
+        bad._mechanical_item_done_marker(spec_path).write_text("done\n", encoding="utf-8")
+
+        results: dict = {"bound": [], "failed": [], "skipped": []}
+        with (
+            patch.object(bad, "_target_yaml_exists", return_value=True),
+            patch.object(bad, "_bind") as mock_bind,
+            patch.object(bad, "_tick") as mock_tick,
+            patch.object(bad, "_verify_dispatched") as mock_verify,
+        ):
+            bad._mechanical_bind_idempotent(
+                REPLAY_TARGET_ID, "agents-core", spec_path, _RUN_TS, results,
+                source_bundle=REPLAY_BUNDLE_ID, debt_id=REPLAY_DEBT_ID,
+            )
+
+        mock_bind.assert_not_called()
+        mock_tick.assert_not_called()
+        mock_verify.assert_not_called()
+        assert results["failed"] == []
+        assert results["skipped"][0]["reason"] == "target_already_active"

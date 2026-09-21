@@ -813,21 +813,25 @@ def _provenance_row(mem, target_id: str, action_kind: str, head_sha: str,
 def clear_reviewer_state_for_cycle(mem, target_id: str, pr_number: int,
                                    cycle: int) -> int:
     """D3: the per-(target, pr, cycle) counter clear. Touches ONLY the three
-    pm/reviewer- prefixes for THIS (pr, cycle) — NOT the target-granular
+    pm/reviewer- keys for THIS (pr, cycle) — NOT the target-granular
     clear_reviewer_attempts wipe (a mixed target would lose a sibling PR's
-    real-verdict budget, spec H5). Returns the number of keys cleared."""
+    real-verdict budget, spec H5). Returns the number of keys cleared.
+
+    The key shapes come from the daemon's own constructors (DRY — a
+    hardcoded template drifts and silently fails to delete the markers):
+      * ``pm_core._reviewer_attempt_key`` — the attempts counter
+        (``pm/reviewer-attempts/<tid>/pr=<pr>/cycle=<cycle>``).
+      * ``pm_core._reviewer_attempt_ceiling_marker_key`` — the ceiling pause
+        marker (``.../cycle=<cycle>/recorded``).
+      * ``pm_core._reviewer_infra_budget_marker_key`` — the infra-budget
+        pause marker (``.../cycle=<cycle>/recorded``).
+    """
     cleared = 0
-    for prefix in _REVIEWER_STATE_PREFIXES:
-        key = prefix.format(target_id=target_id, pr_number=pr_number,
-                            cycle=cycle)
-        # The attempt-state key is an exact key (not a prefix); the ceiling /
-        # infra-budget markers are exact keys too. Delete each exact key.
+    for construct in _REVIEWER_STATE_KEY_CONSTRUCTORS:
+        key = construct(target_id, pr_number, cycle)
+        # Each key is an exact key (the attempts counter and the two pause
+        # markers). Delete it.
         if mem.delete(key):
-            cleared += 1
-        # The recorded marker (the already_recorded marker) is a separate
-        # exact key under the same prefix.
-        marker_key = f"{key}/recorded"
-        if mem.delete(marker_key):
             cleared += 1
     return cleared
 

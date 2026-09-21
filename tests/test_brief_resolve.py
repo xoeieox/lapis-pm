@@ -337,6 +337,7 @@ def test_act_adopt_pr_updates_pm_state_and_fires_no_fixer():
 
     mock_target = MagicMock()
     mock_target.pm_repo = "lapis/test-repo"
+    mock_target.data = {}  # real dict — the handler mutates it
     with (
         patch("agents_core.targets.TargetStore") as MockStore,
         patch("agents_core.forgejo.get_pr") as mock_get_pr,

@@ -665,6 +665,67 @@ def cmd_stall_check(args) -> int:
     return stall_check.main()
 
 
+def cmd_autopilot(args) -> int:
+    """The pipeline autopilot (the prodder) — lapis-pm-pipeline-autopilot-v0.
+
+    ``lapis-pm autopilot sweep``: run one per-tick sweep (PERCEIVE -> classify
+    -> UNBLOCK / ADJUDICATE / RE-FIRE -> ESCALATE). The daemon tick is the
+    sole dispatch/merge actor; the sweep only writes state + emits dossiers +
+    escalates. Shadow-mode-first (``LAPIS_PM_AUTOPILOT=shadow`` default):
+    proposals are observed only. ``off`` halts the sweep.
+
+    ``lapis-pm autopilot report``: the shadow-review surface (the Nudge Log —
+    the narrative render of the last N shadow proposals + reversals).
+
+    ``lapis-pm autopilot liveness``: the BRIX-side liveness backstop (D5) —
+    check the heartbeat freshness and page/record when stale (catches a dead
+    prodder while GW sleeps).
+    """
+    from . import autopilot
+    from . import pm_core
+
+    if args.autopilot_cmd == "sweep":
+        if args.target:
+            target_ids = [args.target]
+        else:
+            target_ids = autopilot._bounded_target_ids()
+        result = autopilot.run_sweep(
+            target_ids, now=None, tick_id=args.tick_id or "")
+        if args.json:
+            import json as _json
+            print(_json.dumps(result, ensure_ascii=False, default=str))
+        else:
+            print(f"[autopilot] mode={result['mode']} "
+                  f"halted={result['halted']} "
+                  f"dossiers_this_tick={result.get('dossiers_this_tick', 0)}")
+            for t in result["targets"]:
+                print(f"  {t.get('target_id')}: {t.get('action', t.get('skipped'))} "
+                      f"(state={t.get('state_code', '-')})")
+        return 0
+
+    if args.autopilot_cmd == "report":
+        mem = pm_core._mem()
+        print(autopilot.report(
+            mem, target_id=args.target, limit=args.limit))
+        return 0
+
+    if args.autopilot_cmd == "liveness":
+        mem = pm_core._mem()
+        result = autopilot.check_prodder_liveness(mem)
+        if args.json:
+            import json as _json
+            print(_json.dumps(result, ensure_ascii=False, default=str))
+        else:
+            print(f"[autopilot liveness] {result.get('action')} "
+                  f"(age={result.get('age_s', 'n/a')}s)")
+        return 0
+
+    # Unknown subcommand (argparse enforces choices, so this is defensive).
+    print(f"ERROR: unknown autopilot subcommand: {args.autopilot_cmd}",
+          file=sys.stderr)
+    return 2
+
+
 def cmd_tick(args) -> int:
     # Force-dispatch: bypass the normal decide path for smoke testing.
     if args.force_dispatch:
@@ -2401,6 +2462,46 @@ def build_parser() -> argparse.ArgumentParser:
              "no LLM calls; run by lapis-pm-stall-check.timer on a 10m cadence.",
     )
     sc.set_defaults(func=cmd_stall_check)
+
+    ap = sub.add_parser(
+        "autopilot",
+        help="The pipeline autopilot (the prodder) — "
+             "lapis-pm-pipeline-autopilot-v0. PERCEIVE -> classify -> UNBLOCK / "
+             "ADJUDICATE / RE-FIRE -> ESCALATE. The daemon tick is the sole "
+             "dispatch/merge actor; the sweep only writes state + emits "
+             "dossiers + escalates. Shadow-mode-first (default).",
+    )
+    ap_sub = ap.add_subparsers(dest="autopilot_cmd", required=True)
+    ap_sweep = ap_sub.add_parser(
+        "sweep",
+        help="Run one per-tick sweep (the prodder loop).",
+    )
+    ap_sweep.add_argument("target", nargs="?", default=None,
+                          help="Target id (default: all pm-bound targets)")
+    ap_sweep.add_argument("--tick-id", default=None,
+                          help="Explicit tick id (default: a UTC ts slug)")
+    ap_sweep.add_argument("--json", action="store_true",
+                          help="Emit machine-readable JSON")
+    ap_sweep.set_defaults(func=cmd_autopilot)
+    ap_report = ap_sub.add_parser(
+        "report",
+        help="The shadow-review surface (the Nudge Log — the narrative render "
+             "of the last N shadow proposals + reversals).",
+    )
+    ap_report.add_argument("target", nargs="?", default=None,
+                           help="Target id (default: all targets)")
+    ap_report.add_argument("--limit", type=int, default=20,
+                           help="Max proposals to show (default: 20)")
+    ap_report.set_defaults(func=cmd_autopilot)
+    ap_live = ap_sub.add_parser(
+        "liveness",
+        help="The BRIX-side liveness backstop (D5) — check the heartbeat "
+             "freshness and page/record when stale (catches a dead prodder "
+             "while GW sleeps).",
+    )
+    ap_live.add_argument("--json", action="store_true",
+                         help="Emit machine-readable JSON")
+    ap_live.set_defaults(func=cmd_autopilot)
 
     s = sub.add_parser("status", help="Show PM state for bound target(s).")
     s.add_argument("target_id", nargs="?")

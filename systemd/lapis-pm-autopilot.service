@@ -1,0 +1,46 @@
+[Unit]
+Description=Lapis PM - pipeline autopilot (the prodder) — perceive-and-write-state loop (lapis-pm-pipeline-autopilot-v0)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+WorkingDirectory=/srv/git/lapis-pm
+ExecStart=/usr/bin/python3 -m lapis_pm.cli autopilot sweep
+# D2 unit hygiene (spec pin, actor model): this unit MUST NOT reference the
+# CREDENTIAL env files (the conductor / phala credential files) that
+# lapis-pm.service carries — no merge-path credential, no Phala key. The
+# actor model is load-bearing: the daemon tick (pm_core.tick) is the SOLE
+# dispatch/merge actor; the autopilot unit is a perceive-and-write-state
+# layer that NEVER dispatches a leg and NEVER merges a PR. Its blast radius
+# is the mem write + the Matrix page. The merge-path credential is an
+# EXPLICIT, NAMED EXCEPTION to the "no merge-path credential" D6a rule,
+# justified by the actor model — merges run under the daemon tick's
+# credential env, not this unit.
+#
+# The scoped env file carries EXACTLY (the key-set contract, pinned here and
+# asserted by tests/test_autopilot.py):
+#   MEM_DB_PATH=/data/memory/mem.db
+#   LAPIS_PM_OWNED_MEM_STORE=/data/memory/mem.db
+#   MATRIX_HOMESERVER_URL=...
+#   MATRIX_ROOM_ID=...
+#   MATRIX_ACCESS_TOKEN=...
+# and NOT the merge-path credential (the merge path runs under the daemon
+# tick's credential env). The scoped file is created by a post-land host op
+# (it is not in the repo); the leading '-' keeps the unit optional-tolerant
+# until that op lands.
+#
+# Privilege scope (spec D2): because merges run under the daemon (not this
+# unit), the unit's own blast radius is the mem write + the Matrix page. This
+# unit performs NO cross-host install and NO privileged service restart
+# (those live in merge_and_deploy's post-land hook, which runs under the
+# daemon).
+EnvironmentFile=-%h/.config/lapis-pm/autopilot.env
+Environment=PYTHONPATH=/data/agents/scripts:/home/user/.local/lib/python3.12/site-packages
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin:/home/user/.local/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

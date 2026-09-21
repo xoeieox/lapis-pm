@@ -933,6 +933,8 @@ class TestCycleKProgression:
             # ts against the SHA stream; the fixer's commit (sha3) landed
             # after it, so the guard passes.
             patch("lapis_pm.pm_core._pr_advanced_since", return_value=True),
+            patch("lapis_pm.pm_core._last_review_verdict",
+                  return_value={"verdict": "fixable", "issues": ISSUES, "confidence": 0.8}),
             patch("lapis_pm.pm_core._collect_review_history", return_value=[
                 {"cycle": 1, "verdict": "fixable", "issues": ISSUES},
                 {"cycle": 2, "verdict": "fixable", "issues": ISSUES},

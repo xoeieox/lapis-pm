@@ -166,6 +166,30 @@ def test_synthesize_emits_sibling_with_pr_number():
     assert merge_opt["action"]["pr"] == 42
 
 
+def test_synthesize_emits_sibling_with_pr_number_for_adopt_pr():
+    """cr-bundle item 61a1ca3a4f: the orphan-adopt trigger injects pr_number
+    into the adopt_pr option (the action handler derives nothing — the PR
+    number must ride the option payload)."""
+    brief_cid = "test-brief-cid-003"
+    captured_options: list = []
+
+    with (
+        patch("agents_core.gw_agent.call_gw_agent", return_value="## State\nok\n## Decision needed\nnone"),
+            patch("lapis_pm.brief.send_notification", return_value=False),
+        patch("lapis_pm.brief.episodic.recall", return_value=[]),
+            patch("lapis_pm.brief.episodic.spec_summary", return_value="spec"),
+        patch("lapis_pm.brief.episodic.write_brief",
+              side_effect=_fake_write_brief_factory(brief_cid)),
+        patch("lapis_pm.brief.episodic.write_brief_options",
+              side_effect=_fake_write_brief_options_factory(captured_options)),
+    ):
+        brief.synthesize("test-tid", trigger="orphan-pr-untraceable", pr_number=77, notify=None)
+
+    data = json.loads(captured_options[0][1])
+    adopt_opt = next(o for o in data["options"] if o["action"]["kind"] == "adopt_pr")
+    assert adopt_opt["action"]["pr"] == 77
+
+
 @pytest.mark.parametrize("trigger", [
     "stuck-daemon",
     "manual force-brief",

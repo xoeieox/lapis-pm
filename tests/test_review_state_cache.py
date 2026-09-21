@@ -3,7 +3,7 @@
 Coverage:
   - Writes cache when _active_review_state returns a dict.
   - mode derivation: hold → fresh-reviewer, otherwise → same-reviewer.
-  - budget derivation: advisory→2, hold→4, unknown→2.
+  - budget derivation: advisory→3, hold→4, unknown→3.
   - Real verdict surfaces (fixable/clean issue handling).
   - Deletes cache when _active_review_state returns None.
   - Idempotent delete: key already absent + state None → no error, no key.

@@ -168,6 +168,262 @@ def _salvage_attempted_marker(spec_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Idempotent mechanical bind (lapis-pm-bundle-autodispatch-idempotent-bind-v0)
+#
+# The nightly run re-sweeps debt_ids whose deterministic target id
+# (cr-bundle-item-<repo>-<debt_slug>) was already bound by a prior night and
+# is still live (unmerged PR, debt never closed). The old code called
+# _bind() unconditionally and classified that collision as
+# mechanical_bind_failed -> exit 1, so a run that did no wrong work read as
+# a broken nightly pipeline.
+#
+# The bound spec (dispatch intent 2026-09-20, supersedes the original
+# skip/force-rebind design):
+#   - target exists + bound spec FINGERPRINT MATCHES the freshly cooked one
+#     -> the prior night bound exactly this spec. Treat as bound=already:
+#       NO re-bind, NO re-tick (the dispatch is live), and — only when the
+#       cooked spec's own .autodispatch-pending write-ahead marker is present
+#       (crash between bind and marker rename) — atomically transition it
+#       pending -> .autodispatch (the success rename, same primitive as
+#       _do_bind_tick_verify). The item is terminal (bound), never failed.
+#   - target exists + fingerprint MISMATCH (or no bound spec at all)
+#     -> AUDIT line + a brief (episodic comment) recording the collision.
+#       The item is terminal (audit-recorded), the unit NEVER aborts and the
+#       item NEVER lands in results["failed"]. A hand-bound or differently
+#       sourced target is never clobbered.
+#   - target does not exist -> bind/tick/verify exactly as before.
+#
+# Fingerprint: sha256 over the cooked spec body. The cook template is
+# byte-deterministic for a given item, so a re-swept unchanged item
+# reproduces the identical body; an amended debt item (new suggestion /
+# files) yields a different body and takes the mismatch branch.
+#
+# R2 mirror (full-gate path): structurally different — the full-gate bind
+# (_do_bind_tick_verify) already carries the same tolerance as a pre-check:
+# _reconcile_one step 4 skips an existing target YAML as externally_bound
+# (AUDIT line) BEFORE the gate ever runs, and the bundle's spec_id is
+# date-stamped (cr-bundle-<repo>-<YYYY-MM-DD>), so a re-run over a prior
+# night's full-gate target can never resolve to the same id. No additional
+# exists-check is needed there; the mechanical path is the only one whose
+# deterministic id (cr-bundle-item-<repo>-<debt_slug>) is stable across
+# nights for an unclosed debt.
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+_MECH_COOK_SOURCE_RE = re.compile(
+    r"^source:\s*bundle-item-level-triage-v0 mechanical cook", re.MULTILINE,
+)
+
+# Every mechanical-cook spec's frontmatter spec_id IS its deterministic
+# target id (cr-bundle-item-<repo>-<debt_slug>) — the prefix is the
+# mechanical namespace.
+_MECH_TARGET_PREFIX = "cr-bundle-item-"
+
+def _spec_fingerprint(spec_body: str) -> str:
+    """sha256 hex digest of a spec body — the idempotent-bind fingerprint."""
+    return hashlib.sha256(spec_body.encode("utf-8")).hexdigest()
+
+
+def _bound_spec_fingerprint(target_id: str) -> str | None:
+    """Fingerprint of the spec body most recently bound to *target_id*, or
+    None when no spec comment exists. Reads episodic only (no Forgejo / GW /
+    paid calls), so it is safe in the hermetic test surface."""
+    try:
+        from . import episodic
+        body = episodic.spec(target_id)
+    except Exception:
+        return None
+    if not body:
+        return None
+    return _spec_fingerprint(body)
+
+
+def _target_is_mech_cook(target_id: str) -> bool:
+    """True when the existing target is OUR prior night's mechanical
+    auto-bound work — its id lives in the cr-bundle-item- namespace AND its
+    bound spec carries the mechanical cook's own source line. A hand-bound
+    or differently-sourced target reusing the id fails at least one check."""
+    if not target_id.startswith(_MECH_TARGET_PREFIX):
+        return False
+    try:
+        from . import episodic
+        body = episodic.spec(target_id)
+    except Exception:
+        return False
+    return bool(body and _MECH_COOK_SOURCE_RE.search(body))
+
+
+def _mechanical_item_marker(spec_path: Path) -> Path:
+    """Write-ahead pending marker for a mechanical item's cooked spec — the
+    same sibling-marker, POSIX-rename(2)-atomic discipline as the
+    bundle-level .autodispatch* family (spec docstring, top of module)."""
+    return Path(str(spec_path) + ".autodispatch-pending")
+
+
+def _mechanical_item_done_marker(spec_path: Path) -> Path:
+    return Path(str(spec_path) + ".autodispatch")
+
+
+def _write_mechanical_brief(
+    target_id: str,
+    repo: str,
+    debt_id: str,
+    source_bundle: str,
+    run_ts: str,
+    existing_fp: str | None,
+    fresh_fp: str,
+    reason: str,
+) -> None:
+    """Fingerprint-mismatch / non-mechanical collision: deposit a brief
+    (episodic comment on the target) so the collision is visible to Erah in
+    the target's own trail. Never raises — a brief failure is logged, not
+    propagated (the item is terminal either way; the unit never aborts)."""
+    body = (
+        f"[bundle-autodispatch {run_ts}] idempotent-bind AUDIT: debt item "
+        f"`{debt_id}` in bundle `{source_bundle}` re-swept onto existing "
+        f"target `{target_id}` (repo `{repo}`). Reason: {reason}. "
+        f"Existing bound spec fingerprint: {existing_fp or '(none)'}; "
+        f"freshly cooked spec fingerprint: {fresh_fp}. No re-bind and no "
+        f"re-dispatch performed — the existing binding is untouched "
+        f"(hand-bound / differently-sourced targets are never clobbered). "
+        f"Human triage: if the existing target is stale, re-bind manually "
+        f"with `lapis-pm bind {target_id} --force`."
+    )
+    try:
+        from . import episodic
+        episodic._store().append(
+            target_id, body,
+            author="lapis-pm-bundle-autodispatch", author_type="system",
+            tags=["spec:audit", "idempotent-bind"],
+        )
+    except Exception as exc:
+        logger.error(
+            "[bundle-autodispatch] AUDIT: brief write failed for %s: %s",
+            target_id, exc,
+        )
+
+
+def _mechanical_bind_idempotent(
+    target_id: str,
+    repo: str,
+    spec_path: Path,
+    run_ts: str,
+    results: dict,
+    source_bundle: str = "",
+    debt_id: str = "",
+) -> None:
+    """Idempotent mechanical bind for one cooked item spec (spec
+    lapis-pm-bundle-autodispatch-idempotent-bind-v0). Mutates *results* in
+    place; the item ALWAYS reaches a terminal state — bound (fresh or
+    bound=already) or audit-recorded skipped — and NEVER lands in
+    results["failed"] on a collision.
+
+    Branches:
+      1. no target yet           -> bind + tick + verify (unchanged flow).
+      2. target exists, bound spec fingerprint MATCHES the freshly cooked
+         spec -> bound=already: no re-bind, no re-tick. If the cooked
+         spec's own .autodispatch-pending marker is present (prior run
+         crashed between bind and the success rename), transition it
+         atomically pending -> .autodispatch.
+      3. target exists, fingerprint MISMATCH (or no bound spec) -> AUDIT
+         line + brief; skip; never re-bind, never fail.
+    """
+    fresh_fp = _spec_fingerprint(spec_path.read_text(encoding="utf-8"))
+
+    if not _target_yaml_exists(target_id):
+        # Branch 1 — brand new: bind exactly as today.
+        bound_ok = _bind(target_id, repo, spec_path)
+        ticked_ok = bound_ok and _tick(target_id, repo)
+        verified_ok = ticked_ok and _verify_dispatched(target_id)
+        if verified_ok:
+            results["bound"].append({
+                "spec": target_id, "repo": repo, "mechanical": True,
+                "source_bundle": source_bundle, "debt_id": debt_id,
+            })
+        else:
+            # A GENUINE bind/tick/verify failure on a fresh target still
+            # fails — results["failed"] continues to mean "real work
+            # failed" (R3: exit-code semantics preserved).
+            results["failed"].append({
+                "spec": target_id, "reason": "mechanical_bind_failed",
+                "source_bundle": source_bundle, "debt_id": debt_id,
+            })
+        return
+
+    # Target already exists — classify before touching the binding.
+    existing_fp = _bound_spec_fingerprint(target_id)
+    if existing_fp == fresh_fp:
+        # Branch 2 — idempotent replay: the prior night bound exactly this
+        # spec. No re-bind, no re-tick (the dispatch is live).
+        pending = _mechanical_item_marker(spec_path)
+        done = _mechanical_item_done_marker(spec_path)
+        if pending.exists():
+            # Crash between the prior run's bind and its success rename:
+            # the bind provably succeeded (target + matching spec exist),
+            # so complete the atomic pending -> success transition.
+            pending.rename(done)
+            logger.warning(
+                "[bundle-autodispatch] AUDIT: %s — bound=already (fingerprint "
+                "match) with stale .autodispatch-pending on the cooked spec; "
+                "atomic pending -> .autodispatch transition completed",
+                target_id,
+            )
+        logger.info(
+            "[bundle-autodispatch] %s: bound=already (spec fingerprint match, "
+            "fp=%s) — no re-bind, no re-tick", target_id, fresh_fp[:12],
+        )
+        results["bound"].append({
+            "spec": target_id, "repo": repo, "mechanical": True,
+            "bound_already": True,
+            "source_bundle": source_bundle, "debt_id": debt_id,
+        })
+        return
+
+    # Branch 3 — collision: fingerprint mismatch (or no bound spec at all).
+    reason = (
+        "target_exists_non_auto" if not _target_is_mech_cook(target_id)
+        else "target_spec_fingerprint_mismatch"
+    )
+    logger.warning(
+        "[bundle-autodispatch] AUDIT: %s — existing target with %s "
+        "(existing fp=%s, fresh fp=%s); recording brief, NOT re-binding, "
+        "NOT failing. Hand-bound / differently-sourced targets are never "
+        "clobbered.",
+        target_id, reason, existing_fp or "(none)", fresh_fp[:12],
+    )
+    _write_mechanical_brief(
+        target_id, repo, debt_id, source_bundle, run_ts,
+        existing_fp, fresh_fp, reason,
+    )
+    results["skipped"].append({
+        "spec": target_id, "reason": reason,
+        "source_bundle": source_bundle, "debt_id": debt_id,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Idempotent mechanical bind (lapis-pm-bundle-autodispatch-idempotent-bind-v0)
+#
+# The nightly run re-sweeps debt_ids whose deterministic target id
+# (cr-bundle-item-<repo>-<debt_slug>) was already bound by a prior night and
+# is still live (unmerged PR, debt never closed). The old code called
+# _bind() unconditionally and classified that collision as
+# mechanical_bind_failed -> exit 1, so a run that did no wrong work read as
+# a broken nightly pipeline.
+#
+# The bound spec (dispatch intent 2026-09-20):
+#   - target exists + bound spec FINGERPRINT MATCHES the freshly cooked one
+#     -> the prior night bound exactly this spec. Treat as bound=already:
+#       NO re-bind, NO re-tick (the dispatch is live), and — only when the
+#       cooked spec's own .autodispatch-pending write-ahead marker is present
+#       (crash between bind and marker rename) — atomically transition it
+#       pending -> .autodispatch (the success rename, same primitive as
+#       _do_bind_tick_verify). The item is terminal (bound), never failed.
+#   - target exists + fingerprint MISMATCH (or no bound spec at all)
+#     -> AUDIT line + a brief (episodic comment) recording the collision.
+#       The item is terminal (audit-recorded), the unit NEVER aborts and the
+# ---------------------------------------------------------------------------
 # State checks
 # ---------------------------------------------------------------------------
 
@@ -855,34 +1111,60 @@ def _triage_bundle_items(
                 if not holds:
                     cls, reason = "fork", "invariance"
                 else:
-                    bound_ok = _bind(target_id, repo, cooked_path)
-                    ticked_ok = bound_ok and _tick(target_id, repo)
-                    verified_ok = ticked_ok and _verify_dispatched(target_id)
+                    # lapis-pm-bundle-autodispatch-idempotent-bind-v0: the
+                    # idempotent mechanical bind handles all three states —
+                    # fresh (bind+tick+verify exactly as before),
+                    # already-bound-with-matching-spec (bound=already, no
+                    # re-bind, atomic pending-marker transition on a crash
+                    # leftover), and collision (AUDIT + brief, never fail).
+                    # It owns the bound/failed/skipped result appends for
+                    # this item; the triage record below reads the outcome
+                    # back from results.
+                    _mechanical_bind_idempotent(
+                        target_id, repo, cooked_path, run_ts, results,
+                        source_bundle=spec_id, debt_id=debt_id,
+                    )
+
+                    bound_entry = next(
+                        (
+                            b for b in reversed(results["bound"])
+                            if b.get("spec") == target_id
+                            and b.get("debt_id") == debt_id
+                        ),
+                        None,
+                    )
+                    verified_ok = bound_entry is not None
+                    bound_already = bool(
+                        bound_entry and bound_entry.get("bound_already")
+                    )
+                    collision = not verified_ok and not any(
+                        f.get("spec") == target_id
+                        and f.get("debt_id") == debt_id
+                        for f in results["failed"]
+                    )
 
                     rec = {
                         "debt_id": debt_id, "class": "mechanical", "reason": None,
                         "target_id": target_id, "cooked_spec": str(cooked_path),
                         "contract": contract, "bound": verified_ok,
+                        "bound_already": bound_already,
+                        "collision": collision,
                         "baseline": item.get("verification_baseline"),
                     }
                     route_records.append(rec)
                     triage_by_debt_id[debt_id] = rec
                     results["triage"].append({"spec": spec_id, **rec})
                     logger.info(
-                        "[bundle-autodispatch] %s item %s: mechanical → cooked %s, bound=%s",
+                        "[bundle-autodispatch] %s item %s: mechanical → cooked %s, bound=%s%s",
                         spec_id, debt_id, cooked_path.name, verified_ok,
+                        " (bound=already, idempotent replay)" if bound_already else "",
                     )
                     if verified_ok:
+                        # bound=already counts as mechanically bound (the
+                        # item is terminal and its dispatch is live) — the
+                        # triage record's Bound: line and the spec drop
+                        # both apply.
                         mechanical_bound_ids.append(debt_id)
-                        results["bound"].append({
-                            "spec": target_id, "repo": repo, "mechanical": True,
-                            "source_bundle": spec_id, "debt_id": debt_id,
-                        })
-                    else:
-                        results["failed"].append({
-                            "spec": target_id, "reason": "mechanical_bind_failed",
-                            "source_bundle": spec_id, "debt_id": debt_id,
-                        })
                     continue
 
         # fork — either from classify_item directly, or a tier-3 re-route.

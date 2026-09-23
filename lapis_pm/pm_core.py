@@ -3125,6 +3125,15 @@ def _post_land_deploy_hook(
     except Exception as e:  # noqa: BLE001
         print(f"[post-land-deploy] D3 deploy report failed (non-fatal): {e}", file=sys.stderr)
 
+    # mem-hygiene-postland-restart-map-v0 (D-2): the §2.3 growth obligation fired
+    # with the third agents-core entry (mem-server.service) — the restart map is
+    # now self-auditing. Scan the user-unit dir for agents_core importers and log
+    # LOUDLY for any absent from _POST_LAND_RESTART_USER. LOG-LOUD, never
+    # FAIL-STOP: findings land on this same stderr surface as the deploy-pass
+    # report and never block the land.
+    if repo == "agents-core":
+        _run_agents_core_restart_map_audit()
+
     units = _POST_LAND_RESTART.get(repo)
     if units:
         # Only claude-queue-runner defers while fixers are in-flight;

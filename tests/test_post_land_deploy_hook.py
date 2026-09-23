@@ -351,6 +351,194 @@ class TestPostLandDeployHook:
         assert "not active after restart" in captured.err
 
 
+# A synthetic user unit that imports agents_core but is NOT in the restart map
+# (the guard must flag it). Module form, mirroring slot-server.service's
+# `python3 -m agents_core.slot_server` ExecStart shape.
+_SYNTHETIC_UNMAPPED_UNIT = """[Unit]
+Description=synthetic agents_core importer (test fixture)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 -m agents_core.synthetic_worker
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+"""
+
+# A synthetic user unit that does NOT import agents_core (the guard must stay
+# quiet about it).
+_SYNTHETIC_UNRELATED_UNIT = """[Unit]
+Description=synthetic unrelated service (test fixture)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /opt/something/unrelated.py
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+"""
+
+
+class TestAgentsCoreRestartMapAudit:
+    """mem-hygiene-postland-restart-map-v0 D-2/D-3: the §2.3 growth obligation
+    fired with mem-server.service as the third agents-core entry — the restart
+    map is now self-auditing. The guard scans the user-unit dir for agents_core
+    importers and logs LOUDLY for any absent from _POST_LAND_RESTART_USER.
+    LOG-LOUD, never FAIL-STOP: findings never raise, never block a land.
+    """
+
+    def _write_units(self, tmp_path: Path, names: dict[str, str]) -> Path:
+        unit_dir = tmp_path / "user"
+        unit_dir.mkdir()
+        for name, text in names.items():
+            (unit_dir / name).write_text(text)
+        return unit_dir
+
+    def test_guard_flags_synthetic_unmapped_importer(self, tmp_path, capsys):
+        """(b) The guard flags a synthetic user unit that imports agents_core
+        but is absent from the map — loud stderr + returned finding."""
+        unit_dir = self._write_units(
+            tmp_path,
+            {
+                "synthetic-worker.service": _SYNTHETIC_UNMAPPED_UNIT,
+                "unrelated.service": _SYNTHETIC_UNRELATED_UNIT,
+            },
+        )
+        findings = pm_core._audit_agents_core_user_units(unit_dir)
+        assert findings == ["synthetic-worker.service"]
+        captured = capsys.readouterr()
+        assert "AUDIT" in captured.err
+        assert "synthetic-worker.service" in captured.err
+        assert "ABSENT from _POST_LAND_RESTART_USER" in captured.err
+
+    def test_guard_quiet_when_map_complete(self, tmp_path, capsys):
+        """(b) The guard stays quiet when every importer is in the map."""
+        # The real map (agents-core tuple incl. mem-server.service) + the
+        # synthetic unit's name → complete.
+        restart_user = dict(pm_core._POST_LAND_RESTART_USER)
+        restart_user["agents-core"] = restart_user["agents-core"] + ("synthetic-worker.service",)
+        unit_dir = self._write_units(
+            tmp_path,
+            {
+                "synthetic-worker.service": _SYNTHETIC_UNMAPPED_UNIT,
+                "unrelated.service": _SYNTHETIC_UNRELATED_UNIT,
+            },
+        )
+        findings = pm_core._audit_agents_core_user_units(unit_dir, restart_user=restart_user)
+        assert findings == []
+        captured = capsys.readouterr()
+        assert "AUDIT" not in captured.err
+
+    def test_guard_ignores_non_importer_units(self, tmp_path, capsys):
+        """A unit that never imports agents_core is not a finding, even if
+        absent from the map."""
+        unit_dir = self._write_units(
+            tmp_path,
+            {"unrelated.service": _SYNTHETIC_UNRELATED_UNIT},
+        )
+        findings = pm_core._audit_agents_core_user_units(unit_dir)
+        assert findings == []
+        assert "AUDIT" not in capsys.readouterr().err
+
+    def test_guard_detects_wrapper_script_importer(self, tmp_path):
+        """Known-wrapper-set detection: a unit whose ExecStart runs a script
+        under /data/agents/scripts/ that itself imports agents_core is an
+        importer (the doorman pattern — the .service text never names
+        agents_core)."""
+        script = tmp_path / "wrapper.py"
+        script.write_text("import sys\nfrom agents_core.wrapper_server import main\n")
+        unit_dir = self._write_units(
+            tmp_path,
+            {
+                "wrapper.service": (
+                    "[Service]\n"
+                    f"ExecStart=/usr/bin/env python3 {script}\n"
+                    "Restart=on-failure\n"
+                ),
+            },
+        )
+        # The script is not under the real wrapper root, so point the root at
+        # the temp dir: detection is root-relative by construction.
+        wrapper_root = str(tmp_path) + "/"
+        with patch.object(pm_core, "_AGENTS_CORE_WRAPPER_ROOTS", (wrapper_root,)):
+            findings = pm_core._audit_agents_core_user_units(unit_dir)
+        assert findings == ["wrapper.service"]
+
+    def test_guard_missing_dir_is_loud_not_fatal(self, tmp_path, capsys):
+        """A missing/unreadable unit dir is one loud line + empty findings —
+        the guard must never raise or block a land."""
+        findings = pm_core._audit_agents_core_user_units(tmp_path / "does-not-exist")
+        assert findings == []
+        captured = capsys.readouterr()
+        assert "AUDIT" in captured.err
+        assert "SKIPPED" in captured.err
+
+    def test_guard_hook_integration_agents_core(self, tmp_path, capsys):
+        """End-to-end: the agents-core hook pass runs the audit (findings land
+        on the deploy-pass-report stderr surface) and the land is never blocked."""
+        unit_dir = self._write_units(
+            tmp_path,
+            {"synthetic-worker.service": _SYNTHETIC_UNMAPPED_UNIT},
+        )
+        revparse_count = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
+            return _make_completed_process(returncode=0, stdout="active")
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                with patch("pathlib.Path.home", return_value=tmp_path / "home"):
+                                    (tmp_path / "home" / ".config" / "systemd" / "user").mkdir(parents=True)
+                                    (tmp_path / "home" / ".config" / "systemd" / "user" / "synthetic-worker.service").write_text(_SYNTHETIC_UNMAPPED_UNIT)
+                                    pm_core._post_land_deploy_hook("agents-core")  # must not raise
+
+        captured = capsys.readouterr()
+        assert "AUDIT" in captured.err
+        assert "synthetic-worker.service" in captured.err
+
+    def test_guard_hook_not_run_for_other_repos(self, tmp_path, capsys):
+        """The audit is agents-core-scoped: a non-agents-core land never runs it
+        (no scanner noise on unrelated lands)."""
+        revparse_count = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                path = cmd[2]
+                revparse_count[path] = revparse_count.get(path, 0) + 1
+                sha = "presha111" if revparse_count[path] == 1 else "postsha222"
+                return _make_completed_process(returncode=0, stdout=sha)
+            if cmd[0] == "git" and "status" in cmd:
+                return _make_completed_process(returncode=0, stdout="")
+            return _make_completed_process(returncode=0, stdout="active")
+
+        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
+            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
+                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
+                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
+                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
+                                with patch("pathlib.Path.home", return_value=tmp_path / "home"):
+                                    (tmp_path / "home" / ".config" / "systemd" / "user").mkdir(parents=True)
+                                    (tmp_path / "home" / ".config" / "systemd" / "user" / "synthetic-worker.service").write_text(_SYNTHETIC_UNMAPPED_UNIT)
+                                    pm_core._post_land_deploy_hook("cockpit")  # must not raise
+
+        captured = capsys.readouterr()
+        assert "synthetic-worker.service" not in captured.err
+
+
 class TestPostLandGitPull:
     """Tests for _post_land_git_pull."""
 

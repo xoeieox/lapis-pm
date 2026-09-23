@@ -425,6 +425,18 @@ _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
 # .service text never names it (the doorman pattern: a bootstrap script under
 # /data/agents/scripts/). Kept deliberately small and explicit — a new wrapper
 # root is a map growth, not a scan expansion.
+#
+# Test-only override for the hook's audit home dir (None = real Path.home()).
+# Lets integration tests inject a tmp home without a global Path.home patch.
+_DEPLOY_HOOK_TEST_HOME: str | Path | None = None
+
+# Best-effort by contract: detection is a small set of regexes plus the
+# explicit wrapper-root set, NOT an exhaustive Python AST scan. A unit that
+# imports agents_core in a form outside the alternatives (e.g. a bare
+# `import agents_core` without `from`, or a wrapper path outside
+# _AGENTS_CORE_WRAPPER_ROOTS) is missed. Acceptable per spec §5: the guard is
+# LOG-LOUD, never FAIL-STOP, and the map stays authoritative — the scan is a
+# systematic double-check, not a gate.
 _AGENTS_CORE_WRAPPER_ROOTS: tuple[str, ...] = ("/data/agents/scripts/",)
 
 # ExecStart lines that import agents_core directly (module form, script path,
@@ -533,11 +545,17 @@ def _audit_agents_core_user_units(
     return findings
 
 
-def _run_agents_core_restart_map_audit() -> None:
+def _run_agents_core_restart_map_audit(
+    home: str | Path | None = None,
+) -> None:
     """Hook-side audit pass. Never raises — a guard failure degrades to one
-    loud line, matching the hook's own best-effort contract."""
+    loud line, matching the hook's own best-effort contract.
+
+    `home` overrides the home directory (tests point it at a tmp_path so no
+    global `pathlib.Path.home` patch is needed); None means the real home."""
     try:
-        user_unit_dir = Path.home() / ".config" / "systemd" / "user"
+        base = Path(home) if home is not None else Path.home()
+        user_unit_dir = base / ".config" / "systemd" / "user"
         _audit_agents_core_user_units(user_unit_dir)
     except Exception as e:  # noqa: BLE001 — LOG-LOUD, never FAIL-STOP
         print(
@@ -3153,7 +3171,8 @@ def _post_land_deploy_hook(
     # FAIL-STOP: findings land on this same stderr surface as the deploy-pass
     # report and never block the land.
     if repo == "agents-core":
-        _run_agents_core_restart_map_audit()
+        # `home` is injectable for tests (no global Path.home patch needed).
+        _run_agents_core_restart_map_audit(home=_DEPLOY_HOOK_TEST_HOME)
 
     units = _POST_LAND_RESTART.get(repo)
     if units:

@@ -10,6 +10,7 @@ import sys
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from contextlib import ExitStack
 from unittest.mock import patch, MagicMock, call
 
 import pytest
@@ -476,12 +477,28 @@ class TestAgentsCoreRestartMapAudit:
         assert "AUDIT" in captured.err
         assert "SKIPPED" in captured.err
 
+    def _hook_env(self, tmp_path, home, fake_run):
+        """Shared patch context for hook integration tests. The audit home is
+        injected via _DEPLOY_HOOK_TEST_HOME (module attribute) instead of a
+        global pathlib.Path.home patch, so no global state can leak between
+        tests if the context manager is interrupted."""
+        return (
+            patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False),
+            patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"),
+            patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run),
+            patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}),
+            patch.object(pm_core, "_count_inflight_fixers", return_value=0),
+            patch.object(pm_core, "_read_restart_pending", return_value=None),
+            patch.object(pm_core, "_DEPLOY_HOOK_TEST_HOME", str(home)),
+        )
+
     def test_guard_hook_integration_agents_core(self, tmp_path, capsys):
         """End-to-end: the agents-core hook pass runs the audit (findings land
         on the deploy-pass-report stderr surface) and the land is never blocked."""
-        unit_dir = self._write_units(
-            tmp_path,
-            {"synthetic-worker.service": _SYNTHETIC_UNMAPPED_UNIT},
+        home = tmp_path / "home"
+        (home / ".config" / "systemd" / "user").mkdir(parents=True)
+        (home / ".config" / "systemd" / "user" / "synthetic-worker.service").write_text(
+            _SYNTHETIC_UNMAPPED_UNIT
         )
         revparse_count = {}
 
@@ -495,16 +512,10 @@ class TestAgentsCoreRestartMapAudit:
                 return _make_completed_process(returncode=0, stdout="")
             return _make_completed_process(returncode=0, stdout="active")
 
-        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
-                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                                with patch("pathlib.Path.home", return_value=tmp_path / "home"):
-                                    (tmp_path / "home" / ".config" / "systemd" / "user").mkdir(parents=True)
-                                    (tmp_path / "home" / ".config" / "systemd" / "user" / "synthetic-worker.service").write_text(_SYNTHETIC_UNMAPPED_UNIT)
-                                    pm_core._post_land_deploy_hook("agents-core")  # must not raise
+        with ExitStack() as stack:
+            for p in self._hook_env(tmp_path, home, fake_run):
+                stack.enter_context(p)
+            pm_core._post_land_deploy_hook("agents-core")  # must not raise
 
         captured = capsys.readouterr()
         assert "AUDIT" in captured.err
@@ -513,6 +524,11 @@ class TestAgentsCoreRestartMapAudit:
     def test_guard_hook_not_run_for_other_repos(self, tmp_path, capsys):
         """The audit is agents-core-scoped: a non-agents-core land never runs it
         (no scanner noise on unrelated lands)."""
+        home = tmp_path / "home"
+        (home / ".config" / "systemd" / "user").mkdir(parents=True)
+        (home / ".config" / "systemd" / "user" / "synthetic-worker.service").write_text(
+            _SYNTHETIC_UNMAPPED_UNIT
+        )
         revparse_count = {}
 
         def fake_run(cmd, **kwargs):
@@ -525,16 +541,10 @@ class TestAgentsCoreRestartMapAudit:
                 return _make_completed_process(returncode=0, stdout="")
             return _make_completed_process(returncode=0, stdout="active")
 
-        with patch.object(pm_core, "_DEPLOY_HOOK_DISABLED", False):
-            with patch.object(pm_core, "_DEPLOY_LOG", tmp_path / "deploy-log.md"):
-                with patch("lapis_pm.pm_core.subprocess.run", side_effect=fake_run):
-                    with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}):
-                        with patch.object(pm_core, "_count_inflight_fixers", return_value=0):
-                            with patch.object(pm_core, "_read_restart_pending", return_value=None):
-                                with patch("pathlib.Path.home", return_value=tmp_path / "home"):
-                                    (tmp_path / "home" / ".config" / "systemd" / "user").mkdir(parents=True)
-                                    (tmp_path / "home" / ".config" / "systemd" / "user" / "synthetic-worker.service").write_text(_SYNTHETIC_UNMAPPED_UNIT)
-                                    pm_core._post_land_deploy_hook("cockpit")  # must not raise
+        with ExitStack() as stack:
+            for p in self._hook_env(tmp_path, home, fake_run):
+                stack.enter_context(p)
+            pm_core._post_land_deploy_hook("cockpit")  # must not raise
 
         captured = capsys.readouterr()
         assert "synthetic-worker.service" not in captured.err

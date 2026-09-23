@@ -378,11 +378,24 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
 #    the actual import root for these units.
 # 2. Failure consequence: a pull failure on /data/agents means these units run stale
 #    code with no signal — hence agents-core is in _POST_LAND_PULL_CRITICAL above.
-# 3. Growth obligation: when a third entry is added here, add a runtime audit guard
-#    (grep ~/.config/systemd/user/*.service for agents_core importers; log loudly if
-#    any is absent from this map). See spec §5 tripwire.
+# 3. Growth obligation (SATISFIED 2026-09-22, mem-hygiene-postland-restart-map-v0):
+#    the third entry (mem-server.service) landed WITH its runtime audit guard —
+#    _audit_agents_core_user_units (below) scans ~/.config/systemd/user/*.service
+#    for agents_core importers and logs LOUDLY (deploy-pass-report surface) if any
+#    importer is absent from this map. LOG-LOUD, never FAIL-STOP: a missing entry
+#    must never block a land (the deploy-pass report already carries WAIVER/GAP
+#    marks for this class; the guard adds the systematic scan).
 _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
-    "agents-core": ("doorman-server.service", "slot-server.service"),
+    # mem-server.service: Type=simple user unit (ExecStart=
+    # /home/user/.local/bin/mem-server, a console-script wrapper that
+    # `from agents_core.mem_server import main`; binds 203.0.113.10:8404).
+    # agents-core origin/main gained the /v0/hygiene/* run surface 2026-09-20;
+    # without this entry the long-running server silently no-serves new routes
+    # after a land (verified live 2026-09-21: 404 on /v0/hygiene/list until a
+    # manual restart) — the exact "silent no-serve, not a failure" class this
+    # map exists to close. Third entry → the §2.3 growth obligation fired; the
+    # audit guard below is the same change.
+    "agents-core": ("doorman-server.service", "slot-server.service", "mem-server.service"),
     # cockpit.service: Type=simple long-running uvicorn (PM/Ops console + vitals rail),
     # binds 203.0.113.10:8409. Restart=on-failure is crash-only; it does not fire on a
     # clean stop, which is the gap this closes (2026-07-05 outage: service inactive ~3h

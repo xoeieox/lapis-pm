@@ -226,7 +226,7 @@ class TestPostLandDeployHook:
                                 pm_core._post_land_deploy_hook("agents-core")
 
         restart_user = [c for c in user_calls if "restart" in c]
-        assert len(restart_user) == 2
+        assert len(restart_user) == 3
         for c in restart_user:
             assert c[0] == "systemctl"
             assert "--user" in c

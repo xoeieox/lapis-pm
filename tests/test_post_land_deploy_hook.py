@@ -142,9 +142,10 @@ class TestPostLandDeployHook:
         assert len(sudo_restart_calls) == 2
         assert "claude-queue-runner.service" in restart_units
         assert "gpu-queue-runner.service" in restart_units
-        assert len(user_restart_calls) == 2
+        assert len(user_restart_calls) == 3
         assert user_restart_calls[0] == ["systemctl", "--user", "restart", "doorman-server.service"]
         assert user_restart_calls[1] == ["systemctl", "--user", "restart", "slot-server.service"]
+        assert user_restart_calls[2] == ["systemctl", "--user", "restart", "mem-server.service"]
 
     def test_unmapped_repo_is_noop(self):
         """Unmapped repo results in zero subprocess.run calls."""

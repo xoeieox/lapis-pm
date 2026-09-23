@@ -444,10 +444,11 @@ class TestAgentsCoreRestartMapAudit:
 
     def test_guard_detects_wrapper_script_importer(self, tmp_path):
         """Known-wrapper-set detection: a unit whose ExecStart runs a script
-        under /data/agents/scripts/ that itself imports agents_core is an
-        importer (the doorman pattern — the .service text never names
-        agents_core)."""
-        script = tmp_path / "wrapper.py"
+        under a wrapper root that itself imports agents_core is an importer
+        (the doorman pattern — the .service text never names agents_core)."""
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        script = scripts_dir / "wrapper.py"
         script.write_text("import sys\nfrom agents_core.wrapper_server import main\n")
         unit_dir = self._write_units(
             tmp_path,
@@ -461,8 +462,7 @@ class TestAgentsCoreRestartMapAudit:
         )
         # The script is not under the real wrapper root, so point the root at
         # the temp dir: detection is root-relative by construction.
-        wrapper_root = str(tmp_path) + "/"
-        with patch.object(pm_core, "_AGENTS_CORE_WRAPPER_ROOTS", (wrapper_root,)):
+        with patch.object(pm_core, "_AGENTS_CORE_WRAPPER_ROOTS", (str(scripts_dir) + "/",)):
             findings = pm_core._audit_agents_core_user_units(unit_dir)
         assert findings == ["wrapper.service"]
 

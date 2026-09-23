@@ -451,15 +451,18 @@ def _user_unit_imports_agents_core(
         # guard must never false-positive on a broken unit).
         for root in wrapper_roots:
             idx = stripped.find(root)
-            if idx != -1:
-                script = stripped[idx + len(root):]
-                # ExecStart may carry flags/args after the script path.
-                script = script.split()[0]
-                try:
-                    if _AGENTS_CORE_IMPORT_RE.search(Path(script).read_text()):
-                        return True
-                except OSError:
-                    continue
+            if idx == -1:
+                continue
+            script = stripped[idx:].split()[0]
+            # The token may include the wrapper root itself (root-relative
+            # match); strip it to get the path to read.
+            if script.startswith(root):
+                script = script[len(root):]
+            try:
+                if _AGENTS_CORE_IMPORT_RE.search(Path(script).read_text()):
+                    return True
+            except OSError:
+                continue
     return False
 
 

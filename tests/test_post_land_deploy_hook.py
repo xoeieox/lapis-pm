@@ -89,6 +89,20 @@ def _advancing_fake_run(extra=None):
 class TestPostLandDeployHook:
     """Tests for _post_land_deploy_hook."""
 
+    def test_agents_core_map_contains_mem_server(self):
+        """mem-hygiene-postland-restart-map-v0 D-1: mem-server.service is in the
+        agents-core user-unit restart map (the /v0/hygiene/* run surface must not
+        silently no-serve after a land)."""
+        assert "mem-server.service" in pm_core._POST_LAND_RESTART_USER["agents-core"]
+        # The existing two entries are untouched — this is an additive entry.
+        assert pm_core._POST_LAND_RESTART_USER["agents-core"] == (
+            "doorman-server.service", "slot-server.service", "mem-server.service",
+        )
+
+    def test_agents_core_pull_critical_untouched(self):
+        """D-1 is a restart-surface change only: the pull critical set is untouched."""
+        assert pm_core._POST_LAND_PULL_CRITICAL == frozenset({"lapis-pm", "agents-core", "synapse"})
+
     def test_mapped_repo_fires_restart_per_unit(self, capsys, tmp_path):
         """Mapped repo causes git pull (both paths) then system + user restarts when HEAD advances."""
         pull_calls = []

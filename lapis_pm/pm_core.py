@@ -453,13 +453,15 @@ def _user_unit_imports_agents_core(
             idx = stripped.find(root)
             if idx == -1:
                 continue
-            script = stripped[idx:].split()[0]
-            # The token may include the wrapper root itself (root-relative
-            # match); strip it to get the path to read.
-            if script.startswith(root):
-                script = script[len(root):]
+            token = stripped[idx:].split()[0]
+            # The matched token may be a relative path (root-relative match);
+            # resolve it against the wrapper root to get the absolute path.
+            script = token[len(root):] if token.startswith(root) else token
+            candidate = Path(script)
+            if not candidate.is_absolute():
+                candidate = Path(root.rstrip("/")) / script
             try:
-                if _AGENTS_CORE_IMPORT_RE.search(Path(script).read_text()):
+                if _AGENTS_CORE_IMPORT_RE.search(candidate.read_text()):
                     return True
             except OSError:
                 continue

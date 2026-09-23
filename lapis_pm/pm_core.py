@@ -509,7 +509,7 @@ def _audit_agents_core_user_units(
                 file=sys.stderr, flush=True,
             )
             continue
-        if not _user_unit_imports_agents_core(text):
+        if not _user_unit_imports_agents_core(text, wrapper_roots):
             continue
         if unit_file.name in mapped:
             continue

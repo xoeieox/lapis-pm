@@ -486,6 +486,14 @@ def _audit_agents_core_user_units(
             file=sys.stderr, flush=True,
         )
         return []
+    if not user_unit_dir.is_dir():
+        print(
+            f"[post-land-deploy] AUDIT: user-unit dir absent ({user_unit_dir}) "
+            f"— agents-core restart-map audit SKIPPED (loud by contract; the "
+            f"map is not self-verifying this pass)",
+            file=sys.stderr, flush=True,
+        )
+        return []
     for unit_file in unit_files:
         try:
             text = unit_file.read_text()

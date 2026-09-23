@@ -434,8 +434,12 @@ _AGENTS_CORE_IMPORT_RE = re.compile(
 )
 
 
-def _user_unit_imports_agents_core(unit_text: str) -> bool:
+def _user_unit_imports_agents_core(
+    unit_text: str, wrapper_roots: tuple[str, ...] | None = None,
+) -> bool:
     """True if any ExecStart line in `unit_text` imports agents_core."""
+    if wrapper_roots is None:
+        wrapper_roots = _AGENTS_CORE_WRAPPER_ROOTS
     for line in unit_text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("ExecStart"):
@@ -445,7 +449,7 @@ def _user_unit_imports_agents_core(unit_text: str) -> bool:
         # Known wrapper set: a script under a wrapper root that itself imports
         # agents_core. Read failure (script absent) → not an importer (the
         # guard must never false-positive on a broken unit).
-        for root in _AGENTS_CORE_WRAPPER_ROOTS:
+        for root in wrapper_roots:
             idx = stripped.find(root)
             if idx != -1:
                 script = stripped[idx + len(root):]

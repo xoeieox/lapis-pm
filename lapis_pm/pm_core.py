@@ -428,9 +428,12 @@ _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
 _AGENTS_CORE_WRAPPER_ROOTS: tuple[str, ...] = ("/data/agents/scripts/",)
 
 # ExecStart lines that import agents_core directly (module form, script path,
-# or console-script wrapper `from agents_core... import main`).
+# or console-script wrapper `from agents_core... import main`). The last
+# alternative matches BOTH `from agents_core import X` (console-script wrapper
+# form) and `from agents_core.module import X` (dot form) — `[\s.]+` covers the
+# separator between the package name and the next token.
 _AGENTS_CORE_IMPORT_RE = re.compile(
-    r"(?:-m\s+agents_core[.\s]|agents_core/[A-Za-z0-9_\-]+\.py|from\s+agents_core\s+import)"
+    r"(?:-m\s+agents_core[.\s]|agents_core/[A-Za-z0-9_\-]+\.py|from\s+agents_core[\s.]+)"
 )
 
 

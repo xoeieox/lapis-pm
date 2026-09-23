@@ -462,8 +462,9 @@ class TestAgentsCoreRestartMapAudit:
         )
         # The script is not under the real wrapper root, so point the root at
         # the temp dir: detection is root-relative by construction.
-        with patch.object(pm_core, "_AGENTS_CORE_WRAPPER_ROOTS", (str(scripts_dir) + "/",)):
-            findings = pm_core._audit_agents_core_user_units(unit_dir)
+        findings = pm_core._audit_agents_core_user_units(
+            unit_dir, wrapper_roots=(str(scripts_dir) + "/",),
+        )
         assert findings == ["wrapper.service"]
 
     def test_guard_missing_dir_is_loud_not_fatal(self, tmp_path, capsys):

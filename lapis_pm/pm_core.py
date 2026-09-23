@@ -466,6 +466,7 @@ def _user_unit_imports_agents_core(
 def _audit_agents_core_user_units(
     user_unit_dir: Path,
     restart_user: dict[str, tuple[str, ...]] | None = None,
+    wrapper_roots: tuple[str, ...] | None = None,
 ) -> list[str]:
     """Scan `user_unit_dir` for agents_core importers missing from the restart map.
 

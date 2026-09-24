@@ -19,6 +19,15 @@ Directive file shape (written by claude-view, consumed by the tick loop):
       "submitter": "claude-view"
     }
 
+Directive COMMENT shape (a comment whose payload is a JSON object carrying
+the directive shape, e.g. a ``kind`` key such as ``"pm_directive"``):
+    The ``human:directive`` tag is REQUIRED for the comment to be
+    processed. ``pm_core._encode_user_comments`` only runs the
+    signed-directive acceptance gate (``signed_directive.verify_directive``)
+    over comments tagged ``human:directive``; an untagged directive-shaped
+    comment is skipped silently (a WARN is logged so the drop surfaces)
+    and its content is never honored.
+
 pm:brief-options comment JSON shape:
     {
       "brief_id": "<comment_id_of_pm:brief_comment>",

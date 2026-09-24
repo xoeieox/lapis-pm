@@ -9445,6 +9445,22 @@ def _act_reviewer_infra_budget_pause(target_id: str, payload: dict) -> str:
 # Encode percepts
 # ---------------------------------------------------------------------------
 
+def _is_directive_shaped(content: str) -> bool:
+    """Best-effort shape check for a directive-shaped comment payload.
+
+    True when the content parses as a JSON object carrying the directive
+    payload shape (a ``kind`` key, e.g. ``"pm_directive"``). Used only to
+    surface silent drops: a comment that LOOKS like a directive but lacks
+    the required ``human:directive`` tag is skipped by the acceptance gate
+    with no other trace, so the caller logs a WARN for it.
+    """
+    try:
+        obj = json.loads(content)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(obj, dict) and "kind" in obj
+
+
 def _encode_user_comments(target_id: str, comments: list) -> list:
     """Return list of comments that triggered any state change worth acting on.
 
@@ -9468,6 +9484,16 @@ def _encode_user_comments(target_id: str, comments: list) -> list:
     directives = []
     for c in comments:
         if episodic.TAG_HUMAN_DIRECTIVE not in c.tags:
+            # Fail-open (the skip is unchanged) but never silent: a comment
+            # whose payload is directive-shaped yet lacks the required
+            # human:directive tag would otherwise be dropped with no trace
+            # (spec cr-bundle-item-lapis-pm-1593db884c).
+            if _is_directive_shaped(c.content):
+                logger.warning(
+                    "directive-shaped comment %s on target %s lacks the "
+                    "required %r tag — skipped without processing",
+                    c.id, target_id, episodic.TAG_HUMAN_DIRECTIVE,
+                )
             continue
         verdict = signed_directive.verify_directive(target_id, c)
         if verdict.ok:

@@ -378,11 +378,24 @@ _POST_LAND_RESTART: dict[str, tuple[str, ...]] = {
 #    the actual import root for these units.
 # 2. Failure consequence: a pull failure on /data/agents means these units run stale
 #    code with no signal — hence agents-core is in _POST_LAND_PULL_CRITICAL above.
-# 3. Growth obligation: when a third entry is added here, add a runtime audit guard
-#    (grep ~/.config/systemd/user/*.service for agents_core importers; log loudly if
-#    any is absent from this map). See spec §5 tripwire.
+# 3. Growth obligation (SATISFIED 2026-09-22, mem-hygiene-postland-restart-map-v0):
+#    the third entry (mem-server.service) landed WITH its runtime audit guard —
+#    _audit_agents_core_user_units (below) scans ~/.config/systemd/user/*.service
+#    for agents_core importers and logs LOUDLY (deploy-pass-report surface) if any
+#    importer is absent from this map. LOG-LOUD, never FAIL-STOP: a missing entry
+#    must never block a land (the deploy-pass report already carries WAIVER/GAP
+#    marks for this class; the guard adds the systematic scan).
 _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
-    "agents-core": ("doorman-server.service", "slot-server.service"),
+    # mem-server.service: Type=simple user unit (ExecStart=
+    # /home/user/.local/bin/mem-server, a console-script wrapper that
+    # `from agents_core.mem_server import main`; binds 203.0.113.10:8404).
+    # agents-core origin/main gained the /v0/hygiene/* run surface 2026-09-20;
+    # without this entry the long-running server silently no-serves new routes
+    # after a land (verified live 2026-09-21: 404 on /v0/hygiene/list until a
+    # manual restart) — the exact "silent no-serve, not a failure" class this
+    # map exists to close. Third entry → the §2.3 growth obligation fired; the
+    # audit guard below is the same change.
+    "agents-core": ("doorman-server.service", "slot-server.service", "mem-server.service"),
     # cockpit.service: Type=simple long-running uvicorn (PM/Ops console + vitals rail),
     # binds 203.0.113.10:8409. Restart=on-failure is crash-only; it does not fire on a
     # clean stop, which is the gap this closes (2026-07-05 outage: service inactive ~3h
@@ -395,6 +408,162 @@ _POST_LAND_RESTART_USER: dict[str, tuple[str, ...]] = {
     # code until restarted. Spec: navigator-loupe-serve-parity-n0-v0.
     "loupe": ("loupe.service",),
 }
+
+# ---------------------------------------------------------------------------
+# agents-core user-unit restart-map audit guard (mem-hygiene-postland-restart-map-v0)
+# ---------------------------------------------------------------------------
+# The §2.3 tripwire fired: mem-server.service is the THIRD agents-core entry in
+# _POST_LAND_RESTART_USER, so the map is now self-auditing. A unit whose
+# ExecStart imports agents_core (directly — `-m agents_core.X`, an
+# agents_core/*.py script, a console-script wrapper that
+# `from agents_core... import main` — or via the known wrapper set such as
+# /data/agents/scripts/*) runs STALE code after an agents-core land unless it is
+# in the map. The guard scans the user-unit dir, cross-references the map, and
+# logs LOUDLY for any importer missing from it.
+
+# Wrapper roots whose ExecStart payload imports agents_core even though the
+# .service text never names it (the doorman pattern: a bootstrap script under
+# /data/agents/scripts/). Kept deliberately small and explicit — a new wrapper
+# root is a map growth, not a scan expansion.
+#
+# Test-only override for the hook's audit home dir (None = real Path.home()).
+# Lets integration tests inject a tmp home without a global Path.home patch.
+_DEPLOY_HOOK_TEST_HOME: str | Path | None = None
+
+# Best-effort by contract: detection is a small set of regexes plus the
+# explicit wrapper-root set, NOT an exhaustive Python AST scan. A unit that
+# imports agents_core in a form outside the alternatives (e.g. a bare
+# `import agents_core` without `from`, or a wrapper path outside
+# _AGENTS_CORE_WRAPPER_ROOTS) is missed. Acceptable per spec §5: the guard is
+# LOG-LOUD, never FAIL-STOP, and the map stays authoritative — the scan is a
+# systematic double-check, not a gate.
+_AGENTS_CORE_WRAPPER_ROOTS: tuple[str, ...] = ("/data/agents/scripts/",)
+
+# ExecStart lines that import agents_core directly (module form, script path,
+# or console-script wrapper `from agents_core... import main`). The last
+# alternative matches BOTH `from agents_core import X` (console-script wrapper
+# form) and `from agents_core.module import X` (dot form) — `[\s.]+` covers the
+# separator between the package name and the next token.
+_AGENTS_CORE_IMPORT_RE = re.compile(
+    r"(?:-m\s+agents_core[.\s]|agents_core/[A-Za-z0-9_\-]+\.py|from\s+agents_core[\s.]+)"
+)
+
+
+def _user_unit_imports_agents_core(
+    unit_text: str, wrapper_roots: tuple[str, ...] | None = None,
+) -> bool:
+    """True if any ExecStart line in `unit_text` imports agents_core."""
+    if wrapper_roots is None:
+        wrapper_roots = _AGENTS_CORE_WRAPPER_ROOTS
+    for line in unit_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("ExecStart"):
+            continue
+        if _AGENTS_CORE_IMPORT_RE.search(stripped):
+            return True
+        # Known wrapper set: a script under a wrapper root that itself imports
+        # agents_core. Read failure (script absent) → not an importer (the
+        # guard must never false-positive on a broken unit).
+        for root in wrapper_roots:
+            idx = stripped.find(root)
+            if idx == -1:
+                continue
+            token = stripped[idx:].split()[0]
+            # The matched token may be a relative path (root-relative match);
+            # resolve it against the wrapper root to get the absolute path.
+            script = token[len(root):] if token.startswith(root) else token
+            candidate = Path(script)
+            if not candidate.is_absolute():
+                candidate = Path(root.rstrip("/")) / script
+            try:
+                if _AGENTS_CORE_IMPORT_RE.search(candidate.read_text()):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _audit_agents_core_user_units(
+    user_unit_dir: Path,
+    restart_user: dict[str, tuple[str, ...]] | None = None,
+    wrapper_roots: tuple[str, ...] | None = None,
+) -> list[str]:
+    """Scan `user_unit_dir` for agents_core importers missing from the restart map.
+
+    Returns the sorted list of un-mapped importer unit names (empty = clean).
+    LOG-LOUD, never FAIL-STOP: every finding is printed to stderr with the
+    [post-land-deploy] AUDIT prefix (the deploy-pass-report surface) and the
+    remediation hint; a scan failure (dir missing, unreadable) is logged as a
+    single loud line and returns [] — a guard bug must never block a land or
+    mask the map itself.
+    """
+    if restart_user is None:
+        restart_user = _POST_LAND_RESTART_USER
+    mapped = {u for units in restart_user.values() for u in units}
+    findings: list[str] = []
+    try:
+        unit_files = sorted(user_unit_dir.glob("*.service"))
+    except OSError as e:
+        print(
+            f"[post-land-deploy] AUDIT: user-unit dir unreadable "
+            f"({user_unit_dir}): {e} — agents-core restart-map audit SKIPPED "
+            f"(loud by contract; the map is not self-verifying this pass)",
+            file=sys.stderr, flush=True,
+        )
+        return []
+    if not user_unit_dir.is_dir():
+        print(
+            f"[post-land-deploy] AUDIT: user-unit dir absent ({user_unit_dir}) "
+            f"— agents-core restart-map audit SKIPPED (loud by contract; the "
+            f"map is not self-verifying this pass)",
+            file=sys.stderr, flush=True,
+        )
+        return []
+    for unit_file in unit_files:
+        try:
+            text = unit_file.read_text()
+        except OSError as e:
+            print(
+                f"[post-land-deploy] AUDIT: unreadable unit file {unit_file.name}: "
+                f"{e} — treated as not-an-importer (cannot verify)",
+                file=sys.stderr, flush=True,
+            )
+            continue
+        if not _user_unit_imports_agents_core(text, wrapper_roots):
+            continue
+        if unit_file.name in mapped:
+            continue
+        findings.append(unit_file.name)
+        print(
+            f"[post-land-deploy] AUDIT: user unit {unit_file.name} imports "
+            f"agents_core but is ABSENT from _POST_LAND_RESTART_USER — it will "
+            f"run STALE code after the next agents-core land (silent no-serve "
+            f"class). Remediate: add it to the agents-core tuple in "
+            f"_POST_LAND_RESTART_USER (pm_core.py).",
+            file=sys.stderr, flush=True,
+        )
+    return findings
+
+
+def _run_agents_core_restart_map_audit(
+    home: str | Path | None = None,
+) -> None:
+    """Hook-side audit pass. Never raises — a guard failure degrades to one
+    loud line, matching the hook's own best-effort contract.
+
+    `home` overrides the home directory (tests point it at a tmp_path so no
+    global `pathlib.Path.home` patch is needed); None means the real home."""
+    try:
+        base = Path(home) if home is not None else Path.home()
+        user_unit_dir = base / ".config" / "systemd" / "user"
+        _audit_agents_core_user_units(user_unit_dir)
+    except Exception as e:  # noqa: BLE001 — LOG-LOUD, never FAIL-STOP
+        print(
+            f"[post-land-deploy] AUDIT: agents-core restart-map audit failed "
+            f"(non-fatal): {e}",
+            file=sys.stderr, flush=True,
+        )
+
 
 # Canonical deploy clone path for facets. Not pip-installed; the spec-review gate
 # injects this path on PYTHONPATH for `python3 -m facets.adapter`.
@@ -2994,6 +3163,16 @@ def _post_land_deploy_hook(
         print(render_land_deploy_report(repo), file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         print(f"[post-land-deploy] D3 deploy report failed (non-fatal): {e}", file=sys.stderr)
+
+    # mem-hygiene-postland-restart-map-v0 (D-2): the §2.3 growth obligation fired
+    # with the third agents-core entry (mem-server.service) — the restart map is
+    # now self-auditing. Scan the user-unit dir for agents_core importers and log
+    # LOUDLY for any absent from _POST_LAND_RESTART_USER. LOG-LOUD, never
+    # FAIL-STOP: findings land on this same stderr surface as the deploy-pass
+    # report and never block the land.
+    if repo == "agents-core":
+        # `home` is injectable for tests (no global Path.home patch needed).
+        _run_agents_core_restart_map_audit(home=_DEPLOY_HOOK_TEST_HOME)
 
     units = _POST_LAND_RESTART.get(repo)
     if units:

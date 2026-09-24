@@ -576,3 +576,107 @@ class TestSeatNoToolCallsCeilingExclusion:
             assert decision.kind == "reviewer_infra_budget_exhausted"
             assert decision.payload["infra_attempts"] == budget
             assert decision.payload["reported_reason"] == "seat_no_tool_calls"
+
+
+# ---------------------------------------------------------------------------
+# lapis-pm-reviewer-gw-seat-occupied-infra-v0: gw_seat_occupied completes the
+# allow-list. The doorman 409 branch (agents_core/gw_agent.py:2630-2637,
+# agents-core-doorman-flashnext-handover-v0 D4) refuses GPU admission when
+# another lease class (creative_occupied / flashnext_occupied) holds the lane;
+# the reviewer never ran, so a 409 must be an infra non-run — it must bump
+# infra_count (bounded by REVIEWER_INFRA_RETRY_BUDGET_DEFAULT, ~70 min of
+# backoff), never the reviewer-attempt ceiling (2). Design intent: an
+# infra-caused wedge must surface as reviewer_infra_budget_exhausted, never
+# as a "clear-reviewer-attempts" ceiling pause (pm_core.py:6939-6940).
+# ---------------------------------------------------------------------------
+
+GW_SEAT_OCCUPIED = "ERROR: local reviewer produced no verdict (reason=gw_seat_occupied)"
+
+
+class TestSeatOccupiedClassification:
+    def test_reason_extraction_path_classifies_gw_seat_occupied(self):
+        """DoD 1: the verbatim no-verdict string the reviewer call path emits
+        (shaped_runner._run_local_reviewer -> gw_agent.call_gw_agent 409
+        branch) classifies via the `reason=<value>` extraction."""
+        assert pm_core._classify_reviewer_infra_reason(GW_SEAT_OCCUPIED) == "gw_seat_occupied"
+
+    def test_bare_substring_fallback_classifies_gw_seat_occupied(self):
+        """DoD 2: the reason can also arrive without the `reason=` prefix —
+        straight from a queue `error` field — and must still classify via the
+        bare-substring fallback."""
+        assert pm_core._classify_reviewer_infra_reason("gw_seat_occupied") == "gw_seat_occupied"
+
+
+class TestSeatOccupiedCeilingAccounting:
+    def test_gw_seat_occupied_bumps_infra_count_not_ceiling(self):
+        """DoD 3: a gw_seat_occupied failure bumps infra_count (not just
+        count), stamps a non-None next_retry_at, and does NOT trigger
+        reviewer_attempt_ceiling at the 2-attempt bound — effective_count
+        (count - infra_count) stays < 2, so the target rides out the
+        occupancy on the infra budget instead of auto-pausing on a
+        'clear-reviewer-attempts' ceiling pause it could never satisfy."""
+        store = _tmp_store()
+        ceiling = pm_core._reviewer_attempt_ceiling()
+        assert ceiling == 2
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            for _ in range(ceiling):
+                pm_core._increment_reviewer_attempt(TID, 22, 1)
+                pm_core._record_reviewer_attempt_reason(
+                    TID, 22, 1, GW_SEAT_OCCUPIED,
+                    completed_at="2026-09-19T07:29:00-07:00",
+                )
+            state = pm_core._reviewer_attempt_state(TID, 22, 1)
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 22, 1)
+        assert state["count"] == ceiling
+        assert state["infra_count"] == ceiling
+        assert state["last_infra_reason"] == "gw_seat_occupied"
+        # R1 (defer-backoff): an infra-classified failure stamps the backoff
+        # window — non-None, and anchored past completed_at.
+        assert state["next_retry_at"] is not None
+        assert state["next_retry_at"] > "2026-09-19T07:29:00-07:00"
+        assert decision is None or decision.kind != "reviewer_attempt_ceiling"
+
+    def test_gw_seat_occupied_streak_at_infra_budget_produces_infra_exhausted(self):
+        """DoD 4: the bound still holds — a gw_seat_occupied streak reaching
+        REVIEWER_INFRA_RETRY_BUDGET_DEFAULT (6) DOES trigger
+        reviewer_infra_budget_exhausted. This change must not make 409s
+        retry forever."""
+        store = _tmp_store()
+        budget = pm_core._reviewer_infra_retry_budget()
+        assert budget == pm_core.REVIEWER_INFRA_RETRY_BUDGET_DEFAULT
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            decision = None
+            for _ in range(budget):
+                pm_core._increment_reviewer_attempt(TID, 23, 1)
+                pm_core._record_reviewer_attempt_reason(TID, 23, 1, GW_SEAT_OCCUPIED)
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 23, 1)
+            assert decision is not None
+            assert decision.kind == "reviewer_infra_budget_exhausted"
+            assert decision.payload["infra_attempts"] == budget
+            assert decision.payload["reported_reason"] == "gw_seat_occupied"
+            # And it is NOT the ceiling pause — the infra check runs first
+            # and wins, per the design-intent line at pm_core.py:6939-6940.
+            assert decision.kind != "reviewer_attempt_ceiling"
+
+    def test_regression_gw_defer_timeout_still_infra_and_unrecognised_fails_closed(self):
+        """DoD 5: regression fences around the new allow-list entry —
+        gw_defer_timeout still classifies as infra, and an unrecognised
+        reason still fails closed and counts against the ceiling (the bound
+        is never silently defeated by a new reason string)."""
+        assert pm_core._classify_reviewer_infra_reason(
+            "ERROR: local reviewer produced no verdict (reason=gw_defer_timeout)"
+        ) == "gw_defer_timeout"
+        assert pm_core._classify_reviewer_infra_reason(
+            "reason=some_new_string"
+        ) is None
+        store = _tmp_store()
+        with patch("lapis_pm.pm_core._mem", return_value=store):
+            pm_core._increment_reviewer_attempt(TID, 24, 1)
+            pm_core._record_reviewer_attempt_reason(TID, 24, 1, "reason=some_new_string")
+            pm_core._increment_reviewer_attempt(TID, 24, 1)
+            pm_core._record_reviewer_attempt_reason(TID, 24, 1, "reason=some_new_string")
+            state = pm_core._reviewer_attempt_state(TID, 24, 1)
+            decision = pm_core._reviewer_attempt_ceiling_check(TID, 24, 1)
+        assert state["infra_count"] == 0
+        assert decision is not None
+        assert decision.kind == "reviewer_attempt_ceiling"

@@ -48,7 +48,14 @@ VALID_SLOT_ALIASES = {"gravitywell-slot1", "gravitywell-slot2"}
 # flash") - there is no alias to pin to, and pinning one would just be
 # wrong. lapis-pm-reviewer-peak-contractor-route-v0 adds the first such
 # entry, reviewer_fresh_contractor, routed to the BRIX phala-test-key seat.
-NON_GRAVITYWELL_CONTRACTOR_AGENTS = {"reviewer_fresh_contractor"}
+#
+# fixer_flash (flashnext-fixer-trial-v0, leg 1, D1) is the second such
+# entry: the sglang flash-next seat at :30000 serves the CONCRETE model id
+# (verified via :30000/v1/models data[0].id) - on this seat the served id
+# IS the concrete id, so the slot-alias pitfall (registry :74-79) does not
+# apply; a slot alias would be the defect. The exact-id pin lives in
+# tests/test_registry_fixer_flash.py (test_fixer_flash_model_equals_served_id).
+NON_GRAVITYWELL_CONTRACTOR_AGENTS = {"reviewer_fresh_contractor", "fixer_flash"}
 
 _REGISTRY = yaml.safe_load(REGISTRY_PATH.read_text())
 _AGENTS = _REGISTRY["agents"]

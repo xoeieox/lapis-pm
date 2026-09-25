@@ -702,17 +702,31 @@ def _dispatch_spec_reviewer(
     )
 
 
-def _gw_slot2_url() -> str | None:
+def _gw_slot2_url(lane: str | None = None) -> str | None:
     """Resolve Slot-2's base URL: GW_SLOT2_URL env if set, else GW_URL's host with
     the port swapped to GW_SLOT2_PORT (default 8082). Mirrors the derivation
     pattern in agents_core.doorman_server._NodeState._slot2_url() — that's an
     instance method and can't be imported directly, so the ~4-line pattern is
     replicated here rather than hardcoding a second Tailscale IP.
 
+    S3 (gate-lanes-registry-driven-flashnext-v0): when ``lane`` names a
+    registry-resolved gate lane, the lane's registry base_url wins over the
+    GW_SLOT2_URL/GW_SLOT2_PORT derivation — the lane IS the endpoint, no port
+    swap. lane=None (the default GW reference leg) is byte-identical to today
+    and never probes the registry.
+
     Returns None when GW_URL has no parseable hostname — callers must treat
     that as "Slot-2 unresolved" and skip gracefully rather than build a
     malformed URL.
     """
+    if lane is not None:
+        try:
+            from lapis_pm import gate_lane as _gate_lane
+            resolved = _gate_lane.resolve_gate_lane(lane=lane)
+            if resolved is not None:
+                return resolved.base_url
+        except Exception:
+            pass  # blind / malformed -> legacy derivation (byte-identical)
     override = os.environ.get("GW_SLOT2_URL")
     if override:
         return override
@@ -727,9 +741,29 @@ def _gw_slot2_url() -> str | None:
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
-def _gw_primary_url() -> str:
+def _gw_primary_url(lane: str | None = None) -> str:
     """The primary GW voicing endpoint — same value Council/Facets voicing
-    resolves through call_operator("gravitywell")."""
+    resolves through call_operator("gravitywell").
+
+    S3 (gate-lanes-registry-driven-flashnext-v0): when ``lane`` names a
+    registry-resolved gate lane (e.g. "flashnext"), the endpoint resolves
+    through the gw-seats registry (lapis_pm.gate_lane) — the lane's actual
+    base_url, never a hardcoded port. The default gravitywell legs pass
+    lane=None and are byte-identical to today: env-var driven (GW_URL),
+    NEVER probing the registry. A registry-blind resolution (None) for an
+    explicit lane degrades to the GW_URL default byte-identically — the
+    ONLY fallback case the S1 caller contract allows; the preflight probe
+    (S5) is what turns a requested-but-dead lane into an honest leg_down
+    before any leg runs.
+    """
+    if lane is not None:
+        try:
+            from lapis_pm import gate_lane as _gate_lane
+            resolved = _gate_lane.resolve_gate_lane(lane=lane)
+            if resolved is not None:
+                return resolved.base_url
+        except Exception:
+            pass  # blind / malformed -> GW_URL fallback (byte-identical)
     return os.environ.get("GW_URL", "http://203.0.113.11:8081")
 
 

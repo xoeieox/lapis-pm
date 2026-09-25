@@ -3120,6 +3120,22 @@ def run_spec_review(
             # leg is byte-identical to today (swarm_serving() on :8081,
             # env-var driven, never registry-probing).
             #
+            # S8 (gate-lanes-registry-driven-flashnext-v0, hardened
+            # acceptance): a LOCAL-voiced council leg must be lease-free.
+            # The live 409 evidence (finding/council-lease-409-under-
+            # flashnext-window-2026-09-25): with flash-next holding the
+            # seat, the council leg under --council-voicing local still
+            # POSTed /lease/acquire on node "gravitywell" and died with 409
+            # -> "Failed to submit council". The guard below pins the
+            # doorman /lease/acquire call site UNREACHABLE on the
+            # local-voicing code path — the 409 contention shape is pinned
+            # unreachable, not merely that a lease-call count is zero (a
+            # zero-count assertion on a path the acquire never reaches is
+            # vacuous; the live 409 fired before the voicing branch was
+            # evaluated). The guard is a fail-closed REFUSE (leg_down),
+            # never a fallback-run on the gravitywell lane; blind (doorman
+            # unreachable) never refuses.
+            #
             # Caller contract (S1): a registry-blind resolution degrades to
             # the legacy probe byte-identically (the ONLY fallback case). A
             # readable registry with a requested-but-dead lane is an honest
@@ -3127,6 +3143,20 @@ def run_spec_review(
             # legacy fallback ("the opencode pin is a marked debt rather
             # than a silent skip" — same honesty shape here).
             _preflight_skip = False
+            if council_voicing == "local":
+                from lapis_pm import gate_lane as _gate_lane
+                _local_ok, _local_reason = _gate_lane.gate_lane_serving(lane="local")
+                if not _local_ok:
+                    _preflight_skip = True
+                    print(
+                        f"[spec-review:council-preflight] local voicing refused: "
+                        f"{_local_reason} — a doorman lease is held on the "
+                        f"gravitywell seat; the local leg must be lease-free. "
+                        f"Honest leg_down, never a fallback-run on the "
+                        f"gravitywell lane.",
+                        file=sys.stderr,
+                    )
+                    council_not_run_reason = _local_reason
             if council_voicing == "flashnext":
                 from lapis_pm import gate_lane as _gate_lane
                 _serving, _reason = _gate_lane.gate_lane_serving(lane="flashnext")

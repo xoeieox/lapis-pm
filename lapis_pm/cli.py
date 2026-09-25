@@ -3089,9 +3089,17 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument(
         "--council-voicing",
         default="gravitywell",
-        choices=["local", "gravitywell"],
+        choices=["local", "gravitywell", "flashnext"],
         dest="council_voicing",
-        help="Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, zero paid spend). Paid-model voicing removed; entity selection retains its own on_wake_fail fallback.",
+        help=(
+            "Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, "
+            "zero paid spend). flashnext = the flash-next seat (GW :30000, "
+            "Qwen3.8-Flash-Next-NVFP4-SSD-Stream), resolved through the gw-seats "
+            "registry (gate-lanes-registry-driven-flashnext-v0 S3/S4): a requested-but-"
+            "inactive flashnext lane is an honest leg_down, never a silent gravitywell "
+            "fallback. Paid-model voicing removed; entity selection retains its own "
+            "on_wake_fail fallback."
+        ),
     )
     sr.add_argument(
         "--timeout",
@@ -3168,7 +3176,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sr.add_argument(
         "--facets-operator",
-        choices=["haiku", "sonnet", "opus", "qwen", "gravitywell"],
+        choices=["haiku", "sonnet", "opus", "qwen", "gravitywell", "flashnext"],
         default="gravitywell",
         dest="facets_operator",
         help=(

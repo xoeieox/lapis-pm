@@ -3111,12 +3111,53 @@ def run_spec_review(
             # D1: GW-liveness preflight on the primary Council+Facets legs.
             # If GW is not serving when council_voicing==gravitywell, skip run_deliberation
             # entirely — do NOT launch a doomed deliberation that may fall back to paid Sonnet.
-            if council_voicing == "gravitywell" and not swarm_serving():
+            #
+            # S5 (gate-lanes-registry-driven-flashnext-v0): the probe is
+            # lane-aware. A flashnext-voiced council probes the flashnext
+            # lane's actual /v1/models for the registry-pinned served-model-
+            # name — NOT the hardcoded :8081 SWARM_URL probe that a
+            # flashnext-voiced council used to mis-skip on. The gravitywell
+            # leg is byte-identical to today (swarm_serving() on :8081,
+            # env-var driven, never registry-probing).
+            #
+            # Caller contract (S1): a registry-blind resolution degrades to
+            # the legacy probe byte-identically (the ONLY fallback case). A
+            # readable registry with a requested-but-dead lane is an honest
+            # leg_down — recorded, never a silent mis-skip, never a masked
+            # legacy fallback ("the opencode pin is a marked debt rather
+            # than a silent skip" — same honesty shape here).
+            _preflight_skip = False
+            if council_voicing == "flashnext":
+                from lapis_pm import gate_lane as _gate_lane
+                _serving, _reason = _gate_lane.gate_lane_serving(lane="flashnext")
+                if not _serving:
+                    _preflight_skip = True
+                    # registry_blind is the only reason that may look like
+                    # the legacy gw_not_serving; a readable registry with a
+                    # dead flashnext lane is its own honest reason.
+                    _preflight_reason = (
+                        "gw_not_serving" if _reason == "registry_blind"
+                        else f"flashnext_not_serving:{_reason}"
+                    )
+                    print(
+                        f"[spec-review:council-preflight] flashnext lane not serving "
+                        f"({_reason}); skipping run_deliberation — honest leg_down, "
+                        f"never a silent gravitywell fallback",
+                        file=sys.stderr,
+                    )
+                    council_not_run_reason = _preflight_reason
+            elif council_voicing == "gravitywell" and not swarm_serving():
                 print(
                     "[spec-review:council-preflight] swarm not serving; skipping run_deliberation",
                     file=sys.stderr,
                 )
                 council_not_run_reason = "gw_not_serving"
+            if _preflight_skip:
+                pass
+            elif council_voicing == "gravitywell" and not swarm_serving():
+                pass
+            if not _preflight_skip and council_not_run_reason == "":
+                pass
                 if _grounding_tmp:
                     try:
                         os.unlink(_grounding_tmp)

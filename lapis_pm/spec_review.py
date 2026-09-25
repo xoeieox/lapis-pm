@@ -13,6 +13,16 @@ invert an opt-in into "on" (sunset 90 days after merge).
 Public entry point: run_spec_review(spec_path, council_voicing, timeout_s, repo_override,
 authority, dispatch_facets, reference_reviewer, compare_opus, with_gw). Returns
 SpecReviewBrief. Synchronous; caller blocks until all dispatched passes complete or timeout.
+
+MARKED DEBT (gate-lanes-registry-driven-flashnext-v0, S7 — tracked follow-up,
+NOT bundled in this PR, 2026-09-25 re-gate fold): the many-eyes pre-gate lens
+legs are opencode subagents pinned by the :8408 registry's
+reality_view.subagent_pin (+ the registry.yaml gate_lane entries mirroring the
+fixer_flash row f0fb039). That pin has no in-repo code point in this tree —
+bundling it risks a silent skip — so it is its own bind after this PR merges:
+the opencode-side pin is a MARKED DEBT rather than a silent skip. The
+registry-resolved lane this debt pins against is lapis_pm.gate_lane
+(resolve_gate_lane / gate_lane_serving).
 """
 from __future__ import annotations
 

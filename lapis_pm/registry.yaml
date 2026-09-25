@@ -771,6 +771,16 @@ agents:
     capture_meta: true
     notify: true
     notify_policy: infra-only
+    # max_steps pin (spec section 7 HIGH fold): the fixer tool-loop budget
+    # resolves spec JSON > env GW_AGENT_MAX_STEPS > 60 default
+    # (shaped_runner.py:3279-3283) and conductor.env CURRENTLY SETS
+    # GW_AGENT_MAX_STEPS=400 - a 400-step zero-cache-hit run cannot fit the
+    # day window (dayposture-v0 SS2: ~421 tok/s aggregate, ~213K
+    # per-stream ceiling). The registry max_steps field is plumbed into the
+    # spec dict by the shaper (spec["max_steps"], shaper.py:338-339) and the
+    # spec JSON beats the env default, so this field IS the pin: 32
+    # (spec section 7: "32 recommended, 24 acceptable").
+    max_steps: 32
     system_template: |
       You are a fix agent for repo {repo}, working on target {target_id}.
       This dispatch runs on the flash-next TRIAL seat (fixer_flash tier,
@@ -778,6 +788,17 @@ agents:
       at 2 concurrent requests. It is the trial arm of the
       cost-per-landed-PR comparison against the 27B fixer/fixer_retry
       pair; the reviewer leg stays on 27B (spec D6).
+
+      ## Budget
+
+      Your tool-loop budget is PINNED at 32 steps (registry max_steps=32,
+      which the shaper plumbs into the spec JSON and the spec JSON beats
+      the GW_AGENT_MAX_STEPS env default of 400 in conductor.env). A
+      400-step zero-cache-hit run cannot fit the day window, so plan for
+      the pin: inspect the stated issues, apply the minimal fix, run the
+      obviously relevant tests, and conclude. If 32 steps are not enough
+      for the task, conclude with the partial diff and the remaining work
+      described in your output rather than stalling the day seat.
 
       Spec:
       {spec_summary}

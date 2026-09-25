@@ -169,12 +169,34 @@ def test_fixer_flash_not_member_of_fixer_pair(agents):
         )
 
 
+def test_fixer_flash_max_steps_pinned(agents):
+    """The max_steps pin (spec section 7 HIGH fold): the fixer tool-loop
+    budget resolves spec JSON > env GW_AGENT_MAX_STEPS > 60 default
+    (shaped_runner.py:3279-3283) and conductor.env currently sets
+    GW_AGENT_MAX_STEPS=400 - a 400-step zero-cache-hit run cannot fit the
+    day window. The registry max_steps field is plumbed into the spec dict
+    by the shaper (spec["max_steps"], shaper.py:338-339) and the spec JSON
+    beats the env default, so the registry row MUST carry the pin: 32
+    recommended, 24 acceptable (spec section 7).
+    """
+    max_steps = agents["fixer_flash"].get("max_steps")
+    assert max_steps in (24, 32), (
+        f"fixer_flash.max_steps={max_steps!r} - the spec section 7 HIGH "
+        "fold requires the trial arm to pin max_steps (32 recommended, 24 "
+        "acceptable) because the env default GW_AGENT_MAX_STEPS=400 in "
+        "conductor.env would otherwise let a zero-cache-hit run overrun "
+        "the day window"
+    )
+
+
 def test_fixer_flash_system_template_renders(agents):
-    """The system_template must render without a KeyError under the full
-    dispatch var set (the fixer template's var surface + the steer
+    """The system_template must render without a KeyError under the
+    template's ACTUAL var surface (the fixer template's vars + the steer
     overlay). The template is str.format-interpolated by the shaper:
     literal braces in the friction.json / verdict JSON examples are
     DOUBLED ({{ }}) - a single brace would raise KeyError at dispatch.
+    (str.format ignores extra vars, so the var set here lists exactly the
+    placeholders the template references - no more, no less.)
     """
     entry = agents["fixer_flash"]
     template = entry["system_template"]
@@ -186,8 +208,6 @@ def test_fixer_flash_system_template_renders(agents):
         "target_id": "flashnext-fixer-trial-v0",
         "spec_summary": "a spec",
         "repo": "lapis-pm",
-        "question": "implement X",
-        "pr_number": "",
         "slug": "forced",
         "existing_branch": "lapis/flashnext-fixer-trial-v0/forced",
         "base_branch": "main",

@@ -311,7 +311,14 @@ def _flashnext_lane_url(
     lane_obj = _gate_lane._resolve_from_payload(payload, _gate_lane.FLASHNEXT_LANE_NAME)
     if lane_obj is None:
         return (None, None, "flashnext_not_serving")  # readable + dead: honest
-    return (lane_obj.base_url, lane_obj.served_model, None)
+    # FULL endpoint URL (R-1 fix, final independent review 2026-09-25): the
+    # raw-POST path uses node_url VERBATIM (httpx.post(_url) at :850) and
+    # the _llm_url() convention is a full endpoint including
+    # /v1/chat/completions — the registry base_url is pathless, and sglang
+    # answers 405 at the root (verified live: POST / -> 405, POST
+    # /v1/chat/completions -> 200). A pathless base_url would convert every
+    # S6 node2 call into an honest-but-inert node2_unavailable.
+    return (f"{lane_obj.base_url}/v1/chat/completions", lane_obj.served_model, None)
 
 
 # _LLM_TIMEOUT 120s (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling

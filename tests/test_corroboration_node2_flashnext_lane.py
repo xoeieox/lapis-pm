@@ -107,13 +107,14 @@ class TestFlashnextLaneUrl:
     the legacy-Phala shape (None, None, None))."""
 
     def test_resolves_flashnext_lane(self):
-        """Under a flashnext-solo stub, the lane seam resolves the
-        :30000 base_url + the registry-served model name — and the client
-        host comes from the registry origin (bind "0.0.0.0" is the LIVE
-        shape, not a dialable host)."""
+        """Under a flashnext-solo stub, the lane seam resolves the FULL
+        endpoint URL (path included — R-1: the raw-POST path uses node_url
+        verbatim and sglang answers 405 at the root; verified live 2026-09-25)
+        + the registry-served model name, with the client host from the
+        registry origin (bind "0.0.0.0" is the LIVE shape, not dialable)."""
         base_url, model, blocked = _flashnext_lane_url(fetcher=_flashnext_solo_payload)
         assert blocked is None
-        assert base_url == "http://203.0.113.11:30000"
+        assert base_url == "http://203.0.113.11:30000/v1/chat/completions"
         assert model == FLASH_SERVED_ID
 
     def test_blind_registry_is_legacy_shape(self):
@@ -168,6 +169,22 @@ class TestNode2FlashnextLane:
         captured: dict = {}
 
         def fake_post(url, json=None, headers=None, timeout=None):
+            # R-1 tripwire (final independent review 2026-09-25): the
+            # live sglang seat answers 405 at the root (verified live), so
+            # a pathless base_url reaching the POST is a FAILURE, not a
+            # pass — model that here so the fabricated-pass shape cannot
+            # return.
+            import httpx as _httpx
+            if not url.endswith("/v1/chat/completions"):
+                resp = MagicMock()
+                resp.status_code = 405
+                resp.raise_for_status.side_effect = _httpx.HTTPStatusError(
+                    "405 Method Not Allowed (pathless URL: the node2 raw-POST "
+                    "path needs the FULL endpoint /v1/chat/completions)",
+                    request=None, response=resp,
+                )
+                resp.json.return_value = {}
+                return resp
             captured["url"] = url
             captured["model"] = json.get("model")
             resp = MagicMock()
@@ -182,15 +199,58 @@ class TestNode2FlashnextLane:
         ):
             result = adapter.score(
                 "some diff", substrates, "lapis-pm",
-                node_url="http://203.0.113.11:30000",
+                node_url="http://203.0.113.11:30000/v1/chat/completions",
                 node_model=FLASH_SERVED_ID,
                 include_vault=False,
             )
 
         assert result.leg_status == "ok"
         assert result.verdict == "clean"
-        assert captured["url"] == "http://203.0.113.11:30000"
+        assert captured["url"] == "http://203.0.113.11:30000/v1/chat/completions"
         assert captured["model"] == FLASH_SERVED_ID
+
+    def test_node2_pathless_lane_url_is_not_a_silent_pass(self, monkeypatch):
+        """R-1 regression pin: if a PATHLESS base_url ever reaches the
+        node2 raw-POST path, the seat answers 405 and the leg must land as
+        an honest non-ok node2 result — never a fabricated pass (the prior
+        stubs answered 200 to every URL and pinned the pathless shape as
+        the expected behavior)."""
+        adapter = self._adapter()
+        substrates = [
+            __import__("lapis_pm.corroboration_adapter", fromlist=["_IdentifierSubstrate"])
+            ._IdentifierSubstrate("tick", [{"file": "f", "line": "1", "text": "def tick"}], []),
+        ]
+
+        import httpx as _httpx
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            resp = MagicMock()
+            if not url.endswith("/v1/chat/completions"):
+                resp.status_code = 405
+                resp.raise_for_status.side_effect = _httpx.HTTPStatusError(
+                    "405", request=None, response=resp)
+            else:
+                resp.status_code = 200
+                resp.json.return_value = _ok_completion(FLASH_SERVED_ID)
+                resp.raise_for_status.return_value = None
+            resp.json.return_value = resp.json.return_value or {}
+            return resp
+
+        with (
+            patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
+            patch("httpx.post", side_effect=fake_post),
+        ):
+            result = adapter.score(
+                "some diff", substrates, "lapis-pm",
+                node_url="http://203.0.113.11:30000",  # pathless — the R-1 shape
+                node_model=FLASH_SERVED_ID,
+                include_vault=False,
+            )
+
+        assert result.leg_status != "ok", (
+            "a pathless node2 URL must not score as a pass — the live seat "
+            "405s every such call (verified live 2026-09-25)"
+        )
 
     def test_node2_unavailable_only_when_30000_unreachable(self, monkeypatch):
         """AC2: node2_unavailable fires ONLY when :30000 is actually
@@ -224,7 +284,7 @@ class TestNode2FlashnextLane:
         # Stub the lane seam: flashnext lane is registered + serving.
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter._flashnext_lane_url",
-            lambda fetcher=None: ("http://203.0.113.11:30000", FLASH_SERVED_ID, None),
+            lambda fetcher=None: ("http://203.0.113.11:30000/v1/chat/completions", FLASH_SERVED_ID, None),
         )
         # :30000 is actually unreachable -> honest node2_unavailable.
         monkeypatch.setattr(
@@ -262,7 +322,7 @@ class TestNode2FlashnextLane:
         flashnext-solo."""
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter._flashnext_lane_url",
-            lambda fetcher=None: ("http://203.0.113.11:30000", FLASH_SERVED_ID, None),
+            lambda fetcher=None: ("http://203.0.113.11:30000/v1/chat/completions", FLASH_SERVED_ID, None),
         )
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter.node_reachable", lambda *a, **k: True

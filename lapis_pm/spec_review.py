@@ -3131,8 +3131,14 @@ def run_spec_review(
             # gate_lane shim — lane = the leg's operator/voicing when it is
             # the registry lane (flashnext), else None (byte-identical to
             # today: the default gravitywell legs never probe the registry).
-            # A dead flashnext lane surfaces as the S5 preflight honest
-            # leg_down below, never a silent :8081 fallback.
+            # Scope of the honest-leg_down claim (R-2 reword, final
+            # independent review 2026-09-25): the S5 preflight below probes
+            # the COUNCIL lane only. For facets_operator=flashnext there is
+            # no lane preflight in this PR — until the companion lands the
+            # facets operator registration, such a facet leg dies LOUDLY at
+            # the facets adapter argparse (unknown operator, named
+            # subprocess error), which is honest but is not a preflight
+            # leg_down. Never a silent :8081 fallback either way.
             _facets_lane = "flashnext" if facets_operator == "flashnext" else None
             _council_lane = "flashnext" if council_voicing == "flashnext" else None
 

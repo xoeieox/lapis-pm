@@ -1062,6 +1062,34 @@ def run_corroboration_pass(
 
     def _score_n2() -> CorroborationResult:
         try:
+            # S6 (gate-lanes-registry-driven-flashnext-v0): under
+            # flashnext-solo (the 27B seat down, the flashnext seat :30000
+            # registered + serving), the node2 leg builds against the
+            # flashnext lane via the existing node_url injection point —
+            # the registry-served model name on :30000, never the dead
+            # Phala/legacy path. node2_unavailable then fires ONLY when
+            # :30000 is actually unreachable (honest panel_starvation row),
+            # eliminating the node2_unavailable starvation class under
+            # flashnext-solo.
+            #
+            # Caller contract (S1): (None, None) = registry blind / lane
+            # absent — the ONLY case that falls back to the legacy
+            # PhalaTeeClient path byte-identically. A readable registry with
+            # a dead flashnext lane is an honest node2_unavailable, never a
+            # masked legacy fallback.
+            _flash_url, _flash_model = _flashnext_lane_url()
+            if _flash_url is not None:
+                return adapter_n2.score(
+                    diff_text, substrates, repo,
+                    node_url=_flash_url,
+                    node_model=_flash_model,
+                    node_timeout=_NODE2_TIMEOUT,
+                    # Code-only tenancy constraint (Erah, 2026-09-01): the
+                    # outside caller never sees vault content — diff excerpt
+                    # + repo grep hits only. Build-time guard; `substrates`
+                    # is not mutated.
+                    include_vault=False,
+                )
             # D2 (lapis-pm-reviewer-leg-repair-v0): node2 rides the sanctioned
             # PhalaTeeClient verifying path (attestation + ACI verify hop on
             # every call), not a raw Bearer POST. The client reads

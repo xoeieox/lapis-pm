@@ -3183,7 +3183,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Model operator for Facets personas and synthesis (default: gravitywell). gravitywell = owned 122B "
             "local, zero paid spend; degrades to haiku when GW is unavailable, and the degrade is reported in "
             "the gate output (⚠️ DEGRADED banner + requested → effective voicing line). Pass sonnet or haiku "
-            "to deliberately spend money on a paid pass instead."
+            "to deliberately spend money on a paid pass instead. flashnext = the flash-next seat (GW :30000, "
+            "Qwen3.8-Flash-Next-NVFP4-SSD-Stream), resolved through the gw-seats registry "
+            "(gate-lanes-registry-driven-flashnext-v0 S3): the lapis-pm side resolves and reports the lane; "
+            "the in-leg operator registration lands with the companion agents-core bind "
+            "(gate-lanes-registry-driven-flashnext-v0-agents-core) — until then a flashnext-voiced facets leg "
+            "resolves its endpoint inside agents-core as today."
         ),
     )
     sr.set_defaults(func=cmd_spec_review)

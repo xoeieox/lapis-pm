@@ -122,10 +122,19 @@ class TestFlashnextPreflight:
         assert brief.council_status == "resolved"
 
     def test_flashnext_operator_resolves_30000_lane(self, advisory_spec, monkeypatch):
-        """S3 (gate-lanes-registry-driven-flashnext-v0): with a stubbed
-        registry flashnext row, the flashnext operator resolves the :30000
-        lane — the facets-leg endpoint builds against the registry lane,
-        never the :8081 GW_URL default."""
+        """S3 (gate-lanes-registry-driven-flashnext-v0): the ENDPOINT-
+        CONSTRUCTION seam — with a stubbed registry flashnext row, the
+        flashnext operator/voicing threads lane="flashnext" into
+        _gw_primary_url, so the leg endpoints are BUILT against the
+        :30000 registry lane, never the :8081 GW_URL default.
+
+        Honest scope (review MED-3 fold, 2026-09-25): this pins that the
+        construction call sites pass the lane — the in-leg HTTP routing
+        itself resolves inside agents-core (facets S2 operator registry /
+        council S4 _build_adapter) and lands with the companion bind
+        gate-lanes-registry-driven-flashnext-v0-agents-core. This test is
+        the lapis-pm-side seam pin, not a claim that the legs already dial
+        the resolved endpoint."""
         monkeypatch.setattr(
             "lapis_pm.gate_lane.gate_lane_serving", lambda *a, **k: (True, "")
         )
@@ -224,6 +233,38 @@ class TestFlashnextPreflight:
         # byte-identically (the ONLY fallback case).
         assert brief.council_error_reason == "gw_not_serving"
 
+    def test_flashnext_blind_with_serving_gw_runs_legacy_path(self, advisory_spec, monkeypatch):
+        """LOW-6 fold (independent review 2026-09-25): the S1/S2 caller
+        contract says blind = "caller falls back to the gravitywell path
+        UNCHANGED". With the registry blind AND the legacy GW probe
+        SERVING, the deliberation leg must RUN on the gravitywell path
+        (reported degrade) — the prior code killed the leg with an
+        unprobed gw_not_serving reason without ever consulting
+        swarm_serving()."""
+        # The autouse _no_live_registry stub returns (False,
+        # "registry_blind") for gate_lane_serving.
+        monkeypatch.setattr("lapis_pm.spec_review.swarm_serving", lambda: True)
+        called = []
+
+        async def mock_run_deliberation(request):
+            called.append(request)
+            return _happy_envelope()
+
+        monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_run_deliberation)
+
+        brief = run_spec_review(
+            advisory_spec, council_voicing="flashnext", timeout_s=30, dispatch_facets=True,
+        )
+        assert len(called) == 1, (
+            "blind + serving GW must fall back to the gravitywell path "
+            "UNCHANGED (S1 caller contract), not skip the leg on an "
+            "unprobed reason"
+        )
+        # The fallback runs on the legacy voicing (byte-identical
+        # gravitywell path), not an un-honored flashnext voicing.
+        assert called[0].council_voicing == "gravitywell"
+        assert brief.council_status == "resolved"
+
     def test_gravitywell_preflight_unchanged(self, advisory_spec, monkeypatch):
         """The gravitywell leg is byte-identical to today: swarm_serving()
         on :8081, env-var driven, never registry-probing."""
@@ -305,3 +346,33 @@ class TestLocalVoicingLeaseFree:
         )
         assert brief.council_status == "error"
         assert "local_seat_lease_refused" in (brief.council_error_reason or "")
+
+    def test_local_voicing_refused_on_the_live_409_shape(self, advisory_spec, monkeypatch):
+        """HIGH-2 fold (independent review 2026-09-25): the OBSERVED live
+        409 shape is the GW seat not serving + the flashnext window up,
+        with lease_count 0 — the guard (pinned in tests/test_gate_lane.py
+        against the exact /status snapshot) refuses with
+        local_voicing_flashnext_window and the preflight must skip the
+        deliberation leg on that reason (honest leg_down), NOT run it into
+        the acquiring council submit path that died 409 live."""
+        monkeypatch.setattr(
+            "lapis_pm.gate_lane.gate_lane_serving",
+            lambda *a, **k: (False, "local_voicing_flashnext_window"),
+        )
+        called = []
+
+        async def mock_run_deliberation(request):
+            called.append(request)
+            return _happy_envelope()
+
+        monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_run_deliberation)
+
+        brief = run_spec_review(
+            advisory_spec, council_voicing="local", timeout_s=30, dispatch_facets=True,
+        )
+        assert called == [], (
+            "the live-409 seat state must be refused BEFORE the leg would "
+            "acquire — the 409 contention shape pinned unreachable"
+        )
+        assert brief.council_status == "error"
+        assert "local_voicing_flashnext_window" in (brief.council_error_reason or "")

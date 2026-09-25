@@ -30,6 +30,9 @@ FLASH_URL = "http://203.0.113.11:30000/v1/chat/completions"
 
 
 def _flashnext_solo_payload():
+    # Row shape matches the LIVE :8408 payload (review HIGH-1 fold,
+    # 2026-09-25): the serving flashnext row carries bind "0.0.0.0" (the
+    # serving-bind); client dialing resolves via the registry origin host.
     return {
         "reality_view": {
             "reality": "flashnext-solo",
@@ -40,7 +43,40 @@ def _flashnext_solo_payload():
             {"port": 30000, "state": "serving", "engine": "sglang",
              "model": FLASH_SERVED_ID,
              "model_root": "/models/models/Qwen3.8-Flash-Next-NVFP4-SSD-Stream",
-             "bind": "203.0.113.11"},
+             "bind": "0.0.0.0"},
+        ],
+    }
+
+
+def _slot1_solo_payload():
+    """27B serving (not flashnext-solo): node2 must stay on the legacy
+    Phala path (MED-5 fold — the switch is conditioned on the 27B being
+    down, not merely on a registered flashnext row)."""
+    return {
+        "reality_view": {
+            "reality": "slot1-solo",
+            "primary": {"port": 8081, "model_root": "/models/models/Qwen3.8-27B-NVFP4"},
+        },
+        "seats": [
+            {"port": 8081, "state": "serving", "engine": "vllm", "model": "gravitywell-27b",
+             "model_root": "/models/models/Qwen3.8-27B-NVFP4", "bind": "0.0.0.0"},
+            {"port": 30000, "state": "down", "model": None, "model_root": None, "bind": None},
+        ],
+    }
+
+
+def _readable_dead_lane_payload():
+    """Readable registry, 27B down, flashnext registered but NOT serving:
+    the honest node2_unavailable case — never a masked Phala fallback
+    (MED-4 fold)."""
+    return {
+        "reality_view": {
+            "reality": "down",
+            "primary": None,
+        },
+        "seats": [
+            {"port": 8081, "state": "down", "model": None, "model_root": None, "bind": None},
+            {"port": 30000, "state": "down", "model": None, "model_root": None, "bind": None},
         ],
     }
 
@@ -65,26 +101,48 @@ def _ok_completion(model: str):
 # ---------------------------------------------------------------------------
 
 class TestFlashnextLaneUrl:
-    def test_resolves_flashnext_lane(self, monkeypatch):
+    """Seam contract (MED-4/MED-5 fold, independent review 2026-09-25):
+    (base_url, served_model, blocked_reason) — a readable registry with
+    the 27B down and a dead flashnext lane returns a BLOCKED reason (never
+    the legacy-Phala shape (None, None, None))."""
+
+    def test_resolves_flashnext_lane(self):
         """Under a flashnext-solo stub, the lane seam resolves the
-        :30000 base_url + the registry-served model name."""
-        monkeypatch.setattr(
-            gate_lane, "resolve_gate_lane",
-            lambda lane=None, fetcher=None: (
-                gate_lane.GateLane(name="flashnext", base_url="http://203.0.113.11:30000",
-                                   served_model=FLASH_SERVED_ID)
-                if lane == "flashnext" else None
-            ),
-        )
-        base_url, model = _flashnext_lane_url()
+        :30000 base_url + the registry-served model name — and the client
+        host comes from the registry origin (bind "0.0.0.0" is the LIVE
+        shape, not a dialable host)."""
+        base_url, model, blocked = _flashnext_lane_url(fetcher=_flashnext_solo_payload)
+        assert blocked is None
         assert base_url == "http://203.0.113.11:30000"
         assert model == FLASH_SERVED_ID
 
-    def test_blind_registry_is_none(self, monkeypatch):
-        """A blind registry (the ONLY fallback case) -> (None, None): the
-        caller falls back to the legacy Phala path byte-identically."""
-        monkeypatch.setattr(gate_lane, "resolve_gate_lane", lambda *a, **k: None)
-        assert _flashnext_lane_url() == (None, None)
+    def test_blind_registry_is_legacy_shape(self):
+        """A blind registry (the ONLY fallback case) -> (None, None, None):
+        the caller falls back to the legacy Phala path byte-identically."""
+        assert _flashnext_lane_url(fetcher=lambda: {}) == (None, None, None)
+
+    def test_fetcher_crash_is_blind(self):
+        """A transport crash on the registry read collapses to blind ->
+        the legacy shape (fail-soft to today's behavior)."""
+        def boom():
+            raise ConnectionError("registry down")
+        assert _flashnext_lane_url(fetcher=boom) == (None, None, None)
+
+    def test_slot1_solo_keeps_legacy_phala_path(self):
+        """MED-5 (spec S6 trigger): the 27B serving = NOT flashnext-solo —
+        node2 stays on the legacy path (the flashnext lane must not steal
+        node2 onto the gate-leg seat while the 27B lane is alive)."""
+        assert _flashnext_lane_url(fetcher=_slot1_solo_payload) == (None, None, None)
+
+    def test_readable_dead_lane_is_blocked_not_fallback(self):
+        """MED-4 (docstring/code agreement): readable registry, 27B down,
+        flashnext lane absent/not serving -> a BLOCKED reason (the caller
+        must record an honest node2_unavailable and NEVER mask the seat's
+        absence on the Phala path)."""
+        base_url, model, blocked = _flashnext_lane_url(fetcher=_readable_dead_lane_payload)
+        assert base_url is None
+        assert model is None
+        assert blocked == "flashnext_not_serving"
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +224,7 @@ class TestNode2FlashnextLane:
         # Stub the lane seam: flashnext lane is registered + serving.
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter._flashnext_lane_url",
-            lambda: ("http://203.0.113.11:30000", FLASH_SERVED_ID),
+            lambda fetcher=None: ("http://203.0.113.11:30000", FLASH_SERVED_ID, None),
         )
         # :30000 is actually unreachable -> honest node2_unavailable.
         monkeypatch.setattr(
@@ -204,7 +262,7 @@ class TestNode2FlashnextLane:
         flashnext-solo."""
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter._flashnext_lane_url",
-            lambda: ("http://203.0.113.11:30000", FLASH_SERVED_ID),
+            lambda fetcher=None: ("http://203.0.113.11:30000", FLASH_SERVED_ID, None),
         )
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter.node_reachable", lambda *a, **k: True
@@ -240,7 +298,7 @@ class TestNode2FlashnextLane:
         via_node2_client=True)."""
         monkeypatch.setattr(
             "lapis_pm.corroboration_adapter._flashnext_lane_url",
-            lambda: (None, None),
+            lambda fetcher=None: (None, None, None),
         )
         # The Phala client import is a wiring failure in this test -> the
         # named node2_client_import_error class (the legacy path was taken,
@@ -257,3 +315,44 @@ class TestNode2FlashnextLane:
         assert combined["cross_node_divergence"] == "node2_unavailable"
         n2 = combined["node2_corroboration"]
         assert "node2_client_import_error" in (n2["notes"] or "")
+
+    def test_blocked_lane_never_masks_on_phala_path(self, monkeypatch):
+        """MED-4 end-to-end (independent review 2026-09-25): readable
+        registry + 27B down + dead flashnext lane is an HONEST
+        node2_unavailable — the Phala/legacy path must NEVER be reached to
+        keep the panel going (a _build_node2_client call here IS the lying
+        leg the S1 caller contract kills)."""
+        monkeypatch.setattr(
+            "lapis_pm.corroboration_adapter._flashnext_lane_url",
+            lambda fetcher=None: (None, None, "flashnext_not_serving"),
+        )
+        monkeypatch.setattr(
+            "lapis_pm.corroboration_adapter._llm_url",
+            lambda: "http://203.0.113.11:8081/v1/chat/completions",
+        )
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = _ok_completion("gravitywell-27b")
+            resp.raise_for_status.return_value = None
+            return resp
+
+        def no_phala(*a, **k):
+            raise AssertionError(
+                "the blocked (readable-registry, dead-lane) shape must NOT "
+                "fall back to the PhalaTeeClient legacy path (no lying leg)"
+            )
+
+        with patch("httpx.post", side_effect=fake_post), \
+             patch("lapis_pm.corroboration_adapter._build_node2_client", side_effect=no_phala):
+            combined = run_corroboration_pass(
+                "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+def tick(): pass\n",
+                "lapis-pm",
+            )
+
+        assert combined["cross_node_divergence"] == "node2_unavailable"
+        n2 = combined["node2_corroboration"]
+        assert n2["leg_status"] != "ok"
+        assert "flashnext_not_serving" in (n2["notes"] or "")
+        assert "no masked legacy fallback" in (n2["notes"] or "")

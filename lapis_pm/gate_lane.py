@@ -100,6 +100,27 @@ def _gw_seats_url() -> str:
     return os.environ.get("GW_SEATS_URL", DEFAULT_GW_SEATS_URL)
 
 
+def _registry_host() -> str:
+    """The CLIENT-REACHABLE host for lane dialing: the gw-seats registry's
+    own origin host (GW_SEATS_URL), default the GW tailscale IP.
+
+    Why not the seat row's ``bind``? ``bind`` is the SERVING bind (the
+    sglang/vllm bind-address on the GW box) — the live :8408 row for the
+    serving :30000 seat advertises ``bind: "0.0.0.0"`` (gw-seats v0,
+    verified live 2026-09-25), which is a wildcard listen address, not a
+    dialable client host. The f0fb039 fixer_flash precedent pins the full
+    URL (http://203.0.113.11:30000) for exactly this reason."""
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(_gw_seats_url()).hostname
+        if isinstance(host, str) and host:
+            return host
+    except Exception:
+        pass
+    return "203.0.113.11"
+
+
 def _lane_name_for_port(port: int) -> str:
     if port == FLASHNEXT_LANE_PORT:
         return FLASHNEXT_LANE_NAME
@@ -131,7 +152,14 @@ def _lane_from_seats(seats: list[dict], lane_name: str) -> Optional[GateLane]:
             continue
         if seat.get("state") != "serving":
             return None
-        host = seat.get("bind") or "203.0.113.11"
+        # ``bind`` is the serving-bind, NOT a client host (review HIGH-1,
+        # 2026-09-25): the live serving row advertises "0.0.0.0", which
+        # would build a phantom http://0.0.0.0:<port> lane. Wildcards (and
+        # absent bind) dial the registry's own origin host instead; a
+        # concrete bind is still honored (registry-forwarded rows).
+        host = seat.get("bind")
+        if not isinstance(host, str) or host.strip() in ("", "0.0.0.0", "::", "*", "[::]"):
+            host = _registry_host()
         base_url = f"http://{host}:{port}"
         served_model = seat.get("model")
         if not isinstance(served_model, str) or not served_model:
@@ -216,10 +244,23 @@ def _local_voicing_lease_free() -> tuple[bool, str]:
     """S8: the local-voicing lease-free guard.
 
     A LOCAL voicing must not acquire a seat-node lease. The guard probes
-    the doorman for an ACTIVE lease on the "gravitywell" seat node (the
-    node the legacy gravitywell voicing leases, and the node the live 409
-    fired on). If such a lease is held, the local voicing is REFUSED
-    (leg_down, honest) — the doorman /lease/acquire call site is pinned
+    the doorman for either of the two shapes that make the acquire die 409
+    on node "gravitywell" (the node the legacy gravitywell voicing leases,
+    and the node the live 409 fired on):
+
+    (a) an ACTIVE lease on that node — refused as
+        ``local_seat_lease_refused``;
+    (b) the LIVE 409 shape (review HIGH-2, 2026-09-25): the GW seat is NOT
+        serving and the doorman's flashnext window sub-view is UP
+        (seat_state up_registered/up_unverified, or window == "active") —
+        the observed 409 fired with lease_count 0
+        (finding/council-lease-409-under-flashnext-window-2026-09-25;
+        doorman ensure_serving refuses every acquire in this state), so
+        keying only on held leases pins the wrong shape. Refused as
+        ``local_voicing_flashnext_window``.
+
+    Either shape REFUSES the local voicing (leg_down, honest) — the
+    doorman /lease/acquire call site is pinned
     unreachable on this path, and the refusal is a leg_down, NEVER a
     fallback-run on the gravitywell lane.
 
@@ -238,7 +279,10 @@ def _local_voicing_lease_free() -> tuple[bool, str]:
 
     Returns (ok, reason): (True, "") = lease-free, run the local leg;
     (False, "local_seat_lease_refused") = a gravitywell-seat lease is
-    held, refuse the local leg (honest leg_down).
+    held, refuse the local leg (honest leg_down);
+    (False, "local_voicing_flashnext_window") = the live-409 seat state
+    (GW seat not serving + flashnext window up), refuse the local leg
+    (honest leg_down).
     """
     try:
         from agents_core.doorman_client import DoormanClient
@@ -265,6 +309,26 @@ def _local_voicing_lease_free() -> tuple[bool, str]:
         if isinstance(nodes, dict):
             gw_node = nodes.get("gravitywell")
             if isinstance(gw_node, dict):
+                # (b) HIGH-2 fold: the live 409 shape is NOT a held lease —
+                # it fires when the GW seat is not serving and the doorman
+                # sees the flashnext window UP (ensure_serving refuses every
+                # acquire in that state; lease_count was 0 in the observed
+                # 409). Sense that predicate from the same /status snapshot
+                # and refuse BEFORE the leg would acquire. Fail-soft note:
+                # this reads the doorman's cached snapshot; when it is stale
+                # the refusal is a conservative honest leg_down, never a
+                # fallback-run.
+                if not gw_node.get("serving", False):
+                    fx = gw_node.get("flashnext")
+                    if isinstance(fx, dict):
+                        _st = fx.get("seat_state")
+                        _window_up = (
+                            (isinstance(_st, str) and _st.startswith("up_"))
+                            or fx.get("window") == "active"
+                            or (_st is None and bool(fx.get("seat_health")))
+                        )
+                        if _window_up:
+                            return (False, "local_voicing_flashnext_window")
                 leases = gw_node.get("leases")
                 if isinstance(leases, list):
                     return (
@@ -338,7 +402,12 @@ def resolve_gate_lane(
             if fetcher is not None:
                 return companion(lane=lane, fetcher=fetcher)
             return companion(lane=lane)
-    except (ImportError, AttributeError, TypeError):
+    except Exception:
+        # Companion-side any-error (import, attribute, shape, RUNTIME):
+        # fall through to the local implementation below. A companion bug
+        # must degrade the shim, never crash the gate (LOW-7, review
+        # 2026-09-25 — the previous (ImportError, AttributeError, TypeError)
+        # catch let a companion runtime error escape to the gate).
         pass
 
     if fetcher is not None:
@@ -397,9 +466,13 @@ def gate_lane_serving(
     # voicing branch was evaluated).
     #
     # The guard is a fail-closed REFUSE, never a fallback-run: a local
-    # voicing that finds a doorman lease on the gravitywell seat is a
-    # leg_down (the honest "local_seat_lease_refused"), and the caller
-    # must NOT re-route the leg to the gravitywell lane to "keep going".
+    # voicing that finds either 409 shape on the doorman snapshot — a
+    # gravitywell-seat lease held, or the live-409 seat state (GW seat not
+    # serving + flashnext window up, the shape that fired 409 with
+    # lease_count 0) — is a leg_down (the honest
+    # "local_seat_lease_refused" / "local_voicing_flashnext_window"), and
+    # the caller must NOT re-route the leg to the gravitywell lane to
+    # "keep going".
     #
     # Blind never refuses: the doorman is unreachable (or the lane is
     # registry-blind) -> the guard is a no-op and the local voicing runs

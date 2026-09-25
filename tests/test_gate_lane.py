@@ -29,9 +29,13 @@ from lapis_pm.gate_lane import (
 
 
 # ---------------------------------------------------------------------------
-# Stubbed registry payloads (the f0fb039 row shape; verified live 2026-09-25
-# against the :8408 status: reality_view + seats[30000] with state/model/
-# model_root/bind)
+# Stubbed registry payloads — row shape matches the LIVE :8408 payload as
+# re-attested 2026-09-25 for the review HIGH-1 fold: the serving :30000 row
+# carries bind "0.0.0.0" (the SERVING bind, not a client host — client
+# dialing must resolve through _registry_host()/GW_SEATS_URL, pinned by
+# TestClientHostDerivation below); non-serving rows carry bind null.
+# (The prior stubs fabricated bind "203.0.113.11" under a "verified
+# live" header — the exact case the live registry never sends.)
 # ---------------------------------------------------------------------------
 
 def _flashnext_solo_payload():
@@ -49,7 +53,7 @@ def _flashnext_solo_payload():
             {"port": 30000, "state": "serving", "engine": "sglang",
              "model": FLASHNEXT_SERVED_ID,
              "model_root": "/models/models/Qwen3.8-Flash-Next-NVFP4-SSD-Stream",
-             "bind": "203.0.113.11"},
+             "bind": "0.0.0.0"},
         ],
     }
 
@@ -127,6 +131,56 @@ class TestResolveGateLaneFlashnext:
         ONLY case in which callers fall back to the GW_URL behavior
         byte-identically."""
         assert resolve_gate_lane(lane=FLASHNEXT_LANE_NAME, fetcher=lambda: {}) is None
+
+    def test_wildcard_bind_uses_registry_origin_host(self, monkeypatch):
+        """HIGH-1 fold (independent review 2026-09-25): the LIVE :8408
+        serving row carries bind "0.0.0.0" (the serving-bind). The client
+        host must be the registry's own origin host (GW_SEATS_URL), never
+        the wildcard — otherwise every resolved lane is a phantom
+        http://0.0.0.0:<port> that cannot be reached from the PM host."""
+        monkeypatch.setenv("GW_SEATS_URL", "http://199.9.9.9:8408")
+        lane = resolve_gate_lane(lane=FLASHNEXT_LANE_NAME, fetcher=_flashnext_solo_payload)
+        assert lane is not None
+        assert lane.base_url == "http://199.9.9.9:30000"
+
+    def test_absent_bind_uses_registry_origin_host(self, monkeypatch):
+        monkeypatch.setenv("GW_SEATS_URL", "http://199.9.9.9:8408")
+        payload = _flashnext_solo_payload()
+        for s in payload["seats"]:
+            if s["port"] == 30000:
+                s["bind"] = None
+        lane = resolve_gate_lane(lane=FLASHNEXT_LANE_NAME, fetcher=lambda: payload)
+        assert lane is not None
+        assert lane.base_url == "http://199.9.9.9:30000"
+
+    def test_ipv6_wildcard_bind_also_defers_to_registry_host(self, monkeypatch):
+        monkeypatch.setenv("GW_SEATS_URL", "http://199.9.9.9:8408")
+        payload = _flashnext_solo_payload()
+        for s in payload["seats"]:
+            if s["port"] == 30000:
+                s["bind"] = "::"
+        lane = resolve_gate_lane(lane=FLASHNEXT_LANE_NAME, fetcher=lambda: payload)
+        assert lane is not None
+        assert lane.base_url == "http://199.9.9.9:30000"
+
+    def test_concrete_bind_still_honored(self):
+        """A concrete bind (registry-forwarded rows) remains authoritative —
+        the wildcard handling must not discard real hosts."""
+        payload = _flashnext_solo_payload()
+        for s in payload["seats"]:
+            if s["port"] == 30000:
+                s["bind"] = "10.0.0.5"
+        lane = resolve_gate_lane(lane=FLASHNEXT_LANE_NAME, fetcher=lambda: payload)
+        assert lane is not None
+        assert lane.base_url == "http://10.0.0.5:30000"
+
+    def test_default_env_resolves_tailscale_ip(self, monkeypatch):
+        """The f0fb039 precedent: with no GW_SEATS_URL override, lanes dial
+        the GW tailscale IP (NOT 0.0.0.0)."""
+        monkeypatch.delenv("GW_SEATS_URL", raising=False)
+        lane = resolve_gate_lane(lane=FLASHNEXT_LANE_NAME, fetcher=_flashnext_solo_payload)
+        assert lane is not None
+        assert lane.base_url == "http://203.0.113.11:30000"
         assert resolve_gate_lane(lane=None, fetcher=lambda: {}) is None
 
     def test_malformed_payload_is_blind_none(self):
@@ -251,7 +305,13 @@ class TestLocalVoicingLeaseFree:
     that a lease-call count is zero. A zero-count assertion on a path the
     acquire never reaches is vacuous; the live 409 fired before the
     voicing branch was evaluated. The guard is a fail-closed REFUSE
-    (leg_down), never a fallback-run; blind never refuses."""
+    (leg_down), never a fallback-run; blind never refuses.
+
+    HIGH-2 fold (independent review 2026-09-25): the OBSERVED live 409
+    fired with lease_count 0 (doorman /status: GW seat serving=false,
+    flashnext sub-view seat_state up_registered, window active). A guard
+    that keys only on held leases pins the wrong shape — the live-shape
+    stub below is the 409 as it actually happened."""
 
     def _doorman(self, status_result, acquire_raises=None):
         from unittest.mock import MagicMock
@@ -268,13 +328,76 @@ class TestLocalVoicingLeaseFree:
             )
         return client
 
-    def test_local_voicing_never_acquires_lease(self, monkeypatch):
-        """(b) the doorman /lease/acquire call site is unreachable on the
-        local-voicing code path: any acquire call raises (the mock's
-        side_effect), and the guard completes without touching it. The
-        guard also makes zero lease calls (a) — assert both: the acquire
-        was never called AND the guard returned the lease-free verdict."""
-        from unittest.mock import MagicMock
+    def _live_409_shape_status(self):
+        """The doorman /status snapshot captured 2026-09-25 while the
+        acquire path was answering 409 (finding/council-lease-409-under-
+        flashnext-window-2026-09-25): nodes.gravitywell.serving == false,
+        flashnext sub-view up_registered with window active, lease_count 0
+        and an EMPTY lease list. A guard that returns (True, "") on THIS
+        shape sends the local leg into the acquiring council submit path
+        and reproduces the live 409 — exactly the vacuity the spec text
+        pre-judges."""
+        return {
+            "nodes": {
+                "gravitywell": {
+                    "serving": False,
+                    "lease_count": 0,
+                    "leases": [],
+                    "flashnext": {
+                        "seat_health": True,
+                        "seat_state": "up_registered",
+                        "served_id": FLASHNEXT_SERVED_ID,
+                        "registered": True,
+                        "window": "active",
+                    },
+                }
+            }
+        }
+
+    def test_local_voicing_refuses_the_live_409_shape(self, monkeypatch):
+        """The live-409 shape (seat down + flashnext window up, lease_count
+        0, empty lease list) MUST be refused BEFORE the leg would acquire:
+        the guard returns the honest leg_down reason, and the acquire call
+        site stays unreachable (the mock's side_effect would raise)."""
+        client = self._doorman(self._live_409_shape_status())
+        monkeypatch.setattr(
+            "agents_core.doorman_client.DoormanClient", lambda *a, **k: client
+        )
+        ok, reason = gate_lane_serving(lane="local")
+        assert ok is False
+        assert reason == "local_voicing_flashnext_window"
+        client.acquire.assert_not_called()
+        client.status.assert_called_once()
+
+    def test_local_voicing_runs_lease_free_on_a_clean_seat(self, monkeypatch):
+        """Lease-free shape: the GW seat itself is not asserting a flashnext
+        window conflict and no lease is held -> the local voicing runs,
+        making ZERO lease calls (the acquire call site is unreachable)."""
+        status = {
+            "nodes": {
+                "gravitywell": {
+                    "serving": True,
+                    "lease_count": 0,
+                    "leases": [],
+                    "flashnext": {"seat_health": False, "seat_state": "down", "window": "closed"},
+                }
+            }
+        }
+        client = self._doorman(status)
+        monkeypatch.setattr(
+            "agents_core.doorman_client.DoormanClient", lambda *a, **k: client
+        )
+        ok, reason = gate_lane_serving(lane="local")
+        assert ok is True
+        assert reason == ""
+        client.acquire.assert_not_called()
+        client.status.assert_called_once()
+
+    def test_local_voicing_legacy_status_shape_falls_back_conservatively(self, monkeypatch):
+        """A /status payload WITHOUT the nodes block (a client whose shape
+        lacks per-node leases) falls back to the GLOBAL lease_count — the
+        honest fallback the guard's docstring documents; zero-count ->
+        allow, zero acquire calls."""
         client = self._doorman({"lease_count": 0, "leases": []})
         monkeypatch.setattr(
             "agents_core.doorman_client.DoormanClient", lambda *a, **k: client

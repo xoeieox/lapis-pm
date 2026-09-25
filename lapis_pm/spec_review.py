@@ -3160,7 +3160,11 @@ def run_spec_review(
             # unreachable, not merely that a lease-call count is zero (a
             # zero-count assertion on a path the acquire never reaches is
             # vacuous; the live 409 fired before the voicing branch was
-            # evaluated). The guard is a fail-closed REFUSE (leg_down),
+            # evaluated). The guard refuses BOTH 409 shapes on the doorman
+            # /status snapshot: a held gravitywell-seat lease, and the
+            # observed live shape (GW seat not serving + flashnext window
+            # up — the 409 fired there with lease_count 0; review HIGH-2
+            # fold 2026-09-25). The guard is a fail-closed REFUSE (leg_down),
             # never a fallback-run on the gravitywell lane; blind (doorman
             # unreachable) never refuses.
             #
@@ -3182,31 +3186,53 @@ def run_spec_review(
                 if not _local_ok:
                     print(
                         f"[spec-review:council-preflight] local voicing refused: "
-                        f"{_local_reason} — a doorman lease is held on the "
-                        f"gravitywell seat; the local leg must be lease-free. "
-                        f"Honest leg_down, never a fallback-run on the "
-                        f"gravitywell lane.",
+                        f"{_local_reason} — the doorman seat-state sense reports "
+                        f"contention (a held gravitywell-seat lease, or the "
+                        f"live-409 state: GW seat not serving while the "
+                        f"flashnext window is up); the local leg must be "
+                        f"lease-free. Honest leg_down, never a fallback-run "
+                        f"on the gravitywell lane.",
                         file=sys.stderr,
                     )
                     council_not_run_reason = _local_reason
             if _council_lane is not None:
                 from lapis_pm import gate_lane as _gate_lane
                 _serving, _reason = _gate_lane.gate_lane_serving(lane=_council_lane)
-                if not _serving:
-                    # registry_blind is the only reason that may look like
-                    # the legacy gw_not_serving; a readable registry with a
-                    # dead flashnext lane is its own honest reason.
-                    _preflight_reason = (
-                        "gw_not_serving" if _reason == "registry_blind"
-                        else "flashnext_not_serving"
+                if not _serving and _reason == "registry_blind":
+                    # S1 caller contract (LOW-6 fold, review 2026-09-25):
+                    # blind is the ONLY fallback case, and the fallback is
+                    # "the caller falls back to the gravitywell path
+                    # UNCHANGED" (spec S2) — i.e. degrade to the legacy
+                    # gravitywell probe and report the degrade, NEVER
+                    # assert gw_not_serving without probing it (the prior
+                    # code killed the leg with an unprobed reason).
+                    _council_lane = None
+                    print(
+                        "[spec-review:council-preflight] gate-lane registry blind; "
+                        "council voicing flashnext unavailable — degrading to the "
+                        "legacy gravitywell probe (S1 caller contract, reported "
+                        "degrade, not a silent mask)",
+                        file=sys.stderr,
                     )
+                    request.council_voicing = "gravitywell"
+                    if not swarm_serving():
+                        print(
+                            "[spec-review:council-preflight] swarm not serving; "
+                            "skipping run_deliberation",
+                            file=sys.stderr,
+                        )
+                        council_not_run_reason = "gw_not_serving"
+                elif not _serving:
+                    # readable registry + dead requested lane: honest
+                    # leg_down, its own reason, never a masked legacy
+                    # fallback (the "lying leg" the re-gate fold kills).
                     print(
                         f"[spec-review:council-preflight] flashnext lane not serving "
                         f"({_reason}); skipping run_deliberation — honest leg_down, "
                         f"never a silent gravitywell fallback",
                         file=sys.stderr,
                     )
-                    council_not_run_reason = _preflight_reason
+                    council_not_run_reason = "flashnext_not_serving"
             elif _council_lane is None and council_voicing == "gravitywell" and not swarm_serving():
                 print(
                     "[spec-review:council-preflight] swarm not serving; skipping run_deliberation",
@@ -3222,16 +3248,26 @@ def run_spec_review(
             else:
                 try:
                     # S3 (gate-lanes-registry-driven-flashnext-v0): the
-                    # facets-leg endpoint seam — the facets leg's voicing
-                    # endpoint resolves through the gate_lane shim with the
-                    # leg's lane (flashnext when facets_operator is the
-                    # registry lane, else None = byte-identical GW_URL,
-                    # never registry-probing). A dead flashnext lane is
-                    # already refused by the S5 preflight above; this seam
-                    # is the endpoint-construction point the S3 wiring
-                    # names, so the leg's operator is provably resolved
-                    # through the shim (assertable in tests) and can never
-                    # silently build a :8081 endpoint for a flashnext leg.
+                    # facets/council leg ENDPOINT-CONSTRUCTION seam — the
+                    # legs' voicing endpoints resolve through the gate_lane
+                    # shim with the leg's lane (flashnext when the
+                    # operator/voicing is the registry lane, else None =
+                    # byte-identical GW_URL, never registry-probing), and
+                    # are recorded here for the tests to pin and for
+                    # operator legibility.
+                    #
+                    # Companion-scope disclosure (review MED-3, 2026-09-25,
+                    # same shape as the S4 note above): this seam BUILDS
+                    # and reports the resolved endpoints; it does not
+                    # route them. The facets leg's in-leg HTTP calls resolve
+                    # their endpoint inside agents-core (facets CLI via the
+                    # S2 operator registry), and the council adapter is
+                    # constructed inside agents-core (S4 _build_adapter) —
+                    # both land with the companion bind
+                    # gate-lanes-registry-driven-flashnext-v0-agents-core.
+                    # Until then the legs keep resolving the legacy GW_URL
+                    # inside agents-core; this seam proves the lapis-pm-side
+                    # construction and must not be read as the router.
                     _leg_endpoints = {
                         "facets": _gw_primary_url(lane=_facets_lane),
                         "council": _gw_primary_url(lane=_council_lane),

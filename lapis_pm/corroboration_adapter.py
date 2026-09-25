@@ -262,30 +262,56 @@ def _llm_url() -> str:
     return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
 
 
-def _flashnext_lane_url() -> tuple[str | None, str | None]:
+def _flashnext_lane_url(
+    fetcher: "Callable[[], dict] | None" = None,
+) -> tuple[str | None, str | None, str | None]:
     """S6 (gate-lanes-registry-driven-flashnext-v0): resolve the flashnext
     node2 lane through the gw-seats registry.
 
-    Returns (base_url, served_model) when the registry is readable AND the
-    flashnext seat (:30000) is serving — the node2 leg builds against that
-    lane (registry-served model name on :30000) so corroboration does not
-    silently attenuate panels under flashnext-solo.
+    Returns (base_url, served_model, blocked_reason):
 
-    Returns (None, None) in the ONLY blind case: the registry is
-    unreachable/malformed or the flashnext lane is absent/not serving.
-    A readable registry with a dead flashnext lane is an honest
-    node2_unavailable (the panel_starvation row stays truthful) — never a
-    silent fallback to the Phala/legacy path that would mask the seat's
-    absence (the S1 caller contract, "no lying leg").
+    * (base_url, served_model, None) — the registry is readable, the 27B
+      is NOT serving (flashnext-solo, the spec's S6 trigger: "reality_view
+      says the 27B is down and a flashnext row is registered"), and the
+      flashnext seat (:30000) is serving. The node2 leg builds against that
+      lane (registry-served model name on :30000) so corroboration does not
+      silently attenuate panels under flashnext-solo.
+    * (None, None, None) — a LEGACY-shape case: the registry is blind
+      (unreachable/malformed, the S1 contract's ONLY fallback case) OR the
+      27B IS serving (dual/slot1 posture — the spec keeps the phala path
+      unchanged there; MED-5 fold: the switch is conditioned on
+      flashnext-solo, not merely a registered flashnext row, so node2 never
+      jumps onto a seat the gate legs run on while the 27B lane is alive).
+      The caller rides the sanctioned PhalaTeeClient path byte-identically.
+    * (None, None, reason) — readable registry, 27B down, flashnext lane
+      absent/not serving: an honest node2_unavailable (the panel_starvation
+      row stays truthful) — NEVER a silent fallback to the Phala/legacy
+      path that would mask the seat's absence (the S1 caller contract,
+      "no lying leg"; MED-4 fold: the code now matches this docstring —
+      resolve_gate_lane collapses blind and dead-lane to the same None, so
+      the distinction is made by re-reading the payload, the same pattern
+      gate_lane_serving uses).
+
+    Single registry read (one _fetch_payload, no double-fetch); reads the
+    seat rows directly from the payload via the gate_lane helpers (shim-
+    internal: the companion lane_registry promotion keeps the same shape).
     """
     try:
         from lapis_pm import gate_lane as _gate_lane
-        lane_obj = _gate_lane.resolve_gate_lane(lane="flashnext")
     except Exception:
-        return (None, None)
+        return (None, None, None)  # module unavailable -> today's behavior
+    try:
+        payload = (fetcher or _gate_lane._fetch_payload)()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or not _gate_lane._seat_rows(payload):
+        return (None, None, None)  # blind — the ONLY legacy-fallback case
+    if _gate_lane._resolve_from_payload(payload, _gate_lane.SLOT1_LANE_NAME) is not None:
+        return (None, None, None)  # 27B serving: not flashnext-solo; phala unchanged
+    lane_obj = _gate_lane._resolve_from_payload(payload, _gate_lane.FLASHNEXT_LANE_NAME)
     if lane_obj is None:
-        return (None, None)
-    return (lane_obj.base_url, lane_obj.served_model)
+        return (None, None, "flashnext_not_serving")  # readable + dead: honest
+    return (lane_obj.base_url, lane_obj.served_model, None)
 
 
 # _LLM_TIMEOUT 120s (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling
@@ -1072,12 +1098,20 @@ def run_corroboration_pass(
             # eliminating the node2_unavailable starvation class under
             # flashnext-solo.
             #
-            # Caller contract (S1): (None, None) = registry blind / lane
-            # absent — the ONLY case that falls back to the legacy
-            # PhalaTeeClient path byte-identically. A readable registry with
-            # a dead flashnext lane is an honest node2_unavailable, never a
-            # masked legacy fallback.
-            _flash_url, _flash_model = _flashnext_lane_url()
+            # Caller contract (S1): (None, None, None) = registry blind OR
+            # a non-solo posture (27B up) — the ONLY shapes that fall back
+            # to the legacy PhalaTeeClient path byte-identically. A readable
+            # registry, 27B down, with a dead flashnext lane is an honest
+            # node2_unavailable, never a masked legacy fallback (MED-4
+            # fold: the blocked reason now flows here as the third value).
+            _flash_url, _flash_model, _flash_blocked = _flashnext_lane_url()
+            if _flash_blocked is not None:
+                return _make_uncertain(
+                    repo,
+                    f"node2_unavailable: gate-lanes registry readable, 27B "
+                    f"down, flashnext lane not serving ({_flash_blocked}) — "
+                    f"honest leg_down, no masked legacy fallback",
+                )
             if _flash_url is not None:
                 return adapter_n2.score(
                     diff_text, substrates, repo,

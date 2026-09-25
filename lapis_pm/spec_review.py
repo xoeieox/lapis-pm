@@ -3152,12 +3152,7 @@ def run_spec_review(
                     file=sys.stderr,
                 )
                 council_not_run_reason = "gw_not_serving"
-            if _preflight_skip:
-                pass
-            elif council_voicing == "gravitywell" and not swarm_serving():
-                pass
-            if not _preflight_skip and council_not_run_reason == "":
-                pass
+            if council_not_run_reason:
                 if _grounding_tmp:
                     try:
                         os.unlink(_grounding_tmp)

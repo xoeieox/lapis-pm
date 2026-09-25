@@ -223,6 +223,14 @@ def _local_voicing_lease_free() -> tuple[bool, str]:
     unreachable on this path, and the refusal is a leg_down, NEVER a
     fallback-run on the gravitywell lane.
 
+    Scope: the /status payload carries per-node leases
+    (``nodes.<node>.leases``); the guard PREFERS the gravitywell node's
+    lease list (node-scoped — a lease held on some OTHER seat node does
+    not contend with the gravitywell seat the local leg would race). A
+    client whose /status shape lacks per-node leases falls back to the
+    GLOBAL lease_count (the doorman-wide count) — a coarser but
+    conservative refusal, and the honest shape for that client.
+
     Blind never refuses: the doorman is unreachable -> (True, "") — the
     local voicing runs lease-free exactly as today (the 409 only fires
     when the doorman IS reachable and the seat is leased, which is the
@@ -248,7 +256,28 @@ def _local_voicing_lease_free() -> tuple[bool, str]:
         # produces because it never acquires.
         return (True, "")
     try:
-        if isinstance(status, dict) and status.get("lease_count", 0) > 0:
+        if not isinstance(status, dict):
+            return (True, "")
+        # Prefer the gravitywell node's lease list (the /status payload
+        # carries per-node leases: nodes.<node>.leases). A lease held on a
+        # different node does not contend with the gravitywell seat.
+        nodes = status.get("nodes")
+        if isinstance(nodes, dict):
+            gw_node = nodes.get("gravitywell")
+            if isinstance(gw_node, dict):
+                leases = gw_node.get("leases")
+                if isinstance(leases, list):
+                    return (
+                        (False, "local_seat_lease_refused") if leases else (True, "")
+                    )
+                lease_count = gw_node.get("lease_count", 0)
+                if isinstance(lease_count, int) and lease_count > 0:
+                    return (False, "local_seat_lease_refused")
+                return (True, "")
+        # The client's /status shape lacks per-node leases: fall back to
+        # the GLOBAL lease_count (the doorman-wide count — coarser but
+        # conservative; the docstring documents this fallback shape).
+        if status.get("lease_count", 0) > 0:
             return (False, "local_seat_lease_refused")
     except Exception:
         pass

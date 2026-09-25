@@ -121,6 +121,56 @@ class TestFlashnextPreflight:
         assert called[0].council_voicing == "flashnext"
         assert brief.council_status == "resolved"
 
+    def test_flashnext_operator_resolves_30000_lane(self, advisory_spec, monkeypatch):
+        """S3 (gate-lanes-registry-driven-flashnext-v0): with a stubbed
+        registry flashnext row, the flashnext operator resolves the :30000
+        lane — the facets-leg endpoint builds against the registry lane,
+        never the :8081 GW_URL default."""
+        monkeypatch.setattr(
+            "lapis_pm.gate_lane.gate_lane_serving", lambda *a, **k: (True, "")
+        )
+        from lapis_pm.gate_lane import FLASHNEXT_SERVED_ID, GateLane
+        monkeypatch.setattr(
+            "lapis_pm.gate_lane.resolve_gate_lane",
+            lambda *a, **k: GateLane(
+                name="flashnext",
+                base_url="http://203.0.113.11:30000",
+                served_model=FLASHNEXT_SERVED_ID,
+            ),
+        )
+        endpoints = []
+
+        def spy_primary_url(lane=None):
+            endpoints.append(lane)
+            return "http://203.0.113.11:30000"
+
+        monkeypatch.setattr("lapis_pm.spec_review._gw_primary_url", spy_primary_url)
+        called = []
+
+        async def mock_run_deliberation(request):
+            called.append(request)
+            return _happy_envelope()
+
+        monkeypatch.setattr("lapis_pm.spec_review.run_deliberation", mock_run_deliberation)
+
+        brief = run_spec_review(
+            advisory_spec,
+            council_voicing="flashnext",
+            facets_operator="flashnext",
+            timeout_s=30,
+            dispatch_facets=True,
+        )
+        assert len(called) == 1, "a serving flashnext lane must run the deliberation leg"
+        # The flashnext operator/voicing resolved the :30000 registry lane
+        # through the shim — the endpoint-construction call sites passed
+        # lane="flashnext" (never lane=None, which would silently build the
+        # :8081 GW_URL default).
+        assert "flashnext" in endpoints, (
+            "the flashnext facets-leg endpoint must resolve the :30000 lane "
+            f"through the gate_lane shim; got {endpoints}"
+        )
+        assert brief.council_status == "resolved"
+
     def test_flashnext_down_is_honest_leg_down(self, advisory_spec, monkeypatch):
         """A readable registry with a dead flashnext lane is an honest
         leg_down (flashnext_not_serving) — the deliberation leg is skipped,

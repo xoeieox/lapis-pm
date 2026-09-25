@@ -956,6 +956,7 @@ def _dispatch_gw_reviewer(
     run_id: str,
     gw_principal: str | None = None,
     abandoned_event: threading.Event | None = None,
+    lane: str | None = None,
 ) -> tuple[str | None, list[dict], float, str, GwLegProvenance | None]:
     """Dispatch and run the GW reference reviewer synchronously against Slot-2
     Devstral (:8082), lease-free — a distinct-model second opinion that runs
@@ -993,7 +994,7 @@ def _dispatch_gw_reviewer(
         )
         return None, [], elapsed, "gw_leg_retired", None
 
-    gw_slot2_url = _gw_slot2_url()
+    gw_slot2_url = _gw_slot2_url(lane=lane)
     if gw_slot2_url is None:
         elapsed = time.time() - start_time
         print(
@@ -1004,7 +1005,7 @@ def _dispatch_gw_reviewer(
         )
         return None, [], elapsed, "no_parseable_hostname", None
 
-    primary_url = _gw_primary_url()
+    primary_url = _gw_primary_url(lane=lane)
     if _gw_endpoints_collapsed(gw_slot2_url, primary_url):
         elapsed = time.time() - start_time
         print(
@@ -2860,6 +2861,12 @@ def run_spec_review(
         gw_run_id = str(uuid.uuid4())[:8]
         gw_principal = f"gw-gate-{uuid.uuid4().hex[:12]}"
         do_gw = with_gw and effective_authority in {"advisory", "hold"}
+        # S3 (gate-lanes-registry-driven-flashnext-v0): the GW reference leg
+        # is a gravitywell-lane leg (Slot-2 Devstral, lease-free) — it is
+        # never the flashnext lane, so it resolves with lane=None (byte-
+        # identical to today). The flashnext lane is the council/facets
+        # leg's lane, wired at the preflight + run_deliberation seam below.
+        _gw_lane = None
         # Single source of truth for the GW leg's timeout: the join below must wait
         # on exactly this value, not a separate hardcoded number, or a raised
         # GW_REVIEWER_TIMEOUT_SEC (e.g. #243's 900->1800) silently fails to take effect.
@@ -2878,6 +2885,7 @@ def run_spec_review(
                     run_id=gw_run_id,
                     gw_principal=gw_principal,
                     abandoned_event=gw_abandoned_event,
+                    lane=_gw_lane,
                 )
                 print(
                     f"[spec-review:gw-reviewer] submitted to executor work_id={gw_run_id}",
@@ -3118,6 +3126,16 @@ def run_spec_review(
                 gw_principal=gw_principal,
             )
 
+            # S3 (gate-lanes-registry-driven-flashnext-v0): the facets-leg
+            # and council-leg endpoints resolve their lane through the
+            # gate_lane shim — lane = the leg's operator/voicing when it is
+            # the registry lane (flashnext), else None (byte-identical to
+            # today: the default gravitywell legs never probe the registry).
+            # A dead flashnext lane surfaces as the S5 preflight honest
+            # leg_down below, never a silent :8081 fallback.
+            _facets_lane = "flashnext" if facets_operator == "flashnext" else None
+            _council_lane = "flashnext" if council_voicing == "flashnext" else None
+
             # D1: GW-liveness preflight on the primary Council+Facets legs.
             # If GW is not serving when council_voicing==gravitywell, skip run_deliberation
             # entirely — do NOT launch a doomed deliberation that may fall back to paid Sonnet.
@@ -3152,12 +3170,16 @@ def run_spec_review(
             # leg_down — recorded, never a silent mis-skip, never a masked
             # legacy fallback ("the opencode pin is a marked debt rather
             # than a silent skip" — same honesty shape here).
-            _preflight_skip = False
+            #
+            # S4 companion-scope note (gate-lanes-registry-driven-flashnext-v0):
+            # council-adapter construction for voicing flashnext (S4
+            # _build_adapter) is companion-scope (companion bind
+            # gate-lanes-registry-driven-flashnext-v0-agents-core); this PR
+            # carries enum + preflight + probe.
             if council_voicing == "local":
                 from lapis_pm import gate_lane as _gate_lane
                 _local_ok, _local_reason = _gate_lane.gate_lane_serving(lane="local")
                 if not _local_ok:
-                    _preflight_skip = True
                     print(
                         f"[spec-review:council-preflight] local voicing refused: "
                         f"{_local_reason} — a doorman lease is held on the "
@@ -3167,17 +3189,16 @@ def run_spec_review(
                         file=sys.stderr,
                     )
                     council_not_run_reason = _local_reason
-            if council_voicing == "flashnext":
+            if _council_lane is not None:
                 from lapis_pm import gate_lane as _gate_lane
-                _serving, _reason = _gate_lane.gate_lane_serving(lane="flashnext")
+                _serving, _reason = _gate_lane.gate_lane_serving(lane=_council_lane)
                 if not _serving:
-                    _preflight_skip = True
                     # registry_blind is the only reason that may look like
                     # the legacy gw_not_serving; a readable registry with a
                     # dead flashnext lane is its own honest reason.
                     _preflight_reason = (
                         "gw_not_serving" if _reason == "registry_blind"
-                        else f"flashnext_not_serving:{_reason}"
+                        else "flashnext_not_serving"
                     )
                     print(
                         f"[spec-review:council-preflight] flashnext lane not serving "
@@ -3186,7 +3207,7 @@ def run_spec_review(
                         file=sys.stderr,
                     )
                     council_not_run_reason = _preflight_reason
-            elif council_voicing == "gravitywell" and not swarm_serving():
+            elif _council_lane is None and council_voicing == "gravitywell" and not swarm_serving():
                 print(
                     "[spec-review:council-preflight] swarm not serving; skipping run_deliberation",
                     file=sys.stderr,
@@ -3200,6 +3221,31 @@ def run_spec_review(
                         pass
             else:
                 try:
+                    # S3 (gate-lanes-registry-driven-flashnext-v0): the
+                    # facets-leg endpoint seam — the facets leg's voicing
+                    # endpoint resolves through the gate_lane shim with the
+                    # leg's lane (flashnext when facets_operator is the
+                    # registry lane, else None = byte-identical GW_URL,
+                    # never registry-probing). A dead flashnext lane is
+                    # already refused by the S5 preflight above; this seam
+                    # is the endpoint-construction point the S3 wiring
+                    # names, so the leg's operator is provably resolved
+                    # through the shim (assertable in tests) and can never
+                    # silently build a :8081 endpoint for a flashnext leg.
+                    _leg_endpoints = {
+                        "facets": _gw_primary_url(lane=_facets_lane),
+                        "council": _gw_primary_url(lane=_council_lane),
+                    }
+                    if _facets_lane is not None or _council_lane is not None:
+                        print(
+                            f"[spec-review:gate-lane] facets-leg endpoint="
+                            f"{_leg_endpoints['facets']} (lane={_facets_lane}) "
+                            f"council-leg endpoint={_leg_endpoints['council']} "
+                            f"(lane={_council_lane}) — resolved through the "
+                            f"gate_lane shim",
+                            file=sys.stderr,
+                        )
+
                     async def _deliberate():
                         init_facets_semaphore(int(os.environ.get("SHARED_DELIBERATION_MAX_CONCURRENT", "2")))
                         return await run_deliberation(request)

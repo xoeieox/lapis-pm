@@ -183,7 +183,7 @@ class TestResolveGateLaneGwUrlFallback:
         from lapis_pm.spec_review import _gw_primary_url
         assert _gw_primary_url(lane="flashnext") == "http://203.0.113.11:30000"
         # lane=None stays byte-identical (never registry-probing)
-        assert _gw_primary_url() == "http://100.0.9.9:9999".replace("100.0.9.9", "10.0.0.9")
+        assert _gw_primary_url() == "http://10.0.0.9:9999"
 
 
 # ---------------------------------------------------------------------------

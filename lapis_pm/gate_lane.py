@@ -235,9 +235,12 @@ def _local_voicing_lease_free() -> tuple[bool, str]:
     try:
         from agents_core.doorman_client import DoormanClient
         client = DoormanClient()
-        # A read-only seat-state SENSE (GET), never an acquire: the guard
-        # must not itself take the lease it is guarding against.
-        status = client.status("gravitywell")
+        # A read-only seat-state SENSE (GET /status), never an acquire: the
+        # guard must not itself take the lease it is guarding against.
+        # DoormanClient.status() is the no-arg /status snapshot (the
+        # gravitywell doorman's own seat state — the node the legacy
+        # gravitywell voicing leases and the node the live 409 fired on).
+        status = client.status()
     except Exception:
         # Blind doorman (unreachable / malformed) -> never refuses. The
         # local voicing runs lease-free as today; the 409 shape requires a

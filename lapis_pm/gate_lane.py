@@ -212,6 +212,46 @@ def _resolve_from_payload(payload: dict, lane: Optional[str] = None) -> Optional
     return _lane_from_seats(seats, lane)
 
 
+def _local_voicing_lease_free() -> tuple[bool, str]:
+    """S8: the local-voicing lease-free guard.
+
+    A LOCAL voicing must not acquire a seat-node lease. The guard probes
+    the doorman for an ACTIVE lease on the "gravitywell" seat node (the
+    node the legacy gravitywell voicing leases, and the node the live 409
+    fired on). If such a lease is held, the local voicing is REFUSED
+    (leg_down, honest) — the doorman /lease/acquire call site is pinned
+    unreachable on this path, and the refusal is a leg_down, NEVER a
+    fallback-run on the gravitywell lane.
+
+    Blind never refuses: the doorman is unreachable -> (True, "") — the
+    local voicing runs lease-free exactly as today (the 409 only fires
+    when the doorman IS reachable and the seat is leased, which is the
+    shape this guard refuses BEFORE the leg would acquire).
+
+    Returns (ok, reason): (True, "") = lease-free, run the local leg;
+    (False, "local_seat_lease_refused") = a gravitywell-seat lease is
+    held, refuse the local leg (honest leg_down).
+    """
+    try:
+        from agents_core.doorman_client import DoormanClient
+        client = DoormanClient()
+        # A read-only seat-state SENSE (GET), never an acquire: the guard
+        # must not itself take the lease it is guarding against.
+        status = client.status("gravitywell")
+    except Exception:
+        # Blind doorman (unreachable / malformed) -> never refuses. The
+        # local voicing runs lease-free as today; the 409 shape requires a
+        # reachable doorman with a held lease, which this path never
+        # produces because it never acquires.
+        return (True, "")
+    try:
+        if isinstance(status, dict) and status.get("lease_count", 0) > 0:
+            return (False, "local_seat_lease_refused")
+    except Exception:
+        pass
+    return (True, "")
+
+
 def _fetch_payload(timeout: float = GW_SEATS_TIMEOUT_S) -> dict:
     """Live registry read (GET {GW_SEATS_URL}/). Any error -> {} (blind).
 
@@ -309,6 +349,31 @@ def gate_lane_serving(
                 return swarm_model(base_url)
             except Exception:
                 return None
+
+    # S8 (gate-lanes-registry-driven-flashnext-v0, hardened acceptance):
+    # a LOCAL-voiced council leg must be lease-free. The live 409 evidence
+    # (finding/council-lease-409-under-flashnext-window-2026-09-25): with
+    # flash-next holding the seat, the council leg under --council-voicing
+    # local still POSTed /lease/acquire on node "gravitywell" and died with
+    # 409 -> "Failed to submit council". The doorman seat-state contract
+    # applies to every gate leg: a local voicing acquires NO seat-node
+    # lease. This guard is the lapis-pm-side pin: it makes the doorman
+    # /lease/acquire call site UNREACHABLE on the local-voicing code path —
+    # the 409 contention shape is pinned unreachable, not merely that a
+    # lease-call count is zero (a zero-count assertion on a path the
+    # acquire never reaches is vacuous; the live 409 fired before the
+    # voicing branch was evaluated).
+    #
+    # The guard is a fail-closed REFUSE, never a fallback-run: a local
+    # voicing that finds a doorman lease on the gravitywell seat is a
+    # leg_down (the honest "local_seat_lease_refused"), and the caller
+    # must NOT re-route the leg to the gravitywell lane to "keep going".
+    #
+    # Blind never refuses: the doorman is unreachable (or the lane is
+    # registry-blind) -> the guard is a no-op and the local voicing runs
+    # lease-free as today.
+    if lane == "local":
+        return _local_voicing_lease_free()
 
     lane_obj = resolve_gate_lane(lane=lane, fetcher=fetcher)
     if lane_obj is None:

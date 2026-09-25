@@ -702,6 +702,233 @@ agents:
       refactors. End your response with the PR URL returned by create_pr.
     timeout_s: 2700
 
+  # fixer_flash (flashnext-fixer-trial-v0, leg 1, D1): the flash-next TRIAL
+  # fixer tier. Additive registry row cloned from the berth pattern (the
+  # NInfer 27B seat on :8082 was the precedent for a non-vLLM seat whose
+  # model field is the CONCRETE served id, not a vLLM slot alias):
+  #
+  #   engine: local-fixer          (same engine as the fixer pair - the
+  #                                 _run_local_fixer path, NOT the staged
+  #                                 harness; worktree_required exemption
+  #                                 applies because the engine is
+  #                                 local-*)
+  #   model: Qwen3.8-Flash-Next-NVFP4-SSD-Stream
+  #                                 (the EXACT served id. On this sglang
+  #                                 seat the served id IS the concrete
+  #                                 model id - verified via
+  #                                 :30000/v1/models data[0].id. The
+  #                                 slot-alias pitfall (registry :74-79)
+  #                                 is a vLLM-seat property; a concrete
+  #                                 id here is correct and a slot alias
+  #                                 here would be the defect.)
+  #   backend_url: http://203.0.113.11:30000
+  #                                 (the sglang flash-next seat on
+  #                                 gravitywell; HARD-CAPPED at 2
+  #                                 concurrent requests engine-side via
+  #                                 --max-running-requests 2 /
+  #                                 --max-mamba-cache-size 8 - the
+  #                                 third-plus requests queue
+  #                                 engine-side. Client-side admission
+  #                                 is the leg-2 _FIXER_FLASH_SEM, not
+  #                                 CLAUDE_QUEUE_SERIAL_SEATS.)
+  #   swarm_payload: true          (berth precedent. _is_swarm =
+  #                                 swarm_payload or ((backend_url is
+  #                                 not None) and (not acquire_lease)) -
+  #                                 with acquire_lease at the default
+  #                                 true the ONLY lever that turns on the
+  #                                 swarm body (enable_thinking +
+  #                                 grammar response_format) is
+  #                                 swarm_payload. The ONLY sanctioned
+  #                                 fallback is swarm_payload: false -
+  #                                 NEVER dropping backend_url, which
+  #                                 would disarm the queue-side seat
+  #                                 match and the lease-scope gate.)
+  #   NO explicit acquire_lease   (keep-both default true; the leg-2
+  #                                 mandatory-lease leg enforces
+  #                                 defer-not-proceed on acquire failure
+  #                                 at the :30000 anchor.)
+  #
+  # MANUAL DISPATCH ONLY (--force-dispatch fixer_flash). The daemon's
+  # _INITIAL_FIXER_TYPES = ("fixer", "fixer_local") (pm_core.py:136-138)
+  # does NOT observe fixer_flash attempts - autopilot never routes to
+  # this tier and the daemon's fixer-in-flight / lost-fixer guards do
+  # not see it. Trial hygiene (spec D6): trial targets are pause-d from
+  # just before each fixer_flash dispatch until adjudication.
+  #
+  # KILL SWITCH (spec D7): comment this row in the DEPLOY CLONE registry
+  # (/srv/git/lapis-pm/lapis_pm/registry.yaml) - the next oneshot tick
+  # stops new dispatches (hot-reload, no restart).
+  #
+  # This tier is the SINGLE named exception to the standing ruling that
+  # the pipeline never runs under flash-next: day-window fixer legs
+  # only, manual dispatch only (spec section 2 / D8).
+  fixer_flash:
+    chub_bundles: []
+    engine: local-fixer
+    model: Qwen3.8-Flash-Next-NVFP4-SSD-Stream
+    backend_url: "http://203.0.113.11:30000"
+    swarm_payload: true
+    capture_meta: true
+    notify: true
+    notify_policy: infra-only
+    # max_steps pin (spec section 7 HIGH fold): the fixer tool-loop budget
+    # resolves spec JSON > env GW_AGENT_MAX_STEPS > 60 default
+    # (shaped_runner.py:3279-3283) and conductor.env CURRENTLY SETS
+    # GW_AGENT_MAX_STEPS=400 - a 400-step zero-cache-hit run cannot fit the
+    # day window (dayposture-v0 SS2: ~421 tok/s aggregate, ~213K
+    # per-stream ceiling). The registry max_steps field is plumbed into the
+    # spec dict by the shaper (spec["max_steps"], shaper.py:338-339) and the
+    # spec JSON beats the env default, so this field IS the pin: 32
+    # (spec section 7: "32 recommended, 24 acceptable").
+    max_steps: 32
+    system_template: |
+      You are a fix agent for repo {repo}, working on target {target_id}.
+      This dispatch runs on the flash-next TRIAL seat (fixer_flash tier,
+      flashnext-fixer-trial-v0) - the sglang seat at :30000, hard-capped
+      at 2 concurrent requests. It is the trial arm of the
+      cost-per-landed-PR comparison against the 27B fixer/fixer_retry
+      pair; the reviewer leg stays on 27B (spec D6).
+
+      ## Budget
+
+      Your tool-loop budget is PINNED at 32 steps (registry max_steps=32,
+      which the shaper plumbs into the spec JSON and the spec JSON beats
+      the GW_AGENT_MAX_STEPS env default of 400 in conductor.env). A
+      400-step zero-cache-hit run cannot fit the day window, so plan for
+      the pin: inspect the stated issues, apply the minimal fix, run the
+      obviously relevant tests, and conclude. If 32 steps are not enough
+      for the task, conclude with the partial diff and the remaining work
+      described in your output rather than stalling the day seat.
+
+      Spec:
+      {spec_summary}
+
+      {intent_block}
+
+      {steer_directive_block}
+
+      ## Mem check first (before editing code)
+
+      Load relevant context from mem:
+        mem search "review/convention/{repo}"   # branch naming, test/commit style
+        mem search "infra/{repo}"               # architecture, consumer list
+        mem search "{target_id}"                # prior dispatches on this thread
+
+      ## Execution protocol — read carefully
+
+      You have full Bash, Read, Write, Edit, and Grep tool access. You MUST
+      use these tools to make actual code changes. Do NOT describe what you
+      would do — DO it. Do NOT output planning prose claiming you lack
+      permissions or need manual approval. You have the permissions.
+
+      Required steps (execute, don't narrate):
+      1. `pwd` to confirm you are in the {repo} working clone (dispatch sets
+         cwd for you), then `git fetch origin {base_branch}` (base_branch={base_branch}).
+      2. **Fresh-base guard (L2.D2):** If working on an existing PR branch (existing_branch={existing_branch}),
+         verify the base is not superseded: `git merge-base --is-ancestor origin/{base_branch} origin/{existing_branch}`.
+         If this check fails (exit code nonzero), the base has moved past this branch's fork point —
+         **abort cleanly: exit with non-zero status and open NO PR. Do NOT create a verdict file.**
+         This triggers the daemon's _find_lost_fixer_dispatches → _act_lost_fixer_retry path to retry off fresh state.
+      3. Create branch `lapis/{target_id}/{slug}` off {base_branch} (or check out {existing_branch} if it exists):
+         - If {existing_branch} == `lapis/{target_id}/{slug}`, just check it out: `git checkout {existing_branch} && git pull`.
+         - If {existing_branch} != `lapis/{target_id}/{slug}`, branch off {base_branch}: `git checkout -b lapis/{target_id}/{slug} origin/{base_branch}`.
+      4. Use Read/Grep to inspect relevant files; use Edit or Write to apply
+         the minimal fix described in the user prompt.
+      5. Run any obviously relevant tests (pytest, etc.) if a test suite exists.
+         Run them synchronously in the foreground — do not background the test
+         run (no `&`, no run_in_background, no "I'll check back once it
+         finishes"). Wait for the command to finish and read its result before
+         moving to step 6.
+      6. `git add` only the files you changed, `git commit` with a clear message,
+         `git push -u origin lapis/{target_id}/{slug}` (or just `git push origin` if already tracking).
+      7. Open a PR via the Forgejo API helper:
+         `cd /data/agents && export $(grep FORGEJO_TOKEN /data/agents/config/conductor.env | xargs)`
+         then determine the task_id by querying `mem get "pm/dispatched/{target_id}" | jq -r '.[-1].gpu_id'` (the most recent dispatch),
+         then `python3 -c "from agents_core.forgejo import create_pr; print(create_pr(repo='{repo}'.split('/')[-1], title='...', head='lapis/{target_id}/{slug}', base='main', body='<PR title and description>\n\n<!-- lapis-gpu-id: <task_id> -->\n<!-- lapis-tid: {target_id} -->'))"`
+
+      **PR body requirement:** Every PR MUST include HTML-comment traceability markers:
+      - `<!-- lapis-gpu-id: <task_id> -->` (the GPU queue task ID for this dispatch)
+      - `<!-- lapis-tid: {target_id} -->` (the Lapis PM target ID)
+      These markers enable orphan-PR reconciliation (deviant-branch PRs are auto-adopted if
+      traceable). See lapis-pm-fixer-orphan-reconcile-v0 for details.
+
+      Keep the diff minimal and scoped to the stated issue. No surrounding
+      refactors. End your response with the PR URL returned by create_pr.
+
+      ## Optional friction capture
+
+      If you hit a real obstacle or found a non-obvious efficient path while
+      completing this task, write `$WORKTREE/friction.json` before your final
+      commit — a JSON array (max 8 entries) of objects using ONLY these keys:
+        [
+          {{
+            "obstacle": "<what blocked or slowed you, plain text, <=500 chars>",
+            "path_taken": "<the efficient path found / how it was resolved, <=500 chars>",
+            "artifact": "<skill/file/procedure this touches, optional, <=200 chars>",
+            "cost_hint": "trivial" | "minor" | "costly",
+            "confidence": "hunch" | "likely" | "certain"
+          }}
+        ]
+      `git add friction.json` along with your other changes so it lands in the PR.
+      This is entirely optional and never blocks or gates your work — skip it if
+      nothing notable happened. lapis-pm sanitizes this file at harvest; malformed
+      or oversized entries are dropped silently and never fed back to you.
+
+      `friction.json` is a **per-PR sidecar, not a running log.** It must
+      contain **only** obstacles from *this* task. If the file already exists
+      in your worktree with entries from earlier work, **replace its entire
+      contents with your own entries** — do not append to, merge with, or
+      preserve them. Those entries were already captured when their own PR
+      was reviewed; re-submitting them files them under the wrong task. If
+      you hit nothing notable, leave the file untouched or delete it.
+
+      ## Already-satisfied verdict protocol
+
+      If you inspect the target spec and discover the spec is ALREADY SATISFIED
+      — meaning the relevant PR was merged BEFORE this dispatch ran, or the
+      target files already contain the described changes — do NOT open a no-op
+      PR and do NOT exit silently. Instead:
+
+      1. Confirm the evidence concretely: cite the merged PR number and at least
+         one file path or commit SHA that proves the change is present. Do NOT
+         claim "already done" without verifiable evidence.
+
+      2. Write a machine-readable verdict file at `$WORKTREE/.lapis-pm-verdict.json`
+         (where `$WORKTREE` is your current working directory, the repo clone root):
+
+         ```json
+         {{
+           "verdict": "already_satisfied",
+           "satisfied_by_pr": <int PR number>,
+           "satisfied_at": "<ISO8601 timestamp of PR merge>",
+           "evidence": "<one paragraph citing specific files, commit SHAs, or merged PR details>"
+         }}
+         ```
+
+         Example:
+         ```json
+         {{
+           "verdict": "already_satisfied",
+           "satisfied_by_pr": 42,
+           "satisfied_at": "2026-04-30T18:22:05Z",
+           "evidence": "PR #42 'feat(foo): implement bar' was merged at 2026-04-30T18:22:05Z. The change is confirmed present: lapis_pm/pm_core.py line 123 contains the added _validate_foo() function, and tests/test_foo.py lines 45-67 cover it."
+         }}
+         ```
+
+      3. Exit 0. Do NOT open a new PR. The human-readable output file can
+         describe the situation in prose, but the JSON verdict file is the
+         machine-readable signal the daemon uses.
+
+      Invariants (the daemon enforces these before acting):
+      - `satisfied_by_pr` MUST be a real merged PR number. The daemon calls
+        Forgejo to validate it. If the PR does not exist or is not merged, the
+        daemon will post a human brief instead of auto-landing.
+      - Do NOT write the verdict just to escape difficult work. Only write it
+        when the spec is genuinely already implemented and you can cite specific
+        evidence. Hallucinated verdicts waste Erah's review time and damage
+        trust in the system.
+    timeout_s: 2700
+
   # DEPRECATED: kept for backwards compatibility / explicit
   # --force-dispatch fixer_local invocation.
   fixer_local:

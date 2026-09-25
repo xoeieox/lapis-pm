@@ -324,6 +324,31 @@ class TestInjectOverlay:
         assert "Active PM directive" in vars_["steer_directive_block"]
         mem.delete.assert_called_once()
 
+    def test_fixer_flash_with_overlay_sets_block_and_consumes(self):
+        """flashnext-fixer-trial-v0 (leg 1): the fixer_flash trial tier
+        consumes the single-shot directive overlay - a mid-run PM directive
+        filed against a trial target must reach the trial dispatch rather
+        than silently persist past it."""
+        mem = self._mem_mock("trial directive: focus on the pin")
+        with patch("lapis_pm.steer._mem", return_value=mem), \
+             patch("lapis_pm.episodic.write_observation"):
+            from lapis_pm import steer
+            vars_ = {}
+            steer.inject_overlay("tid", vars_, "fixer_flash")
+        assert "trial directive: focus on the pin" in vars_["steer_directive_block"]
+        assert "Active PM directive" in vars_["steer_directive_block"]
+        mem.delete.assert_called_once()
+
+    def test_fixer_flash_without_overlay_sets_empty_string(self):
+        mem = self._mem_mock(None)
+        with patch("lapis_pm.steer._mem", return_value=mem), \
+             patch("lapis_pm.episodic.write_observation"):
+            from lapis_pm import steer
+            vars_ = {}
+            steer.inject_overlay("tid", vars_, "fixer_flash")
+        assert vars_["steer_directive_block"] == ""
+        mem.delete.assert_not_called()
+
     def test_fixer_staged_without_overlay_sets_empty_string(self):
         mem = self._mem_mock(None)
         with patch("lapis_pm.steer._mem", return_value=mem), \

@@ -250,6 +250,14 @@ class TestNode2Repoint:
             patch("lapis_pm.corroboration_adapter.node_reachable", return_value=True),
             patch("httpx.post", side_effect=_post),
             patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
+            # These D2-era tests pin the LEGACY node2 contract (the
+            # sanctioned PhalaTeeClient path), which the gate-lanes PR
+            # scopes to the blind/non-solo lane shape (S1 caller contract).
+            # Stub the seam to that shape so the assertions hold
+            # host-independently; the flashnext-solo lane shape is pinned by
+            # tests/test_corroboration_node2_flashnext_lane.py.
+            patch("lapis_pm.corroboration_adapter._flashnext_lane_url",
+                  return_value=(None, None, None)),
             patch.dict("os.environ", {"PHALA_API_KEY": "phala-test-key"}),
         ):
             mock_client.return_value.chat_completion.side_effect = _fake_chat_completion
@@ -286,6 +294,10 @@ class TestPhalaKeyFailClosed:
                 status_code=200, json=lambda: VALID_CORR_RESP, raise_for_status=lambda: None,
             )),
             patch("lapis_pm.corroboration_adapter._build_node2_client") as mock_client,
+            # Legacy (blind-lane) shape, host-independent (see the
+            # TestNode2Repoint sibling).
+            patch("lapis_pm.corroboration_adapter._flashnext_lane_url",
+                  return_value=(None, None, None)),
             patch.dict("os.environ", {}, clear=False),
         ):
             mock_client.return_value.chat_completion.side_effect = _NoKeyError("no key")

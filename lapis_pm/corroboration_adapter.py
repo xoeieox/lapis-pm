@@ -262,6 +262,65 @@ def _llm_url() -> str:
     return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
 
 
+def _flashnext_lane_url(
+    fetcher: "Callable[[], dict] | None" = None,
+) -> tuple[str | None, str | None, str | None]:
+    """S6 (gate-lanes-registry-driven-flashnext-v0): resolve the flashnext
+    node2 lane through the gw-seats registry.
+
+    Returns (base_url, served_model, blocked_reason):
+
+    * (base_url, served_model, None) — the registry is readable, the 27B
+      is NOT serving (flashnext-solo, the spec's S6 trigger: "reality_view
+      says the 27B is down and a flashnext row is registered"), and the
+      flashnext seat (:30000) is serving. The node2 leg builds against that
+      lane (registry-served model name on :30000) so corroboration does not
+      silently attenuate panels under flashnext-solo.
+    * (None, None, None) — a LEGACY-shape case: the registry is blind
+      (unreachable/malformed, the S1 contract's ONLY fallback case) OR the
+      27B IS serving (dual/slot1 posture — the spec keeps the phala path
+      unchanged there; MED-5 fold: the switch is conditioned on
+      flashnext-solo, not merely a registered flashnext row, so node2 never
+      jumps onto a seat the gate legs run on while the 27B lane is alive).
+      The caller rides the sanctioned PhalaTeeClient path byte-identically.
+    * (None, None, reason) — readable registry, 27B down, flashnext lane
+      absent/not serving: an honest node2_unavailable (the panel_starvation
+      row stays truthful) — NEVER a silent fallback to the Phala/legacy
+      path that would mask the seat's absence (the S1 caller contract,
+      "no lying leg"; MED-4 fold: the code now matches this docstring —
+      resolve_gate_lane collapses blind and dead-lane to the same None, so
+      the distinction is made by re-reading the payload, the same pattern
+      gate_lane_serving uses).
+
+    Single registry read (one _fetch_payload, no double-fetch); reads the
+    seat rows directly from the payload via the gate_lane helpers (shim-
+    internal: the companion lane_registry promotion keeps the same shape).
+    """
+    try:
+        from lapis_pm import gate_lane as _gate_lane
+    except Exception:
+        return (None, None, None)  # module unavailable -> today's behavior
+    try:
+        payload = (fetcher or _gate_lane._fetch_payload)()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or not _gate_lane._seat_rows(payload):
+        return (None, None, None)  # blind — the ONLY legacy-fallback case
+    if _gate_lane._resolve_from_payload(payload, _gate_lane.SLOT1_LANE_NAME) is not None:
+        return (None, None, None)  # 27B serving: not flashnext-solo; phala unchanged
+    lane_obj = _gate_lane._resolve_from_payload(payload, _gate_lane.FLASHNEXT_LANE_NAME)
+    if lane_obj is None:
+        return (None, None, "flashnext_not_serving")  # readable + dead: honest
+    # FULL endpoint URL (R-1 fix, final independent review 2026-09-25): the
+    # raw-POST path uses node_url VERBATIM (httpx.post(_url) at :850) and
+    # the _llm_url() convention is a full endpoint including
+    # /v1/chat/completions — the registry base_url is pathless, and sglang
+    # answers 405 at the root (verified live: POST / -> 405, POST
+    # /v1/chat/completions -> 200). A pathless base_url would convert every
+    # S6 node2 call into an honest-but-inert node2_unavailable.
+    return (f"{lane_obj.base_url}/v1/chat/completions", lane_obj.served_model, None)
+
+
 # _LLM_TIMEOUT 120s (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling
 # 2026-09-01): sized by measurement, not precaution — the runaway-guard
 # principle (Erah, 2026-08-12) applied to the new measurement. Arm C measured
@@ -1036,6 +1095,42 @@ def run_corroboration_pass(
 
     def _score_n2() -> CorroborationResult:
         try:
+            # S6 (gate-lanes-registry-driven-flashnext-v0): under
+            # flashnext-solo (the 27B seat down, the flashnext seat :30000
+            # registered + serving), the node2 leg builds against the
+            # flashnext lane via the existing node_url injection point —
+            # the registry-served model name on :30000, never the dead
+            # Phala/legacy path. node2_unavailable then fires ONLY when
+            # :30000 is actually unreachable (honest panel_starvation row),
+            # eliminating the node2_unavailable starvation class under
+            # flashnext-solo.
+            #
+            # Caller contract (S1): (None, None, None) = registry blind OR
+            # a non-solo posture (27B up) — the ONLY shapes that fall back
+            # to the legacy PhalaTeeClient path byte-identically. A readable
+            # registry, 27B down, with a dead flashnext lane is an honest
+            # node2_unavailable, never a masked legacy fallback (MED-4
+            # fold: the blocked reason now flows here as the third value).
+            _flash_url, _flash_model, _flash_blocked = _flashnext_lane_url()
+            if _flash_blocked is not None:
+                return _make_uncertain(
+                    repo,
+                    f"node2_unavailable: gate-lanes registry readable, 27B "
+                    f"down, flashnext lane not serving ({_flash_blocked}) — "
+                    f"honest leg_down, no masked legacy fallback",
+                )
+            if _flash_url is not None:
+                return adapter_n2.score(
+                    diff_text, substrates, repo,
+                    node_url=_flash_url,
+                    node_model=_flash_model,
+                    node_timeout=_NODE2_TIMEOUT,
+                    # Code-only tenancy constraint (Erah, 2026-09-01): the
+                    # outside caller never sees vault content — diff excerpt
+                    # + repo grep hits only. Build-time guard; `substrates`
+                    # is not mutated.
+                    include_vault=False,
+                )
             # D2 (lapis-pm-reviewer-leg-repair-v0): node2 rides the sanctioned
             # PhalaTeeClient verifying path (attestation + ACI verify hop on
             # every call), not a raw Bearer POST. The client reads

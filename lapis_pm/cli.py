@@ -3089,9 +3089,17 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument(
         "--council-voicing",
         default="gravitywell",
-        choices=["local", "gravitywell"],
+        choices=["local", "gravitywell", "flashnext"],
         dest="council_voicing",
-        help="Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, zero paid spend). Paid-model voicing removed; entity selection retains its own on_wake_fail fallback.",
+        help=(
+            "Voicing for Mirror Council deliberation (default: gravitywell — owned 122B, "
+            "zero paid spend). flashnext = the flash-next seat (GW :30000, "
+            "Qwen3.8-Flash-Next-NVFP4-SSD-Stream), resolved through the gw-seats "
+            "registry (gate-lanes-registry-driven-flashnext-v0 S3/S4): a requested-but-"
+            "inactive flashnext lane is an honest leg_down, never a silent gravitywell "
+            "fallback. Paid-model voicing removed; entity selection retains its own "
+            "on_wake_fail fallback."
+        ),
     )
     sr.add_argument(
         "--timeout",
@@ -3168,14 +3176,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sr.add_argument(
         "--facets-operator",
-        choices=["haiku", "sonnet", "opus", "qwen", "gravitywell"],
+        choices=["haiku", "sonnet", "opus", "qwen", "gravitywell", "flashnext"],
         default="gravitywell",
         dest="facets_operator",
         help=(
             "Model operator for Facets personas and synthesis (default: gravitywell). gravitywell = owned 122B "
             "local, zero paid spend; degrades to haiku when GW is unavailable, and the degrade is reported in "
             "the gate output (⚠️ DEGRADED banner + requested → effective voicing line). Pass sonnet or haiku "
-            "to deliberately spend money on a paid pass instead."
+            "to deliberately spend money on a paid pass instead. flashnext = the flash-next seat (GW :30000, "
+            "Qwen3.8-Flash-Next-NVFP4-SSD-Stream), resolved through the gw-seats registry "
+            "(gate-lanes-registry-driven-flashnext-v0 S3): the lapis-pm side resolves and reports the lane; "
+            "the in-leg operator registration lands with the companion agents-core bind "
+            "(gate-lanes-registry-driven-flashnext-v0-agents-core) — until then a flashnext-voiced facets leg "
+            "resolves its endpoint inside agents-core as today."
         ),
     )
     sr.set_defaults(func=cmd_spec_review)

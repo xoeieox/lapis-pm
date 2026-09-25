@@ -262,6 +262,32 @@ def _llm_url() -> str:
     return os.environ.get("LOCAL_LLM_URL", "http://203.0.113.11:8081/v1/chat/completions")
 
 
+def _flashnext_lane_url() -> tuple[str | None, str | None]:
+    """S6 (gate-lanes-registry-driven-flashnext-v0): resolve the flashnext
+    node2 lane through the gw-seats registry.
+
+    Returns (base_url, served_model) when the registry is readable AND the
+    flashnext seat (:30000) is serving — the node2 leg builds against that
+    lane (registry-served model name on :30000) so corroboration does not
+    silently attenuate panels under flashnext-solo.
+
+    Returns (None, None) in the ONLY blind case: the registry is
+    unreachable/malformed or the flashnext lane is absent/not serving.
+    A readable registry with a dead flashnext lane is an honest
+    node2_unavailable (the panel_starvation row stays truthful) — never a
+    silent fallback to the Phala/legacy path that would mask the seat's
+    absence (the S1 caller contract, "no lying leg").
+    """
+    try:
+        from lapis_pm import gate_lane as _gate_lane
+        lane_obj = _gate_lane.resolve_gate_lane(lane="flashnext")
+    except Exception:
+        return (None, None)
+    if lane_obj is None:
+        return (None, None)
+    return (lane_obj.base_url, lane_obj.served_model)
+
+
 # _LLM_TIMEOUT 120s (lapis-pm-panel-leg-survival-v0 rev 4, Erah ruling
 # 2026-09-01): sized by measurement, not precaution — the runaway-guard
 # principle (Erah, 2026-08-12) applied to the new measurement. Arm C measured

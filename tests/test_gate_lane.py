@@ -339,3 +339,28 @@ class TestLocalVoicingLeaseFree:
             monkeypatch.undo()
         assert ok is True
         assert reason == ""
+
+
+# ---------------------------------------------------------------------------
+# S7: the many-eyes pin is a MARKED DEBT, not a silent skip (tracked
+# follow-up, NOT bundled in this PR — 2026-09-25 re-gate fold)
+# ---------------------------------------------------------------------------
+
+class TestS7MarkedDebt:
+    def test_s7_follow_up_is_marked_not_implemented(self):
+        """S7 (the :8408 reality_view.subagent_pin + registry.yaml gate_lane
+        entries for the opencode lens legs) has NO in-repo code point in this
+        tree — it is its own bind after this PR merges. This test pins the
+        debt as MARKED (the spec_review module docstring names it) rather
+        than a silent skip: the opencode-side pin is a marked debt rather
+        than a silent skip."""
+        import lapis_pm.spec_review as sr
+        doc = sr.__doc__ or ""
+        assert "MARKED DEBT" in doc
+        assert "S7" in doc
+        assert "subagent_pin" in doc
+        # The debt is tracked (not bundled): the gate_lane module is the
+        # protocol boundary the follow-up pins against, and it carries the
+        # follow-up reference in its docstring.
+        doc_lane = gate_lane.__doc__ or ""
+        assert "gate-lanes-registry-driven-flashnext-v0" in doc_lane

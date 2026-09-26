@@ -176,3 +176,7 @@ CLAUDE.md                role spec for PM-shaped sessions in this repo
 2026-04-28) has a runtime dep on `chub_broker`, which still lives in
 `/data/agents/scripts/` (deferred from agents-core day-one scope). See
 `SPEC.md` § "Known couplings".
+
+## License
+
+Apache License 2.0 - see `LICENSE` and `NOTICE`.

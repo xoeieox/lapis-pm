@@ -499,3 +499,90 @@ def test_brief_on_well_formed_tagged_fault_briefs(
 
     mock_synth.assert_called_once()
     mock_set_outstanding.assert_called_once_with("my-target", fake_brief)
+
+
+# ---------------------------------------------------------------------------
+# AC13 — untagged directive-shaped comments surface a WARN (silent-drop
+#        guard, spec cr-bundle-item-lapis-pm-1593db884c)
+# ---------------------------------------------------------------------------
+
+
+def _untagged_directive_shaped_comment(tid="my-target", content=None):
+    """A directive-shaped JSON payload (the signed_directive deposit payload
+    shape) deposited as a comment WITHOUT the human:directive tag."""
+    if content is None:
+        content = json.dumps(
+            {
+                "kind": "pm_directive",
+                "target_id": tid,
+                "cid": "cmt-untagged-1",
+                "content": "surgical change",
+            }
+        )
+    return episodic._store().append(
+        tid, content, author="Erah", author_type="user", tags=[]
+    )
+
+
+def test_encode_user_comments_untagged_directive_shaped_logs_warn(
+    scratch_zephyr, monkeypatch, caplog
+):
+    """An untagged directive-shaped comment is skipped (fail-open, no
+    encoding) but the skip is surfaced: a WARN naming the comment id and
+    the target id."""
+    monkeypatch.setenv("LAPIS_PM_DIRECTIVE_ENFORCEMENT", "observe")
+    c = _untagged_directive_shaped_comment()
+
+    with patch("lapis_pm.pm_core.episodic.write_observation") as mock_obs, \
+         caplog.at_level("WARNING", logger="lapis_pm.pm_core"):
+        honored = pm_core._encode_user_comments("my-target", [c])
+
+    # Fail-open: the untagged comment is NOT honored (behavior unchanged).
+    assert honored == []
+    # No held-fault observation — the comment never entered the gate.
+    assert not any("HELD FAULT" in call.args[1] for call in mock_obs.call_args_list)
+    # The WARN names the comment id + target id.
+    warns = [rec for rec in caplog.records if rec.levelname == "WARNING"]
+    assert len(warns) == 1
+    msg = warns[0].getMessage()
+    assert c.id in msg
+    assert "my-target" in msg
+    assert "human:directive" in msg
+
+
+def test_encode_user_comments_untagged_plain_comment_no_warn(
+    scratch_zephyr, monkeypatch, caplog
+):
+    """A non-directive-shaped untagged comment takes no WARN path (the
+    shape check does not false-positive on ordinary chatter)."""
+    monkeypatch.setenv("LAPIS_PM_DIRECTIVE_ENFORCEMENT", "observe")
+    c = episodic._store().append(
+        "my-target", "just some chatter, not a directive",
+        author="Erah", author_type="user", tags=[],
+    )
+
+    with caplog.at_level("WARNING", logger="lapis_pm.pm_core"):
+        honored = pm_core._encode_user_comments("my-target", [c])
+
+    assert honored == []
+    assert not [rec for rec in caplog.records if rec.levelname == "WARNING"]
+
+
+def test_encode_user_comments_tagged_directive_no_untagged_warn(
+    scratch_zephyr, root_signer, agent_signer, pinned_root, monkeypatch, caplog
+):
+    """Tagged directive encoding is unchanged: the acceptance gate runs,
+    the comment is honored, and the untagged-drop WARN is NOT taken."""
+    monkeypatch.setenv("LAPIS_PM_DIRECTIVE_ENFORCEMENT", "enforce")
+    _vouched_agent(scratch_zephyr, root_signer, agent_signer, pinned_root)
+    result = signed_directive.emit_signed_directive(
+        "my-target", "do the surgical thing", signer=agent_signer
+    )
+
+    with patch("lapis_pm.pm_core.episodic.write_observation"), \
+         caplog.at_level("WARNING", logger="lapis_pm.pm_core"):
+        honored = pm_core._encode_user_comments("my-target", [result["comment"]])
+
+    assert honored == [result["comment"]]
+    warns = [rec for rec in caplog.records if rec.levelname == "WARNING"]
+    assert not any("lacks the required" in rec.getMessage() for rec in warns)

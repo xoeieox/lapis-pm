@@ -174,7 +174,7 @@ _WORKTREE_DIR_RE = re.compile(r"^(?P<repo>.+)-(?P<sha7>[0-9a-f]{7})$")
 
 
 def _repo_root(repo: str) -> Path:
-    """Convention path for a repo's local working clone (CLAUDE.md 'Repos:'
+    """Convention path for a repo's local working clone (AGENTS.md 'Repos:'
     section: /srv/git/<repo>-working). A thin, monkeypatchable indirection —
     tests override this rather than touching the real filesystem."""
     return Path(f"/srv/git/{repo}-working")

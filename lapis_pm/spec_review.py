@@ -509,20 +509,20 @@ def _synth_target_id(parsed_target_id: str) -> str:
 
 
 def _load_invariant_context(repo: str) -> str:
-    """Load CLAUDE.md + SPEC.md + Constitution-Kernel.md for the given repo.
+    """Load AGENTS.md + SPEC.md + Constitution-Kernel.md for the given repo.
 
-    CLAUDE.md and Constitution-Kernel.md are REQUIRED.
+    AGENTS.md and Constitution-Kernel.md are REQUIRED.
     SPEC.md is optional (empty section if missing).
     Raises InvariantContextError if a required file is missing.
     No truncation in v0 (per Invariant 12).
     """
-    claude_md_path = Path(f"/srv/git/{repo}-working/CLAUDE.md")
+    claude_md_path = Path(f"/srv/git/{repo}-working/AGENTS.md")
     spec_md_path = Path(f"/srv/git/{repo}-working/SPEC.md")
     kernel_path = Path("/srv/git/inertia-vault-working/Lapis/Constitution-Kernel.md")
 
     if not claude_md_path.exists():
         raise InvariantContextError(
-            f"CLAUDE.md not found at {claude_md_path} — cannot load invariant context"
+            f"AGENTS.md not found at {claude_md_path} — cannot load invariant context"
         )
     if not kernel_path.exists():
         raise InvariantContextError(
@@ -534,7 +534,7 @@ def _load_invariant_context(repo: str) -> str:
     kernel = kernel_path.read_text(encoding="utf-8")
 
     return (
-        f"=== CLAUDE.md ({repo}) ===\n{claude_md}\n\n"
+        f"=== AGENTS.md ({repo}) ===\n{claude_md}\n\n"
         f"=== SPEC.md ({repo}) ===\n{spec_md}\n\n"
         f"=== Constitution-Kernel.md ===\n{kernel}"
     )

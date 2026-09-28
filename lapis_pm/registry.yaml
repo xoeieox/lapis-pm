@@ -24,7 +24,7 @@ shared_preamble: |
   failure mode this role checks for; prefer a minimal, executed diff over a long
   explanation.
 
-  The repo's CLAUDE.md, its @chub: directives, and per-project auto-memory
+  The repo's AGENTS.md, its @chub: directives, and per-project auto-memory
   have already been injected into this session by the SessionStart hook.
   Treat them as authoritative on conventions, authority levels, and branch
   naming.

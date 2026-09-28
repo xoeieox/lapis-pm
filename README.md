@@ -12,7 +12,7 @@ now that `agents-core` exists to carry the shared primitives.
 ## Install
 
 ```bash
-pip install -e /srv/lapis/lapis-pm --user --break-system-packages
+pip install -e .
 ```
 
 After install, `python3 -m lapis_pm.cli --help` works from any cwd.
@@ -164,7 +164,7 @@ lapis_pm/
 bin/lapis-pm             shell wrapper (sources env)
 systemd/                 service + timer units
 SPEC.md                  identity + what is owned vs. not + known couplings
-CLAUDE.md                role spec for PM-shaped sessions in this repo
+AGENTS.md                role spec for PM-shaped sessions in this repo
 ```
 
 ## Dependencies

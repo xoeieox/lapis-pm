@@ -52,9 +52,9 @@ git init --bare -b main "$TEST_BARE" >/dev/null
 git clone "$TEST_BARE" "$TEST_REPO" >/dev/null 2>&1
 
 cd "$TEST_REPO"
-cat > CLAUDE.md <<'EOF'
+cat > AGENTS.md <<'EOF'
 # Parallel smoke sandbox
-Minimal CLAUDE.md so setup_worktree's tripwire passes.
+Minimal AGENTS.md so setup_worktree's tripwire passes.
 EOF
 mkdir -p .claude
 cat > .claude/settings.json <<'EOF'

@@ -11,7 +11,7 @@ advisory / hold), and synthesizing briefs into `pm:brief` comments with
 Pushover delivery.
 
 A PM-shaped human Claude Code session opens in a product repo (e.g. `lapis-engine`)
-via the thin-`CLAUDE.md` + chub-inject pattern, shapes the spec + authority
+via the thin-`AGENTS.md` + chub-inject pattern, shapes the spec + authority
 in conversation with Erah, then hands off to this daemon via `lapis-pm bind`.
 The daemon takes over monitoring. When the thread lands, `lapis-pm land`
 synthesizes an arc doc at `/srv/lapis/lapis-state/<tid>.md` (RoomRAG-indexed).

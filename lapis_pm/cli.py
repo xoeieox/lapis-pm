@@ -3542,12 +3542,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Resolve node identity once, before any command dispatch. Fail-closed:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Resolve node identity once, before command dispatch -- after argparse so
+    # `--help` works on a fresh checkout with no env configured. Fail-closed:
     # NodeIdentityViolation / NodeConfigError propagate and exit the process
     # (spec: lapis-pm-node-write-ownership-v0, Design §1).
     node_identity.resolve_node_identity()
-    parser = build_parser()
-    args = parser.parse_args(argv)
     return args.func(args)
 
 

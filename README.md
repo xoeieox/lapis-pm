@@ -36,11 +36,11 @@ The `lapis-pm` shell wrapper at `bin/lapis-pm` sources `conductor.env`
 (FORGEJO_TOKEN, PUSHOVER_\*) and execs `python3 -m lapis_pm.cli`. Symlink
 it to `/usr/local/bin/lapis-pm` for manual use.
 
-### Adopting a freehand PR (post-cutover workflow)
+### Adopting a freehand PR
 
-During BRIX cutover, work done in freehand Claude Code sessions produces PRs on
-`feat/*` branches outside the PM loop. Use `--adopt-pr` to bring them in without
-manual branch re-homing:
+Work done outside the PM loop - for example in an interactive coding session -
+can land as a PR on a `feat/*` branch. Use `--adopt-pr` to bring such a PR into
+the managed loop without manual branch re-homing:
 
 ```bash
 lapis-pm bind <target_id> \
